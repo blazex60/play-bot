@@ -70,7 +70,7 @@ async def _get_or_create_session(
     # Connect to VC
     vc = await channel.connect()
     queue = GuildQueue()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async def on_disconnect() -> None:
         s = _sessions.pop(ctx.guild_id, None)
@@ -137,9 +137,7 @@ async def cmd_play(
                 await ctx.followup.send("❌ URLを取得できませんでした", ephemeral=True)
                 return
             try:
-                track = await resolve_metadata(
-                    webpage_url, requested_by=ctx.author.display_name
-                )
+                track = await resolve_metadata(webpage_url, requested_by=ctx.author.display_name)
             except YtdlpError as exc:
                 await ctx.followup.send(f"❌ 取得に失敗しました: {exc}", ephemeral=True)
                 return

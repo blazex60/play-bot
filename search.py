@@ -15,7 +15,6 @@ YDL_OPTS_SEARCH: dict[str, Any] = {
     "quiet": True,
     "no_warnings": True,
     "extract_flat": True,
-    "default_search": "ytsearch5",
     "skip_download": True,
 }
 
@@ -44,7 +43,7 @@ class YtdlpError(Exception):
 
 def _sync_search(query: str) -> list[dict[str, Any]]:
     with yt_dlp.YoutubeDL(YDL_OPTS_SEARCH) as ydl:
-        result = ydl.extract_info(query, download=False)
+        result = ydl.extract_info(f"ytsearch5:{query}", download=False)
     if result is None:
         return []
     entries: list[dict[str, Any]] = result.get("entries", [])
