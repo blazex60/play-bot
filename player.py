@@ -42,28 +42,22 @@ class GuildPlayer:
     async def play_next(self) -> None:
         """Resolve stream URL and start playback for the current track."""
         async with self._lock:
-            track = self._queue.current
-            if track is None:
-                await self._on_disconnect()
-                return
-
-            try:
-                stream_url = await resolve_stream_url(track.webpage_url)
-            except YtdlpError as exc:
-                logger.warning("Stream resolution failed for %s: %s", track.title, exc)
-                # Skip to next on error
-                next_track = self._queue.next(force_advance=True)
-                if next_track is None:
+            while True:
+                track = self._queue.current
+                if track is None:
                     await self._on_disconnect()
                     return
-                # Release lock before recursing
-            else:
-                next_track = None  # resolved successfully
 
-            if next_track is not None:
-                # Error path: already advanced, play the new current
-                await self.play_next()
-                return
+                try:
+                    stream_url = await resolve_stream_url(track.webpage_url)
+                except YtdlpError as exc:
+                    logger.warning("Stream resolution failed for %s: %s", track.title, exc)
+                    if self._queue.next(force_advance=True) is None:
+                        await self._on_disconnect()
+                        return
+                    continue
+
+                break
 
             source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
             source = discord.PCMVolumeTransformer(source, volume=self._volume)
