@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 FFMPEG_OPTIONS: dict[str, str] = {
     "before_options": (
-        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1"
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
     ),
     "options": "-vn",
 }
@@ -58,6 +58,7 @@ class GuildPlayer:
         self._lock = asyncio.Lock()
         self._force_skip = False
         self._volume = 1.0
+        self._watchdog_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Core playback
@@ -92,8 +93,10 @@ class GuildPlayer:
                 asyncio.run_coroutine_threadsafe(self._handle_after(), self._loop)
 
             if self._vc.is_connected():
+                if self._watchdog_task and not self._watchdog_task.done():
+                    self._watchdog_task.cancel()
                 self._vc.play(monitored, after=_after)
-                asyncio.create_task(self._watchdog(monitored))
+                self._watchdog_task = asyncio.create_task(self._watchdog(monitored))
 
     async def _watchdog(self, source: _WatchdogSource) -> None:
         """Detect stalled playback (FFmpeg hanging) and force-advance the queue."""
