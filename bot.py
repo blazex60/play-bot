@@ -6,12 +6,19 @@ import logging
 import os
 
 import discord
+import discord.voice.state as _voice_state
 from dotenv import load_dotenv
 
 from player import GuildPlayer
 from queue_manager import GuildQueue, LoopMode
 from search import YtdlpError, resolve_metadata, search_youtube
 from views import SearchResultView
+
+# Disable DAVE E2EE: when the `davey` package is installed py-cord advertises
+# max_dave_protocol_version=1, causing Discord to initiate MLS key exchanges on
+# every member join. py-cord's DAVE implementation is incomplete and drops audio
+# for new members. Setting DAVE_PROTOCOL_VERSION=0 opts out entirely.
+_voice_state.DAVE_PROTOCOL_VERSION = 0
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
