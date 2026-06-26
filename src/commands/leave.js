@@ -1,11 +1,11 @@
-import { SlashCommandBuilder } from 'discord.js'
+import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 
 export default {
   data: new SlashCommandBuilder().setName('leave').setDescription('ボットをVCから退出させます'),
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ ボットはVCにいません', ephemeral: true })
+    if (!session) return interaction.reply({ content: '❌ ボットはVCにいません', flags: MessageFlags.Ephemeral })
     sessions.delete(interaction.guildId)
     session.connection.destroy()
     await interaction.reply('👋 VCから退出しました')

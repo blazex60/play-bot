@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js'
+import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { LoopMode } from '../queue.js'
 
 const LOOP_LABELS = {
@@ -14,7 +14,7 @@ export default {
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', ephemeral: true })
+    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
     const newMode = session.queue.cycleLoop()
     await interaction.reply(`🔁 ループモード: **${LOOP_LABELS[newMode]}**`)
   },

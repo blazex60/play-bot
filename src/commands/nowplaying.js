@@ -1,4 +1,4 @@
-import { SlashCommandBuilder, EmbedBuilder } from 'discord.js'
+import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js'
 import { LoopMode } from '../queue.js'
 
 const LOOP_LABELS = {
@@ -20,9 +20,9 @@ export default {
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', ephemeral: true })
+    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
     const track = session.queue.current
-    if (!track) return interaction.reply({ content: '📭 現在再生中の曲はありません', ephemeral: true })
+    if (!track) return interaction.reply({ content: '📭 現在再生中の曲はありません', flags: MessageFlags.Ephemeral })
 
     const embed = new EmbedBuilder()
       .setTitle('🎵 Now Playing')

@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js'
+import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { createTrack } from '../queue.js'
 import { searchYoutube, resolveMetadata, YtdlpError } from '../search.js'
 import { createSearchResultComponents } from '../views.js'
@@ -25,7 +25,7 @@ export default {
 
     const member = interaction.member
     if (!member.voice?.channel) {
-      return interaction.followUp({ content: '❌ まずVCに参加してください', ephemeral: true })
+      return interaction.followUp({ content: '❌ まずVCに参加してください', flags: MessageFlags.Ephemeral })
     }
     const channel = member.voice.channel
     const query = interaction.options.getString('query')
@@ -36,14 +36,14 @@ export default {
       try {
         info = await resolveMetadata(query, { requestedBy: interaction.member.displayName })
       } catch (err) {
-        return interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, ephemeral: true })
+        return interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
       }
 
       let session
       try {
         session = await getOrCreateSession(interaction, channel)
       } catch (err) {
-        return interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, ephemeral: true })
+        return interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
       }
 
       const wasEmpty = session.queue.isEmpty
@@ -58,10 +58,10 @@ export default {
     try {
       results = await searchYoutube(query)
     } catch (err) {
-      return interaction.followUp({ content: `❌ 検索に失敗しました: ${err.message}`, ephemeral: true })
+      return interaction.followUp({ content: `❌ 検索に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
     }
     if (!results.length) {
-      return interaction.followUp({ content: '❌ 検索結果が見つかりませんでした', ephemeral: true })
+      return interaction.followUp({ content: '❌ 検索結果が見つかりませんでした', flags: MessageFlags.Ephemeral })
     }
 
     const components = createSearchResultComponents(results)
@@ -70,21 +70,21 @@ export default {
     const onSelect = async entry => {
       const url = entry.url || entry.webpage_url
       if (!url) {
-        await interaction.followUp({ content: '❌ URLを取得できませんでした', ephemeral: true })
+        await interaction.followUp({ content: '❌ URLを取得できませんでした', flags: MessageFlags.Ephemeral })
         return
       }
       let info
       try {
         info = await resolveMetadata(url, { requestedBy: interaction.member.displayName })
       } catch (err) {
-        await interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, ephemeral: true })
+        await interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         return
       }
       let session
       try {
         session = await getOrCreateSession(interaction, channel)
       } catch (err) {
-        await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, ephemeral: true })
+        await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         return
       }
       const wasEmpty = session.queue.isEmpty

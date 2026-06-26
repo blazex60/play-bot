@@ -60,7 +60,20 @@ export class GuildPlayer {
       return;
     }
 
-    const streamUrl = await resolveStreamUrl(track.webpageUrl);
+    let streamUrl;
+    try {
+      streamUrl = await resolveStreamUrl(track.webpageUrl);
+    } catch (err) {
+      console.error(`[GuildPlayer] resolveStreamUrl failed for "${track.title}":`, err);
+      const next = this.#queue.next({ forceAdvance: true });
+      if (next !== null) {
+        await this.playNext();
+      } else {
+        this.#clearWatchdog();
+        await this.#onDisconnect();
+      }
+      return;
+    }
 
     const resource = createAudioResource(streamUrl, {
       inputType: StreamType.Arbitrary,

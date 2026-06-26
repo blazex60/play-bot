@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js'
+import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { LoopMode } from '../queue.js'
 
 const LOOP_LABELS = {
@@ -21,7 +21,7 @@ export default {
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
     if (!session || session.queue.isEmpty) {
-      return interaction.reply({ content: '📭 キューは空です', ephemeral: true })
+      return interaction.reply({ content: '📭 キューは空です', flags: MessageFlags.Ephemeral })
     }
     const current = session.queue.current
     const upcoming = session.queue.upcoming()

@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js'
+import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 
 export default {
   data: new SlashCommandBuilder()
@@ -10,7 +10,7 @@ export default {
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', ephemeral: true })
+    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
     const level = interaction.options.getInteger('level')
     session.player.setVolume(level / 100)
     await interaction.reply(`🔊 音量を ${level}% に設定しました`)

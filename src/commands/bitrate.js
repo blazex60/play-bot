@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from 'discord.js'
+import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 
 const BITRATE_BY_TIER = { 0: 96_000, 1: 128_000, 2: 256_000, 3: 384_000 }
 
@@ -14,7 +14,7 @@ export default {
     await interaction.deferReply()
     const member = interaction.member
     if (!member.voice?.channel) {
-      return interaction.followUp({ content: '❌ まずVCに参加してください', ephemeral: true })
+      return interaction.followUp({ content: '❌ まずVCに参加してください', flags: MessageFlags.Ephemeral })
     }
     const channel = member.voice.channel
     const tier = interaction.guild.premiumTier
@@ -24,7 +24,7 @@ export default {
     try {
       await channel.setBitrate(target)
     } catch {
-      return interaction.followUp({ content: '❌ チャンネルの編集権限がありません', ephemeral: true })
+      return interaction.followUp({ content: '❌ チャンネルの編集権限がありません', flags: MessageFlags.Ephemeral })
     }
     const suffix = kbps !== null && target < kbps * 1000 ? `（Tier${tier} 上限に丸めました）` : ''
     await interaction.followUp(`✅ ビットレートを **${target / 1000}kbps** に設定しました${suffix}`)

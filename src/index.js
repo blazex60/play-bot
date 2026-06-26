@@ -1,5 +1,5 @@
 import 'dotenv/config'
-import { Client, Collection, Events, GatewayIntentBits } from 'discord.js'
+import { Client, Collection, Events, GatewayIntentBits, MessageFlags } from 'discord.js'
 
 import { readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -33,7 +33,7 @@ client.on(Events.InteractionCreate, async interaction => {
       await command.execute(interaction, sessions)
     } catch (err) {
       console.error(`[${interaction.commandName}] error:`, err)
-      const reply = { content: '❌ コマンドの実行中にエラーが発生しました', ephemeral: true }
+      const reply = { content: '❌ コマンドの実行中にエラーが発生しました', flags: MessageFlags.Ephemeral }
       if (interaction.replied || interaction.deferred) {
         await interaction.followUp(reply).catch(() => {})
       } else {
@@ -47,7 +47,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const index = parseSearchCustomId(interaction.customId)
     if (index === null) return
     const pending = pendingStore.get(interaction.message.id)
-    if (!pending) return interaction.reply({ content: '❌ 検索セッションが期限切れです', ephemeral: true })
+    if (!pending) return interaction.reply({ content: '❌ 検索セッションが期限切れです', flags: MessageFlags.Ephemeral })
     pendingStore.delete(interaction.message.id)
     await interaction.deferUpdate()
     await pending.onSelect(pending.results[index])
