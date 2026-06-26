@@ -37,6 +37,19 @@ export async function resolveMetadata(url, { requestedBy }) {
   });
 }
 
-export function resolveStreamUrl(url) {
-  return spawnAsync('yt-dlp', ['-f', 'bestaudio/best', '--get-url', url]);
+export function resolveAudioStream(url) {
+  const proc = spawn('yt-dlp', [
+    '-f', 'bestaudio/best',
+    '--no-playlist',
+    '-o', '-',
+    url,
+  ]);
+  let stderrBuf = '';
+  proc.stderr.on('data', d => { stderrBuf += d; });
+  proc.on('close', code => {
+    if (code !== 0) {
+      proc.stdout.destroy(new YtdlpError(stderrBuf.trim() || `yt-dlp exited ${code}`));
+    }
+  });
+  return proc.stdout;
 }

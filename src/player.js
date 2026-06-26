@@ -5,7 +5,7 @@ import {
   StreamType,
 
 } from '@discordjs/voice';
-import { resolveStreamUrl } from './search.js';
+import { resolveAudioStream } from './search.js';
 import { LoopMode } from './queue.js';
 
 const RECONNECT_GRACE = 5000;
@@ -24,6 +24,7 @@ export class GuildPlayer {
   #currentResource = null;
   #volume = 1.0;
   #forceSkip = false;
+  #hadError = false;
   #playbackStart = 0;
   #lastActiveAt = 0;
   #watchdogTimer = null;
@@ -48,6 +49,7 @@ export class GuildPlayer {
 
     this.#audioPlayer.on('error', err => {
       console.error('[GuildPlayer] audioPlayer error:', err);
+      this.#hadError = true;
     });
 
     this.#connection.subscribe(this.#audioPlayer);
@@ -60,22 +62,9 @@ export class GuildPlayer {
       return;
     }
 
-    let streamUrl;
-    try {
-      streamUrl = await resolveStreamUrl(track.webpageUrl);
-    } catch (err) {
-      console.error(`[GuildPlayer] resolveStreamUrl failed for "${track.title}":`, err);
-      const next = this.#queue.next({ forceAdvance: true });
-      if (next !== null) {
-        await this.playNext();
-      } else {
-        this.#clearWatchdog();
-        await this.#onDisconnect();
-      }
-      return;
-    }
+    const stream = resolveAudioStream(track.webpageUrl);
 
-    const resource = createAudioResource(streamUrl, {
+    const resource = createAudioResource(stream, {
       inputType: StreamType.Arbitrary,
       inlineVolume: true,
     });
@@ -128,12 +117,13 @@ export class GuildPlayer {
     const track = this.#queue.current;
     const isShortTrack = track?.duration != null && track.duration < 5;
 
-    if (elapsed < RECONNECT_GRACE && !isShortTrack) {
+    if (elapsed < RECONNECT_GRACE && !isShortTrack && !this.#hadError) {
       await sleep(2000);
       await this.playNext();
       return;
     }
 
+    this.#hadError = false;
     const nextTrack = this.#queue.next({ forceAdvance: false });
     if (nextTrack === null) {
       this.#clearWatchdog();
