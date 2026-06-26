@@ -3,7 +3,6 @@ import {
   createAudioResource,
   AudioPlayerStatus,
   StreamType,
-
 } from '@discordjs/voice';
 import { resolveAudioStream } from './search.js';
 import { LoopMode } from './queue.js';
@@ -123,8 +122,9 @@ export class GuildPlayer {
       return;
     }
 
+    const shouldForceAdvance = this.#hadError;
     this.#hadError = false;
-    const nextTrack = this.#queue.next({ forceAdvance: false });
+    const nextTrack = this.#queue.next({ forceAdvance: shouldForceAdvance });
     if (nextTrack === null) {
       this.#clearWatchdog();
       await this.#onDisconnect();
@@ -141,6 +141,7 @@ export class GuildPlayer {
         Date.now() - this.#lastActiveAt > WATCHDOG_STALL_THRESHOLD
       ) {
         console.warn('[GuildPlayer] watchdog: stall detected, stopping player');
+        this.#hadError = true;
         this.#audioPlayer.stop();
       }
     }, WATCHDOG_INTERVAL);
