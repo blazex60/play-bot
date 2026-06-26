@@ -26,6 +26,29 @@ logger = logging.getLogger(__name__)
 
 bot = discord.Bot()
 
+
+class _SelfDeafVoiceClient(discord.VoiceClient):
+    """VoiceClient that self-deafens on initial connect.
+
+    py-cord's Connectable.connect() (abc.py:2087) calls voice.connect() without
+    self_deaf, so we override it here. Calling guild.change_voice_state() after
+    connect sends a second VOICE_STATE_UPDATE which makes Discord close the voice
+    WebSocket with code 1000, causing an immediate disconnect.
+    """
+
+    async def connect(
+        self,
+        *,
+        timeout: float,
+        reconnect: bool,
+        self_deaf: bool = False,
+        self_mute: bool = False,
+    ) -> None:
+        await super().connect(
+            timeout=timeout, reconnect=reconnect, self_deaf=True, self_mute=self_mute
+        )
+
+
 # ---------------------------------------------------------------------------
 # Per-guild session
 # ---------------------------------------------------------------------------
@@ -76,9 +99,7 @@ async def _get_or_create_session(
     session = _sessions.get(ctx.guild_id)
     if session and session.voice_client.is_connected():
         return session
-    vc = await channel.connect()
-    # Deafen after connecting: py-cord's connect() lacks self_deaf; change_voice_state does it.
-    await ctx.guild.change_voice_state(channel=vc.channel, self_deaf=True)
+    vc = await channel.connect(cls=_SelfDeafVoiceClient)
     queue = GuildQueue()
     loop = asyncio.get_running_loop()
 
