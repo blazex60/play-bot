@@ -46,12 +46,39 @@ docker compose up --build
 
 ---
 
+## 音声実装の詳細
+
+音声関連はすべて `@discordjs/voice` で処理する。`ytdl-core` や他の音声ライブラリは使わない。
+
+### VC 接続 (`src/sessions.js`)
+
+```
+joinVoiceChannel({ selfDeaf: true }) → entersState(Ready, 30s)
+```
+
+- **`network_mode: host` 必須** — Docker の bridge NAT が UDP をブロックし `entersState(Ready)` がタイムアウトする。`docker-compose.yml` に `network_mode: "host"` を設定すること（Linux 専用、Mac/Windows 不可）
+- **`@discordjs/voice` は `^0.19.2` 以上を使うこと** — Discord が 2024年11月に旧暗号化方式（`xsalsa20_poly1305` 系）を廃止し、`aead_xchacha20_poly1305_rtpsize` / `aead_aes256_gcm_rtpsize` が必須になった。0.17.x 以前は接続しても UDP ハンドシェイクが失敗する
+
+### 音声ストリーム (`src/search.js` → `src/player.js`)
+
+```
+resolveAudioStream(url)  →  yt-dlp stdout  →  createAudioResource(stream)
+```
+
+- **yt-dlp の stdout を直接パイプする** — `yt-dlp --get-url` で URL 文字列を取得して FFmpeg に渡す方式は、googlevideo URL へのアクセスに必要なヘッダーが揃わず音声がストールする。`yt-dlp -o -` で stdout にパイプし、そのまま `createAudioResource` に渡すこと
+- **`StreamType.Arbitrary`** — yt-dlp が出力するコンテナ形式（webm/opus、m4a/aac 等）を FFmpeg が自動検出してトランスコードする
+
+### ウォッチドッグ (`src/player.js`)
+
+- **`playbackDuration` の進捗で判定する** — `stateChange` イベントは再生開始時に一度しか発火しないため、それを基準にすると正常再生中でも常に 30 秒で誤発火する。`state.playbackDuration` が 10 秒間隔で増加しているかを確認し、増加が止まった場合のみストールと判定する
+- **`#hadError` フラグ** — 音声エラー発生時に TRACK ループモードで同一トラックへ無限リトライしないよう、エラー時は `queue.next({ forceAdvance: true })` で強制スキップする。フラグ値は `next()` を呼ぶ前に退避してからリセットすること（順序が逆だとフラグが無効になる）
+
+---
+
 ## 設計上の制約
 
-- **selfDeaf はネイティブ対応** — `joinVoiceChannel({ selfDeaf: true })` を使用。py-cord の close code 1000 問題を解消
-- **ストリーム URL はキャッシュしない** — googlevideo URL は数時間で失効するため再生直前に `resolveStreamUrl()` で都度解決
-- **AudioPlayerStatus.Idle イベント** — 曲終了後の次曲再生はこのイベントで駆動（スレッド問題なし）
-- **ウォッチドッグ** — 10 秒ごとに再生状態を監視し、30 秒間停止状態が続いたら強制 stop
+- **selfDeaf はネイティブ対応** — `joinVoiceChannel({ selfDeaf: true })` を使用
+- **AudioPlayerStatus.Idle イベント** — 曲終了後の次曲再生はこのイベントで駆動
 - **循環インポート防止** — `sessions.js` が共有状態を管理。`index.js` と `play.js` の双方向依存を排除
 - **LLM 不使用** — 外部 AI API は一切使わない
 
