@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable, Coroutine
 
 import discord
@@ -17,6 +18,27 @@ FFMPEG_OPTIONS: dict[str, str] = {
     ),
     "options": "-vn",
 }
+
+_WATCHDOG_INTERVAL = 10.0
+_STALL_TIMEOUT = 30.0
+
+
+class _WatchdogSource(discord.PCMVolumeTransformer):
+    """PCMVolumeTransformer that tracks when audio data was last produced."""
+
+    def __init__(self, source: discord.AudioSource, volume: float) -> None:
+        super().__init__(source, volume=volume)
+        self._last_read_at: float = time.monotonic()
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            self._last_read_at = time.monotonic()
+        return data
+
+    @property
+    def last_read_at(self) -> float:
+        return self._last_read_at
 
 
 class GuildPlayer:
@@ -62,7 +84,7 @@ class GuildPlayer:
                 break
 
             source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
-            source = discord.PCMVolumeTransformer(source, volume=self._volume)
+            monitored = _WatchdogSource(source, volume=self._volume)
 
             def _after(error: Exception | None) -> None:
                 if error:
@@ -70,7 +92,20 @@ class GuildPlayer:
                 asyncio.run_coroutine_threadsafe(self._handle_after(), self._loop)
 
             if self._vc.is_connected():
-                self._vc.play(source, after=_after)
+                self._vc.play(monitored, after=_after)
+                asyncio.create_task(self._watchdog(monitored))
+
+    async def _watchdog(self, source: _WatchdogSource) -> None:
+        """Detect stalled playback (FFmpeg hanging) and force-advance the queue."""
+        while True:
+            await asyncio.sleep(_WATCHDOG_INTERVAL)
+            if not self._vc.is_playing():
+                break
+            stale = time.monotonic() - source.last_read_at
+            if stale >= _STALL_TIMEOUT:
+                logger.warning("Playback stalled (%.0fs no audio). Force-stopping.", stale)
+                self._vc.stop()
+                break
 
     async def _handle_after(self) -> None:
         """Called from the after= callback via run_coroutine_threadsafe."""
