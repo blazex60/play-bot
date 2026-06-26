@@ -14,13 +14,14 @@ logger = logging.getLogger(__name__)
 
 FFMPEG_OPTIONS: dict[str, str] = {
     "before_options": (
-        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1"
     ),
     "options": "-vn",
 }
 
 _WATCHDOG_INTERVAL = 10.0
 _STALL_TIMEOUT = 30.0
+_DURATION_BUFFER = 10.0  # seconds past expected duration before treating as loop
 
 
 class _WatchdogSource(discord.PCMVolumeTransformer):
@@ -96,13 +97,22 @@ class GuildPlayer:
                 if self._watchdog_task and not self._watchdog_task.done():
                     self._watchdog_task.cancel()
                 self._vc.play(monitored, after=_after)
-                self._watchdog_task = asyncio.create_task(self._watchdog(monitored))
+                self._watchdog_task = asyncio.create_task(self._watchdog(monitored, track.duration))
 
-    async def _watchdog(self, source: _WatchdogSource) -> None:
-        """Detect stalled playback (FFmpeg hanging) and force-advance the queue."""
+    async def _watchdog(self, source: _WatchdogSource, duration: int | None) -> None:
+        """Detect stalled or looping playback and force-advance the queue."""
+        start = time.monotonic()
         while True:
             await asyncio.sleep(_WATCHDOG_INTERVAL)
             if not self._vc.is_playing():
+                break
+            elapsed = time.monotonic() - start
+            if duration is not None and elapsed > duration + _DURATION_BUFFER:
+                logger.info(
+                    "Playback exceeded track duration (%.0fs elapsed, %ds expected). Advancing.",
+                    elapsed, duration,
+                )
+                self._vc.stop()
                 break
             stale = time.monotonic() - source.last_read_at
             if stale >= _STALL_TIMEOUT:
