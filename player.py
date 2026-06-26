@@ -22,6 +22,7 @@ FFMPEG_OPTIONS: dict[str, str] = {
 _WATCHDOG_INTERVAL = 10.0
 _STALL_TIMEOUT = 30.0
 _DURATION_BUFFER = 10.0  # seconds past expected duration before treating as loop
+_RECONNECT_GRACE = 5.0   # if playback ends within this many seconds, assume VC reconnect interrupted it
 
 
 class _WatchdogSource(discord.PCMVolumeTransformer):
@@ -60,6 +61,7 @@ class GuildPlayer:
         self._force_skip = False
         self._volume = 1.0
         self._watchdog_task: asyncio.Task | None = None
+        self._playback_start: float = 0.0
 
     # ------------------------------------------------------------------
     # Core playback
@@ -96,6 +98,7 @@ class GuildPlayer:
             if self._vc.is_connected():
                 if self._watchdog_task and not self._watchdog_task.done():
                     self._watchdog_task.cancel()
+                self._playback_start = time.monotonic()
                 self._vc.play(monitored, after=_after)
                 self._watchdog_task = asyncio.create_task(self._watchdog(monitored, track.duration))
 
@@ -124,6 +127,27 @@ class GuildPlayer:
         """Called from the after= callback via run_coroutine_threadsafe."""
         force = self._force_skip
         self._force_skip = False
+
+        elapsed = time.monotonic() - self._playback_start
+        if not force and elapsed < _RECONNECT_GRACE:
+            track = self._queue.current
+            track_is_short = (
+                track is not None
+                and track.duration is not None
+                and track.duration < _RECONNECT_GRACE
+            )
+            if not track_is_short:
+                logger.info(
+                    "Playback ended after %.1fs (< %.0fs grace); "
+                    "assuming gateway/voice reconnect — retrying current track.",
+                    elapsed, _RECONNECT_GRACE,
+                )
+                await asyncio.sleep(2.0)
+                if self._vc.is_connected():
+                    await self.play_next()
+                else:
+                    await self._on_disconnect()
+                return
 
         next_track = self._queue.next(force_advance=force)
         if next_track is None:
