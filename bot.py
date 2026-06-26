@@ -69,8 +69,8 @@ async def _get_or_create_session(
     session = _sessions.get(ctx.guild_id)
     if session and session.voice_client.is_connected():
         return session
-    # Connect to VC
-    vc = await channel.connect()
+    # self_deaf=True avoids a py-cord AttributeError on SSRC events when members join/leave.
+    vc = await channel.connect(self_deaf=True)
     queue = GuildQueue()
     loop = asyncio.get_running_loop()
 
@@ -286,7 +286,9 @@ async def cmd_volume(
     await ctx.respond(f"🔊 音量を {level}% に設定しました")
 
 
-@bot.slash_command(name="bitrate", description="VCのビットレートを設定します（省略時はサーバー最大値）")
+@bot.slash_command(
+    name="bitrate", description="VCのビットレートを設定します（省略時はサーバー最大値）"
+)
 async def cmd_bitrate(
     ctx: discord.ApplicationContext,
     kbps: int | None = discord.Option(

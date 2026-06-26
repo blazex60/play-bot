@@ -22,7 +22,7 @@ FFMPEG_OPTIONS: dict[str, str] = {
 _WATCHDOG_INTERVAL = 10.0
 _STALL_TIMEOUT = 30.0
 _DURATION_BUFFER = 10.0  # seconds past expected duration before treating as loop
-_RECONNECT_GRACE = 5.0   # if playback ends within this many seconds, assume VC reconnect interrupted it
+_RECONNECT_GRACE = 5.0  # playback ending this quickly implies VC reconnect interrupted it
 
 
 class _WatchdogSource(discord.PCMVolumeTransformer):
@@ -69,6 +69,18 @@ class GuildPlayer:
 
     async def play_next(self) -> None:
         """Resolve stream URL and start playback for the current track."""
+        # Poll OUTSIDE the lock: holding _lock during sleep would deadlock via
+        # watchdog -> _vc.stop() -> _after -> _handle_after -> play_next -> lock wait.
+        if not self._vc.is_connected():
+            logger.info("VC not connected; waiting up to 10s for reconnect...")
+            for _ in range(10):
+                await asyncio.sleep(1.0)
+                if self._vc.is_connected():
+                    break
+            else:
+                await self._on_disconnect()
+                return
+
         async with self._lock:
             while True:
                 track = self._queue.current
@@ -95,12 +107,16 @@ class GuildPlayer:
                     logger.error("Playback error: %s", error)
                 asyncio.run_coroutine_threadsafe(self._handle_after(), self._loop)
 
-            if self._vc.is_connected():
-                if self._watchdog_task and not self._watchdog_task.done():
-                    self._watchdog_task.cancel()
-                self._playback_start = time.monotonic()
+            if self._watchdog_task and not self._watchdog_task.done():
+                self._watchdog_task.cancel()
+            self._playback_start = time.monotonic()
+            try:
                 self._vc.play(monitored, after=_after)
-                self._watchdog_task = asyncio.create_task(self._watchdog(monitored, track.duration))
+            except discord.ClientException as exc:
+                logger.warning("Could not start playback (VC disconnected): %s", exc)
+                await self._on_disconnect()
+                return
+            self._watchdog_task = asyncio.create_task(self._watchdog(monitored, track.duration))
 
     async def _watchdog(self, source: _WatchdogSource, duration: int | None) -> None:
         """Detect stalled or looping playback and force-advance the queue."""
@@ -113,7 +129,8 @@ class GuildPlayer:
             if duration is not None and elapsed > duration + _DURATION_BUFFER:
                 logger.info(
                     "Playback exceeded track duration (%.0fs elapsed, %ds expected). Advancing.",
-                    elapsed, duration,
+                    elapsed,
+                    duration,
                 )
                 self._vc.stop()
                 break
@@ -140,13 +157,11 @@ class GuildPlayer:
                 logger.info(
                     "Playback ended after %.1fs (< %.0fs grace); "
                     "assuming gateway/voice reconnect — retrying current track.",
-                    elapsed, _RECONNECT_GRACE,
+                    elapsed,
+                    _RECONNECT_GRACE,
                 )
                 await asyncio.sleep(2.0)
-                if self._vc.is_connected():
-                    await self.play_next()
-                else:
-                    await self._on_disconnect()
+                await self.play_next()
                 return
 
         next_track = self._queue.next(force_advance=force)
