@@ -135,11 +135,16 @@ export class GuildPlayer {
 
   #resetWatchdog() {
     this.#clearWatchdog();
+    let lastPlaybackDuration = 0;
     this.#watchdogTimer = setInterval(() => {
-      if (
-        this.#audioPlayer.state.status === AudioPlayerStatus.Playing &&
-        Date.now() - this.#lastActiveAt > WATCHDOG_STALL_THRESHOLD
-      ) {
+      const state = this.#audioPlayer.state;
+      if (state.status !== AudioPlayerStatus.Playing) return;
+
+      const duration = state.playbackDuration ?? 0;
+      if (duration > lastPlaybackDuration) {
+        lastPlaybackDuration = duration;
+        this.#lastActiveAt = Date.now();
+      } else if (Date.now() - this.#lastActiveAt > WATCHDOG_STALL_THRESHOLD) {
         console.warn('[GuildPlayer] watchdog: stall detected, stopping player');
         this.#hadError = true;
         this.#audioPlayer.stop();
