@@ -1,14 +1,13 @@
-# dockerfile
-FROM python:3.12-slim 
+FROM node:20-alpine
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
-RUN pip install uv
+RUN apk add --no-cache ffmpeg python3 py3-pip && \
+    pip3 install --break-system-packages yt-dlp
 
-COPY pyproject.toml .
-RUN uv sync --no-dev
+COPY package*.json ./
+RUN npm install --omit=dev
 
-COPY . .
+COPY src/ ./src/
 
-CMD ["uv", "run", "python", "bot.py"]
+CMD ["node", "src/index.js"]

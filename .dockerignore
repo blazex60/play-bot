@@ -1,6 +1,2 @@
 .env
-__pycache__/
-.venv/
-.pytest_cache/
-.ruff_cache/
-tests/
+node_modules/

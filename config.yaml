@@ -1,4 +1,0 @@
-bot:
-  default_volume: 50
-  max_queue_size: 100
-  search_results: 5
