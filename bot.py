@@ -69,8 +69,9 @@ async def _get_or_create_session(
     session = _sessions.get(ctx.guild_id)
     if session and session.voice_client.is_connected():
         return session
-    # self_deaf=True avoids a py-cord AttributeError on SSRC events when members join/leave.
-    vc = await channel.connect(self_deaf=True)
+    vc = await channel.connect()
+    # Deafen after connecting: py-cord's connect() lacks self_deaf; change_voice_state does it.
+    await ctx.guild.change_voice_state(channel=vc.channel, self_deaf=True)
     queue = GuildQueue()
     loop = asyncio.get_running_loop()
 
