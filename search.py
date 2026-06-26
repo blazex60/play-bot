@@ -21,7 +21,7 @@ YDL_OPTS_SEARCH: dict[str, Any] = {
 YDL_OPTS_STREAM: dict[str, Any] = {
     "quiet": True,
     "no_warnings": True,
-    "format": "bestaudio/best",
+    "format": "bestaudio[protocol^=https][vcodec=none]/bestaudio[vcodec=none]/bestaudio/best",
     "noplaylist": True,
     "skip_download": True,
 }

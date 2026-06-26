@@ -4,8 +4,6 @@ from typing import Any, Callable, Coroutine
 
 import discord
 
-from queue_manager import Track
-
 
 class SearchResultView(discord.ui.View):
     """Presents up to 5 YouTube search results as a select menu."""

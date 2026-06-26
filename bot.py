@@ -9,7 +9,7 @@ import discord
 from dotenv import load_dotenv
 
 from player import GuildPlayer
-from queue_manager import GuildQueue, LoopMode, Track
+from queue_manager import GuildQueue, LoopMode
 from search import YtdlpError, resolve_metadata, search_youtube
 from views import SearchResultView
 
@@ -42,6 +42,8 @@ _LOOP_LABELS = {
     LoopMode.TRACK: "1曲リピート",
     LoopMode.QUEUE: "キューリピート",
 }
+
+_BITRATE_BY_TIER: dict[int, int] = {0: 96_000, 1: 128_000, 2: 256_000, 3: 384_000}
 
 
 def _fmt_duration(seconds: int | None) -> str:
@@ -282,6 +284,33 @@ async def cmd_volume(
         return
     session.player.set_volume(level / 100.0)
     await ctx.respond(f"🔊 音量を {level}% に設定しました")
+
+
+@bot.slash_command(name="bitrate", description="VCのビットレートを設定します（省略時はサーバー最大値）")
+async def cmd_bitrate(
+    ctx: discord.ApplicationContext,
+    kbps: int | None = discord.Option(
+        int,
+        description="ビットレート (kbps)。省略するとサーバー最大値を設定",
+        min_value=8,
+        required=False,
+        default=None,
+    ),
+) -> None:
+    await ctx.defer()
+    channel = await _ensure_in_vc(ctx)
+    if channel is None:
+        return
+    tier = ctx.guild.premium_tier
+    max_bitrate = _BITRATE_BY_TIER.get(tier, 96_000)
+    target = max_bitrate if kbps is None else min(kbps * 1000, max_bitrate)
+    try:
+        await channel.edit(bitrate=target)
+    except discord.Forbidden:
+        await ctx.followup.send("❌ チャンネルの編集権限がありません", ephemeral=True)
+        return
+    suffix = f"（Tier{tier} 上限に丸めました）" if kbps is not None and target < kbps * 1000 else ""
+    await ctx.followup.send(f"✅ ビットレートを **{target // 1000}kbps** に設定しました{suffix}")
 
 
 @bot.slash_command(name="nowplaying", description="現在再生中の曲を表示します")

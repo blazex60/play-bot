@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Callable, Coroutine, Any
+from typing import Any, Callable, Coroutine
 
 import discord
 
@@ -12,7 +12,9 @@ from search import YtdlpError, resolve_stream_url
 logger = logging.getLogger(__name__)
 
 FFMPEG_OPTIONS: dict[str, str] = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": (
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_at_eof 1"
+    ),
     "options": "-vn",
 }
 
