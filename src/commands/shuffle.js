@@ -9,6 +9,6 @@ export default {
       return interaction.reply({ content: '❌ キューが空です', flags: MessageFlags.Ephemeral })
     }
     session.queue.shuffle()
-    await interaction.reply('🔀 キューをシャッフルしました')
+    await interaction.reply({ content: '🔀 キューをシャッフルしました', flags: MessageFlags.Ephemeral })
   },
 }

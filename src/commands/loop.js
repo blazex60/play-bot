@@ -16,6 +16,6 @@ export default {
     const session = sessions.get(interaction.guildId)
     if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
     const newMode = session.queue.cycleLoop()
-    await interaction.reply(`🔁 ループモード: **${LOOP_LABELS[newMode]}**`)
+    await interaction.reply({ content: `🔁 ループモード: **${LOOP_LABELS[newMode]}**`, flags: MessageFlags.Ephemeral })
   },
 }

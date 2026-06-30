@@ -1,6 +1,6 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { createTrack } from '../queue.js'
-import { searchYoutube, resolveMetadata, YtdlpError } from '../search.js'
+import { searchYoutube, resolveMetadata } from '../search.js'
 import { createSearchResultComponents } from '../views.js'
 import { getOrCreateSession, pendingStore } from '../sessions.js'
 
@@ -21,15 +21,20 @@ export default {
     ),
 
   async execute(interaction, sessions) {
-    await interaction.deferReply()
+    const query = interaction.options.getString('query')
+    const isUrl = query.startsWith('http://') || query.startsWith('https://')
+
+    // URL直接再生は公開defer。キーワード検索はephemeral（検索パネルを本人のみ表示）
+    await interaction.deferReply(isUrl ? {} : { ephemeral: true })
 
     const member = interaction.member
     if (!member.voice?.channel) {
-      return interaction.followUp({ content: '❌ まずVCに参加してください', flags: MessageFlags.Ephemeral })
+      if (isUrl) {
+        return interaction.followUp({ content: '❌ まずVCに参加してください', flags: MessageFlags.Ephemeral })
+      }
+      return interaction.editReply({ content: '❌ まずVCに参加してください' })
     }
     const channel = member.voice.channel
-    const query = interaction.options.getString('query')
-    const isUrl = query.startsWith('http://') || query.startsWith('https://')
 
     if (isUrl) {
       let info
@@ -58,14 +63,14 @@ export default {
     try {
       results = await searchYoutube(query)
     } catch (err) {
-      return interaction.followUp({ content: `❌ 検索に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+      return interaction.editReply({ content: `❌ 検索に失敗しました: ${err.message}` })
     }
     if (!results.length) {
-      return interaction.followUp({ content: '❌ 検索結果が見つかりませんでした', flags: MessageFlags.Ephemeral })
+      return interaction.editReply({ content: '❌ 検索結果が見つかりませんでした' })
     }
 
     const components = createSearchResultComponents(results)
-    const msg = await interaction.followUp({ content: '🔍 検索結果:', components })
+    const msg = await interaction.editReply({ content: '🔍 検索結果:', components })
 
     const onSelect = async entry => {
       const url = entry.url || entry.webpage_url
@@ -87,6 +92,7 @@ export default {
         await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         return
       }
+      await interaction.deleteReply().catch(() => {})
       const wasEmpty = session.queue.isEmpty
       session.queue.add(createTrack(info))
       await interaction.followUp(`✅ キューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`)

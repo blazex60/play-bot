@@ -11,10 +11,10 @@ export default {
     ),
 
   async execute(interaction, sessions) {
-    await interaction.deferReply()
+    await interaction.deferReply({ ephemeral: true })
     const member = interaction.member
     if (!member.voice?.channel) {
-      return interaction.followUp({ content: '❌ まずVCに参加してください', flags: MessageFlags.Ephemeral })
+      return interaction.editReply({ content: '❌ まずVCに参加してください' })
     }
     const channel = member.voice.channel
     const tier = interaction.guild.premiumTier
@@ -24,9 +24,9 @@ export default {
     try {
       await channel.setBitrate(target)
     } catch {
-      return interaction.followUp({ content: '❌ チャンネルの編集権限がありません', flags: MessageFlags.Ephemeral })
+      return interaction.editReply({ content: '❌ チャンネルの編集権限がありません' })
     }
     const suffix = kbps !== null && target < kbps * 1000 ? `（Tier${tier} 上限に丸めました）` : ''
-    await interaction.followUp(`✅ ビットレートを **${target / 1000}kbps** に設定しました${suffix}`)
+    await interaction.editReply({ content: `✅ ビットレートを **${target / 1000}kbps** に設定しました${suffix}` })
   },
 }

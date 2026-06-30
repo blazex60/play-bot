@@ -13,6 +13,6 @@ export default {
     if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
     const level = interaction.options.getInteger('level')
     session.player.setVolume(level / 100)
-    await interaction.reply(`🔊 音量を ${level}% に設定しました`)
+    await interaction.reply({ content: `🔊 音量を ${level}% に設定しました`, flags: MessageFlags.Ephemeral })
   },
 }

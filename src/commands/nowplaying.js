@@ -34,6 +34,6 @@ export default {
         { name: 'ループ', value: LOOP_LABELS[session.queue.loopMode], inline: true },
       )
     if (track.thumbnail) embed.setThumbnail(track.thumbnail)
-    await interaction.reply({ embeds: [embed] })
+    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral })
   },
 }
