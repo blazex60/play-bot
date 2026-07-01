@@ -15,7 +15,21 @@ function parseCustomId(customId) {
 }
 
 export async function handleQueueEditorInteraction(interaction, sessions) {
+  const parsed = parseCustomId(interaction.customId)
+  if (!parsed) return
+  const { action, page } = parsed
+  let { selectedIndex } = parsed
+
   const session = sessions.get(interaction.guildId)
+
+  if (interaction.isButton() && action === 'qedit_close') {
+    if (session && interaction.member.voice.channelId !== session.connection.joinConfig.channelId) {
+      return interaction.reply({ content: '❌ 同じボイスチャンネルに参加してから操作してください', flags: MessageFlags.Ephemeral })
+    }
+    await interaction.deferUpdate()
+    return interaction.message.delete().catch(() => {})
+  }
+
   if (!session || session.queue.isEmpty) {
     return interaction.reply({ content: '📭 キューは空です', flags: MessageFlags.Ephemeral })
   }
@@ -25,10 +39,6 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
     return interaction.reply({ content: '❌ 同じボイスチャンネルに参加してから操作してください', flags: MessageFlags.Ephemeral })
   }
 
-  const parsed = parseCustomId(interaction.customId)
-  if (!parsed) return
-  const { action, page } = parsed
-  let { selectedIndex } = parsed
   const { queue } = session
 
   if (interaction.isStringSelectMenu() && action === 'qedit_select') {

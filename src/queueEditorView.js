@@ -85,7 +85,11 @@ export function buildQueueEditorPayload(queue, { page = 0, selectedIndex = null 
     .setLabel('次へ ▶')
     .setStyle(ButtonStyle.Secondary)
     .setDisabled(clampedPage >= totalPages - 1)
-  components.push(new ActionRowBuilder().addComponents(prevButton, nextButton))
+  const closeButton = new ButtonBuilder()
+    .setCustomId(`qedit_close_p${clampedPage}`)
+    .setLabel('✖ 閉じる')
+    .setStyle(ButtonStyle.Secondary)
+  components.push(new ActionRowBuilder().addComponents(prevButton, nextButton, closeButton))
 
   if (effectiveSelectedIndex != null) {
     const suffix = `_p${clampedPage}_i${effectiveSelectedIndex}`
