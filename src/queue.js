@@ -28,13 +28,11 @@ export class GuildQueue {
   }
 
   shuffle() {
-    if (this.#currentIndex < this.#tracks.length) {
-      const current = this.#tracks.splice(this.#currentIndex, 1)[0];
-      for (let i = this.#tracks.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [this.#tracks[i], this.#tracks[j]] = [this.#tracks[j], this.#tracks[i]];
-      }
-      this.#tracks.splice(this.#currentIndex, 0, current);
+    const start = this.#currentIndex + 1;
+    if (start >= this.#tracks.length) return;
+    for (let i = this.#tracks.length - 1; i > start; i--) {
+      const j = start + Math.floor(Math.random() * (i - start + 1));
+      [this.#tracks[i], this.#tracks[j]] = [this.#tracks[j], this.#tracks[i]];
     }
   }
 
