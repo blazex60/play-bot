@@ -66,4 +66,27 @@ export class GuildQueue {
     return this.#tracks.slice(this.#currentIndex + 1);
   }
 
+  #upcomingToAbsolute(upcomingIndex) {
+    const abs = this.#currentIndex + 1 + upcomingIndex;
+    if (upcomingIndex < 0 || abs >= this.#tracks.length) return null;
+    return abs;
+  }
+
+  removeUpcoming(upcomingIndex) {
+    const abs = this.#upcomingToAbsolute(upcomingIndex);
+    if (abs === null) return false;
+    this.#tracks.splice(abs, 1);
+    return true;
+  }
+
+  moveUpcoming(fromIndex, toIndex) {
+    const len = this.upcoming().length;
+    if (fromIndex < 0 || fromIndex >= len || toIndex < 0 || toIndex >= len || fromIndex === toIndex) return false;
+    const absFrom = this.#currentIndex + 1 + fromIndex;
+    const absTo = this.#currentIndex + 1 + toIndex;
+    const [track] = this.#tracks.splice(absFrom, 1);
+    this.#tracks.splice(absTo, 0, track);
+    return true;
+  }
+
 }

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { sessions, pendingStore } from './sessions.js'
 import { parseSearchCustomId } from './views.js'
+import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -51,6 +52,11 @@ client.on(Events.InteractionCreate, async interaction => {
     pendingStore.delete(interaction.message.id)
     await interaction.deferUpdate()
     await pending.onSelect(pending.results[index])
+    return
+  }
+
+  if (interaction.customId?.startsWith('qedit_')) {
+    return handleQueueEditorInteraction(interaction, sessions)
   }
 })
 
