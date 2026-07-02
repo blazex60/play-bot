@@ -1,6 +1,6 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { createTrack } from '../queue.js'
-import { searchYoutube, resolveMetadata } from '../search.js'
+import { searchYoutube, resolveMetadata, isPlaylistUrl, resolveFlatPlaylist, PLAYLIST_LIMIT } from '../search.js'
 import { createSearchResultComponents } from '../views.js'
 import { getOrCreateSession, pendingStore } from '../sessions.js'
 
@@ -37,6 +37,36 @@ export default {
     const channel = member.voice.channel
 
     if (isUrl) {
+      if (isPlaylistUrl(query)) {
+        let tracks, truncated
+        try {
+          ({ tracks, truncated } = await resolveFlatPlaylist(query, {
+            requestedBy: interaction.member.displayName,
+          }))
+        } catch (err) {
+          return interaction.followUp({ content: `❌ プレイリストの取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+        }
+
+        if (!tracks.length) {
+          return interaction.followUp({ content: '❌ プレイリストに動画が見つかりませんでした', flags: MessageFlags.Ephemeral })
+        }
+
+        let session
+        try {
+          session = await getOrCreateSession(interaction, channel)
+        } catch (err) {
+          return interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+        }
+
+        const wasEmpty = session.queue.isEmpty
+        for (const track of tracks) session.queue.add(track)
+
+        const truncNote = truncated ? `\n⚠️ プレイリストが大きいため先頭 ${PLAYLIST_LIMIT} 件のみ追加しました` : ''
+        await interaction.followUp(`✅ プレイリストから **${tracks.length}曲** をキューに追加しました${truncNote}`)
+        if (wasEmpty) await session.player.playNext()
+        return
+      }
+
       let info
       try {
         info = await resolveMetadata(query, { requestedBy: interaction.member.displayName })
