@@ -20,8 +20,6 @@ export class GuildPlayer {
   #queue;
   #onDisconnect;
   #audioPlayer;
-  #currentResource = null;
-  #volume = 1.0;
   #forceSkip = false;
   #hadError = false;
   #playbackStart = 0;
@@ -65,11 +63,8 @@ export class GuildPlayer {
 
     const resource = createAudioResource(stream, {
       inputType: StreamType.Arbitrary,
-      inlineVolume: true,
     });
-    resource.volume.setVolume(this.#volume);
 
-    this.#currentResource = resource;
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
 
@@ -95,13 +90,6 @@ export class GuildPlayer {
     this.#queue.clear();
     this.#audioPlayer.stop();
     this.#clearWatchdog();
-  }
-
-  setVolume(level) {
-    this.#volume = level;
-    if (this.#currentResource?.volume) {
-      this.#currentResource.volume.setVolume(level);
-    }
   }
 
   async #handleAfter() {

@@ -37,11 +37,11 @@ docker compose up --build
 |---|---|
 | `src/index.js` | Bot エントリーポイント（コマンドロード・イベント処理） |
 | `src/sessions.js` | VC セッション共有状態（joinVoiceChannel・GuildQueue・GuildPlayer） |
-| `src/player.js` | GuildPlayer（ウォッチドッグ・音量・ループ処理） |
+| `src/player.js` | GuildPlayer（ウォッチドッグ・ループ処理） |
 | `src/queue.js` | GuildQueue（LoopMode: OFF/TRACK/QUEUE） |
 | `src/search.js` | yt-dlp 連携（検索・メタデータ取得・ストリーム URL 解決） |
 | `src/views.js` | 検索結果ボタン UI（ActionRowBuilder） |
-| `src/commands/` | 12 個のスラッシュコマンド |
+| `src/commands/` | 11 個のスラッシュコマンド |
 | `src/deploy.js` | スラッシュコマンド登録スクリプト |
 
 ---

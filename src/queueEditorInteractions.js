@@ -1,5 +1,6 @@
 import { MessageFlags, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } from 'discord.js'
 import { buildQueueEditorPayload } from './queueEditorView.js'
+import { checkSameVoiceChannel } from './permissions.js'
 
 const CUSTOM_ID_RE = /^(qedit_[a-z]+)_p(\d+)(?:_i(\d+))?$/
 
@@ -23,9 +24,7 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
   const session = sessions.get(interaction.guildId)
 
   if (interaction.isButton() && action === 'qedit_close') {
-    if (session && interaction.member.voice.channelId !== session.connection.joinConfig.channelId) {
-      return interaction.reply({ content: '❌ 同じボイスチャンネルに参加してから操作してください', flags: MessageFlags.Ephemeral })
-    }
+    if (!checkSameVoiceChannel(interaction, session)) return
     await interaction.deferUpdate()
     return interaction.message.delete().catch(() => {})
   }
@@ -34,10 +33,7 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
     return interaction.reply({ content: '📭 キューは空です', flags: MessageFlags.Ephemeral })
   }
 
-  const botChannelId = session.connection.joinConfig.channelId
-  if (interaction.member.voice.channelId !== botChannelId) {
-    return interaction.reply({ content: '❌ 同じボイスチャンネルに参加してから操作してください', flags: MessageFlags.Ephemeral })
-  }
+  if (!checkSameVoiceChannel(interaction, session)) return
 
   const { queue } = session
 
