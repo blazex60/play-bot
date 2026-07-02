@@ -3,6 +3,7 @@ import { createTrack } from '../queue.js'
 import { searchYoutube, resolveMetadata } from '../search.js'
 import { createSearchResultComponents } from '../views.js'
 import { getOrCreateSession, pendingStore } from '../sessions.js'
+import { checkSameVoiceChannel } from '../permissions.js'
 
 function fmtDuration(seconds) {
   if (seconds == null) return '不明'
@@ -35,6 +36,7 @@ export default {
       return interaction.editReply({ content: '❌ まずVCに参加してください' })
     }
     const channel = member.voice.channel
+    if (!checkSameVoiceChannel(interaction, sessions.get(interaction.guildId))) return
 
     if (isUrl) {
       let info
@@ -73,6 +75,7 @@ export default {
     const msg = await interaction.editReply({ content: '🔍 検索結果:', components })
 
     const onSelect = async entry => {
+      if (!checkSameVoiceChannel(interaction, sessions.get(interaction.guildId))) return
       const url = entry.url || entry.webpage_url
       if (!url) {
         await interaction.followUp({ content: '❌ URLを取得できませんでした', flags: MessageFlags.Ephemeral })

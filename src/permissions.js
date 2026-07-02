@@ -6,7 +6,12 @@ export function checkSameVoiceChannel(interaction, session) {
   const inVoice = interaction.member.voice.channelId === botChannelId
   const inChat = interaction.channelId === botChannelId
   if (!inVoice || !inChat) {
-    interaction.reply({ content: '❌ 参加しているボイスチャンネルのチャットから操作してください', flags: MessageFlags.Ephemeral })
+    const payload = { content: '❌ 参加しているボイスチャンネルのチャットから操作してください', flags: MessageFlags.Ephemeral }
+    if (interaction.deferred || interaction.replied) {
+      interaction.followUp(payload)
+    } else {
+      interaction.reply(payload)
+    }
     return false
   }
   return true
