@@ -1,8 +1,12 @@
 import { MessageFlags } from 'discord.js'
 
 export function checkSameVoiceChannel(interaction, session) {
-  if (session && interaction.member.voice.channelId !== session.connection.joinConfig.channelId) {
-    interaction.reply({ content: '❌ 同じボイスチャンネルに参加してから操作してください', flags: MessageFlags.Ephemeral })
+  if (!session) return true
+  const botChannelId = session.connection.joinConfig.channelId
+  const inVoice = interaction.member.voice.channelId === botChannelId
+  const inChat = interaction.channelId === botChannelId
+  if (!inVoice || !inChat) {
+    interaction.reply({ content: '❌ 参加しているボイスチャンネルのチャットから操作してください', flags: MessageFlags.Ephemeral })
     return false
   }
   return true
