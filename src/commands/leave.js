@@ -10,6 +10,6 @@ export default {
     if (!checkSameVoiceChannel(interaction, session)) return
     sessions.delete(interaction.guildId)
     session.connection.destroy()
-    await interaction.reply({ content: `👋 ${interaction.member.displayName} がボットをVCから退出させました`, flags: MessageFlags.Ephemeral })
+    await interaction.reply(`👋 ${interaction.member.displayName} がボットをVCから退出させました`)
   },
 }

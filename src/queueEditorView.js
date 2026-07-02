@@ -38,6 +38,7 @@ export function buildQueueEditorPayload(queue, { page = 0, selectedIndex = null 
   const lines = []
   if (current) {
     lines.push(`**▶ 再生中:** ${current.title} (${fmtDuration(current.duration)})`)
+    lines.push(`　└ リクエスト: ${current.requestedBy}`)
   } else {
     lines.push('**▶ 再生中:** なし')
   }
@@ -47,7 +48,7 @@ export function buildQueueEditorPayload(queue, { page = 0, selectedIndex = null 
     pageItems.forEach((t, i) => {
       const absIndex = pageStart + i
       const marker = absIndex === effectiveSelectedIndex ? '▶ ' : '　'
-      lines.push(`${marker}${absIndex + 1}. ${t.title} (${fmtDuration(t.duration)})`)
+      lines.push(`${marker}${absIndex + 1}. ${t.title} (${fmtDuration(t.duration)}) — ${t.requestedBy}`)
     })
   } else {
     lines.push('次の曲はありません')

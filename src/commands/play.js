@@ -64,7 +64,7 @@ export default {
         for (const track of tracks) session.queue.add(track)
 
         const truncNote = truncated ? `\n⚠️ プレイリストが大きいため先頭 ${PLAYLIST_LIMIT} 件のみ追加しました` : ''
-        await interaction.followUp(`✅ プレイリストから **${tracks.length}曲** をキューに追加しました${truncNote}`)
+        await interaction.followUp(`✅ ${interaction.member.displayName} がプレイリストから **${tracks.length}曲** をキューに追加しました${truncNote}`)
         if (wasEmpty) await session.player.playNext()
         return
       }
@@ -85,7 +85,7 @@ export default {
 
       const wasEmpty = session.queue.isEmpty
       session.queue.add(createTrack(info))
-      await interaction.followUp(`✅ キューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`)
+      await interaction.followUp(`✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`)
       if (wasEmpty) await session.player.playNext()
       return
     }
@@ -128,7 +128,7 @@ export default {
       await interaction.deleteReply().catch(() => {})
       const wasEmpty = session.queue.isEmpty
       session.queue.add(createTrack(info))
-      await interaction.followUp(`✅ キューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`)
+      await interaction.followUp(`✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`)
       if (wasEmpty) await session.player.playNext()
     }
 
