@@ -3,6 +3,8 @@ import { createTrack } from './queue.js';
 
 export class YtdlpError extends Error {}
 
+const YTDLP_JS_RUNTIME_ARGS = ['--js-runtimes', 'node'];
+
 function spawnAsync(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
@@ -18,7 +20,12 @@ function spawnAsync(cmd, args) {
 }
 
 export async function searchYoutube(query) {
-  const output = await spawnAsync('yt-dlp', ['--dump-json', '--flat-playlist', `ytsearch5:${query}`]);
+  const output = await spawnAsync('yt-dlp', [
+    ...YTDLP_JS_RUNTIME_ARGS,
+    '--dump-json',
+    '--flat-playlist',
+    `ytsearch5:${query}`,
+  ]);
   return output
     .split('\n')
     .filter(line => line.trim())
@@ -53,6 +60,7 @@ function toWatchUrl(entry) {
 
 export async function resolveFlatPlaylist(url, { requestedBy, limit = PLAYLIST_LIMIT } = {}) {
   const output = await spawnAsync('yt-dlp', [
+    ...YTDLP_JS_RUNTIME_ARGS,
     '--dump-json',
     '--flat-playlist',
     '--playlist-end', String(limit + 1),
@@ -71,7 +79,11 @@ export async function resolveFlatPlaylist(url, { requestedBy, limit = PLAYLIST_L
 }
 
 export async function resolveMetadata(url, { requestedBy }) {
-  const output = await spawnAsync('yt-dlp', ['--dump-json', url]);
+  const output = await spawnAsync('yt-dlp', [
+    ...YTDLP_JS_RUNTIME_ARGS,
+    '--dump-json',
+    url,
+  ]);
   const info = JSON.parse(output);
   return createTrack({
     title: info.title ?? 'Unknown',
@@ -84,6 +96,7 @@ export async function resolveMetadata(url, { requestedBy }) {
 
 export function resolveAudioStream(url) {
   const proc = spawn('yt-dlp', [
+    ...YTDLP_JS_RUNTIME_ARGS,
     '-f', 'bestaudio/best',
     '--no-playlist',
     '-o', '-',

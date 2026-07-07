@@ -72,6 +72,7 @@ export const canNormalizeTrack = isNormalizeDurationAllowed
 export async function downloadAudio(url, destPath) {
   await mkdir(path.dirname(destPath), { recursive: true })
   await spawnBuffered('yt-dlp', [
+    '--js-runtimes', 'node',
     '-f', 'bestaudio/best',
     '--no-playlist',
     '-o', destPath,
