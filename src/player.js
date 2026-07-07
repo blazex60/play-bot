@@ -72,6 +72,28 @@ export class GuildPlayer {
 
     const resource = await this.#createResource(track);
 
+    // stop()/skip() may have been issued while the resource was being
+    // prepared (download + loudnorm analysis can take several seconds).
+    // The player was still Idle during that window, so no natural
+    // stateChange->Idle transition fired to drive #handleAfter(); recheck
+    // here instead of unconditionally playing a now-stale resource.
+    if (this.#queue.current !== track) {
+      await this.#discardStaleResource(resource);
+      if (!this.#queue.current) await this.#onDisconnect();
+      return;
+    }
+    if (this.#forceSkip) {
+      await this.#discardStaleResource(resource);
+      this.#forceSkip = false;
+      const nextTrack = this.#queue.next({ forceAdvance: true });
+      if (nextTrack === null) {
+        await this.#onDisconnect();
+      } else {
+        await this.playNext();
+      }
+      return;
+    }
+
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
 
@@ -207,6 +229,11 @@ export class GuildPlayer {
         });
       }
     });
+  }
+
+  async #discardStaleResource(resource) {
+    resource.playStream.destroy();
+    await this.#cleanupCurrentTempFile();
   }
 
   async #cleanupCurrentTempFile() {
