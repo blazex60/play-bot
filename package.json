@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node src/deploy.js && node src/index.js",
     "deploy": "node src/deploy.js",
     "test": "node --test src/**/*.test.js"
   },
