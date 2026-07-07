@@ -26,18 +26,34 @@ export async function searchYoutube(query) {
     '--flat-playlist',
     `ytsearch5:${query}`,
   ]);
-  return output
-    .split('\n')
-    .filter(line => line.trim())
-    .map(line => JSON.parse(line));
+  return parseJsonLines(output, 'youtube search results');
 }
 
 export const PLAYLIST_LIMIT = 100;
 
+export function parseJsonLines(output, context = 'yt-dlp output') {
+  return output
+    .split(/\r?\n/)
+    .filter(line => line.trim())
+    .map((line, index) => {
+      try {
+        return JSON.parse(line);
+      } catch (err) {
+        throw new YtdlpError(`${context}: invalid JSON on line ${index + 1}: ${err.message}`);
+      }
+    });
+}
+
+export function parseFirstJsonLine(output, context = 'yt-dlp output') {
+  const [first] = parseJsonLines(output, context);
+  if (!first) throw new YtdlpError(`${context}: no JSON output`);
+  return first;
+}
+
 export function isPlaylistUrl(url) {
   try {
     const u = new URL(url);
-    return u.searchParams.has('list') && !u.searchParams.has('v');
+    return u.searchParams.has('list');
   } catch {
     return false;
   }
@@ -66,7 +82,7 @@ export async function resolveFlatPlaylist(url, { requestedBy, limit = PLAYLIST_L
     '--playlist-end', String(limit + 1),
     url,
   ]);
-  const entries = output.split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
+  const entries = parseJsonLines(output, 'playlist entries');
   const truncated = entries.length > limit;
   const tracks = entries.slice(0, limit).map(entry => createTrack({
     title: entry.title ?? 'Unknown',
@@ -82,9 +98,10 @@ export async function resolveMetadata(url, { requestedBy }) {
   const output = await spawnAsync('yt-dlp', [
     ...YTDLP_JS_RUNTIME_ARGS,
     '--dump-json',
+    '--no-playlist',
     url,
   ]);
-  const info = JSON.parse(output);
+  const info = parseFirstJsonLine(output, 'video metadata');
   return createTrack({
     title: info.title ?? 'Unknown',
     webpageUrl: info.webpage_url ?? url,
