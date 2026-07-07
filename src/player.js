@@ -165,6 +165,16 @@ export class GuildPlayer {
   async #createResource(track) {
     this.#currentTempFile = null;
 
+    const prefetched = await this.#getPrefetchedOrFetch(track);
+
+    console.info(
+      `[normalize] applying: ${track.title} ` +
+      `(${prefetched.measured.measured_I} LUFS -> -16 LUFS)`
+    );
+
+    this.#currentTempFile = prefetched.filePath;
+    return createNormalizedResource(prefetched.filePath, prefetched.measured);
+
     if (!getGuildSettings(this.#guildId).normalize || !isNormalizeDurationAllowed(track)) {
       this.#discardPrefetch();
       return this.#createFallbackResource(track);
