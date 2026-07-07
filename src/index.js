@@ -7,8 +7,13 @@ import { dirname, join } from 'node:path'
 import { sessions, pendingStore } from './sessions.js'
 import { parseSearchCustomId } from './views.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
+import { loadSettings } from './settings.js'
+import { cleanupStaleTempDir } from './normalize.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+
+await loadSettings()
+await cleanupStaleTempDir()
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],

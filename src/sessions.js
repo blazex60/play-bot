@@ -39,7 +39,7 @@ export async function getOrCreateSession(interaction, channel) {
     }
   }
 
-  const player = new GuildPlayer({ connection, queue, onDisconnect })
+  const player = new GuildPlayer({ guildId: interaction.guildId, connection, queue, onDisconnect })
   const session = { connection, player, queue }
   sessions.set(interaction.guildId, session)
   return session

@@ -5,7 +5,13 @@ import {
   StreamType,
 } from '@discordjs/voice';
 import { resolveAudioStream } from './search.js';
-import { LoopMode } from './queue.js';
+import { getGuildSettings } from './settings.js';
+import {
+  cleanupTempFile,
+  createNormalizedResource,
+  isNormalizeDurationAllowed,
+  prefetchTrack,
+} from './normalize.js';
 
 const RECONNECT_GRACE = 5000;
 const WATCHDOG_INTERVAL = 10_000;
@@ -16,6 +22,7 @@ function sleep(ms) {
 }
 
 export class GuildPlayer {
+  #guildId;
   #connection;
   #queue;
   #onDisconnect;
@@ -25,8 +32,12 @@ export class GuildPlayer {
   #playbackStart = 0;
   #lastActiveAt = 0;
   #watchdogTimer = null;
+  #currentTempFile = null;
+  #prefetchTrack = null;
+  #prefetchPromise = null;
 
-  constructor({ connection, queue, onDisconnect }) {
+  constructor({ guildId, connection, queue, onDisconnect }) {
+    this.#guildId = guildId;
     this.#connection = connection;
     this.#queue = queue;
     this.#onDisconnect = onDisconnect;
@@ -59,11 +70,7 @@ export class GuildPlayer {
       return;
     }
 
-    const stream = resolveAudioStream(track.webpageUrl);
-
-    const resource = createAudioResource(stream, {
-      inputType: StreamType.Arbitrary,
-    });
+    const resource = await this.#createResource(track);
 
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
@@ -71,6 +78,7 @@ export class GuildPlayer {
     this.#resetWatchdog();
 
     this.#audioPlayer.play(resource);
+    this.#prefetchUpcoming();
   }
 
   pause() {
@@ -90,9 +98,13 @@ export class GuildPlayer {
     this.#queue.clear();
     this.#audioPlayer.stop();
     this.#clearWatchdog();
+    await this.#cleanupCurrentTempFile();
+    this.#discardPrefetch();
   }
 
   async #handleAfter() {
+    await this.#cleanupCurrentTempFile();
+
     if (this.#forceSkip) {
       this.#forceSkip = false;
       this.#queue.next({ forceAdvance: true });
@@ -118,6 +130,90 @@ export class GuildPlayer {
       await this.#onDisconnect();
     } else {
       await this.playNext();
+    }
+  }
+
+  #createFallbackResource(track) {
+    const stream = resolveAudioStream(track.webpageUrl);
+    return createAudioResource(stream, {
+      inputType: StreamType.Arbitrary,
+    });
+  }
+
+  async #createResource(track) {
+    this.#currentTempFile = null;
+
+    if (!getGuildSettings(this.#guildId).normalize || !isNormalizeDurationAllowed(track)) {
+      this.#discardPrefetch();
+      return this.#createFallbackResource(track);
+    }
+
+    try {
+      const prefetched = await this.#getPrefetchedOrFetch(track);
+      this.#currentTempFile = prefetched.filePath;
+      return createNormalizedResource(prefetched.filePath, prefetched.measured);
+    } catch (err) {
+      console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err);
+      return this.#createFallbackResource(track);
+    }
+  }
+
+  async #getPrefetchedOrFetch(track) {
+    if (this.#prefetchTrack === track && this.#prefetchPromise) {
+      const promise = this.#prefetchPromise;
+      this.#prefetchTrack = null;
+      this.#prefetchPromise = null;
+      const result = await promise;
+      if (result.error) throw result.error;
+      return result.value;
+    }
+
+    this.#discardPrefetch(track);
+    return prefetchTrack(track);
+  }
+
+  #prefetchUpcoming() {
+    if (!getGuildSettings(this.#guildId).normalize) {
+      this.#discardPrefetch();
+      return;
+    }
+
+    const [track] = this.#queue.upcoming();
+    if (!track || !isNormalizeDurationAllowed(track)) {
+      this.#discardPrefetch();
+      return;
+    }
+
+    if (this.#prefetchTrack === track) return;
+
+    this.#discardPrefetch(track);
+    this.#prefetchTrack = track;
+    this.#prefetchPromise = prefetchTrack(track).then(
+      value => ({ value }),
+      error => ({ error })
+    );
+  }
+
+  #discardPrefetch(keepTrack = null) {
+    if (!this.#prefetchPromise || this.#prefetchTrack === keepTrack) return;
+
+    const promise = this.#prefetchPromise;
+    this.#prefetchTrack = null;
+    this.#prefetchPromise = null;
+    promise.then(result => {
+      if (result.value?.filePath) {
+        cleanupTempFile(result.value.filePath).catch(err => {
+          console.error('[GuildPlayer] prefetch cleanup error:', err);
+        });
+      }
+    });
+  }
+
+  async #cleanupCurrentTempFile() {
+    const filePath = this.#currentTempFile;
+    this.#currentTempFile = null;
+    if (filePath) {
+      await cleanupTempFile(filePath);
     }
   }
 
