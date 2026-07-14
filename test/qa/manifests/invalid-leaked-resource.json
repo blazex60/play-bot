@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "task": "P0",
+  "cases": {
+    "failure": {
+      "resources": {
+        "port": 46115,
+        "database": "leak-db",
+        "browserProfile": "leak-browser",
+        "composeProject": "leak-compose"
+      },
+      "steps": [{
+        "id": "leaked-resource",
+        "command": ["node", "-e", "require('node:fs').writeFileSync('.qa-p0-leak', 'leak'); console.log('OK')"],
+        "cwd": ".",
+        "timeoutMs": 1000,
+        "assertions": [{ "kind": "outputIncludes", "value": "OK" }],
+        "cleanup": { "absentPaths": [".qa-p0-leak"] }
+      }]
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "task": "P0",
+  "cases": {
+    "failure": {
+      "resources": {
+        "port": 46114,
+        "database": "fake-db",
+        "browserProfile": "fake-browser",
+        "composeProject": "fake-compose"
+      },
+      "steps": [{
+        "id": "fake-success",
+        "command": ["node", "-e", "console.log('QA_SUCCESS'); process.exit(7)"],
+        "cwd": ".",
+        "timeoutMs": 1000,
+        "assertions": [{ "kind": "outputIncludes", "value": "QA_SUCCESS" }],
+        "cleanup": { "absentPaths": [] }
+      }]
+    }
+  }
+}

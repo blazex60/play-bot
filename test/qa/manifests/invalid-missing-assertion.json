@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "task": "P0",
+  "cases": {
+    "failure": {
+      "resources": {
+        "port": 46112,
+        "database": "assertion-db",
+        "browserProfile": "assertion-browser",
+        "composeProject": "assertion-compose"
+      },
+      "steps": [{
+        "id": "missing-assertion",
+        "command": ["node", "-e", "console.log('OK')"],
+        "cwd": ".",
+        "timeoutMs": 1000,
+        "assertions": [],
+        "cleanup": { "absentPaths": [] }
+      }]
+    }
+  }
+}

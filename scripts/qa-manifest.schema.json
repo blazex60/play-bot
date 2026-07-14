@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://music-bot.local/schemas/qa-manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "task", "cases"],
+  "properties": {
+    "version": { "const": 1 },
+    "task": { "type": "string", "pattern": "^(P0|[1-9]|1[0-7]|F[1-4])$" },
+    "cases": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]*$" },
+      "additionalProperties": { "$ref": "#/$defs/case" }
+    }
+  },
+  "$defs": {
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port", "database", "browserProfile", "composeProject"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+        "database": { "type": "string", "minLength": 1 },
+        "browserProfile": { "type": "string", "minLength": 1 },
+        "composeProject": { "type": "string", "minLength": 1 }
+      }
+    },
+    "assertion": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "outputIncludes" },
+            "value": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path"],
+          "properties": {
+            "kind": { "const": "pathExists" },
+            "path": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["absentPaths"],
+      "properties": {
+        "absentPaths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "command", "cwd", "timeoutMs", "assertions", "cleanup"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "cwd": { "type": "string", "minLength": 1 },
+        "timeoutMs": { "type": "integer", "minimum": 50, "maximum": 120000 },
+        "assertions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/assertion" }
+        },
+        "cleanup": { "$ref": "#/$defs/cleanup" }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resources", "steps"],
+      "properties": {
+        "resources": { "$ref": "#/$defs/resources" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "task": "P0",
+  "cases": {
+    "happy": {
+      "resources": {
+        "port": 46101,
+        "database": "p0-memory-sqlite",
+        "browserProfile": "p0-ephemeral-chromium",
+        "composeProject": "p0-no-container"
+      },
+      "steps": [
+        {
+          "id": "sqlite-load",
+          "command": ["node", "-e", "const Database=require('better-sqlite3'); const db=new Database(':memory:'); db.prepare('select 1 as ok').get(); db.close(); console.log('P0_SQLITE_OK')"],
+          "cwd": ".",
+          "timeoutMs": 10000,
+          "assertions": [{ "kind": "outputIncludes", "value": "P0_SQLITE_OK" }],
+          "cleanup": { "absentPaths": [] }
+        },
+        {
+          "id": "server-smoke",
+          "command": ["node", "--test", "test/qa/server-smoke.test.mjs"],
+          "cwd": ".",
+          "timeoutMs": 10000,
+          "assertions": [{ "kind": "outputIncludes", "value": "P0 Fastify and Zod server harness" }],
+          "cleanup": { "absentPaths": [] }
+        },
+        {
+          "id": "dom-smoke",
+          "command": ["npm", "run", "test:web"],
+          "cwd": ".",
+          "timeoutMs": 20000,
+          "assertions": [{ "kind": "outputIncludes", "value": "P0 React DOM harness" }],
+          "cleanup": { "absentPaths": [] }
+        },
+        {
+          "id": "typecheck",
+          "command": ["npm", "run", "typecheck"],
+          "cwd": ".",
+          "timeoutMs": 20000,
+          "assertions": [{ "kind": "outputIncludes", "value": "P0_TYPECHECK_OK" }],
+          "cleanup": { "absentPaths": [] }
+        },
+        {
+          "id": "vite-build",
+          "command": ["npm", "run", "build:web"],
+          "cwd": ".",
+          "timeoutMs": 20000,
+          "assertions": [{ "kind": "outputIncludes", "value": "P0_VITE_BUILD_OK" }],
+          "cleanup": { "absentPaths": [] }
+        },
+        {
+          "id": "chromium-smoke",
+          "command": ["npm", "run", "test:browser"],
+          "cwd": ".",
+          "timeoutMs": 30000,
+          "assertions": [{ "kind": "outputIncludes", "value": "P0_CHROMIUM_RUN_OK" }],
+          "cleanup": { "absentPaths": [] }
+        }
+      ]
+    }
+  }
+}

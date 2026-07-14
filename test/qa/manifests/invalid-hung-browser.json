@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "task": "P0",
+  "cases": {
+    "failure": {
+      "resources": {
+        "port": 46116,
+        "database": "hung-db",
+        "browserProfile": "hung-browser",
+        "composeProject": "hung-compose"
+      },
+      "steps": [{
+        "id": "hung-browser-command",
+        "command": ["node", "-e", "setInterval(() => {}, 1000)"],
+        "cwd": ".",
+        "timeoutMs": 100,
+        "assertions": [{ "kind": "outputIncludes", "value": "never" }],
+        "cleanup": { "absentPaths": [] }
+      }]
+    }
+  }
+}

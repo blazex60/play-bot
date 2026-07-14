@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "task": "P0",
+  "cases": {
+    "failure": {
+      "resources": {
+        "port": 46113,
+        "database": "escape-db",
+        "browserProfile": "escape-browser",
+        "composeProject": "escape-compose"
+      },
+      "steps": [{
+        "id": "path-escape",
+        "command": ["node", "-e", "console.log('OK')"],
+        "cwd": "..",
+        "timeoutMs": 1000,
+        "assertions": [{ "kind": "outputIncludes", "value": "OK" }],
+        "cleanup": { "absentPaths": [] }
+      }]
+    }
+  }
+}

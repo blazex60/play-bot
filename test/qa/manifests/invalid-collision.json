@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "task": "P0",
+  "cases": {
+    "first": {
+      "resources": {
+        "port": 46110,
+        "database": "collision-db-a",
+        "browserProfile": "collision-browser-a",
+        "composeProject": "collision-compose-a"
+      },
+      "steps": [{
+        "id": "first",
+        "command": ["node", "-e", "console.log('OK')"],
+        "cwd": ".",
+        "timeoutMs": 1000,
+        "assertions": [{ "kind": "outputIncludes", "value": "OK" }],
+        "cleanup": { "absentPaths": [] }
+      }]
+    },
+    "second": {
+      "resources": {
+        "port": 46110,
+        "database": "collision-db-b",
+        "browserProfile": "collision-browser-b",
+        "composeProject": "collision-compose-b"
+      },
+      "steps": [{
+        "id": "second",
+        "command": ["node", "-e", "console.log('OK')"],
+        "cwd": ".",
+        "timeoutMs": 1000,
+        "assertions": [{ "kind": "outputIncludes", "value": "OK" }],
+        "cleanup": { "absentPaths": [] }
+      }]
+    }
+  }
+}

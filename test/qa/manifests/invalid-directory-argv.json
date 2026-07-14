@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "task": "P0",
+  "cases": {
+    "failure": {
+      "resources": {
+        "port": 46111,
+        "database": "directory-db",
+        "browserProfile": "directory-browser",
+        "composeProject": "directory-compose"
+      },
+      "steps": [{
+        "id": "directory-argv",
+        "command": ["node", "--test", "src"],
+        "cwd": ".",
+        "timeoutMs": 1000,
+        "assertions": [{ "kind": "outputIncludes", "value": "never" }],
+        "cleanup": { "absentPaths": [] }
+      }]
+    }
+  }
+}
