@@ -43,6 +43,34 @@ docker compose up --build
 | `src/views.js` | 検索結果ボタン UI（ActionRowBuilder） |
 | `src/commands/` | 11 個のスラッシュコマンド |
 | `src/deploy.js` | スラッシュコマンド登録スクリプト |
+| `src/botApi.js` | Web process から呼ぶ loopback-only internal API |
+| `src/web/server/` | Fastify Web server、OAuth、SQLite-backed session/token/import routes |
+| `web/src/` | React dashboard UI |
+| `web/dist/` | Docker build stage が生成し、`music-web` が配信する静的 assets |
+
+---
+
+## Web UI / OAuth アーキテクチャ
+
+`docker-compose.yml` は同じ image から `music-bot` と `music-web` を別 process として起動する。
+
+- `music-bot`: Discord client、VC connection、`sessions` Map、`GuildPlayer`、`GuildQueue` を保持する。`src/botApi.js` は `127.0.0.1:${BOT_API_PORT}` に bind し、`BOT_API_TOKEN` bearer なしの呼び出しを拒否する
+- `music-web`: `node src/web/server/index.js` で起動する。React dashboard を `web/dist` から配信し、Discord/Spotify/YouTube OAuth、cookie session、encrypted token store、import history を SQLite に書く
+- `cloudflared`: `WEB_PORT` だけを tunnel する。Bot API port は絶対に tunnel しない
+
+Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用で、Bot のライブ操作は internal HTTP API 経由に限定する。
+
+### Web routes
+
+- `/` dashboard
+- `/login` Discord OAuth entry
+- `/callback/*` OAuth callback fallback screen
+- `/api/*` authenticated dashboard data/control routes
+- `/auth/discord`, `/auth/spotify`, `/auth/youtube` OAuth routes
+
+### Web UI scope
+
+Dashboard は single-screen 構成。Now playing、transport controls、volume slider、queue reorder/remove、Spotify/YouTube playlist browser、import panel、post-import match review を表示する。Apple Music は disabled の「準備中」だけを表示し、機能リンクは作らない。
 
 ---
 
@@ -85,4 +113,6 @@ resolveAudioStream(url)  →  yt-dlp stdout  →  createAudioResource(stream)
 ## シークレット管理
 
 - `DISCORD_TOKEN` / `CLIENT_ID` は必ず `.env` に書く
+- Web UI では `DISCORD_CLIENT_SECRET`, `SPOTIFY_CLIENT_SECRET`, `GOOGLE_CLIENT_SECRET`, `WEB_SESSION_SECRET`, `BOT_API_TOKEN`, `MUSICBOT_TOKEN_ENC_KEY` も `.env` のみ
+- OAuth redirect URI は `PUBLIC_BASE_URL` から導出する。Discord だけ `DISCORD_OAUTH_REDIRECT` で明示 override 可能
 - ソースコードにシークレットを書かない

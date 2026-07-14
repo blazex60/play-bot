@@ -7,16 +7,16 @@ import { SearchPendingStore } from './views.js'
 export const sessions = new Map()
 export const pendingStore = new SearchPendingStore()
 
-export async function getOrCreateSession(interaction, channel) {
-  const existing = sessions.get(interaction.guildId)
+export async function getOrCreateSession({ guildId, guild, channel }) {
+  const existing = sessions.get(guildId)
   if (existing && existing.connection.state.status !== VoiceConnectionStatus.Destroyed) {
     return existing
   }
 
   const connection = joinVoiceChannel({
     channelId: channel.id,
-    guildId: interaction.guildId,
-    adapterCreator: interaction.guild.voiceAdapterCreator,
+    guildId,
+    adapterCreator: guild.voiceAdapterCreator,
     selfDeaf: true,
   })
 
@@ -30,17 +30,17 @@ export async function getOrCreateSession(interaction, channel) {
   const queue = new GuildQueue()
 
   const onDisconnect = async () => {
-    const s = sessions.get(interaction.guildId)
+    const s = sessions.get(guildId)
     if (s) {
-      sessions.delete(interaction.guildId)
+      sessions.delete(guildId)
       if (s.connection.state.status !== VoiceConnectionStatus.Destroyed) {
         s.connection.destroy()
       }
     }
   }
 
-  const player = new GuildPlayer({ guildId: interaction.guildId, connection, queue, onDisconnect })
+  const player = new GuildPlayer({ guildId, connection, queue, onDisconnect })
   const session = { connection, player, queue }
-  sessions.set(interaction.guildId, session)
+  sessions.set(guildId, session)
   return session
 }

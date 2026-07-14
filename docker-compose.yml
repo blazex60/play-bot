@@ -7,3 +7,23 @@ services:
     volumes:
       - ./data:/app/data
     network_mode: "host"
+
+  music-web:
+    build: .
+    restart: unless-stopped
+    command: ["node", "src/web/server/index.js"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    network_mode: "host"
+    depends_on:
+      - music-bot
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://127.0.0.1:${WEB_PORT:-3000}
+    network_mode: "host"
+    depends_on:
+      - music-web

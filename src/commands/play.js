@@ -55,7 +55,7 @@ export default {
 
         let session
         try {
-          session = await getOrCreateSession(interaction, channel)
+          session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel })
         } catch (err) {
           return interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         }
@@ -78,7 +78,7 @@ export default {
 
       let session
       try {
-        session = await getOrCreateSession(interaction, channel)
+        session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel })
       } catch (err) {
         return interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
       }
@@ -120,7 +120,7 @@ export default {
       }
       let session
       try {
-        session = await getOrCreateSession(interaction, channel)
+        session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel })
       } catch (err) {
         await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         return

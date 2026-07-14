@@ -116,6 +116,7 @@ export function createNormalizedResource(filePath, measured) {
 
   return createAudioResource(proc.stdout, {
     inputType: StreamType.Raw,
+    inlineVolume: true,
   })
 }
 

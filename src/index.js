@@ -9,6 +9,7 @@ import { parseSearchCustomId } from './views.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
 import { loadSettings } from './settings.js'
 import { cleanupStaleTempDir } from './normalize.js'
+import { startBotApi } from './botApi.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -16,7 +17,7 @@ await loadSettings()
 await cleanupStaleTempDir()
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMembers],
 })
 
 // Load commands
@@ -29,6 +30,10 @@ for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js'))) {
 
 client.once(Events.ClientReady, c => {
   console.log(`Bot ready: ${c.user.tag} (id=${c.user.id})`)
+  startBotApi({ client, sessions }).catch(err => {
+    console.error('[bot-api] failed to start:', err)
+    process.exitCode = 1
+  })
 })
 
 client.on(Events.InteractionCreate, async interaction => {

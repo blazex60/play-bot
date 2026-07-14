@@ -35,13 +35,27 @@ export class GuildPlayer {
   #currentTempFile = null;
   #prefetchTrack = null;
   #prefetchPromise = null;
+  #currentResource = null;
+  #volume = 1;
+  #createAudioResource;
+  #resolveAudioStream;
 
-  constructor({ guildId, connection, queue, onDisconnect }) {
+  constructor({
+    guildId,
+    connection,
+    queue,
+    onDisconnect,
+    audioPlayer = createAudioPlayer(),
+    createAudioResourceFn = createAudioResource,
+    resolveAudioStreamFn = resolveAudioStream,
+  }) {
     this.#guildId = guildId;
     this.#connection = connection;
     this.#queue = queue;
     this.#onDisconnect = onDisconnect;
-    this.#audioPlayer = createAudioPlayer();
+    this.#audioPlayer = audioPlayer;
+    this.#createAudioResource = createAudioResourceFn;
+    this.#resolveAudioStream = resolveAudioStreamFn;
 
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
       this.#handleAfter().catch(err => {
@@ -70,7 +84,7 @@ export class GuildPlayer {
       return;
     }
 
-    const resource = await this.#createResource(track);
+    const resource = this.#applyVolume(await this.#createResource(track));
 
     // stop()/skip() may have been issued while the resource was being
     // prepared (download + loudnorm analysis can take several seconds).
@@ -107,8 +121,19 @@ export class GuildPlayer {
     return this.#audioPlayer.pause();
   }
 
+  get status() {
+    return this.#audioPlayer.state.status;
+  }
+
   resume() {
     return this.#audioPlayer.unpause();
+  }
+
+  setVolume(level) {
+    const volume = Math.min(2, Math.max(0, Number(level)));
+    this.#volume = Number.isFinite(volume) ? volume : 1;
+    this.#currentResource?.volume?.setVolume(this.#volume);
+    return this.#volume;
   }
 
   async skip() {
@@ -119,12 +144,14 @@ export class GuildPlayer {
   async stop() {
     this.#queue.clear();
     this.#audioPlayer.stop();
+    this.#currentResource = null;
     this.#clearWatchdog();
     await this.#cleanupCurrentTempFile();
     this.#discardPrefetch();
   }
 
   async #handleAfter() {
+    this.#currentResource = null;
     await this.#cleanupCurrentTempFile();
 
     if (this.#forceSkip) {
@@ -156,9 +183,10 @@ export class GuildPlayer {
   }
 
   #createFallbackResource(track) {
-    const stream = resolveAudioStream(track.webpageUrl);
-    return createAudioResource(stream, {
+    const stream = this.#resolveAudioStream(track.webpageUrl);
+    return this.#createAudioResource(stream, {
       inputType: StreamType.Arbitrary,
+      inlineVolume: true,
     });
   }
 
@@ -184,6 +212,12 @@ export class GuildPlayer {
       console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err);
       return this.#createFallbackResource(track);
     }
+  }
+
+  #applyVolume(resource) {
+    this.#currentResource = resource;
+    resource.volume?.setVolume(this.#volume);
+    return resource;
   }
 
   async #getPrefetchedOrFetch(track) {
@@ -238,6 +272,9 @@ export class GuildPlayer {
   }
 
   async #discardStaleResource(resource) {
+    if (this.#currentResource === resource) {
+      this.#currentResource = null;
+    }
     resource.playStream.destroy();
     await this.#cleanupCurrentTempFile();
   }
