@@ -57,6 +57,37 @@ test('Discord OAuth callback upserts user, creates signed session cookie, and au
   assert.equal(fetchImpl.calls.length, 2)
 })
 
+test('Discord callback rejects scheme-relative redirect targets (open redirect)', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const evilRedirects = ['//evil.example', '/\\evil.example', 'https://evil.example']
+  // Each loop iteration drives a full token+userinfo exchange, so the sequence
+  // needs one token/user pair per iteration.
+  const fetchImpl = fetchJsonSequence(
+    evilRedirects.flatMap(() => [
+      { body: { access_token: 'discord-access' } },
+      { body: { id: 'u123', username: 'lemitsu' } },
+    ])
+  )
+  const app = await buildApp({ db, config, fetchImpl })
+  t.after(() => app.close())
+
+  for (const evilRedirect of evilRedirects) {
+    const authorize = await app.inject({
+      method: 'GET',
+      url: `/auth/discord?redirect=${encodeURIComponent(evilRedirect)}`,
+    })
+    const state = new URL(authorize.headers.location).searchParams.get('state')
+    const callback = await app.inject({
+      method: 'GET',
+      url: `/auth/discord/callback?code=abc&state=${state}`,
+    })
+    assert.equal(callback.statusCode, 302)
+    assert.equal(callback.headers.location, '/', `redirect=${evilRedirect} must fall back to '/'`)
+  }
+})
+
 test('Discord callback rejects missing or consumed state', async (t) => {
   const db = createMemoryDb()
   t.after(() => db.close())

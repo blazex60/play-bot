@@ -9,10 +9,17 @@ const serverExcludedParts = new Set([
   'browser',
   'container',
   'manifests',
-  'web',
   'dist',
   'build',
 ])
+
+// Only the top-level frontend app (<root>/web) is excluded from the server
+// test suite. This must NOT be a generic basename match against 'web' -- the
+// backend web server lives at <root>/src/web/ and its tests (auth, routes,
+// index.test.js) need to run. A prior version of this exclusion matched any
+// directory named 'web' anywhere in the tree, which silently dropped every
+// src/web/**/*.test.js file from `npm run test:server` / `npm run check`.
+const topLevelExcludedDirs = new Set(['web'])
 
 function toPortablePath(path) {
   return path.split(sep).join('/')
@@ -25,7 +32,9 @@ async function collectTests(root, directory, excludedParts, files) {
     const path = resolve(directory, entry.name)
     const relativePath = toPortablePath(relative(root, path))
     if (entry.isDirectory()) {
-      if (!excludedParts.has(entry.name)) {
+      const isExcluded = excludedParts.has(entry.name)
+        || (directory === root && topLevelExcludedDirs.has(entry.name))
+      if (!isExcluded) {
         await collectTests(root, path, excludedParts, files)
       }
     } else if (entry.isFile() && /\.test\.(?:js|mjs)$/.test(entry.name)) {

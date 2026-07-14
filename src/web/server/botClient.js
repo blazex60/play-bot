@@ -36,6 +36,10 @@ export function createBotClient({ baseUrl, token, fetchImpl = globalThis.fetch }
   }
 
   return {
+    // Generic passthrough required by route-utils.js#callBot (used by
+    // control/queue routes and the requireBotPermission fallback), which
+    // expect botClient.request(method, path, body) to exist.
+    request: (method, path, body) => request(path, { method, body }),
     healthz: () => request('/healthz'),
     state: (guildId) => request(`/state/${encodeURIComponent(guildId)}`),
     permission: ({ guildId, userId }) => {

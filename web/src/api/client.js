@@ -107,4 +107,5 @@ export const api = {
   /** @param {number} trackId @param {unknown} body */
   replaceImportTrack: (trackId, body) =>
     request(`/api/import/tracks/${encodeURIComponent(trackId)}/replace`, { method: 'POST', body }),
+  logout: () => request('/auth/logout', { method: 'POST' }),
 }

@@ -8,7 +8,12 @@ import {
 
 function redirectAfterFromRequest(request) {
   const value = request.query?.redirect
-  return typeof value === 'string' && value.startsWith('/') ? value : '/'
+  if (typeof value !== 'string' || value.length === 0) return '/'
+  // Reject scheme-relative ("//evil.example") and backslash ("/\evil.example")
+  // forms that some browsers treat as protocol-relative URLs, to prevent an
+  // open redirect after Discord OAuth completes.
+  if (!value.startsWith('/') || value.startsWith('//') || value.startsWith('/\\')) return '/'
+  return value
 }
 
 export function registerDiscordAuthRoutes(app, { db, config, fetchImpl = globalThis.fetch } = {}) {

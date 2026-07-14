@@ -102,6 +102,14 @@ export function Dashboard() {
     setGuildId(value.trim())
   }
 
+  async function handleLogout() {
+    try {
+      await api.logout()
+    } finally {
+      window.location.assign('/login')
+    }
+  }
+
   /** @param {string} action */
   function control(action) {
     return runAction(() => api.control(guildId, action, action === 'volume' ? { level: volume } : {}), '操作を送信しました')
@@ -194,7 +202,7 @@ export function Dashboard() {
         </div>
         <div className="header-meta">
           <span>{user?.username ?? user?.discordId ?? 'ログイン確認中'}</span>
-          <a href="/auth/logout">Logout</a>
+          <button type="button" onClick={handleLogout}>Logout</button>
         </div>
       </header>
 

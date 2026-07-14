@@ -29,6 +29,7 @@ test('discoverServerTests returns sorted test files when forbidden roots exist',
       createFile(root, 'test/qa/fixtures/ignored.test.js'),
       createFile(root, 'test/qa/manifests/ignored.test.js'),
       createFile(root, 'web/src/ignored.test.js'),
+      createFile(root, 'src/web/server/included.test.js'),
       createFile(root, 'src/not-a-test.js'),
     ])
 
@@ -37,8 +38,9 @@ test('discoverServerTests returns sorted test files when forbidden roots exist',
     assert.deepEqual(files, [
       'scripts/runner.test.mjs',
       'src/a.test.mjs',
+      'src/web/server/included.test.js',
       'src/z.test.js',
-    ])
+    ], 'top-level frontend web/ must be excluded, but nested src/web/ (backend) must not be')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

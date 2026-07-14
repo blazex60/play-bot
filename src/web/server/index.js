@@ -11,6 +11,13 @@ import { registerDiscordAuthRoutes } from './auth/discord.js'
 import { registerSpotifyAuthRoutes } from './auth/spotify.js'
 import { registerYoutubeAuthRoutes } from './auth/youtube.js'
 import { createRequireAuth } from './middleware/requireAuth.js'
+import { runMigrations } from '../../db/migrate.js'
+import { stateRoutes } from './routes/state.js'
+import { linksRoutes } from './routes/links.js'
+import { controlRoutes } from './routes/control.js'
+import { queueRoutes } from './routes/queue.js'
+import { importRoutes } from './routes/import.js'
+import { importEditRoutes } from './routes/import-edit.js'
 
 const thisDir = dirname(fileURLToPath(import.meta.url))
 const projectRoot = resolve(thisDir, '../../..')
@@ -45,6 +52,7 @@ export async function buildWebServer({
     trustProxy: config.trustProxy,
   })
   const database = db ?? await loadDefaultDb()
+  runMigrations(database)
 
   await app.register(cookie, {
     secret: config.session.secret,
@@ -80,6 +88,19 @@ export async function buildWebServer({
   registerDiscordAuthRoutes(app, { db: database, config, fetchImpl })
   registerSpotifyAuthRoutes(app, { db: database, config, requireAuth, fetchImpl })
   registerYoutubeAuthRoutes(app, { db: database, config, requireAuth, fetchImpl })
+
+  // Dashboard data/control routes require an authenticated session. Registered
+  // in an encapsulated sub-context so the requireAuth preHandler hook applies
+  // only to these routes, not to /healthz or the /auth/* OAuth routes above.
+  await app.register(async (authenticated) => {
+    authenticated.addHook('preHandler', requireAuth)
+    await authenticated.register(stateRoutes, { botClient })
+    await authenticated.register(linksRoutes, { db: database })
+    await authenticated.register(controlRoutes, { botClient })
+    await authenticated.register(queueRoutes, { botClient })
+    await authenticated.register(importRoutes, { db: database, botClient })
+    await authenticated.register(importEditRoutes, { db: database, botClient })
+  })
 
   if (existsSync(webDist)) {
     await app.register(fastifyStatic, {
