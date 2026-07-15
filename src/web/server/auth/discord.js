@@ -8,7 +8,7 @@ import {
 
 function redirectAfterFromRequest(request) {
   const value = request.query?.redirect
-  if (typeof value !== 'string' || value.length === 0) return '/'
+  if (typeof value !== 'string' || value.length === 0) return '/dashboard'
   // Reject scheme-relative ("//evil.example") and backslash ("/\evil.example")
   // forms that some browsers treat as protocol-relative URLs, to prevent an
   // open redirect after Discord OAuth completes.

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { api, ApiError } from '../api/client.js'
+import '../dashboard.css'
 import { MatchReview } from '../components/MatchReview.jsx'
 import { NowPlaying } from '../components/NowPlaying.jsx'
 import { PlaylistPanel } from '../components/PlaylistPanel.jsx'

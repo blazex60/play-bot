@@ -57,10 +57,27 @@ async function installDashboardMocks(page, { relink = false } = {}) {
   await page.route('**/api/import/tracks/7/replace', (route) => json(route, { track: { title: 'Replacement Track' } }))
 }
 
+
+test('landing route is public and links to the dashboard login flow', async ({ page }) => {
+  const apiRequests = []
+  page.on('request', (request) => {
+    if (new URL(request.url()).pathname.startsWith('/api/')) {
+      apiRequests.push(request.url())
+    }
+  })
+
+  await page.goto('/')
+
+  await expect(page.getByRole('heading', { name: /Discord の音楽 Bot/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Discord でログイン' })).toHaveAttribute('href', '/auth/discord?redirect=/dashboard')
+  await expect(page.getByRole('link', { name: 'Dashboard' })).toHaveAttribute('href', '/dashboard')
+  expect(apiRequests).toEqual([])
+})
+
 test('dashboard drives playback, queue, import, and match review flows', async ({ page }) => {
   await installDashboardMocks(page)
 
-  await page.goto('/?guildId=guild-1')
+  await page.goto('/dashboard?guildId=guild-1')
 
   await expect(page.getByRole('heading', { name: 'Music Dashboard' })).toBeVisible()
   await expect(page.getByText('Lo-fi Study')).toBeVisible()
@@ -90,7 +107,7 @@ test('dashboard drives playback, queue, import, and match review flows', async (
 test('dashboard surfaces expired provider tokens as relink action', async ({ page }) => {
   await installDashboardMocks(page, { relink: true })
 
-  await page.goto('/?guildId=guild-1')
+  await page.goto('/dashboard?guildId=guild-1')
 
   await expect(page.getByText('youtube の認証が切れています。')).toBeVisible()
   await page.getByRole('button', { name: '再連携' }).click()
@@ -101,5 +118,5 @@ test('login route exposes Discord OAuth entry point', async ({ page }) => {
   await page.goto('/login')
 
   await expect(page.getByRole('heading', { name: 'Discord ログイン' })).toBeVisible()
-  await expect(page.getByRole('link', { name: 'Discord でログイン' })).toHaveAttribute('href', '/auth/discord')
+  await expect(page.getByRole('link', { name: 'Discord でログイン' })).toHaveAttribute('href', '/auth/discord?redirect=/dashboard')
 })

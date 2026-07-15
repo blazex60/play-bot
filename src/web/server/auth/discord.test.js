@@ -57,6 +57,29 @@ test('Discord OAuth callback upserts user, creates signed session cookie, and au
   assert.equal(fetchImpl.calls.length, 2)
 })
 
+
+test('Discord OAuth defaults to dashboard after direct login', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = fetchJsonSequence([
+    { body: { access_token: 'discord-access' } },
+    { body: { id: 'u123', username: 'lemitsu' } },
+  ])
+  const app = await buildApp({ db, config, fetchImpl })
+  t.after(() => app.close())
+
+  const authorize = await app.inject({ method: 'GET', url: '/auth/discord' })
+  const state = new URL(authorize.headers.location).searchParams.get('state')
+  const callback = await app.inject({
+    method: 'GET',
+    url: `/auth/discord/callback?code=abc&state=${state}`,
+  })
+
+  assert.equal(callback.statusCode, 302)
+  assert.equal(callback.headers.location, '/dashboard')
+})
+
 test('Discord callback rejects scheme-relative redirect targets (open redirect)', async (t) => {
   const db = createMemoryDb()
   t.after(() => db.close())
