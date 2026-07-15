@@ -85,8 +85,8 @@ export function Landing() {
       <footer className="landing-footer">
         <span>Play-bot</span>
         <nav aria-label="Legal links">
-          <a href="https://legal.blazex60.com/terms">利用規約</a>
-          <a href="https://legal.blazex60.com/privacy">プライバシーポリシー</a>
+          <a href="https://agreement.blazex60.com/terms">利用規約</a>
+          <a href="https://agreement.blazex60.com/privacy">プライバシーポリシー</a>
         </nav>
       </footer>
     </main>
