@@ -40,6 +40,7 @@ export function PlaylistPanel(props) {
     onRelink,
   } = props
   const selectedLink = links.find((link) => link.service === selectedService)
+  const isLinked = selectedLink?.status === 'active'
   const needsRelink = selectedLink?.status === 'needs_relink'
 
   return (
@@ -72,19 +73,19 @@ export function PlaylistPanel(props) {
           </button>
         ))}
       </div>
-      {needsRelink ? (
+      {!isLinked ? (
         <div className="inline-warning">
-          <p>{selectedService} の認証が切れています。</p>
+          <p>{needsRelink ? `${selectedService} の認証が切れています。` : `${selectedService} と連携していません。`}</p>
           <button type="button" onClick={() => onRelink(selectedService)} disabled={busy}>
-            再連携
+            {needsRelink ? '再連携' : '連携する'}
           </button>
         </div>
       ) : null}
       <div className="playlist-actions">
-        <button type="button" onClick={() => onLoadPlaylists(selectedService)} disabled={busy || needsRelink}>
+        <button type="button" onClick={() => onLoadPlaylists(selectedService)} disabled={busy || !isLinked}>
           プレイリストを取得
         </button>
-        <button type="button" className="primary" onClick={onImport} disabled={busy || !selectedPlaylistId || needsRelink}>
+        <button type="button" className="primary" onClick={onImport} disabled={busy || !selectedPlaylistId || !isLinked}>
           キューに追加
         </button>
       </div>
