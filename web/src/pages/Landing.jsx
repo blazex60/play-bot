@@ -81,6 +81,14 @@ export function Landing() {
           ))}
         </div>
       </section>
+
+      <footer className="landing-footer">
+        <span>Music Bot</span>
+        <nav aria-label="Legal links">
+          <a href="/terms.html">利用規約</a>
+          <a href="/privacy.html">プライバシーポリシー</a>
+        </nav>
+      </footer>
     </main>
   )
 }

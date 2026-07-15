@@ -175,7 +175,7 @@
 }
 
 .landing-section {
-  padding: 0 0 var(--space-20);
+  padding: 0 0 var(--space-12);
 }
 
 .landing-section-heading {
@@ -210,6 +210,22 @@
   margin: 0;
 }
 
+.landing-footer {
+  align-items: center;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  display: flex;
+  gap: var(--space-4);
+  justify-content: space-between;
+  padding: var(--space-6) 0 var(--space-4);
+}
+
+.landing-footer nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -237,5 +253,10 @@
 
   .landing-hero {
     padding-top: var(--space-4);
+  }
+
+  .landing-footer {
+    align-items: start;
+    flex-direction: column;
   }
 }
