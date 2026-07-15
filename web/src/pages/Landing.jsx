@@ -9,7 +9,7 @@ const FEATURES = [
   },
   {
     title: 'YouTube プレイリスト取り込み',
-    copy: '連携した YouTube アカウントのプレイリストを読み取り、Discord の再生キューへ追加できます。',
+    copy: 'Google / YouTube 連携は、ユーザー自身の YouTube プレイリストを読み取り、選択した曲を Discord の再生キューに追加するために使用します。',
   },
   {
     title: '自宅運用向けの安全な境界',
@@ -30,10 +30,11 @@ export function Landing() {
 
       <section className="landing-hero" aria-labelledby="landing-title">
         <div className="landing-copy">
-          <p className="eyebrow">Discord VC Music Control</p>
-          <h1 id="landing-title">Discord の音楽 Bot を、ブラウザから静かに操る。</h1>
+          <p className="eyebrow">Play-bot | Discord VC Music Control</p>
+          <h1 id="landing-title">Play-bot は Discord VC 用の音楽 Bot です。</h1>
           <p className="landing-lead">
-            YouTube 音楽の再生、キュー編集、プレイリスト取り込みをひとつの Web ダッシュボードに集約しました。
+            Play-bot は、Discord ボイスチャンネルで YouTube 音楽を再生・管理するための Web ダッシュボード付き Discord Bot です。
+            再生、一時停止、スキップ、キュー編集、YouTube プレイリスト取り込みをひとつの画面に集約します。
             未ログインでもこのページで概要を確認し、必要なときだけ Discord OAuth で入れます。
           </p>
           <div className="landing-cta-group">
