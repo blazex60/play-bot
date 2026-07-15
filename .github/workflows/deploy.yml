@@ -22,7 +22,5 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            set -e
             cd ~/music-bot
-            git pull origin main
-            docker compose up --build -d
+            bash scripts/deploy.sh
