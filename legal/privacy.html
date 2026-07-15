@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Discord Music Bot のプライバシーポリシーです。" />
+    <title>プライバシーポリシー | Discord Music Bot</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="site-shell">
+      <header class="site-header">
+        <div>
+          <p class="eyebrow">Privacy Policy</p>
+          <h1>プライバシーポリシー</h1>
+          <p class="lead">本ポリシーは、Discord Music Bot（以下「本Bot」）が取り扱う情報と、その利用目的を説明するものです。</p>
+        </div>
+        <nav class="header-nav" aria-label="法務文書">
+          <a href="/">文書一覧</a>
+          <a href="/terms">利用規約</a>
+        </nav>
+      </header>
+
+      <article class="document-card">
+        <dl class="document-meta">
+          <div><dt>施行日</dt><dd>2026年7月15日</dd></div>
+          <div><dt>対象</dt><dd>Discord Music Bot</dd></div>
+        </dl>
+
+        <h2>1. 基本方針</h2>
+        <p>本Botの運営者は、機能提供に必要な範囲でのみ情報を取得し、取得した情報を本ポリシーに記載する目的の範囲内で利用します。取得する権限およびデータは、ユーザー向け機能の提供に必要な範囲に限定します。</p>
+
+        <h2>2. 取得する情報</h2>
+        <p>本Botは、次の情報を取得または保存する場合があります。</p>
+        <ul>
+          <li>DiscordユーザーID、ユーザー名、サーバーID、ロール、ボイスチャンネル参加状態など、認証、権限確認、Bot操作に必要なDiscord上の情報。</li>
+          <li>Webダッシュボードのログインセッション、OAuth state、認証日時、有効期限など、ログイン状態と不正利用防止に必要な情報。</li>
+          <li>YouTubeを含むGoogle API Services、Spotifyなどの連携サービスでユーザーが認可したOAuthアクセストークン、リフレッシュトークン、スコープ、有効期限。</li>
+          <li>再生中の曲、再生キュー、プレイリスト情報、プレイリスト取り込み結果、検索・差し替え候補など、本Botの機能実行に必要な情報。</li>
+          <li>障害調査、セキュリティ対応、不正利用防止に必要な最小限の技術ログ。</li>
+        </ul>
+
+        <h2>3. 利用目的</h2>
+        <ul>
+          <li>Discord上で音楽再生、停止、スキップ、音量変更、キュー管理などの機能を提供するため。</li>
+          <li>Webダッシュボードへのログイン、セッション管理、権限確認、外部サービス連携を提供するため。</li>
+          <li>ユーザーが選択したプレイリストを取得し、再生キューに追加し、取り込み結果を確認・修正できるようにするため。</li>
+          <li>OAuthトークンを必要に応じて更新し、ユーザーが再認証なしに連携機能を利用できるようにするため。</li>
+          <li>不具合の調査、セキュリティ対応、不正利用防止、サービスの維持改善を行うため。</li>
+        </ul>
+
+        <h2>4. Google API ServicesおよびYouTube API Services</h2>
+        <p>本BotがGoogle API ServicesまたはYouTube API Servicesから取得した情報は、ユーザーが明示的に利用するプレイリスト取得、楽曲検索、取り込み、再生キュー作成などのユーザー向け機能を提供または改善する目的に限って利用します。</p>
+        <ul>
+          <li>本Botは、Googleユーザーデータを広告配信、リターゲティング、信用評価、データ販売、またはデータブローカーへの提供に利用しません。</li>
+          <li>本Botは、ユーザー向け機能の提供、セキュリティ対応、法令遵守、またはユーザーの明示的な同意がある場合を除き、Googleユーザーデータを第三者へ移転しません。</li>
+          <li>本Botは、Google API Services User Data Policy（Limited Useを含む）およびYouTube API Services Terms of Service / Developer Policiesに従ってGoogleユーザーデータを取り扱います。</li>
+        </ul>
+
+        <h2>5. 保存期間と削除</h2>
+        <p>ログインセッションとOAuth stateには有効期限を設定し、期限切れのデータは定期的に削除します。OAuthトークンおよび連携サービスに関する情報は、連携機能の提供に必要な期間保存されます。連携解除、Botの利用停止、または削除依頼があった場合、運営上または法令上必要な範囲を除き、合理的な期間内に対象データを削除します。</p>
+
+        <h2>6. 安全管理</h2>
+        <p>保存が必要なOAuthトークンは、環境変数で管理される暗号鍵により暗号化して保存します。セッションCookieには、認証とセキュリティに必要な属性を設定します。認証情報、APIキー、暗号鍵などの秘密情報は、ソースコードに含めず、運用環境の秘密情報として管理します。</p>
+
+        <h2>7. 第三者提供</h2>
+        <p>本Botの運営者は、法令に基づく場合、ユーザーの同意がある場合、セキュリティ対応に必要な場合、または本Botの機能提供に必要な外部サービスへのリクエストを行う場合を除き、取得した個人データを第三者に販売または提供しません。</p>
+
+        <h2>8. Cookie</h2>
+        <p>Webダッシュボードでは、ログイン状態を維持するためにセッションCookieを使用します。このCookieは認証、セッション管理、不正利用防止のために利用され、広告目的のトラッキングには使用しません。</p>
+
+        <h2>9. ユーザーによる管理</h2>
+        <ul>
+          <li>Googleアカウントの連携は、Googleの<a href="https://myaccount.google.com/permissions" rel="noreferrer">サードパーティアクセス管理画面</a>から取り消すことができます。</li>
+          <li>Discordサーバー管理者は、本Botをサーバーから削除することで、そのサーバー内での利用を停止できます。</li>
+          <li>保存済みデータの開示、訂正、削除、利用停止を希望する場合は、本Botを導入しているDiscordサーバー上で案内される連絡先、または本Botの運営者が別途指定する連絡先までご連絡ください。</li>
+        </ul>
+
+        <h2>10. 外部サービスのポリシー</h2>
+        <p>本Botは、Discord、Google、YouTube、Spotifyなどの外部サービスを利用します。各外部サービスにおけるデータの取り扱いは、それぞれの利用規約およびプライバシーポリシーに従います。</p>
+        <ul>
+          <li><a href="https://policies.google.com/privacy" rel="noreferrer">Google プライバシーポリシー</a></li>
+          <li><a href="https://developers.google.com/terms/api-services-user-data-policy" rel="noreferrer">Google API Services User Data Policy</a></li>
+          <li><a href="https://developers.google.com/youtube/terms/api-services-terms-of-service" rel="noreferrer">YouTube API Services Terms of Service</a></li>
+          <li><a href="https://developers.google.com/youtube/terms/developer-policies" rel="noreferrer">YouTube API Services Developer Policies</a></li>
+        </ul>
+
+        <h2>11. 変更</h2>
+        <p>本ポリシーは、法令、外部サービスの規約、機能変更、運用方針の変更に応じて改定される場合があります。重要な変更がある場合は、Webサイトでの掲載、Discordサーバー上での案内、その他合理的な方法により告知します。</p>
+
+        <h2>12. お問い合わせ</h2>
+        <p>本ポリシーに関する問い合わせは、本Botを導入しているDiscordサーバー上で案内される連絡先、または本Botの運営者が別途指定する連絡先までお願いします。</p>
+      </article>
+
+      <footer class="site-footer">
+        <p>最終更新日: 2026年7月15日</p>
+      </footer>
+    </main>
+  </body>
+</html>
