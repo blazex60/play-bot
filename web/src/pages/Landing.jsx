@@ -20,8 +20,8 @@ const FEATURES = [
 export function Landing() {
   return (
     <main className="landing-page">
-      <header className="landing-nav" aria-label="Music Bot navigation">
-        <Link className="brand-link" to="/">Music Bot</Link>
+      <header className="landing-nav" aria-label="Play-bot navigation">
+        <Link className="brand-link" to="/">Play-bot</Link>
         <nav className="landing-nav-actions" aria-label="Primary navigation">
           <Link to="/login">ログイン</Link>
           <Link className="primary-link" to="/dashboard">Dashboard</Link>
@@ -83,10 +83,10 @@ export function Landing() {
       </section>
 
       <footer className="landing-footer">
-        <span>Music Bot</span>
+        <span>Play-bot</span>
         <nav aria-label="Legal links">
-          <a href="/terms.html">利用規約</a>
-          <a href="/privacy.html">プライバシーポリシー</a>
+          <a href="https://legal.blazex60.com/terms">利用規約</a>
+          <a href="https://legal.blazex60.com/privacy">プライバシーポリシー</a>
         </nav>
       </footer>
     </main>

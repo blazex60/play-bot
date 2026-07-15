@@ -8,7 +8,7 @@ function LoginPage() {
   return (
     <main className="auth-page">
       <section className="auth-card">
-        <p className="eyebrow">Music Bot</p>
+        <p className="eyebrow">Play-bot</p>
         <h1>Discord ログイン</h1>
         <p>ダッシュボードを使うには Discord OAuth でログインしてください。</p>
         <a className="primary-link" href="/auth/discord?redirect=/dashboard">Discord でログイン</a>
