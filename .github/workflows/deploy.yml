@@ -23,4 +23,6 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd ~/music-bot
-            bash scripts/deploy.sh
+            OLD_SHA=$(git rev-parse HEAD)
+            git pull origin main
+            bash scripts/deploy.sh "$OLD_SHA"

@@ -5,8 +5,10 @@
 # unrelated web/docs changes.
 set -e
 
-OLD_SHA=$(git rev-parse HEAD)
-git pull origin main
+# OLD_SHA is passed in by the caller (captured BEFORE `git pull`), since this
+# script only exists on disk after the pull that fetches it — it cannot pull
+# itself and then know what the pre-pull HEAD was.
+OLD_SHA="${1:?usage: deploy.sh <old-sha>}"
 NEW_SHA=$(git rev-parse HEAD)
 
 if [ "$OLD_SHA" = "$NEW_SHA" ]; then
