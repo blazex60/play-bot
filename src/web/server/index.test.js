@@ -64,6 +64,7 @@ test('dashboard API routes are registered and require authentication (regression
   const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
   t.after(() => app.close())
 
+  /** @type {{ method: 'GET' | 'POST', url: string }[]} */
   const protectedRoutes = [
     { method: 'GET', url: '/api/state/g1' },
     { method: 'GET', url: '/api/links' },

@@ -37,7 +37,7 @@ export function Dashboard() {
   const [state, setState] = useState(/** @type {import('../api/client.js').PlaybackState} */ ({ active: false, upcoming: [] }))
   const [links, setLinks] = useState(/** @type {import('../api/client.js').ServiceLink[]} */ ([]))
   const [playlists, setPlaylists] = useState(/** @type {import('../api/client.js').Playlist[]} */ ([]))
-  const [selectedService, setSelectedService] = useState('spotify')
+  const [selectedService, setSelectedService] = useState('youtube')
   const [selectedPlaylist, setSelectedPlaylist] = useState(/** @type {import('../api/client.js').Playlist | null} */ (null))
   const [importJob, setImportJob] = useState(/** @type {import('../api/client.js').ImportJob | null} */ (null))
   const [reviewTracks, setReviewTracks] = useState(/** @type {import('../api/client.js').ImportTrack[]} */ ([]))

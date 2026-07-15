@@ -70,7 +70,11 @@ Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用
 
 ### Web UI scope
 
-Dashboard は single-screen 構成。Now playing、transport controls、volume slider、queue reorder/remove、Spotify/YouTube playlist browser、import panel、post-import match review を表示する。Apple Music は disabled の「準備中」だけを表示し、機能リンクは作らない。
+Dashboard は single-screen 構成。Now playing、transport controls、volume slider、queue reorder/remove、YouTube playlist browser、import panel、post-import match review を表示する。Spotify と Apple Music は disabled の「準備中」だけを表示し、機能リンクは作らない。
+
+**Spotify が disabled な理由**: Spotify は 2026年2月の仕様変更で Development Mode アプリの認可ユーザー数上限が 5 人に制限された（以前は 25 人）。個人用途の音楽 Bot でこの上限を超える見込みが高いため、UI 上のリンクボタンのみ無効化している。バックエンドの OAuth ルート（`src/web/server/auth/spotify.js`）・DB スキーマ（`service_links` の `spotify` 行）・import パイプラインはそのまま残しており、将来的に有効化する場合は `web/src/components/PlaylistPanel.jsx` の `SERVICES`/`DISABLED_SERVICES` を戻すだけで復活できる。
+
+**YouTube の OAuth スコープ**: `https://www.googleapis.com/auth/youtube.readonly`（`src/web/server/config.js`）。自分の非公開プレイリストの一覧・中身の読み取りのみに必要な最小権限で、書き込み系スコープは不要。ただし Google の「Testing」公開ステータスのままだと（1）テストユーザー数が最大100人、（2）各ユーザーの認可が7日で失効し再連携が必要、という制約がある。ユーザー数や運用期間次第では Google の App Verification（本番公開のための審査）が必要になる場合がある。
 
 ---
 

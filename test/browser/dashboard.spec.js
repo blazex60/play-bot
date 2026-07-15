@@ -28,14 +28,13 @@ async function installDashboardMocks(page, { relink = false } = {}) {
   await page.route('**/api/state/guild-1', (route) => json(route, statePayload))
   await page.route('**/api/links', (route) => json(route, {
     services: [
-      { service: 'spotify', linked: !relink, status: relink ? 'needs_relink' : 'active' },
-      { service: 'youtube', linked: true, status: 'active' },
+      { service: 'youtube', linked: !relink, status: relink ? 'needs_relink' : 'active' },
     ],
   }))
-  await page.route('**/api/links/spotify/playlists', (route) => json(route, {
+  await page.route('**/api/links/youtube/playlists', (route) => json(route, {
     playlists: [{ id: 'playlist-1', name: 'Focus Mix', trackCount: 12 }],
   }))
-  await page.route('**/api/links/spotify/relink', (route) => json(route, { redirectUrl: '/auth/spotify' }))
+  await page.route('**/api/links/youtube/relink', (route) => json(route, { redirectUrl: '/auth/youtube' }))
   await page.route('**/api/guilds/guild-1/control/**', (route) => json(route, { ok: true, state: statePayload }))
   await page.route('**/api/guilds/guild-1/queue/**', (route) => json(route, { ok: true, state: statePayload }))
   await page.route('**/api/import/guild-1', (route) => json(route, {
@@ -65,6 +64,7 @@ test('dashboard drives playback, queue, import, and match review flows', async (
 
   await expect(page.getByRole('heading', { name: 'Music Dashboard' })).toBeVisible()
   await expect(page.getByText('Lo-fi Study')).toBeVisible()
+  await expect(page.getByRole('button', { name: /Spotify/ })).toBeDisabled()
   await expect(page.getByRole('button', { name: /Apple Music/ })).toBeDisabled()
 
   await page.getByRole('button', { name: 'Pause' }).click()
@@ -92,9 +92,9 @@ test('dashboard surfaces expired provider tokens as relink action', async ({ pag
 
   await page.goto('/?guildId=guild-1')
 
-  await expect(page.getByText('spotify の認証が切れています。')).toBeVisible()
+  await expect(page.getByText('youtube の認証が切れています。')).toBeVisible()
   await page.getByRole('button', { name: '再連携' }).click()
-  await expect(page).toHaveURL(/\/auth\/spotify$/)
+  await expect(page).toHaveURL(/\/auth\/youtube$/)
 })
 
 test('login route exposes Discord OAuth entry point', async ({ page }) => {
