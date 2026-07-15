@@ -125,13 +125,13 @@ Build settings は以下にする。
 
 ### カスタムドメイン設定
 
-Google OAuth 同意画面のプライバシーポリシー URL とホームページ（`music.blazex60.com`）を同一ドメイン系列に揃えるため、`music-bot-legal` Pages project に `legal.blazex60.com` をカスタムドメインとして割り当てる。
+Google OAuth 同意画面のプライバシーポリシー URL とホームページ（`music.blazex60.com`）を同一ドメイン系列に揃えるため、`music-bot-legal` Pages project に `agreement.blazex60.com` をカスタムドメインとして割り当てる。
 
 1. Cloudflare Dashboard → **Workers & Pages → music-bot-legal → Custom domains → Set up a custom domain**
-2. `legal.blazex60.com` を入力し、指示された CNAME を `blazex60.com` の DNS ゾーンに追加する（Cloudflare 管理下なら自動提案される）
-3. 反映後、`https://legal.blazex60.com/`・`/terms`・`/privacy` がそれぞれ開けることを確認する
+2. `agreement.blazex60.com` を入力し、指示された CNAME を `blazex60.com` の DNS ゾーンに追加する（Cloudflare 管理下なら自動提案される）
+3. 反映後、`https://agreement.blazex60.com/`・`/terms`・`/privacy` がそれぞれ開けることを確認する
 
-この設定は Cloudflare Dashboard 側の操作が必要で、リポジトリの変更だけでは反映されない。設定後、`web/src/pages/Landing.jsx` のフッターリンクと Google OAuth 同意画面の「プライバシーポリシー URL」を `https://legal.blazex60.com/privacy` に統一する。
+この設定は Cloudflare Dashboard 側の操作が必要で、リポジトリの変更だけでは反映されない。設定後、`web/src/pages/Landing.jsx` のフッターリンクと Google OAuth 同意画面の「プライバシーポリシー URL」を `https://agreement.blazex60.com/privacy` に統一する。
 
 ### 更新方法
 
