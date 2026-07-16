@@ -7,7 +7,7 @@ export function TransportControls(props) {
         <p className="eyebrow">Transport</p>
         <h2 id="transport-title">操作</h2>
       </div>
-      <div className="control-grid">
+      <div className="transport-dock">
         <button type="button" onClick={() => onAction('pause')} disabled={busy}>
           Pause
         </button>

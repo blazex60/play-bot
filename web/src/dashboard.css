@@ -1,104 +1,232 @@
 .dashboard-shell {
-  margin: 0 auto; max-width: 1360px;
-  padding: 28px;
+  margin: 0 auto;
+  max-width: 1360px;
+  padding: 24px 28px 64px;
 }
 
-.app-header,
-.guild-bar,
 .panel {
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  background: var(--color-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-surface);
   box-shadow: var(--shadow-panel);
-}
-
-.app-header {
-  align-items: center;
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 16px;
   padding: 20px;
 }
 
-.app-header h1,
-.section-heading h2 {
-  margin: 0;
+.app-header,
+.guild-bar {
+  align-items: center;
+  display: flex;
+}
+
+.app-header {
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding: 14px 4px;
+}
+
+.brand-block {
+  align-items: center;
+  display: flex;
+  gap: 14px;
+}
+
+.brand-mark {
+  align-items: center;
+  background: var(--accent);
+  border-radius: 14px;
+  color: #fff;
+  display: grid;
+  flex-shrink: 0;
+  font-size: 1.15rem;
+  font-weight: 800;
+  height: 42px;
+  place-items: center;
+  width: 42px;
 }
 
 .app-header h1 {
-  font-size: clamp(2rem, 5vw, 4.5rem);
-  letter-spacing: 0;
-  line-height: 1;
+  font-size: 1.4rem;
+  letter-spacing: -0.01em;
+  margin: 0;
 }
 
 .header-meta {
-  align-items: flex-end;
+  align-items: center;
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  gap: 12px;
+}
+
+.user-chip {
+  align-items: center;
+  background: var(--bg-surface-raised);
+  border-radius: 999px;
+  display: flex;
+  gap: 8px;
+  padding: 6px 14px 6px 6px;
+}
+
+.user-avatar {
+  align-items: center;
+  background: var(--accent-soft);
+  border-radius: 50%;
+  color: var(--text-link);
+  display: grid;
+  font-size: 0.85rem;
+  font-weight: 700;
+  height: 28px;
+  place-items: center;
+  width: 28px;
+}
+
+.user-name {
+  color: var(--text-secondary);
+  font-size: 0.88rem;
+  font-weight: 600;
 }
 
 .guild-bar {
-  align-items: end;
-  display: grid;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
   gap: 12px;
-  grid-template-columns: minmax(0, 1fr) auto;
-  margin-bottom: 16px;
-  padding: 16px;
+  margin-bottom: 20px;
+  padding: 10px 14px;
 }
 
-.guild-bar label,
-.volume-control,
-.search-row {
-  display: grid;
-  gap: 8px;
+.guild-bar label {
+  align-items: center;
+  display: flex;
+  flex: 1;
+  gap: 10px;
+}
+
+.guild-bar label span {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.guild-bar input {
+  flex: 1;
 }
 
 .status-message {
-  border-left: 4px solid var(--color-accent-hover);
-  margin: 0 0 16px;
-  padding: 10px 12px;
-  background: var(--color-solid);
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  color: var(--text-primary);
+  margin: 0 0 20px;
+  padding: 12px 14px;
 }
 
 .dashboard-grid {
   display: grid;
   gap: 16px;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 0.9fr);
+  grid-template-columns: minmax(0, 1.3fr) minmax(300px, 1fr);
+  grid-template-areas:
+    "now      queue"
+    "controls queue"
+    "playlist playlist"
+    "review   review";
 }
 
-.panel {
-  padding: 18px;
-}
-
-.queue-panel,
-.review-panel {
-  grid-column: span 2;
-}
+.now-playing { grid-area: now; }
+.controls-panel { grid-area: controls; }
+.queue-panel { grid-area: queue; display: flex; flex-direction: column; }
+.playlist-panel { grid-area: playlist; }
+.review-panel { grid-area: review; }
 
 .section-heading {
   margin-bottom: 16px;
 }
 
+.section-heading h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.vc-status-chip {
+  align-items: center;
+  background: var(--bg-surface-raised);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  display: inline-flex;
+  font-size: 0.8rem;
+  font-weight: 600;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 6px 12px;
+}
+
+.status-dot {
+  background: var(--text-muted);
+  border-radius: 50%;
+  flex-shrink: 0;
+  height: 8px;
+  width: 8px;
+}
+
+.vc-status-chip.status-playing {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.vc-status-chip.status-playing .status-dot {
+  background: var(--success);
+  box-shadow: 0 0 0 0 rgb(35 165 90 / 0.5);
+  animation: speaking-pulse 1.8s ease-out infinite;
+}
+
+.vc-status-chip.status-paused {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.vc-status-chip.status-paused .status-dot {
+  background: var(--warning);
+}
+
+@keyframes speaking-pulse {
+  0% { box-shadow: 0 0 0 0 rgb(35 165 90 / 0.45); }
+  70% { box-shadow: 0 0 0 8px rgb(35 165 90 / 0); }
+  100% { box-shadow: 0 0 0 0 rgb(35 165 90 / 0); }
+}
+
 .track-hero {
   align-items: center;
   display: grid;
-  gap: 16px;
-  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 18px;
+  grid-template-columns: 108px minmax(0, 1fr);
+}
+
+.art-wrap {
+  border-radius: 12px;
+  flex-shrink: 0;
+  height: 108px;
+  width: 108px;
+}
+
+.art-wrap.is-live {
+  box-shadow: 0 0 0 3px var(--success);
 }
 
 .track-hero img,
 .art-fallback {
   aspect-ratio: 1;
-  border-radius: 8px;
-  background: linear-gradient(135deg, var(--color-accent-hover), var(--color-accent-soft));
-  width: 96px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent-hover), var(--accent));
+  display: block;
+  height: 108px;
+  object-fit: cover;
+  width: 108px;
 }
 
 .track-title {
-  font-size: 1.3rem;
-  font-weight: 760;
-  margin: 0 0 8px;
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin: 0 0 6px;
 }
 
 .state-grid,
@@ -111,50 +239,77 @@
 
 .state-grid div,
 .job-summary span {
+  background: var(--bg-surface-raised);
   border-radius: 8px;
-  background: var(--color-muted);
   padding: 8px 10px;
 }
 
 .state-grid dt {
-  color: var(--color-text-muted);
-  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
 }
 
 .state-grid dd {
-  margin: 0;
+  margin: 2px 0 0;
 }
 
-.control-grid,
-.playlist-actions {
-  display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+.empty-copy {
+  color: var(--text-muted);
 }
 
-.danger,
-.ghost-danger {
-  border-color: var(--color-danger);
-  background: var(--color-danger);
+.transport-dock {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
-.ghost-danger {
-  background: transparent;
-  color: var(--color-danger);
+.transport-dock button {
+  background: var(--bg-surface-raised);
+  border-radius: 999px;
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 88px;
+}
+
+.transport-dock button:hover:not(:disabled) {
+  background: var(--border-strong);
+}
+
+.transport-dock button.danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.transport-dock button.danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
 }
 
 .volume-control {
+  display: grid;
+  gap: 8px;
   margin-top: 18px;
 }
 
-.volume-control input {
-  accent-color: var(--color-accent);
+.volume-control span {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.volume-control input[type="range"] {
+  accent-color: var(--accent);
+  background: transparent;
+  height: 20px;
+  min-height: 0;
+  padding: 0;
 }
 
 .queue-list,
 .review-list {
   display: grid;
-  gap: 8px;
+  gap: 6px;
   list-style: none;
   margin: 0;
   padding: 0;
@@ -163,41 +318,78 @@
 .queue-item,
 .review-list li {
   align-items: center;
-  border: 1px solid var(--color-border-subtle);
   border-radius: 8px;
   display: grid;
   gap: 12px;
-  grid-template-columns: 40px minmax(0, 1fr) auto;
-  padding: 10px;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  padding: 8px 10px;
+  transition: background 120ms ease;
+}
+
+.queue-item:hover,
+.review-list li:hover {
+  background: var(--bg-surface-raised);
 }
 
 .queue-index {
   align-items: center;
-  background: var(--color-muted);
+  background: var(--accent-soft);
   border-radius: 8px;
+  color: var(--text-link);
   display: inline-flex;
+  font-size: 0.8rem;
+  font-weight: 700;
   height: 32px;
   justify-content: center;
   width: 32px;
 }
 
 .queue-item p,
-.review-list p,
-.empty-copy {
+.review-list p {
   margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-item small,
+.review-list small {
+  color: var(--text-muted);
+  font-size: 0.78rem;
 }
 
 .queue-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   justify-content: end;
+}
+
+.queue-actions button {
+  background: var(--bg-surface-raised);
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.queue-actions button.ghost-danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+
+.ghost-danger {
+  background: transparent;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
+.ghost-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
 }
 
 .service-tabs,
 .playlist-list {
   display: grid;
-  gap: 10px;
+  gap: 8px;
 }
 
 .service-tabs {
@@ -207,42 +399,56 @@
 .service-tabs button,
 .playlist-list button {
   align-items: start;
-  background: var(--color-solid);
-  border-color: var(--color-border-subtle);
-  color: var(--color-text);
+  background: var(--bg-surface-raised);
+  border: 1px solid transparent;
+  color: var(--text-secondary);
   display: grid;
+  gap: 4px;
   justify-items: start;
   min-height: 58px;
-  padding: 10px;
+  padding: 10px 12px;
 }
 
 .service-tabs button.selected,
 .playlist-list button.selected {
-  border-color: var(--color-accent);
-  box-shadow: inset 0 0 0 1px var(--color-accent);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text-primary);
 }
 
 .service-tabs span,
 .playlist-list span,
 .review-list small,
 .queue-item small {
-  color: var(--color-text-muted);
-  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-size: 0.76rem;
 }
 
 .disabled-service {
-  opacity: 0.6;
+  opacity: 0.5;
 }
 
 .inline-warning {
   align-items: center;
-  background: var(--color-warning-bg);
-  border: 1px solid var(--color-warning-border);
-  border-radius: 8px;
+  background: var(--warning-soft);
+  border-left: 3px solid var(--warning);
+  border-radius: 0 8px 8px 0;
+  color: var(--text-primary);
   display: flex;
   justify-content: space-between;
-  margin: 12px 0;
-  padding: 10px;
+  gap: 12px;
+  margin: 14px 0;
+  padding: 10px 12px;
+}
+
+.inline-warning p {
+  margin: 0;
+}
+
+.inline-warning button {
+  background: var(--warning);
+  color: #1e1f22;
+  flex-shrink: 0;
 }
 
 .playlist-actions,
@@ -251,44 +457,65 @@
   margin-top: 14px;
 }
 
+.playlist-actions {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .search-row {
-  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: end;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.search-row span {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
 }
 
 @media (max-width: 860px) {
   .dashboard-shell {
-    padding: 16px;
-  }
-
-
-  .app-header,
-  .guild-bar,
-  .dashboard-grid,
-  .queue-item,
-  .review-list li,
-  .search-row {
-    grid-template-columns: 1fr;
+    padding: 16px 16px 48px;
   }
 
   .app-header {
-    align-items: start;
-    display: grid;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
   }
 
-  .header-meta {
-    align-items: start;
-    margin-top: 12px;
+  .guild-bar {
+    flex-direction: column;
+    align-items: stretch;
   }
 
-  .queue-panel,
-  .review-panel {
-    grid-column: auto;
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "now"
+      "controls"
+      "queue"
+      "playlist"
+      "review";
+  }
+
+  .track-hero {
+    grid-template-columns: 1fr;
+    justify-items: center;
+    text-align: center;
   }
 
   .service-tabs { grid-template-columns: 1fr; }
 
-  .inline-warning { align-items: stretch; display: grid; gap: 10px; }
+  .playlist-actions { grid-template-columns: 1fr; }
 
-  .queue-actions { justify-content: start; }
+  .search-row { grid-template-columns: 1fr; }
+
+  .inline-warning { align-items: stretch; flex-direction: column; }
+
+  .queue-actions { justify-content: flex-start; }
 }

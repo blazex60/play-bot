@@ -211,13 +211,21 @@ export function Dashboard() {
   return (
     <main className="dashboard-shell">
       <header className="app-header">
-        <div>
-          <p className="eyebrow">Discord Music Bot</p>
-          <h1>Music Dashboard</h1>
+        <div className="brand-block">
+          <span className="brand-mark" aria-hidden="true">P</span>
+          <div>
+            <p className="eyebrow">Discord Music Bot</p>
+            <h1>Music Dashboard</h1>
+          </div>
         </div>
         <div className="header-meta">
-          <span>{user?.username ?? user?.discordId ?? 'ログイン確認中'}</span>
-          <button type="button" onClick={handleLogout}>Logout</button>
+          <span className="user-chip">
+            <span className="user-avatar" aria-hidden="true">
+              {(user?.username ?? user?.discordId ?? '?').slice(0, 1).toUpperCase()}
+            </span>
+            <span className="user-name">{user?.username ?? user?.discordId ?? 'ログイン確認中'}</span>
+          </span>
+          <button type="button" className="ghost-button" onClick={handleLogout}>Logout</button>
         </div>
       </header>
 
@@ -226,7 +234,7 @@ export function Dashboard() {
           <span>Guild ID</span>
           <input value={guildId} onChange={(event) => updateGuildId(event.target.value)} placeholder="Discord guild id" />
         </label>
-        <button type="button" onClick={refreshState} disabled={!guildId || busy}>
+        <button type="button" className="ghost-button" onClick={refreshState} disabled={!guildId || busy}>
           Refresh
         </button>
       </section>
