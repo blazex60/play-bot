@@ -90,6 +90,8 @@ export const api = {
   playlists: (service) => request(`/api/links/${encodeURIComponent(service)}/playlists`),
   /** @param {string} service */
   relink: (service) => request(`/api/links/${encodeURIComponent(service)}/relink`, { method: 'POST' }),
+  /** @param {string} service */
+  disconnect: (service) => request(`/api/links/${encodeURIComponent(service)}`, { method: 'DELETE' }),
   /** @param {string} guildId @param {string} action @param {unknown} [body] */
   control: (guildId, action, body = {}) =>
     request(`/api/guilds/${encodeURIComponent(guildId)}/control/${action}`, { method: 'POST', body }),

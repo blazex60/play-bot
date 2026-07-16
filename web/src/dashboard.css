@@ -286,11 +286,9 @@
     grid-column: auto;
   }
 
-  .service-tabs {
-    grid-template-columns: 1fr;
-  }
+  .service-tabs { grid-template-columns: 1fr; }
 
-  .queue-actions {
-    justify-content: start;
-  }
+  .inline-warning { align-items: stretch; display: grid; gap: 10px; }
+
+  .queue-actions { justify-content: start; }
 }

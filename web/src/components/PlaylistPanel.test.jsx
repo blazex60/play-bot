@@ -16,6 +16,7 @@ function baseProps(overrides = {}) {
     onSelectPlaylist: vi.fn(),
     onImport: vi.fn(),
     onRelink: vi.fn(),
+    onDisconnect: vi.fn(),
     ...overrides,
   }
 }
@@ -52,6 +53,22 @@ describe('PlaylistPanel link state', () => {
     expect(screen.getByText('youtube の認証が切れています。')).toBeTruthy()
     expect(screen.getByRole('button', { name: '再連携' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'プレイリストを取得' }).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('calls disconnect for an active linked service', async () => {
+    const onDisconnect = vi.fn()
+    render(
+      <PlaylistPanel
+        {...baseProps({
+          links: [{ service: 'youtube', status: 'active' }],
+          onDisconnect,
+        })}
+      />
+    )
+
+    await userEvent.click(screen.getByRole('button', { name: '連携解除' }))
+
+    expect(onDisconnect).toHaveBeenCalledWith('youtube')
   })
 
   it('enables playlist actions and hides the warning when linked', () => {

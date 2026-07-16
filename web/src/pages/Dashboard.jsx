@@ -169,6 +169,20 @@ export function Dashboard() {
     }, '再連携へ移動します')
   }
 
+  /** @param {string} service */
+  async function disconnect(service) {
+    await runAction(async () => {
+      const payload = await api.disconnect(service)
+      if (typeof payload === 'object' && payload !== null && 'service' in payload && typeof payload.service === 'string') {
+        setLinks((currentLinks) => currentLinks.map((link) => (link.service === payload.service ? payload : link)))
+      }
+      if (service === selectedService) {
+        setPlaylists([])
+        setSelectedPlaylist(null)
+      }
+    }, '連携を解除しました')
+  }
+
   async function searchReplacement() {
     if (reviewTracks.length === 0) return
     await runAction(async () => {
@@ -234,6 +248,7 @@ export function Dashboard() {
           onSelectPlaylist={setSelectedPlaylist}
           onImport={importPlaylist}
           onRelink={relink}
+          onDisconnect={disconnect}
         />
         <MatchReview
           job={importJob}

@@ -1,3 +1,4 @@
+import { deleteServiceLink } from '../../../db/tokenStore.js'
 import { listSpotifyPlaylists } from '../services/spotify.js'
 import { listYoutubePlaylists } from '../services/youtube.js'
 import { bindRouteError, getSessionUser } from './route-utils.js'
@@ -55,6 +56,19 @@ export async function linksRoutes(app, { db, services, authBasePath = '/auth' } 
       const { service } = request.params
       if (!SERVICES.includes(service)) return reply.code(404).send({ error: 'unknown_service' })
       return reply.send({ redirectUrl: `${authBasePath}/${service}` })
+    } catch (error) {
+      return bindRouteError(reply, error)
+    }
+  })
+
+  app.delete('/api/links/:service', async (request, reply) => {
+    try {
+      const user = getSessionUser(request)
+      const { service } = request.params
+      if (!SERVICES.includes(service)) return reply.code(404).send({ error: 'unknown_service' })
+      if (!db) throw new Error('db is required for links routes')
+      deleteServiceLink({ db, userId: user.discordId, service })
+      return reply.send(serviceStatus(db, user.discordId, service))
     } catch (error) {
       return bindRouteError(reply, error)
     }

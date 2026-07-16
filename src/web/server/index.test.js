@@ -153,3 +153,75 @@ test('/api/permission ignores a client-supplied userId and always uses the sessi
   assert.ok(permissionCall.includes('userId=u1'), 'must query permission for the authenticated session user, not the query-string userId')
   assert.ok(!permissionCall.includes('someone-else'))
 })
+
+
+test('authenticated user can disconnect a linked OAuth service and tokens are removed', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {},
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+  db.prepare(`
+    INSERT INTO service_links (
+      discord_user_id,
+      service,
+      access_token_enc,
+      refresh_token_enc,
+      key_id,
+      status,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+  `).run('u1', 'youtube', Buffer.from('access'), Buffer.from('refresh'), 'test-key', Date.now(), Date.now())
+
+  const response = await app.inject({
+    method: 'DELETE',
+    url: '/api/links/youtube',
+    headers: { cookie },
+  })
+
+  assert.equal(response.statusCode, 200)
+  assert.deepEqual(response.json(), {
+    service: 'youtube',
+    linked: false,
+    status: 'unlinked',
+    tokenExpiresAt: null,
+    updatedAt: null,
+  })
+  const remaining = db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM service_links
+    WHERE discord_user_id = ? AND service = ?
+  `).get('u1', 'youtube')
+  assert.equal(remaining.count, 0)
+})
+
+test('disconnect rejects unknown OAuth services', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {},
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  const response = await app.inject({
+    method: 'DELETE',
+    url: '/api/links/apple',
+    headers: { cookie },
+  })
+
+  assert.equal(response.statusCode, 404)
+  assert.equal(response.json().error, 'unknown_service')
+})

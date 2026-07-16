@@ -198,6 +198,14 @@ export function upsertServiceLink({
   )
 }
 
+export function deleteServiceLink({ db = getDatabase(), userId, service }) {
+  inflightRefreshes.delete(refreshKey(userId, service))
+  return db.prepare(`
+    DELETE FROM service_links
+    WHERE discord_user_id = ? AND service = ?
+  `).run(userId, service)
+}
+
 export function configureTokenStoreForTest({ fetch } = {}) {
   fetchImpl = fetch ?? globalThis.fetch
   inflightRefreshes.clear()

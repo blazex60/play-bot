@@ -24,6 +24,7 @@ const DISABLED_SERVICES = [
  *   onSelectPlaylist: (playlist: import('../api/client.js').Playlist) => void,
  *   onImport: () => void,
  *   onRelink: (service: string) => void,
+ *   onDisconnect: (service: string) => void,
  * }} props
  */
 export function PlaylistPanel(props) {
@@ -38,6 +39,7 @@ export function PlaylistPanel(props) {
     onSelectPlaylist,
     onImport,
     onRelink,
+    onDisconnect,
   } = props
   const selectedLink = links.find((link) => link.service === selectedService)
   const isLinked = selectedLink?.status === 'active'
@@ -88,6 +90,11 @@ export function PlaylistPanel(props) {
         <button type="button" className="primary" onClick={onImport} disabled={busy || !selectedPlaylistId || !isLinked}>
           キューに追加
         </button>
+        {isLinked ? (
+          <button type="button" className="ghost-danger" onClick={() => onDisconnect(selectedService)} disabled={busy}>
+            連携解除
+          </button>
+        ) : null}
       </div>
       <div className="playlist-list" role="listbox" aria-label="プレイリスト">
         {playlists.map((playlist) => (
