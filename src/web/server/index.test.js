@@ -132,6 +132,55 @@ test('authenticated session can read state/links/permission and issue control+qu
   assert.equal(queue.statusCode, 200, 'queue route must reach the bot API via botClient.request (callBot contract)')
 })
 
+test('/api/state/:guildId requires bot permission for that guild (regression: was reachable by any authenticated session for any guild)', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {
+      '/permission': { body: { basic: false, extended: false } },
+    },
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  const state = await app.inject({ method: 'GET', url: '/api/state/some-other-guild', headers: { cookie } })
+  assert.equal(state.statusCode, 403, 'a session user with no permission in the guild must not read its playback state')
+})
+
+test('/api/import/jobs/:jobId/tracks only returns tracks for the requesting user\'s own job (regression: IDOR across import jobs)', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {},
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  db.prepare(`
+    INSERT INTO discord_users (discord_id, username, created_at, last_seen_at)
+    VALUES ('other-user', 'someone-else', ?, ?)
+  `).run(Date.now(), Date.now())
+  const job = db.prepare(`
+    INSERT INTO import_jobs (discord_user_id, guild_id, service, playlist_id, playlist_name, created_at)
+    VALUES ('other-user', 'g1', 'youtube', 'pl1', 'Other users playlist', ?)
+  `).run(Date.now())
+
+  const response = await app.inject({
+    method: 'GET',
+    url: `/api/import/jobs/${job.lastInsertRowid}/tracks`,
+    headers: { cookie },
+  })
+  assert.equal(response.statusCode, 404, 'must not expose another user\'s import job tracks')
+})
+
 test('/api/permission ignores a client-supplied userId and always uses the session user', async (t) => {
   const db = createMemoryDb()
   t.after(() => db.close())

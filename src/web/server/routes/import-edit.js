@@ -30,8 +30,12 @@ export async function importEditRoutes(app, { db, botClient, searchYoutube } = {
   const search = searchYoutube ?? defaultSearchYoutube
   app.get('/api/import/jobs/:jobId/tracks', async (request, reply) => {
     try {
-      getSessionUser(request)
+      const user = getSessionUser(request)
       if (!db) throw new Error('db is required for import edit routes')
+      const job = db.prepare('SELECT discord_user_id FROM import_jobs WHERE id = ?').get(request.params.jobId)
+      if (!job || job.discord_user_id !== user.discordId) {
+        return reply.code(404).send({ error: 'import_job_not_found' })
+      }
       const rows = db.prepare('SELECT * FROM import_tracks WHERE job_id = ? ORDER BY position ASC').all(request.params.jobId)
       return reply.send({ tracks: rows })
     } catch (error) {

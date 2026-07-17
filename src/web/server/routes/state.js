@@ -1,10 +1,11 @@
-import { bindRouteError, getSessionUser } from './route-utils.js'
+import { bindRouteError, getSessionUser, requireBotPermission } from './route-utils.js'
 
 export async function stateRoutes(app, { botClient } = {}) {
   app.get('/api/state/:guildId', async (request, reply) => {
     try {
-      getSessionUser(request)
+      const user = getSessionUser(request)
       if (!botClient) throw new Error('botClient is required for state routes')
+      await requireBotPermission({ botClient, guildId: request.params.guildId, userId: user.discordId })
       const state = await botClient.state(request.params.guildId)
       return reply.send(state)
     } catch (error) {

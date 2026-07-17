@@ -91,3 +91,20 @@ export function tokenExpiresAt(tokenResponse, now = nowMs()) {
   }
   return now + Number(tokenResponse.expires_in) * 1000
 }
+
+export function createUserSession({ db, config, reply, discordId, now = nowMs() }) {
+  const sessionId = randomToken()
+  db.prepare(`
+    INSERT INTO web_sessions (session_id, discord_user_id, created_at, expires_at)
+    VALUES (?, ?, ?, ?)
+  `).run(sessionId, discordId, now, now + config.session.ttlSeconds * 1000)
+
+  reply.setCookie(config.session.cookieName, sessionId, {
+    httpOnly: true,
+    secure: config.session.secure,
+    sameSite: 'lax',
+    path: '/',
+    signed: true,
+    maxAge: config.session.ttlSeconds,
+  })
+}

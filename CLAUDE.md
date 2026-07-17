@@ -76,6 +76,8 @@ Dashboard は single-screen 構成。Now playing、transport controls、volume s
 
 **YouTube の OAuth スコープ**: `https://www.googleapis.com/auth/youtube.readonly`（`src/web/server/config.js`）。自分の非公開プレイリストの一覧・中身の読み取りのみに必要な最小権限で、書き込み系スコープは不要。ただし Google の「Testing」公開ステータスのままだと（1）テストユーザー数が最大100人、（2）各ユーザーの認可が7日で失効し再連携が必要、という制約がある。ユーザー数や運用期間次第では Google の App Verification（本番公開のための審査）が必要になる場合がある。
 
+**デモログイン機能**: Google OAuth 審査担当者がDiscordアカウントを作成せずに YouTube 同意画面に到達するための限定的なログイン機能。`DEMO_LOGIN_ENABLED` / `DEMO_LOGIN_PASSWORD`（`.env` のみ、`DEMO_LOGIN_PASSWORD` が未設定なら自動的に無効）で制御される。非公開の `/login/demo` ページからパスワードを入力すると、固定ID `google-review-demo` のデモユーザーとしてセッションが発行され、ダッシュボード表示・YouTube OAuth 連携・プレイリスト閲覧といった審査に必要な導線を辿れる。セキュリティ根拠として、デモユーザーは実 Discord ギルドに所属しないため、実 Bot 操作時に必須の `requireBotPermission()` ギルド権限チェック（`src/web/server/routes/route-utils.js`）により自然に 403 で遮断される。追加のアクセス制御コードは不要。**審査完了後は `DEMO_LOGIN_ENABLED` を外す（または `false` にする）ことで即座に無効化できる**。加えて DB クリーンアップとして `discord_users`・`web_sessions`・`service_links` テーブルから `discord_id='google-review-demo'` 行を削除すれば、デモアカウント関連のデータも完全に除去できる。
+
 ---
 
 ## 音声実装の詳細

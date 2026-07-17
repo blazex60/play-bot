@@ -1,9 +1,9 @@
 import {
   appendParams,
   consumeOauthState,
+  createUserSession,
   fetchJson,
   insertOauthState,
-  randomToken,
 } from './oauth.js'
 
 function redirectAfterFromRequest(request) {
@@ -24,10 +24,6 @@ export function registerDiscordAuthRoutes(app, { db, config, fetchImpl = globalT
     ON CONFLICT(discord_id) DO UPDATE SET
       username = excluded.username,
       last_seen_at = excluded.last_seen_at
-  `)
-  const createSession = db.prepare(`
-    INSERT INTO web_sessions (session_id, discord_user_id, created_at, expires_at)
-    VALUES (?, ?, ?, ?)
   `)
   const deleteSession = db.prepare('DELETE FROM web_sessions WHERE session_id = ?')
 
@@ -77,21 +73,7 @@ export function registerDiscordAuthRoutes(app, { db, config, fetchImpl = globalT
     const username = user.global_name ?? user.username ?? user.id
     upsertUser.run(user.id, username, createdAt, createdAt)
 
-    const sessionId = randomToken()
-    createSession.run(
-      sessionId,
-      user.id,
-      createdAt,
-      createdAt + config.session.ttlSeconds * 1000
-    )
-    reply.setCookie(config.session.cookieName, sessionId, {
-      httpOnly: true,
-      secure: config.session.secure,
-      sameSite: 'lax',
-      path: '/',
-      signed: true,
-      maxAge: config.session.ttlSeconds,
-    })
+    createUserSession({ db, config, reply, discordId: user.id, now: createdAt })
     return reply.redirect(consumed.row.redirect_after || '/')
   })
 
