@@ -22,6 +22,15 @@ export function cancelPendingRecommendations(guildId) {
   cancelRecommendations(guildId, recommendPendingStore)
 }
 
+// Invalidates any queue-exhaustion planning currently in flight for a guild.
+// Call this whenever something changes state that in-flight planning already
+// read before its first await — stopping playback, or flipping autoplayMode/
+// personalize — so a stale continuation can't act on outdated assumptions.
+export function bumpPlanToken(guildId) {
+  const session = sessions.get(guildId)
+  if (session) session.planToken += 1
+}
+
 export async function getOrCreateSession({ guildId, guild, channel, textChannelId = null }) {
   const existing = sessions.get(guildId)
   if (existing && existing.connection.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -45,9 +54,18 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
 
   const queue = new GuildQueue()
 
+  // Assigned once at the bottom of this function; onDisconnect closes over
+  // this binding (not a snapshot) so it can tell whether it's still the
+  // current session for the guild by the time it actually runs.
+  let session
+
   const onDisconnect = async () => {
     const s = sessions.get(guildId)
-    if (s) {
+    // handleQueueExhausted's async planning can still be in flight when
+    // /leave deletes this session and a fresh /play immediately creates a
+    // new one for the same guild. Without this identity check, this stale
+    // closure would delete and destroy that brand new, unrelated session.
+    if (s && s === session) {
       sessions.delete(guildId)
       cancelRecommendations(guildId, recommendPendingStore)
       if (s.connection.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -103,6 +121,14 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
           await onDisconnect()
         },
       })
+      if (isStale()) {
+        // /stop (or similar) can land while channel.send() calls were still
+        // in flight above: the messages already got posted with live
+        // buttons before we knew to cancel them. Undo that now rather than
+        // leaving a pickable prompt that could revive playback post-stop.
+        cancelRecommendations(guildId, recommendPendingStore)
+        return false
+      }
       return postedCount > 0
     }
 
@@ -122,7 +148,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   // that starts playback with no /play command in the picture) still gets
   // somewhere to post recommend-mode choices instead of recommend mode
   // silently falling through to a disconnect at the next queue exhaustion.
-  const session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0 }
+  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0 }
   sessions.set(guildId, session)
   return session
 }

@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 
-import { getOrCreateSession, cancelPendingRecommendations } from './sessions.js';
+import { getOrCreateSession, cancelPendingRecommendations, bumpPlanToken } from './sessions.js';
 import { resolveWebPermission } from './webPermission.js';
 import { getGuildSettings, setAutoplayMode, setPersonalize } from './settings.js';
 
@@ -157,6 +157,10 @@ export function buildBotApi({
       if (personalize !== undefined) {
         await setPersonalize(guildId, personalize === true);
       }
+      // Queue-exhaustion planning already in flight read the old settings
+      // before its first await; invalidate it so it can't act on values the
+      // user just changed from the dashboard.
+      bumpPlanToken(guildId);
       return { ok: true, state: serializeSession(sessions.get(guildId), guildId) };
     }
 
@@ -178,7 +182,7 @@ export function buildBotApi({
         // Mirror commands/stop.js: invalidate any in-flight autoplay
         // planning and drop pending recommendation prompts, or a
         // continuation resolving after this stop could undo it.
-        session.planToken += 1;
+        bumpPlanToken(guildId);
         cancelPendingRecommendations(guildId);
         return { ok: true, state: serializeSession(session) };
       case 'volume': {

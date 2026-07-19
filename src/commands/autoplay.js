@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { setAutoplayMode, setPersonalize } from '../settings.js'
+import { bumpPlanToken } from '../sessions.js'
 
 const MODE_LABELS = { off: 'オフ', auto: '自動', recommend: 'おすすめ' }
 
@@ -38,6 +39,10 @@ export default {
     if (subcommand === 'mode') {
       const mode = interaction.options.getString('value', true)
       await setAutoplayMode(interaction.guildId, mode)
+      // Queue-exhaustion planning already in flight read the old mode before
+      // its first await; invalidate it so it can't act on a setting the user
+      // just changed (e.g. finishing an "auto" pick after switching to off).
+      bumpPlanToken(interaction.guildId)
       await interaction.reply({
         content: `✅ 自動再生モードを **${MODE_LABELS[mode]}** にしました`,
         flags: MessageFlags.Ephemeral,
@@ -48,6 +53,7 @@ export default {
     if (subcommand === 'personalize') {
       const enabled = interaction.options.getBoolean('value', true)
       await setPersonalize(interaction.guildId, enabled)
+      bumpPlanToken(interaction.guildId)
       await interaction.reply({
         content: `✅ パーソナライズを **${enabled ? '有効' : '無効'}** にしました`,
         flags: MessageFlags.Ephemeral,
