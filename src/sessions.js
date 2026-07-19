@@ -117,7 +117,12 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     handleQueueExhausted,
     recordPlayFn: webClient.recordPlay,
   })
-  const session = { guildId, connection, player, queue, textChannelId, planToken: 0 }
+  // A voice channel's own built-in chat can receive messages too, so a
+  // session created without an interaction text channel (e.g. an import
+  // that starts playback with no /play command in the picture) still gets
+  // somewhere to post recommend-mode choices instead of recommend mode
+  // silently falling through to a disconnect at the next queue exhaustion.
+  const session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0 }
   sessions.set(guildId, session)
   return session
 }
