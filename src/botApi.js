@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 
-import { getOrCreateSession } from './sessions.js';
+import { getOrCreateSession, cancelPendingRecommendations } from './sessions.js';
 import { resolveWebPermission } from './webPermission.js';
 import { getGuildSettings, setAutoplayMode, setPersonalize } from './settings.js';
 
@@ -175,6 +175,11 @@ export function buildBotApi({
         return { ok: true, state: serializeSession(session) };
       case 'stop':
         await session.player.stop();
+        // Mirror commands/stop.js: invalidate any in-flight autoplay
+        // planning and drop pending recommendation prompts, or a
+        // continuation resolving after this stop could undo it.
+        session.planToken += 1;
+        cancelPendingRecommendations(guildId);
         return { ok: true, state: serializeSession(session) };
       case 'volume': {
         const level = Number(request.body?.level);

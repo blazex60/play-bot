@@ -107,8 +107,15 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   // they rejoin and try again, instead of silently expiring the prompt.
   if (!checkSameVoiceChannel(interaction, session)) return
 
-  clearTimeout(entry.timeoutHandle)
-  pendingStore.delete(interaction.message.id)
+  // Claim the whole guild's recommendation round synchronously, before any
+  // await: two users clicking different prompts in the same tick would
+  // otherwise both pass every check above and both enqueue a track, since
+  // neither yields control until here. Node never interleaves another
+  // interaction handler's synchronous prefix with this one, so whichever
+  // handler reaches this line first wins the round; a handler that runs
+  // after will find its own entry.get() already gone. This also disables
+  // the clicked message itself (it's included in the guild's entries).
+  cancelRecommendations(entry.guildId, pendingStore)
 
   await interaction.deferUpdate()
   // Recommendation candidates start with requestedById: null (they came from
@@ -123,7 +130,4 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   const wasEmpty = session.queue.isEmpty
   session.queue.add(chosenTrack)
   if (wasEmpty) await session.player.playNext()
-  await disableMessage(interaction.message).catch(() => {})
-
-  cancelRecommendations(entry.guildId, pendingStore)
 }

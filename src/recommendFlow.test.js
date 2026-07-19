@@ -142,3 +142,29 @@ test('handleRecommendChoice: does not restart playback if the queue was already 
   assert.equal(session.player.playNextCalls.length, 0, 'must not interrupt an already-playing manual track')
   assert.deepEqual(session.queue.upcoming().map((t) => t.videoId), ['v1'], 'picked track should be appended instead')
 })
+
+function makeSentMessage(id) {
+  return { id, components: [{ components: [{ setDisabled() {} }] }], async edit() {} }
+}
+
+test('handleRecommendChoice: two users clicking different prompts in the same guild at once, only one wins', async () => {
+  const pendingStore = new PendingChoiceStore()
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
+  pendingStore.set('msg-2', { guildId: 'g1', targetUserId: 'u2', candidates: [makeCandidate('v2')], message: makeSentMessage('msg-2'), timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+
+  const interactionA = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1' })
+  const interactionB = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-2', userId: 'u2', voiceChannelId: 'vc-1' })
+
+  // Both handlers start "simultaneously" (neither has awaited anything yet
+  // when the other starts), matching two near-simultaneous button clicks.
+  await Promise.all([
+    handleRecommendChoice(interactionA, sessions, pendingStore),
+    handleRecommendChoice(interactionB, sessions, pendingStore),
+  ])
+
+  assert.equal(session.player.playNextCalls.length, 1, 'exactly one pick should win the round')
+  const queued = [session.queue.current, ...session.queue.upcoming()].filter(Boolean)
+  assert.equal(queued.length, 1, 'only the winning pick should be enqueued')
+})
