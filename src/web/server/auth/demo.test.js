@@ -62,6 +62,65 @@ test('Demo login with correct password creates a user/session and authenticates 
   assert.equal(me.json().user.discordId, 'google-review-demo')
 })
 
+test('Demo login clears any service links left by a previous demo user', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig({ DEMO_LOGIN_ENABLED: 'true', DEMO_LOGIN_PASSWORD: 'test-secret' })
+  const app = await buildApp({ db, config })
+  t.after(() => app.close())
+
+  db.prepare(`
+    INSERT INTO discord_users (discord_id, username, created_at, last_seen_at)
+    VALUES (?, ?, ?, ?)
+  `).run('google-review-demo', 'Google Reviewer', Date.now(), Date.now())
+  db.prepare(`
+    INSERT INTO service_links (
+      discord_user_id, service, access_token_enc, refresh_token_enc, key_id, scope,
+      token_expires_at, status, created_at, updated_at
+    ) VALUES (?, 'youtube', x'00', x'00', 'key-1', 'scope', NULL, 'active', ?, ?)
+  `).run('google-review-demo', Date.now(), Date.now())
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/auth/demo/login',
+    payload: { password: 'test-secret' },
+  })
+  assert.equal(response.statusCode, 302)
+
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM service_links WHERE discord_user_id = ?')
+      .get('google-review-demo').count,
+    0
+  )
+})
+
+test('Disabling demo login at startup deletes existing sessions and service links', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+
+  db.prepare(`
+    INSERT INTO discord_users (discord_id, username, created_at, last_seen_at)
+    VALUES (?, ?, ?, ?)
+  `).run('google-review-demo', 'Google Reviewer', Date.now(), Date.now())
+  db.prepare(`
+    INSERT INTO web_sessions (session_id, discord_user_id, created_at, expires_at)
+    VALUES (?, ?, ?, ?)
+  `).run('stale-session', 'google-review-demo', Date.now(), Date.now() + 1000)
+  db.prepare(`
+    INSERT INTO service_links (
+      discord_user_id, service, access_token_enc, refresh_token_enc, key_id, scope,
+      token_expires_at, status, created_at, updated_at
+    ) VALUES (?, 'youtube', x'00', x'00', 'key-1', 'scope', NULL, 'active', ?, ?)
+  `).run('google-review-demo', Date.now(), Date.now())
+
+  const config = createTestConfig()
+  const app = await buildApp({ db, config })
+  t.after(() => app.close())
+
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM web_sessions').get().count, 0)
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM service_links').get().count, 0)
+})
+
 test('Demo login with wrong password returns 401', async (t) => {
   const db = createMemoryDb()
   t.after(() => db.close())

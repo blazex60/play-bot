@@ -25,6 +25,20 @@ export function createMemoryDb() {
       created_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL
     );
+    CREATE TABLE service_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      discord_user_id TEXT NOT NULL REFERENCES discord_users(discord_id),
+      service TEXT NOT NULL CHECK (service IN ('spotify','youtube')),
+      access_token_enc BLOB NOT NULL,
+      refresh_token_enc BLOB,
+      key_id TEXT NOT NULL,
+      scope TEXT,
+      token_expires_at INTEGER,
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','needs_relink')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE (discord_user_id, service)
+    );
   `)
   return db
 }
