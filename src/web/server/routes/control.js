@@ -11,7 +11,10 @@ export async function controlRoutes(app, { botClient } = {}) {
       if (!botClient) throw new Error('botClient is required for control routes')
 
       await requireBotPermission({ botClient, guildId, userId: user.discordId })
-      const result = await callBot(botClient, 'POST', `/control/${encodeURIComponent(guildId)}/${action}`, request.body ?? {})
+      // The bot API requires body.userId on every control action; always use
+      // the authenticated session user rather than trusting a client-
+      // supplied value, matching /api/permission's convention.
+      const result = await callBot(botClient, 'POST', `/control/${encodeURIComponent(guildId)}/${action}`, { ...request.body, userId: user.discordId })
       return reply.send(result ?? { ok: true })
     } catch (error) {
       return bindRouteError(reply, error)

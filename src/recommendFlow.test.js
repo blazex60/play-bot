@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { GuildQueue, createTrack } from './queue.js'
 import { PendingChoiceStore } from './views.js'
-import { handleRecommendChoice, postRecommendations } from './recommendFlow.js'
+import { cancelRecommendations, handleRecommendChoice, postRecommendations } from './recommendFlow.js'
 
 function makeCandidate(videoId) {
   return createTrack({ title: videoId, webpageUrl: `https://example.com/${videoId}`, duration: 60, videoId })
@@ -88,6 +88,43 @@ test('postRecommendations: skips plans with no candidates', async () => {
   const count = await postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
   assert.equal(count, 0)
   assert.equal(channel.sent.length, 0)
+})
+
+test('postRecommendations: discards a message whose send resolves after the round already won', async (t) => {
+  const pendingStore = new PendingChoiceStore()
+  let resolveSecondSend
+  const secondSendGate = new Promise((resolve) => { resolveSecondSend = resolve })
+  let sendCount = 0
+  const channel = {
+    async send() {
+      sendCount += 1
+      if (sendCount === 1) return makeSentMessage('msg-1')
+      await secondSendGate
+      return makeSentMessage('msg-2')
+    },
+  }
+  const plans = [
+    { userId: 'u1', candidates: [makeCandidate('v1')] },
+    { userId: 'u2', candidates: [makeCandidate('v2')] },
+  ]
+
+  const postPromise = postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
+
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.ok(pendingStore.get('msg-1'), 'first message should already be stored while the second send is still pending')
+  t.after(() => {
+    const entry = pendingStore.get('msg-1')
+    if (entry) clearTimeout(entry.timeoutHandle)
+  })
+
+  // Simulate the first message's pick winning the round while the second
+  // send is still in flight.
+  cancelRecommendations('g1', pendingStore)
+  resolveSecondSend()
+
+  const postedCount = await postPromise
+  assert.equal(postedCount, 1, 'the late-arriving message must not count as posted')
+  assert.equal(pendingStore.get('msg-2'), null, 'the late message must not be left as a live, pickable entry')
 })
 
 test('handleRecommendChoice: rejects a click from someone other than the target user', async () => {

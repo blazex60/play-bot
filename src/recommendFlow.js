@@ -40,8 +40,18 @@ export function cancelRecommendations(guildId, pendingStore) {
 // (e.g. the remembered text channel was deleted or the bot lost permission).
 export async function postRecommendations({ client, channel, guildId, plans, pendingStore, onTimeout }) {
   let postedCount = 0
+  // Each channel.send() below is awaited sequentially, so a user can already
+  // pick (and cancelRecommendations the whole round) before every prompt has
+  // even been posted. Track the first message we store and treat its
+  // disappearance from pendingStore as "the round is already over" — cheap
+  // to check and equivalent to checking every entry, since cancellation
+  // always clears a guild's entries as one atomic sweep.
+  let firstPostedMessageId = null
+  const roundAlreadyOver = () => firstPostedMessageId !== null && !pendingStore.get(firstPostedMessageId)
+
   for (const { userId, candidates } of plans) {
     if (!candidates.length) continue
+    if (roundAlreadyOver()) break
 
     const embed = new EmbedBuilder()
       .setTitle('🎵 次の曲のおすすめ')
@@ -63,6 +73,13 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
       continue
     }
 
+    if (roundAlreadyOver()) {
+      // Someone picked while this exact send was in flight; don't leave a
+      // second live, pickable prompt around after the round already ended.
+      disableMessage(message).catch(() => {})
+      continue
+    }
+
     const entry = { guildId, targetUserId: userId, candidates, message, timeoutHandle: null }
     entry.timeoutHandle = setTimeout(async () => {
       pendingStore.delete(message.id)
@@ -77,6 +94,7 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
     }, RECOMMEND_TIMEOUT_MS)
 
     pendingStore.set(message.id, entry)
+    if (firstPostedMessageId === null) firstPostedMessageId = message.id
     postedCount += 1
   }
   return postedCount
