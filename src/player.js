@@ -16,6 +16,7 @@ import {
 const RECONNECT_GRACE = 5000;
 const WATCHDOG_INTERVAL = 10_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
+const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -27,6 +28,7 @@ export class GuildPlayer {
   #queue;
   #onDisconnect;
   #handleQueueExhausted;
+  #queueExhaustedTimeoutMs;
   #recordPlayFn;
   #audioPlayer;
   #forceSkip = false;
@@ -48,6 +50,7 @@ export class GuildPlayer {
     queue,
     onDisconnect,
     handleQueueExhausted = null,
+    queueExhaustedTimeoutMs = QUEUE_EXHAUSTED_TIMEOUT,
     recordPlayFn = null,
     audioPlayer = createAudioPlayer(),
     createAudioResourceFn = createAudioResource,
@@ -58,6 +61,7 @@ export class GuildPlayer {
     this.#queue = queue;
     this.#onDisconnect = onDisconnect;
     this.#handleQueueExhausted = handleQueueExhausted;
+    this.#queueExhaustedTimeoutMs = queueExhaustedTimeoutMs;
     this.#recordPlayFn = recordPlayFn;
     this.#audioPlayer = audioPlayer;
     this.#createAudioResource = createAudioResourceFn;
@@ -213,11 +217,23 @@ export class GuildPlayer {
 
   async #tryHandleQueueExhausted(finishedTrack) {
     if (!this.#handleQueueExhausted) return false;
+    // planAutoTrack/planRecommendations await yt-dlp and fetch calls with no
+    // timeout of their own; without a bound here, a hang there would leave
+    // the player idle forever since the watchdog was already cleared.
+    let timeoutHandle;
+    const timeout = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(
+        () => reject(new Error('handleQueueExhausted timed out')),
+        this.#queueExhaustedTimeoutMs
+      );
+    });
     try {
-      return await this.#handleQueueExhausted(finishedTrack);
+      return await Promise.race([this.#handleQueueExhausted(finishedTrack), timeout]);
     } catch (err) {
       console.error('[GuildPlayer] handleQueueExhausted error:', err);
       return false;
+    } finally {
+      clearTimeout(timeoutHandle);
     }
   }
 

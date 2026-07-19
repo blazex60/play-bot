@@ -18,6 +18,16 @@ function fakeFetch(responses) {
   return fetchImpl
 }
 
+function hangingFetch() {
+  return (_url, options = {}) => new Promise((_resolve, reject) => {
+    options.signal?.addEventListener('abort', () => {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      reject(err)
+    })
+  })
+}
+
 test('recordPlay posts to /internal/play-history with a bearer token', async () => {
   const fetchImpl = fakeFetch([{ body: { ok: true } }])
   const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl })
@@ -76,4 +86,17 @@ test('getRecentHistory returns {} for an empty userIds list without calling fetc
   const result = await client.getRecentHistory({ guildId: 'g1', userIds: [] })
   assert.deepEqual(result, {})
   assert.equal(fetchImpl.calls.length, 0)
+})
+
+test('recordPlay aborts a hung request after the configured timeout instead of hanging forever', async () => {
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl: hangingFetch(), requestTimeoutMs: 20 })
+
+  await assert.doesNotReject(() => client.recordPlay({ guildId: 'g1', discordUserId: 'u1', trackTitle: 'T', trackUrl: 'https://example.com/t' }))
+})
+
+test('getRecentHistory aborts a hung request after the configured timeout and returns {}', async () => {
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl: hangingFetch(), requestTimeoutMs: 20 })
+
+  const result = await client.getRecentHistory({ guildId: 'g1', userIds: ['u1'] })
+  assert.deepEqual(result, {})
 })

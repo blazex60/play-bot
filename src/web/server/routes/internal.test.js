@@ -104,3 +104,53 @@ test('GET /internal/play-history/recent returns rows scoped per user, newest fir
   assert.equal(body.u2.length, 1)
   assert.equal(body.u2[0].videoId, 'v3')
 })
+
+test('POST /internal/play-history rejects a payload missing required fields', async (t) => {
+  const { app, config } = await setup(t)
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/play-history',
+    headers: authHeaders(config),
+    payload: { guildId: 'g1', discordUserId: 'u1' }, // missing trackTitle/trackUrl
+  })
+  assert.equal(response.statusCode, 400)
+})
+
+test('GET /internal/play-history/recent requires the bot API bearer token', async (t) => {
+  const { app } = await setup(t)
+  const response = await app.inject({
+    method: 'GET',
+    url: '/internal/play-history/recent?guildId=g1&userIds=u1',
+  })
+  assert.equal(response.statusCode, 401)
+})
+
+test('GET /internal/play-history/recent rejects a request missing required query fields', async (t) => {
+  const { app, config } = await setup(t)
+  const response = await app.inject({
+    method: 'GET',
+    url: '/internal/play-history/recent?guildId=g1', // missing userIds
+    headers: authHeaders(config),
+  })
+  assert.equal(response.statusCode, 400)
+})
+
+test('GET /internal/play-history/recent clamps a negative limit instead of returning unlimited rows', async (t) => {
+  const { app, config } = await setup(t)
+  const record = (n) =>
+    app.inject({
+      method: 'POST',
+      url: '/internal/play-history',
+      headers: authHeaders(config),
+      payload: { guildId: 'g1', discordUserId: 'u1', trackTitle: `T${n}`, trackUrl: `https://example.com/${n}`, videoId: `v${n}` },
+    })
+  for (let i = 0; i < 3; i += 1) await record(i)
+
+  const response = await app.inject({
+    method: 'GET',
+    url: '/internal/play-history/recent?guildId=g1&userIds=u1&limit=-1',
+    headers: authHeaders(config),
+  })
+  assert.equal(response.statusCode, 200)
+  assert.equal(response.json().u1.length, 3, 'a negative limit should fall back to the default cap, not become unlimited')
+})

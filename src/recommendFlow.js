@@ -1,6 +1,7 @@
 import { ActionRowBuilder, EmbedBuilder, MessageFlags } from 'discord.js'
 import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
 import { checkSameVoiceChannel } from './permissions.js'
+import { createTrack } from './queue.js'
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
 const RECOMMEND_TIMEOUT_MS = 5 * 60 * 1000
@@ -110,8 +111,17 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   pendingStore.delete(interaction.message.id)
 
   await interaction.deferUpdate()
+  // Recommendation candidates start with requestedById: null (they came from
+  // the bot's own suggestion, not a request), which would make GuildPlayer
+  // skip recording the play. Attribute it to the picker now so recommend-mode
+  // picks actually feed back into that user's personalization history.
+  const chosenTrack = createTrack({
+    ...track,
+    requestedBy: interaction.member?.displayName ?? interaction.user.username,
+    requestedById: interaction.user.id,
+  })
   const wasEmpty = session.queue.isEmpty
-  session.queue.add(track)
+  session.queue.add(chosenTrack)
   if (wasEmpty) await session.player.playNext()
   await disableMessage(interaction.message).catch(() => {})
 

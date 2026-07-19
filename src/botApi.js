@@ -25,17 +25,19 @@ function getBearerToken(request) {
   return token;
 }
 
-function serializeSession(session) {
-  if (!session) return { active: false };
-  const settings = session.guildId ? getGuildSettings(session.guildId) : {};
+function serializeSession(session, guildId = session?.guildId) {
+  // autoplayMode/personalize are guild-level settings, not session state, so
+  // they're reported even when the bot isn't currently in a VC for the guild.
+  const settings = guildId ? getGuildSettings(guildId) : {};
+  const autoplaySettings = { autoplayMode: settings.autoplayMode ?? 'off', personalize: settings.personalize ?? false };
+  if (!session) return { active: false, ...autoplaySettings };
   return {
     active: true,
     current: session.queue.current,
     upcoming: session.queue.upcoming(),
     playerStatus: session.player.status ?? 'unknown',
     loopMode: session.queue.loopMode,
-    autoplayMode: settings.autoplayMode ?? 'off',
-    personalize: settings.personalize ?? false,
+    ...autoplaySettings,
   };
 }
 
@@ -119,7 +121,7 @@ export function buildBotApi({
   app.get('/healthz', async () => ({ ok: true }));
 
   app.get('/state/:guildId', async (request) => {
-    return serializeSession(sessions.get(request.params.guildId));
+    return serializeSession(sessions.get(request.params.guildId), request.params.guildId);
   });
 
   app.get('/permission', async (request, reply) => {
@@ -135,12 +137,35 @@ export function buildBotApi({
     const userId = requireBodyUserId(request, reply);
     if (!userId) return;
     const guildId = request.params.guildId;
+    const action = request.params.action;
+
+    // autoplayMode/personalize are guild-level settings, not playback state,
+    // so they must be configurable even when the bot has no active session
+    // for the guild (unlike every other action below, which mutates a live
+    // player/queue and therefore requires one).
+    if (action === 'autoplay') {
+      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+      if (!permission) return;
+      const { mode, personalize } = request.body ?? {};
+      if (mode !== undefined) {
+        if (!AUTOPLAY_MODES.has(mode)) {
+          reply.code(400).send({ error: 'invalid_autoplay_mode' });
+          return;
+        }
+        await setAutoplayMode(guildId, mode);
+      }
+      if (personalize !== undefined) {
+        await setPersonalize(guildId, personalize === true);
+      }
+      return { ok: true, state: serializeSession(sessions.get(guildId), guildId) };
+    }
+
     const session = requireSession(sessions, guildId, reply);
     if (!session) return;
     const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
     if (!permission) return;
 
-    switch (request.params.action) {
+    switch (action) {
       case 'pause':
         return { ok: session.player.pause(), state: serializeSession(session) };
       case 'resume':
@@ -162,20 +187,6 @@ export function buildBotApi({
           return;
         }
         session.player.setVolume(level);
-        return { ok: true, state: serializeSession(session) };
-      }
-      case 'autoplay': {
-        const { mode, personalize } = request.body ?? {};
-        if (mode !== undefined) {
-          if (!AUTOPLAY_MODES.has(mode)) {
-            reply.code(400).send({ error: 'invalid_autoplay_mode' });
-            return;
-          }
-          await setAutoplayMode(guildId, mode);
-        }
-        if (personalize !== undefined) {
-          await setPersonalize(guildId, personalize === true);
-        }
         return { ok: true, state: serializeSession(session) };
       }
       default:

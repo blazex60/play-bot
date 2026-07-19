@@ -91,7 +91,7 @@ export async function importRoutes(app, { db, botClient, services, searchYoutube
       const resolved = await resolveImportTracks({
         service,
         tracks: providerTracks,
-        requestedBy: user.discordId,
+        requestedBy: user.username,
         requestedById: user.discordId,
         searchYoutube,
       })

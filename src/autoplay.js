@@ -122,16 +122,22 @@ export async function planAutoTrack({ guildId, channel, lastTrack, webClient, no
     }
   }
 
-  const excludeVideoIds = new Set([lastTrack.videoId])
-
-  let candidates = consensusVideoId && consensusVideoId !== lastTrack.videoId
-    ? await tryResolveRelated(resolveRelatedFn, consensusVideoId, 10)
-    : null
+  // RD mix playlists conventionally include the seed video itself among the
+  // results, so whichever seed actually produced these candidates must be
+  // excluded too, not just the just-finished track.
+  let usedSeedVideoId = null
+  let candidates = null
+  if (consensusVideoId && consensusVideoId !== lastTrack.videoId) {
+    candidates = await tryResolveRelated(resolveRelatedFn, consensusVideoId, 10)
+    if (candidates) usedSeedVideoId = consensusVideoId
+  }
   if (!candidates) {
     candidates = await tryResolveRelated(resolveRelatedFn, lastTrack.videoId, 10)
+    if (candidates) usedSeedVideoId = lastTrack.videoId
   }
   if (!candidates) return null
 
+  const excludeVideoIds = new Set([lastTrack.videoId, usedSeedVideoId].filter(Boolean))
   const filtered = candidates.filter((candidate) => !candidate.videoId || !excludeVideoIds.has(candidate.videoId))
   if (filtered.length === 0) return null
 
@@ -153,6 +159,17 @@ export async function planRecommendations({ guildId, channel, lastTrack, webClie
   const excludeVideoIds = new Set([lastTrack?.videoId].filter(Boolean))
   const plans = []
 
+  // Users who share the same seed (e.g. everyone falling back to lastTrack
+  // when nobody has stable history) would otherwise each spawn their own
+  // yt-dlp lookup for an identical result; resolve each distinct seed once.
+  const candidatesBySeed = new Map()
+  async function getCandidatesForSeed(seedVideoId) {
+    if (!candidatesBySeed.has(seedVideoId)) {
+      candidatesBySeed.set(seedVideoId, await tryResolveRelated(resolveRelatedFn, seedVideoId, 6))
+    }
+    return candidatesBySeed.get(seedVideoId)
+  }
+
   for (const userId of humanIds) {
     const vector = buildDecayedVector(history[userId] ?? [], { now })
     const isStable = totalWeight(vector.videoWeights) >= STABLE_MIN_WEIGHT
@@ -160,10 +177,11 @@ export async function planRecommendations({ guildId, channel, lastTrack, webClie
     const seedVideoId = topEntry ? topEntry[0] : lastTrack?.videoId
     if (!seedVideoId) continue
 
-    const candidates = await tryResolveRelated(resolveRelatedFn, seedVideoId, 6)
+    const candidates = await getCandidatesForSeed(seedVideoId)
     if (!candidates) continue
 
-    const filtered = candidates.filter((candidate) => !candidate.videoId || !excludeVideoIds.has(candidate.videoId))
+    const excludeForUser = new Set([...excludeVideoIds, seedVideoId])
+    const filtered = candidates.filter((candidate) => !candidate.videoId || !excludeForUser.has(candidate.videoId))
     if (filtered.length === 0) continue
 
     const ranked = rankByChannelAffinity(filtered, vector.channelWeights)

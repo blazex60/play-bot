@@ -6,7 +6,7 @@ import { createWebClient } from './webClient.js'
 import { planAutoTrack, planRecommendations } from './autoplay.js'
 import { cancelRecommendations, postRecommendations } from './recommendFlow.js'
 
-// Map<guildId, { guildId, connection, player, queue, textChannelId }>
+// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken }>
 export const sessions = new Map()
 export const pendingStore = new PendingChoiceStore()
 export const recommendPendingStore = new PendingChoiceStore()
@@ -59,14 +59,22 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   const handleQueueExhausted = async (lastTrack) => {
     const session = sessions.get(guildId)
     if (!session) return false
+    // planAutoTrack/planRecommendations do multi-second async work (history
+    // fetch, yt-dlp). /stop can clear the queue in that window without
+    // deleting the session, which would otherwise make queue.isEmpty look
+    // "still idle" again and let this continuation undo the stop. planToken
+    // is bumped on /stop so a stale continuation can tell it happened.
+    const planToken = session.planToken
+    const isStale = () => sessions.get(guildId) !== session || session.planToken !== planToken
+
     const voiceChannel = guild.channels.cache.get(connection.joinConfig.channelId)
     if (!voiceChannel) return false
 
     const autoTrack = await planAutoTrack({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
+    if (isStale()) return false
     if (autoTrack) {
-      // planAutoTrack does async history/yt-dlp work; a manual /play may
-      // have already re-filled and started the queue while we were waiting,
-      // so only auto-start playback if it's still actually idle.
+      // A manual /play may have already re-filled and started the queue
+      // while we were waiting, so only auto-start playback if still idle.
       const wasEmpty = queue.isEmpty
       queue.add(autoTrack)
       if (wasEmpty) await session.player.playNext()
@@ -74,6 +82,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     }
 
     const plans = await planRecommendations({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
+    if (isStale()) return false
     if (plans && plans.length > 0) {
       const textChannelId = session.textChannelId
       const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
@@ -86,7 +95,13 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
         queue,
         player: session.player,
         pendingStore: recommendPendingStore,
-        onTimeout: onDisconnect,
+        onTimeout: async () => {
+          // A manual /play may have started a track while this prompt sat
+          // unanswered; only the shared onDisconnect path should tear the
+          // session down, and only if nothing is actually playing/queued.
+          if (!queue.isEmpty || isStale()) return
+          await onDisconnect()
+        },
       })
       return postedCount > 0
     }
@@ -102,7 +117,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     handleQueueExhausted,
     recordPlayFn: webClient.recordPlay,
   })
-  const session = { guildId, connection, player, queue, textChannelId }
+  const session = { guildId, connection, player, queue, textChannelId, planToken: 0 }
   sessions.set(guildId, session)
   return session
 }

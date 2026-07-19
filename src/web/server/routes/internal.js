@@ -49,7 +49,8 @@ export async function internalRoutes(app, { db, token } = {}) {
       return reply.code(400).send({ error: 'missing_fields' })
     }
     const ids = String(userIds).split(',').map((id) => id.trim()).filter(Boolean)
-    const rowLimit = Math.min(Number.parseInt(limit, 10) || 200, 500)
+    const parsedLimit = Number.parseInt(limit, 10)
+    const rowLimit = Math.min(Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : 200, 500)
     const stmt = db.prepare(`
       SELECT video_id as videoId, channel, played_at as playedAt
       FROM play_history

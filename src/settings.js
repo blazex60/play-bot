@@ -57,31 +57,24 @@ async function writeSettings() {
   await rename(tmpPath, settingsPath)
 }
 
-export async function setNormalize(guildId, enabled) {
+async function updateGuildSettings(guildId, patch) {
   ensureLoaded()
-  guildSettings.set(guildId, { ...getGuildSettings(guildId), normalize: enabled === true })
+  guildSettings.set(guildId, { ...getGuildSettings(guildId), ...patch })
   writeChain = writeChain.then(() => writeSettings())
   await writeChain
   return getGuildSettings(guildId)
 }
 
-export async function setAutoplayMode(guildId, mode) {
-  ensureLoaded()
-  guildSettings.set(guildId, {
-    ...getGuildSettings(guildId),
-    autoplayMode: AUTOPLAY_MODES.has(mode) ? mode : 'off',
-  })
-  writeChain = writeChain.then(() => writeSettings())
-  await writeChain
-  return getGuildSettings(guildId)
+export function setNormalize(guildId, enabled) {
+  return updateGuildSettings(guildId, { normalize: enabled === true })
 }
 
-export async function setPersonalize(guildId, enabled) {
-  ensureLoaded()
-  guildSettings.set(guildId, { ...getGuildSettings(guildId), personalize: enabled === true })
-  writeChain = writeChain.then(() => writeSettings())
-  await writeChain
-  return getGuildSettings(guildId)
+export function setAutoplayMode(guildId, mode) {
+  return updateGuildSettings(guildId, { autoplayMode: AUTOPLAY_MODES.has(mode) ? mode : 'off' })
+}
+
+export function setPersonalize(guildId, enabled) {
+  return updateGuildSettings(guildId, { personalize: enabled === true })
 }
 
 export function configureSettingsPathForTest(filePath) {
