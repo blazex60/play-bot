@@ -68,6 +68,12 @@ export function createWebConfig(env = process.env) {
       url: botApiUrl,
       token: env.BOT_API_TOKEN,
     },
+    demoLogin: {
+      enabled: env.DEMO_LOGIN_ENABLED === 'true' && Boolean(env.DEMO_LOGIN_PASSWORD),
+      password: env.DEMO_LOGIN_PASSWORD ?? null,
+      discordId: 'google-review-demo',
+      username: 'Google Reviewer',
+    },
   }
 }
 

@@ -8,6 +8,7 @@ import { createBotClient } from './botClient.js'
 import { startCleanupJob } from './cleanup.js'
 import { createWebConfig, defaultConfig } from './config.js'
 import { registerDiscordAuthRoutes } from './auth/discord.js'
+import { registerDemoAuthRoutes } from './auth/demo.js'
 import { registerSpotifyAuthRoutes } from './auth/spotify.js'
 import { registerYoutubeAuthRoutes } from './auth/youtube.js'
 import { createRequireAuth } from './middleware/requireAuth.js'
@@ -86,6 +87,7 @@ export async function buildWebServer({
   }))
 
   registerDiscordAuthRoutes(app, { db: database, config, fetchImpl })
+  registerDemoAuthRoutes(app, { db: database, config })
   registerSpotifyAuthRoutes(app, { db: database, config, requireAuth, fetchImpl })
   registerYoutubeAuthRoutes(app, { db: database, config, requireAuth, fetchImpl })
 
