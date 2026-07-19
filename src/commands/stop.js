@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { checkSameVoiceChannel } from '../permissions.js'
+import { cancelPendingRecommendations } from '../sessions.js'
 
 export default {
   data: new SlashCommandBuilder().setName('stop').setDescription('再生を停止してキューをクリアします'),
@@ -9,6 +10,7 @@ export default {
     if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
     if (!checkSameVoiceChannel(interaction, session)) return
     await session.player.stop()
+    cancelPendingRecommendations(interaction.guildId)
     await interaction.reply(`⏹️ ${interaction.member.displayName} が再生を停止してキューをクリアしました`)
   },
 }

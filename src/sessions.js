@@ -13,6 +13,15 @@ export const recommendPendingStore = new PendingChoiceStore()
 
 const webClient = createWebClient()
 
+// /stop clears playback without destroying the session/connection, and
+// /leave deletes the session directly — neither goes through onDisconnect,
+// so both must explicitly drop any still-open recommendation prompts for
+// the guild (otherwise a stale button click can still enqueue and start a
+// track after the user thought they stopped/left).
+export function cancelPendingRecommendations(guildId) {
+  cancelRecommendations(guildId, recommendPendingStore)
+}
+
 export async function getOrCreateSession({ guildId, guild, channel, textChannelId = null }) {
   const existing = sessions.get(guildId)
   if (existing && existing.connection.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -55,8 +64,12 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
 
     const autoTrack = await planAutoTrack({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
     if (autoTrack) {
+      // planAutoTrack does async history/yt-dlp work; a manual /play may
+      // have already re-filled and started the queue while we were waiting,
+      // so only auto-start playback if it's still actually idle.
+      const wasEmpty = queue.isEmpty
       queue.add(autoTrack)
-      await session.player.playNext()
+      if (wasEmpty) await session.player.playNext()
       return true
     }
 
@@ -65,7 +78,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
       const textChannelId = session.textChannelId
       const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
       if (!textChannel) return false
-      await postRecommendations({
+      const postedCount = await postRecommendations({
         client: guild.client,
         channel: textChannel,
         guildId,
@@ -75,13 +88,20 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
         pendingStore: recommendPendingStore,
         onTimeout: onDisconnect,
       })
-      return true
+      return postedCount > 0
     }
 
     return false
   }
 
-  const player = new GuildPlayer({ guildId, connection, queue, onDisconnect, handleQueueExhausted })
+  const player = new GuildPlayer({
+    guildId,
+    connection,
+    queue,
+    onDisconnect,
+    handleQueueExhausted,
+    recordPlayFn: webClient.recordPlay,
+  })
   const session = { guildId, connection, player, queue, textChannelId }
   sessions.set(guildId, session)
   return session

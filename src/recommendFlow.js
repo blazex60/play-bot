@@ -1,5 +1,6 @@
 import { ActionRowBuilder, EmbedBuilder, MessageFlags } from 'discord.js'
 import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
+import { checkSameVoiceChannel } from './permissions.js'
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
 const RECOMMEND_TIMEOUT_MS = 5 * 60 * 1000
@@ -33,7 +34,11 @@ export function cancelRecommendations(guildId, pendingStore) {
   }
 }
 
+// Returns the number of recommendation messages actually posted, so callers
+// can tell "posted but nobody has picked yet" apart from "every send failed"
+// (e.g. the remembered text channel was deleted or the bot lost permission).
 export async function postRecommendations({ client, channel, guildId, plans, pendingStore, onTimeout }) {
+  let postedCount = 0
   for (const { userId, candidates } of plans) {
     if (!candidates.length) continue
 
@@ -71,7 +76,9 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
     }, RECOMMEND_TIMEOUT_MS)
 
     pendingStore.set(message.id, entry)
+    postedCount += 1
   }
+  return postedCount
 }
 
 export async function handleRecommendChoice(interaction, sessions, pendingStore) {
@@ -88,17 +95,24 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   const track = entry.candidates[index]
   if (!track) return
 
-  clearTimeout(entry.timeoutHandle)
-  pendingStore.delete(interaction.message.id)
-
   const session = sessions.get(entry.guildId)
   if (!session) {
     return interaction.reply({ content: '❌ セッションが終了しています', flags: MessageFlags.Ephemeral })
   }
+  // The target user may have left the VC after the prompt was posted while
+  // other listeners kept the session alive; re-check membership the same way
+  // every other playback-affecting command does before honoring the pick.
+  // Checked before consuming the entry so a legitimate click still works if
+  // they rejoin and try again, instead of silently expiring the prompt.
+  if (!checkSameVoiceChannel(interaction, session)) return
+
+  clearTimeout(entry.timeoutHandle)
+  pendingStore.delete(interaction.message.id)
 
   await interaction.deferUpdate()
+  const wasEmpty = session.queue.isEmpty
   session.queue.add(track)
-  await session.player.playNext()
+  if (wasEmpty) await session.player.playNext()
   await disableMessage(interaction.message).catch(() => {})
 
   cancelRecommendations(entry.guildId, pendingStore)

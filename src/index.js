@@ -4,7 +4,7 @@ import { Client, Collection, Events, GatewayIntentBits, MessageFlags } from 'dis
 import { readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { sessions, pendingStore, recommendPendingStore } from './sessions.js'
+import { sessions, pendingStore, recommendPendingStore, cancelPendingRecommendations } from './sessions.js'
 import { parseSearchCustomId } from './views.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
 import { handleRecommendChoice, RECOMMEND_CUSTOM_ID_PREFIX } from './recommendFlow.js'
@@ -90,6 +90,7 @@ client.on(Events.VoiceStateUpdate, async (oldState) => {
   if (humans.size === 0) {
     console.log(`[VoiceState] All humans left ${channel.name}, auto-disconnecting`)
     sessions.delete(oldState.guild.id)
+    cancelPendingRecommendations(oldState.guild.id)
     session.player.stop().catch(() => {})
     session.connection.destroy()
   }

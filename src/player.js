@@ -27,6 +27,7 @@ export class GuildPlayer {
   #queue;
   #onDisconnect;
   #handleQueueExhausted;
+  #recordPlayFn;
   #audioPlayer;
   #forceSkip = false;
   #hadError = false;
@@ -47,6 +48,7 @@ export class GuildPlayer {
     queue,
     onDisconnect,
     handleQueueExhausted = null,
+    recordPlayFn = null,
     audioPlayer = createAudioPlayer(),
     createAudioResourceFn = createAudioResource,
     resolveAudioStreamFn = resolveAudioStream,
@@ -56,6 +58,7 @@ export class GuildPlayer {
     this.#queue = queue;
     this.#onDisconnect = onDisconnect;
     this.#handleQueueExhausted = handleQueueExhausted;
+    this.#recordPlayFn = recordPlayFn;
     this.#audioPlayer = audioPlayer;
     this.#createAudioResource = createAudioResourceFn;
     this.#resolveAudioStream = resolveAudioStreamFn;
@@ -118,6 +121,22 @@ export class GuildPlayer {
 
     this.#audioPlayer.play(resource);
     this.#prefetchUpcoming();
+    this.#recordPlay(track);
+  }
+
+  #recordPlay(track) {
+    if (!this.#recordPlayFn || !track.requestedById) return;
+    this.#recordPlayFn({
+      guildId: this.#guildId,
+      discordUserId: track.requestedById,
+      username: track.requestedBy,
+      trackTitle: track.title,
+      trackUrl: track.webpageUrl,
+      videoId: track.videoId,
+      channel: track.channel,
+    }).catch((err) => {
+      console.error('[GuildPlayer] recordPlayFn failed:', err.message);
+    });
   }
 
   pause() {
