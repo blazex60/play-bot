@@ -90,7 +90,8 @@ export function registerDemoAuthRoutes(app, { db, config } = {}) {
     resetFailures(ip)
     upsertUser.run(config.demoLogin.discordId, config.demoLogin.username, now, now)
     // The demo account is a single fixed ID shared by every reviewer, so a new
-    // login must not inherit a previous reviewer's linked YouTube/Spotify account.
+    // login must not inherit a previous reviewer's session or linked YouTube/Spotify account.
+    deleteSessionsByUserId.run(config.demoLogin.discordId)
     deleteServiceLinksByUserId.run(config.demoLogin.discordId)
     createUserSession({ db, config, reply, discordId: config.demoLogin.discordId, now })
     return reply.redirect('/dashboard')

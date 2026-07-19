@@ -3,6 +3,7 @@ import { createWebConfig } from './config.js'
 
 export function createMemoryDb() {
   const db = new Database(':memory:')
+  db.pragma('foreign_keys = ON')
   db.exec(`
     CREATE TABLE discord_users (
       discord_id TEXT PRIMARY KEY,
