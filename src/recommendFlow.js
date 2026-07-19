@@ -1,6 +1,6 @@
 import { ActionRowBuilder, EmbedBuilder, MessageFlags } from 'discord.js'
 import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
-import { checkSameVoiceChannel } from './permissions.js'
+import { checkInVoiceChannel } from './permissions.js'
 import { createTrack } from './queue.js'
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
@@ -123,7 +123,7 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   // every other playback-affecting command does before honoring the pick.
   // Checked before consuming the entry so a legitimate click still works if
   // they rejoin and try again, instead of silently expiring the prompt.
-  if (!checkSameVoiceChannel(interaction, session)) return
+  if (!checkInVoiceChannel(interaction, session)) return
 
   // Claim the whole guild's recommendation round synchronously, before any
   // await: two users clicking different prompts in the same tick would

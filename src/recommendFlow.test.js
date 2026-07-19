@@ -152,6 +152,22 @@ test('handleRecommendChoice: rejects and preserves the entry if the target user 
   assert.ok(pendingStore.get('msg-1'), 'entry must survive a failed VC check so a legitimate retry still works')
 })
 
+test('handleRecommendChoice: honors a pick from a text channel other than the VC (regression: recommend prompts posted outside the VC chat were unclickable)', async () => {
+  const pendingStore = new PendingChoiceStore()
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+  // The recommendation was posted to session.textChannelId (wherever /play
+  // was invoked), which is often a normal text channel distinct from the
+  // VC's own chat channel — simulated here via interactionChannelId.
+  const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1', interactionChannelId: 'general-text-channel' })
+
+  await handleRecommendChoice(interaction, sessions, pendingStore)
+
+  assert.equal(session.queue.current.videoId, 'v1', 'the pick must succeed even though it was clicked from a non-VC text channel')
+  assert.equal(session.player.playNextCalls.length, 1)
+})
+
 test('handleRecommendChoice: valid pick on an empty queue starts playback', async () => {
   const pendingStore = new PendingChoiceStore()
   pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
