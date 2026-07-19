@@ -26,6 +26,7 @@ export class GuildPlayer {
   #connection;
   #queue;
   #onDisconnect;
+  #handleQueueExhausted;
   #audioPlayer;
   #forceSkip = false;
   #hadError = false;
@@ -45,6 +46,7 @@ export class GuildPlayer {
     connection,
     queue,
     onDisconnect,
+    handleQueueExhausted = null,
     audioPlayer = createAudioPlayer(),
     createAudioResourceFn = createAudioResource,
     resolveAudioStreamFn = resolveAudioStream,
@@ -53,6 +55,7 @@ export class GuildPlayer {
     this.#connection = connection;
     this.#queue = queue;
     this.#onDisconnect = onDisconnect;
+    this.#handleQueueExhausted = handleQueueExhausted;
     this.#audioPlayer = audioPlayer;
     this.#createAudioResource = createAudioResourceFn;
     this.#resolveAudioStream = resolveAudioStreamFn;
@@ -171,14 +174,31 @@ export class GuildPlayer {
       return;
     }
 
+    const finishedTrack = track;
     const shouldForceAdvance = this.#hadError;
     this.#hadError = false;
     const nextTrack = this.#queue.next({ forceAdvance: shouldForceAdvance });
     if (nextTrack === null) {
+      // Stop the stall watchdog before handing off: nothing is playing right
+      // now either way, and a handler that starts a new track (auto mode) or
+      // waits on a user pick (recommend mode) needs a clean slate rather than
+      // an interval left ticking against an idle player forever.
       this.#clearWatchdog();
+      const handled = await this.#tryHandleQueueExhausted(finishedTrack);
+      if (handled) return;
       await this.#onDisconnect();
     } else {
       await this.playNext();
+    }
+  }
+
+  async #tryHandleQueueExhausted(finishedTrack) {
+    if (!this.#handleQueueExhausted) return false;
+    try {
+      return await this.#handleQueueExhausted(finishedTrack);
+    } catch (err) {
+      console.error('[GuildPlayer] handleQueueExhausted error:', err);
+      return false;
     }
   }
 

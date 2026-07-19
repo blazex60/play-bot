@@ -74,7 +74,7 @@ function toWatchUrl(entry) {
   return raw ?? null;
 }
 
-export async function resolveFlatPlaylist(url, { requestedBy, limit = PLAYLIST_LIMIT } = {}) {
+export async function resolveFlatPlaylist(url, { requestedBy, requestedById = null, limit = PLAYLIST_LIMIT } = {}) {
   const output = await spawnAsync('yt-dlp', [
     ...YTDLP_JS_RUNTIME_ARGS,
     '--dump-json',
@@ -89,12 +89,15 @@ export async function resolveFlatPlaylist(url, { requestedBy, limit = PLAYLIST_L
     webpageUrl: toWatchUrl(entry),
     duration: entry.duration ?? null,
     requestedBy,
+    requestedById,
     thumbnail: pickThumbnail(entry),
+    videoId: entry.id ?? null,
+    channel: entry.channel ?? entry.uploader ?? null,
   }));
   return { tracks, truncated };
 }
 
-export async function resolveMetadata(url, { requestedBy }) {
+export async function resolveMetadata(url, { requestedBy, requestedById = null }) {
   const output = await spawnAsync('yt-dlp', [
     ...YTDLP_JS_RUNTIME_ARGS,
     '--dump-json',
@@ -107,8 +110,32 @@ export async function resolveMetadata(url, { requestedBy }) {
     webpageUrl: info.webpage_url ?? url,
     duration: info.duration ?? null,
     requestedBy,
+    requestedById,
     thumbnail: info.thumbnail ?? null,
+    videoId: info.id ?? null,
+    channel: info.channel ?? info.uploader ?? null,
   });
+}
+
+export async function resolveRelated(videoId, { limit = 10 } = {}) {
+  const output = await spawnAsync('yt-dlp', [
+    ...YTDLP_JS_RUNTIME_ARGS,
+    '--dump-json',
+    '--flat-playlist',
+    '--playlist-end', String(limit + 1),
+    `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`,
+  ]);
+  const entries = parseJsonLines(output, 'related videos');
+  return entries.slice(0, limit).map(entry => createTrack({
+    title: entry.title ?? 'Unknown',
+    webpageUrl: toWatchUrl(entry),
+    duration: entry.duration ?? null,
+    requestedBy: '🔀 自動再生',
+    requestedById: null,
+    thumbnail: pickThumbnail(entry),
+    videoId: entry.id ?? null,
+    channel: entry.channel ?? entry.uploader ?? null,
+  }));
 }
 
 export function resolveAudioStream(url) {

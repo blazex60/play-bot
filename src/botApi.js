@@ -2,6 +2,9 @@ import Fastify from 'fastify';
 
 import { getOrCreateSession } from './sessions.js';
 import { resolveWebPermission } from './webPermission.js';
+import { getGuildSettings, setAutoplayMode, setPersonalize } from './settings.js';
+
+const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 
 const DEFAULT_BOT_API_PORT = 8787;
 const LOOPBACK_HOST = '127.0.0.1';
@@ -24,12 +27,15 @@ function getBearerToken(request) {
 
 function serializeSession(session) {
   if (!session) return { active: false };
+  const settings = session.guildId ? getGuildSettings(session.guildId) : {};
   return {
     active: true,
     current: session.queue.current,
     upcoming: session.queue.upcoming(),
     playerStatus: session.player.status ?? 'unknown',
     loopMode: session.queue.loopMode,
+    autoplayMode: settings.autoplayMode ?? 'off',
+    personalize: settings.personalize ?? false,
   };
 }
 
@@ -156,6 +162,20 @@ export function buildBotApi({
           return;
         }
         session.player.setVolume(level);
+        return { ok: true, state: serializeSession(session) };
+      }
+      case 'autoplay': {
+        const { mode, personalize } = request.body ?? {};
+        if (mode !== undefined) {
+          if (!AUTOPLAY_MODES.has(mode)) {
+            reply.code(400).send({ error: 'invalid_autoplay_mode' });
+            return;
+          }
+          await setAutoplayMode(guildId, mode);
+        }
+        if (personalize !== undefined) {
+          await setPersonalize(guildId, personalize === true);
+        }
         return { ok: true, state: serializeSession(session) };
       }
       default:

@@ -11,8 +11,14 @@ let guildSettings = new Map()
 let loaded = false
 let writeChain = Promise.resolve()
 
+const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend'])
+
 function normalizeRecord(record) {
-  return { normalize: record?.normalize === true }
+  return {
+    normalize: record?.normalize === true,
+    autoplayMode: AUTOPLAY_MODES.has(record?.autoplayMode) ? record.autoplayMode : 'off',
+    personalize: record?.personalize === true,
+  }
 }
 
 function ensureLoaded() {
@@ -40,7 +46,7 @@ export function loadSettings() {
 export function getGuildSettings(guildId) {
   ensureLoaded()
   const settings = guildSettings.get(guildId)
-  return settings ? { ...settings } : { normalize: false }
+  return settings ? { ...settings } : { normalize: false, autoplayMode: 'off', personalize: false }
 }
 
 async function writeSettings() {
@@ -53,7 +59,26 @@ async function writeSettings() {
 
 export async function setNormalize(guildId, enabled) {
   ensureLoaded()
-  guildSettings.set(guildId, { normalize: enabled === true })
+  guildSettings.set(guildId, { ...getGuildSettings(guildId), normalize: enabled === true })
+  writeChain = writeChain.then(() => writeSettings())
+  await writeChain
+  return getGuildSettings(guildId)
+}
+
+export async function setAutoplayMode(guildId, mode) {
+  ensureLoaded()
+  guildSettings.set(guildId, {
+    ...getGuildSettings(guildId),
+    autoplayMode: AUTOPLAY_MODES.has(mode) ? mode : 'off',
+  })
+  writeChain = writeChain.then(() => writeSettings())
+  await writeChain
+  return getGuildSettings(guildId)
+}
+
+export async function setPersonalize(guildId, enabled) {
+  ensureLoaded()
+  guildSettings.set(guildId, { ...getGuildSettings(guildId), personalize: enabled === true })
   writeChain = writeChain.then(() => writeSettings())
   await writeChain
   return getGuildSettings(guildId)

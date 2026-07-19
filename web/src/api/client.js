@@ -2,7 +2,7 @@ const JSON_HEADERS = { 'content-type': 'application/json' }
 
 /**
  * @typedef {{ title?: string, webpageUrl?: string, duration?: number, requestedBy?: string, thumbnail?: string }} Track
- * @typedef {{ active?: boolean, current?: Track | null, upcoming?: Track[], queue?: Track[], playerStatus?: string, loopMode?: string }} PlaybackState
+ * @typedef {{ active?: boolean, current?: Track | null, upcoming?: Track[], queue?: Track[], playerStatus?: string, loopMode?: string, autoplayMode?: string, personalize?: boolean }} PlaybackState
  * @typedef {{ discordId?: string, username?: string }} User
  * @typedef {{ service: string, linked?: boolean, status?: string, tokenExpiresAt?: number | null, updatedAt?: number | null }} ServiceLink
  * @typedef {{ id: string, name: string, trackCount?: number, tracks?: { total?: number } }} Playlist

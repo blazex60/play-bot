@@ -1,6 +1,6 @@
 import { bindRouteError, callBot, getSessionUser, requireBotPermission } from './route-utils.js'
 
-const CONTROL_ACTIONS = new Set(['pause', 'resume', 'skip', 'stop', 'volume'])
+const CONTROL_ACTIONS = new Set(['pause', 'resume', 'skip', 'stop', 'volume', 'autoplay'])
 
 export async function controlRoutes(app, { botClient } = {}) {
   app.post('/api/guilds/:guildId/control/:action', async (request, reply) => {

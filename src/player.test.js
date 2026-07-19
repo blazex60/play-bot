@@ -29,12 +29,12 @@ function makeAudioPlayer() {
   }
 }
 
-function makePlayer({ audioPlayer = makeAudioPlayer() } = {}) {
+function makePlayer({ audioPlayer = makeAudioPlayer(), handleQueueExhausted, onDisconnect = async () => {}, trackDuration = 60 } = {}) {
   const queue = new GuildQueue()
   queue.add(createTrack({
     title: 'Track A',
     webpageUrl: 'https://example.com/a',
-    duration: 60,
+    duration: trackDuration,
   }))
 
   const resources = []
@@ -42,12 +42,13 @@ function makePlayer({ audioPlayer = makeAudioPlayer() } = {}) {
     guildId: 'guild-1',
     queue,
     audioPlayer,
+    handleQueueExhausted,
     connection: {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer)
       },
     },
-    onDisconnect: async () => {},
+    onDisconnect,
     resolveAudioStreamFn(url) {
       return { url }
     },
@@ -71,7 +72,7 @@ function makePlayer({ audioPlayer = makeAudioPlayer() } = {}) {
     },
   })
 
-  return { player, audioPlayer, resources }
+  return { player, audioPlayer, resources, queue }
 }
 
 test('GuildPlayer.status reflects the audio player state', () => {
@@ -100,4 +101,51 @@ test('GuildPlayer.setVolume clamps and applies to current inline-volume resource
   assert.deepEqual(resources[0].volumeCalls, [1.5, 2, 0])
 
   await player.stop()
+})
+
+test('GuildPlayer: queue exhaustion with no handleQueueExhausted disconnects as before', async () => {
+  let disconnected = false
+  const onDisconnect = async () => { disconnected = true }
+  const { player, audioPlayer } = makePlayer({ trackDuration: 3, onDisconnect })
+
+  await player.playNext()
+  const idleHandler = audioPlayer.events.get(AudioPlayerStatus.Idle)
+  idleHandler()
+
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(disconnected, true)
+})
+
+test('GuildPlayer: handleQueueExhausted returning true skips disconnect', async () => {
+  let disconnected = false
+  let handledCalled = false
+  const onDisconnect = async () => { disconnected = true }
+  const handleQueueExhausted = async (finishedTrack) => {
+    handledCalled = true
+    assert.equal(finishedTrack.title, 'Track A')
+    return true
+  }
+  const { player, audioPlayer } = makePlayer({ trackDuration: 3, onDisconnect, handleQueueExhausted })
+
+  await player.playNext()
+  const idleHandler = audioPlayer.events.get(AudioPlayerStatus.Idle)
+  idleHandler()
+
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(handledCalled, true)
+  assert.equal(disconnected, false)
+})
+
+test('GuildPlayer: handleQueueExhausted throwing falls back to disconnect safely', async () => {
+  let disconnected = false
+  const onDisconnect = async () => { disconnected = true }
+  const handleQueueExhausted = async () => { throw new Error('boom') }
+  const { player, audioPlayer } = makePlayer({ trackDuration: 3, onDisconnect, handleQueueExhausted })
+
+  await player.playNext()
+  const idleHandler = audioPlayer.events.get(AudioPlayerStatus.Idle)
+  idleHandler()
+
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(disconnected, true)
 })

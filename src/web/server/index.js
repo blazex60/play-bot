@@ -19,6 +19,7 @@ import { controlRoutes } from './routes/control.js'
 import { queueRoutes } from './routes/queue.js'
 import { importRoutes } from './routes/import.js'
 import { importEditRoutes } from './routes/import-edit.js'
+import { internalRoutes } from './routes/internal.js'
 
 const thisDir = dirname(fileURLToPath(import.meta.url))
 const projectRoot = resolve(thisDir, '../../..')
@@ -85,6 +86,10 @@ export async function buildWebServer({
   app.get('/api/me', { preHandler: requireAuth }, async (request) => ({
     user: request.user,
   }))
+
+  // Bot -> Web internal channel (play history), token-guarded, independent
+  // of the browser cookie-session requireAuth hook used below.
+  await app.register(internalRoutes, { db: database, token: config.botApi.token })
 
   registerDiscordAuthRoutes(app, { db: database, config, fetchImpl })
   registerDemoAuthRoutes(app, { db: database, config })

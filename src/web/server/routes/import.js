@@ -92,6 +92,7 @@ export async function importRoutes(app, { db, botClient, services, searchYoutube
         service,
         tracks: providerTracks,
         requestedBy: user.discordId,
+        requestedById: user.discordId,
         searchYoutube,
       })
 

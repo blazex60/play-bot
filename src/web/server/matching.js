@@ -26,7 +26,7 @@ export function buildSpotifySearchQuery(track) {
   return [title, artist].filter(Boolean).join(' ').trim()
 }
 
-export async function matchSpotifyTrack(track, { requestedBy, searchYoutube = defaultSearchYoutube } = {}) {
+export async function matchSpotifyTrack(track, { requestedBy, requestedById = null, searchYoutube = defaultSearchYoutube } = {}) {
   const query = buildSpotifySearchQuery(track)
   if (!query) {
     return {
@@ -56,12 +56,15 @@ export async function matchSpotifyTrack(track, { requestedBy, searchYoutube = de
       webpageUrl,
       duration: first.duration ?? null,
       requestedBy,
+      requestedById,
       thumbnail: pickThumbnail(first),
+      videoId: first.id ?? null,
+      channel: first.channel ?? first.uploader ?? null,
     }),
   }
 }
 
-export function resolveYoutubeTrack(item, { requestedBy } = {}) {
+export function resolveYoutubeTrack(item, { requestedBy, requestedById = null } = {}) {
   const webpageUrl = youtubeWatchUrl(item)
   if (!webpageUrl) {
     return {
@@ -80,22 +83,25 @@ export function resolveYoutubeTrack(item, { requestedBy } = {}) {
       webpageUrl,
       duration: item.duration ?? null,
       requestedBy,
+      requestedById,
       thumbnail: pickThumbnail(item),
+      videoId: item.contentDetails?.videoId ?? item.snippet?.resourceId?.videoId ?? item.id?.videoId ?? item.id ?? null,
+      channel: item.channel ?? item.snippet?.videoOwnerChannelTitle ?? item.snippet?.channelTitle ?? null,
     }),
   }
 }
 
-export async function resolveImportTracks({ service, tracks, requestedBy, searchYoutube = defaultSearchYoutube }) {
+export async function resolveImportTracks({ service, tracks, requestedBy, requestedById = null, searchYoutube = defaultSearchYoutube }) {
   if (service === 'spotify') {
     const resolved = []
     for (const track of tracks) {
-      resolved.push(await matchSpotifyTrack(track, { requestedBy, searchYoutube }))
+      resolved.push(await matchSpotifyTrack(track, { requestedBy, requestedById, searchYoutube }))
     }
     return resolved
   }
 
   if (service === 'youtube') {
-    return tracks.map((track) => resolveYoutubeTrack(track, { requestedBy }))
+    return tracks.map((track) => resolveYoutubeTrack(track, { requestedBy, requestedById }))
   }
 
   throw new Error(`Unsupported import service: ${service}`)

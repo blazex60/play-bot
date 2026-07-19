@@ -40,6 +40,16 @@ export function createMemoryDb() {
       updated_at INTEGER NOT NULL,
       UNIQUE (discord_user_id, service)
     );
+    CREATE TABLE play_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id TEXT NOT NULL,
+      discord_user_id TEXT NOT NULL REFERENCES discord_users(discord_id),
+      video_id TEXT,
+      channel TEXT,
+      track_title TEXT NOT NULL,
+      track_url TEXT NOT NULL,
+      played_at INTEGER NOT NULL
+    );
   `)
   return db
 }

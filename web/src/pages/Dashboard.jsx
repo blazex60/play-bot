@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { api, ApiError } from '../api/client.js'
 import '../dashboard.css'
+import { AutoplayPanel } from '../components/AutoplayPanel.jsx'
 import { MatchReview } from '../components/MatchReview.jsx'
 import { NowPlaying } from '../components/NowPlaying.jsx'
 import { PlaylistPanel } from '../components/PlaylistPanel.jsx'
@@ -48,6 +49,8 @@ export function Dashboard() {
   const [message, setMessage] = useState('')
 
   const queue = useMemo(() => state.upcoming ?? state.queue ?? [], [state])
+  const autoplayMode = state.autoplayMode ?? 'off'
+  const personalize = state.personalize ?? false
 
   const showError = useCallback((/** @type {unknown} */ error) => {
     if (error instanceof ApiError && error.status === 401) {
@@ -114,6 +117,16 @@ export function Dashboard() {
   /** @param {string} action */
   function control(action) {
     return runAction(() => api.control(guildId, action, action === 'volume' ? { level: volume } : {}), '操作を送信しました')
+  }
+
+  /** @param {string} mode */
+  function setAutoplayModeAction(mode) {
+    return runAction(() => api.control(guildId, 'autoplay', { mode }), '自動再生モードを更新しました')
+  }
+
+  /** @param {boolean} enabled */
+  function setPersonalizeAction(enabled) {
+    return runAction(() => api.control(guildId, 'autoplay', { personalize: enabled }), 'パーソナライズを更新しました')
   }
 
   /** @param {number} level */
@@ -244,6 +257,13 @@ export function Dashboard() {
       <div className="dashboard-grid">
         <NowPlaying state={state} />
         <TransportControls busy={busy || !guildId} volume={volume} onAction={control} onVolumeChange={changeVolume} />
+        <AutoplayPanel
+          mode={autoplayMode}
+          personalize={personalize}
+          busy={busy || !guildId}
+          onSetMode={setAutoplayModeAction}
+          onSetPersonalize={setPersonalizeAction}
+        />
         <QueueList queue={queue} busy={busy || !guildId} onMove={moveQueue} onRemove={removeQueue} />
         <PlaylistPanel
           links={links}
