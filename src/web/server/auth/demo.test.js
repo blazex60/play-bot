@@ -62,7 +62,7 @@ test('Demo login with correct password creates a user/session and authenticates 
   assert.equal(me.json().user.discordId, 'google-review-demo')
 })
 
-test('Demo login clears the previous demo session and service links, but leaves other users alone', async (t) => {
+test('Demo login clears the previous demo session, pending OAuth states, and service links, but leaves other users alone', async (t) => {
   const db = createMemoryDb()
   t.after(() => db.close())
   const config = createTestConfig({ DEMO_LOGIN_ENABLED: 'true', DEMO_LOGIN_PASSWORD: 'test-secret' })
@@ -94,6 +94,13 @@ test('Demo login clears the previous demo session and service links, but leaves 
     'google-review-demo', Date.now(), Date.now(),
     'other-user', Date.now(), Date.now()
   )
+  db.prepare(`
+    INSERT INTO oauth_states (state, discord_user_id, service, code_verifier, redirect_after, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'demo-pending-state', 'google-review-demo', 'youtube', 'verifier', '/callback/youtube', Date.now(), Date.now() + 600_000,
+    'other-user-pending-state', 'other-user', 'youtube', 'verifier', '/callback/youtube', Date.now(), Date.now() + 600_000
+  )
 
   const response = await app.inject({
     method: 'POST',
@@ -117,6 +124,11 @@ test('Demo login clears the previous demo session and service links, but leaves 
       .get().count,
     1
   )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM oauth_states WHERE discord_user_id = ?')
+      .get('google-review-demo').count,
+    0
+  )
 
   assert.equal(
     db.prepare('SELECT COUNT(*) AS count FROM service_links WHERE discord_user_id = ?')
@@ -128,9 +140,14 @@ test('Demo login clears the previous demo session and service links, but leaves 
       .get().session_id,
     'other-user-session'
   )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM oauth_states WHERE discord_user_id = ?')
+      .get('other-user').count,
+    1
+  )
 })
 
-test('Disabling demo login at startup deletes existing demo sessions and service links, but leaves other users alone', async (t) => {
+test('Disabling demo login at startup deletes existing demo sessions, pending OAuth states, and service links, but leaves other users alone', async (t) => {
   const db = createMemoryDb()
   t.after(() => db.close())
 
@@ -159,6 +176,13 @@ test('Disabling demo login at startup deletes existing demo sessions and service
     'google-review-demo', Date.now(), Date.now(),
     'other-user', Date.now(), Date.now()
   )
+  db.prepare(`
+    INSERT INTO oauth_states (state, discord_user_id, service, code_verifier, redirect_after, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    'demo-pending-state', 'google-review-demo', 'youtube', 'verifier', '/callback/youtube', Date.now(), Date.now() + 600_000,
+    'other-user-pending-state', 'other-user', 'youtube', 'verifier', '/callback/youtube', Date.now(), Date.now() + 600_000
+  )
 
   const config = createTestConfig()
   const app = await buildApp({ db, config })
@@ -174,6 +198,11 @@ test('Disabling demo login at startup deletes existing demo sessions and service
       .get('google-review-demo').count,
     0
   )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM oauth_states WHERE discord_user_id = ?')
+      .get('google-review-demo').count,
+    0
+  )
 
   assert.equal(
     db.prepare('SELECT COUNT(*) AS count FROM web_sessions WHERE discord_user_id = ?')
@@ -182,6 +211,11 @@ test('Disabling demo login at startup deletes existing demo sessions and service
   )
   assert.equal(
     db.prepare('SELECT COUNT(*) AS count FROM service_links WHERE discord_user_id = ?')
+      .get('other-user').count,
+    1
+  )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM oauth_states WHERE discord_user_id = ?')
       .get('other-user').count,
     1
   )
