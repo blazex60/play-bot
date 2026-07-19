@@ -21,6 +21,12 @@ export function registerDemoAuthRoutes(app, { db, config } = {}) {
       last_seen_at = excluded.last_seen_at
   `)
 
+  const deleteSessionsByUserId = db.prepare('DELETE FROM web_sessions WHERE discord_user_id = ?')
+
+  if (!config.demoLogin.enabled) {
+    deleteSessionsByUserId.run(config.demoLogin.discordId)
+  }
+
   const failuresByIp = new Map()
 
   function isRateLimited(ip, now) {
@@ -45,6 +51,22 @@ export function registerDemoAuthRoutes(app, { db, config } = {}) {
   function resetFailures(ip) {
     failuresByIp.delete(ip)
   }
+
+  function pruneStaleFailures(now) {
+    for (const [ip, entry] of failuresByIp) {
+      if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+        failuresByIp.delete(ip)
+      }
+    }
+  }
+
+  const pruneTimer = setInterval(() => {
+    pruneStaleFailures(Date.now())
+  }, RATE_LIMIT_WINDOW_MS).unref()
+
+  app.addHook('onClose', async () => {
+    clearInterval(pruneTimer)
+  })
 
   app.post('/auth/demo/login', async (request, reply) => {
     if (!config.demoLogin.enabled) {
