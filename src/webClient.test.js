@@ -28,6 +28,22 @@ function hangingFetch() {
   })
 }
 
+// Simulates fetch resolving as soon as headers arrive while the body stream
+// itself stalls — a different hang point than the connection never opening.
+function hangingBodyFetch() {
+  return (_url, options = {}) => Promise.resolve({
+    ok: true,
+    status: 200,
+    text: () => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => {
+        const err = new Error('The operation was aborted')
+        err.name = 'AbortError'
+        reject(err)
+      })
+    }),
+  })
+}
+
 test('recordPlay posts to /internal/play-history with a bearer token', async () => {
   const fetchImpl = fakeFetch([{ body: { ok: true } }])
   const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl })
@@ -99,4 +115,10 @@ test('getRecentHistory aborts a hung request after the configured timeout and re
 
   const result = await client.getRecentHistory({ guildId: 'g1', userIds: ['u1'] })
   assert.deepEqual(result, {})
+})
+
+test('recordPlay aborts even when the response body read hangs after headers arrive', async () => {
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl: hangingBodyFetch(), requestTimeoutMs: 20 })
+
+  await assert.doesNotReject(() => client.recordPlay({ guildId: 'g1', discordUserId: 'u1', trackTitle: 'T', trackUrl: 'https://example.com/t' }))
 })

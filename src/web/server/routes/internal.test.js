@@ -144,7 +144,7 @@ test('GET /internal/play-history/recent clamps a negative limit instead of retur
       headers: authHeaders(config),
       payload: { guildId: 'g1', discordUserId: 'u1', trackTitle: `T${n}`, trackUrl: `https://example.com/${n}`, videoId: `v${n}` },
     })
-  for (let i = 0; i < 3; i += 1) await record(i)
+  for (let i = 0; i < 201; i += 1) await record(i)
 
   const response = await app.inject({
     method: 'GET',
@@ -152,5 +152,5 @@ test('GET /internal/play-history/recent clamps a negative limit instead of retur
     headers: authHeaders(config),
   })
   assert.equal(response.statusCode, 200)
-  assert.equal(response.json().u1.length, 3, 'a negative limit should fall back to the default cap, not become unlimited')
+  assert.equal(response.json().u1.length, 200, 'a negative limit should fall back to the default cap, not become unlimited')
 })

@@ -24,9 +24,11 @@ export function createWebClient({
   async function request(path, { method = 'GET', body } = {}) {
     const controller = new AbortController()
     const timeoutHandle = setTimeout(() => controller.abort(), requestTimeoutMs)
-    let response
+    // The timer must stay armed through response.text() too: fetchImpl can
+    // resolve as soon as headers arrive, leaving the body stream itself free
+    // to stall with no bound if the timer were cleared here already.
     try {
-      response = await fetchImpl(new URL(path, `${baseUrl}/`), {
+      const response = await fetchImpl(new URL(path, `${baseUrl}/`), {
         method,
         headers: {
           authorization: `Bearer ${token}`,
@@ -35,18 +37,18 @@ export function createWebClient({
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal,
       })
+      const text = await response.text()
+      const payload = text ? JSON.parse(text) : null
+      if (!response.ok) {
+        throw new WebApiError(`Web API request failed: ${method} ${path}`, {
+          status: response.status,
+          body: payload,
+        })
+      }
+      return payload
     } finally {
       clearTimeout(timeoutHandle)
     }
-    const text = await response.text()
-    const payload = text ? JSON.parse(text) : null
-    if (!response.ok) {
-      throw new WebApiError(`Web API request failed: ${method} ${path}`, {
-        status: response.status,
-        body: payload,
-      })
-    }
-    return payload
   }
 
   return {
