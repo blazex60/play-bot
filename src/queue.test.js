@@ -2,6 +2,28 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { GuildQueue, createTrack } from './queue.js'
 
+test('createTrack: videoId/channel/requestedById default to null when omitted', () => {
+  const track = createTrack({ title: 'A', webpageUrl: 'https://example.com/a', duration: 60, requestedBy: 'user' })
+  assert.equal(track.videoId, null)
+  assert.equal(track.channel, null)
+  assert.equal(track.requestedById, null)
+})
+
+test('createTrack: videoId/channel/requestedById are carried through when provided', () => {
+  const track = createTrack({
+    title: 'A',
+    webpageUrl: 'https://example.com/a',
+    duration: 60,
+    requestedBy: 'user',
+    requestedById: 'discord-123',
+    videoId: 'yt-abc',
+    channel: 'Some Channel',
+  })
+  assert.equal(track.videoId, 'yt-abc')
+  assert.equal(track.channel, 'Some Channel')
+  assert.equal(track.requestedById, 'discord-123')
+})
+
 function makeQueueWithUpcoming(titles) {
   const queue = new GuildQueue()
   for (const title of titles) {

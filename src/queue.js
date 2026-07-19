@@ -1,7 +1,7 @@
 export const LoopMode = Object.freeze({ OFF: 'off', TRACK: 'track', QUEUE: 'queue' });
 
-export function createTrack({ title, webpageUrl, duration, requestedBy, thumbnail }) {
-  return { title, webpageUrl, duration, requestedBy, thumbnail };
+export function createTrack({ title, webpageUrl, duration, requestedBy, requestedById = null, thumbnail, videoId = null, channel = null }) {
+  return { title, webpageUrl, duration, requestedBy, requestedById, thumbnail, videoId, channel };
 }
 
 export class GuildQueue {

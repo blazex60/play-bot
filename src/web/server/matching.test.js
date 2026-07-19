@@ -40,7 +40,10 @@ test('matchSpotifyTrack: uses first YouTube result and returns createTrack shape
     webpageUrl: 'https://www.youtube.com/watch?v=youtube-id',
     duration: 123,
     requestedBy: 'user-1',
+    requestedById: null,
     thumbnail: 'https://img.example/thumb.jpg',
+    videoId: 'youtube-id',
+    channel: null,
   })
 })
 
@@ -71,7 +74,10 @@ test('resolveYoutubeTrack: playlist item resolves directly without search', () =
     webpageUrl: 'https://www.youtube.com/watch?v=video-1',
     duration: null,
     requestedBy: 'user-2',
+    requestedById: null,
     thumbnail: 'https://img.example/default.jpg',
+    videoId: 'video-1',
+    channel: null,
   })
 })
 

@@ -44,6 +44,7 @@ export default {
         try {
           ({ tracks, truncated } = await resolveFlatPlaylist(query, {
             requestedBy: interaction.member.displayName,
+            requestedById: interaction.member.id,
           }))
         } catch (err) {
           return interaction.followUp({ content: `❌ プレイリストの取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
@@ -55,7 +56,7 @@ export default {
 
         let session
         try {
-          session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel })
+          session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
         } catch (err) {
           return interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         }
@@ -71,14 +72,14 @@ export default {
 
       let info
       try {
-        info = await resolveMetadata(query, { requestedBy: interaction.member.displayName })
+        info = await resolveMetadata(query, { requestedBy: interaction.member.displayName, requestedById: interaction.member.id })
       } catch (err) {
         return interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
       }
 
       let session
       try {
-        session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel })
+        session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
       } catch (err) {
         return interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
       }
@@ -113,14 +114,14 @@ export default {
       }
       let info
       try {
-        info = await resolveMetadata(url, { requestedBy: interaction.member.displayName })
+        info = await resolveMetadata(url, { requestedBy: interaction.member.displayName, requestedById: interaction.member.id })
       } catch (err) {
         await interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         return
       }
       let session
       try {
-        session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel })
+        session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
       } catch (err) {
         await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         return
@@ -132,6 +133,6 @@ export default {
       if (wasEmpty) await session.player.playNext()
     }
 
-    pendingStore.set(msg.id, results, onSelect)
+    pendingStore.set(msg.id, { results, onSelect })
   },
 }

@@ -5,9 +5,11 @@ import { createMemoryDb, createTestConfig } from './testSupport.js'
 
 function createRoutedFetch({ discordToken, discordUser, botResponses = {} }) {
   const calls = []
-  const fetchImpl = async (url, _options = {}) => {
+  const requests = []
+  const fetchImpl = async (url, options = {}) => {
     const href = url.toString()
     calls.push(href)
+    requests.push({ href, options })
     if (href === 'https://discord.com/api/oauth2/token') {
       return { ok: true, status: 200, text: async () => JSON.stringify(discordToken) }
     }
@@ -26,6 +28,7 @@ function createRoutedFetch({ discordToken, discordUser, botResponses = {} }) {
     throw new Error(`Unexpected fetch call in test: ${href}`)
   }
   fetchImpl.calls = calls
+  fetchImpl.requests = requests
   return fetchImpl
 }
 
@@ -122,6 +125,12 @@ test('authenticated session can read state/links/permission and issue control+qu
     headers: { cookie },
   })
   assert.equal(control.statusCode, 200, 'control route must reach the bot API via botClient.request (callBot contract)')
+  const controlRequest = fetchImpl.requests.find((r) => r.href.endsWith('/control/g1/pause'))
+  assert.equal(
+    JSON.parse(controlRequest.options.body).userId,
+    'u1',
+    'control route must inject the authenticated session user id (regression: dashboard controls got userId_required since the client never sent one)'
+  )
 
   const queue = await app.inject({
     method: 'POST',
@@ -130,6 +139,9 @@ test('authenticated session can read state/links/permission and issue control+qu
     payload: { index: 0 },
   })
   assert.equal(queue.statusCode, 200, 'queue route must reach the bot API via botClient.request (callBot contract)')
+  const queueRequest = fetchImpl.requests.find((r) => r.href.endsWith('/queue/g1/remove'))
+  assert.equal(JSON.parse(queueRequest.options.body).userId, 'u1', 'queue route must inject the authenticated session user id')
+  assert.equal(JSON.parse(queueRequest.options.body).index, 0, 'queue route must still forward the rest of the request body')
 })
 
 test('/api/state/:guildId requires bot permission for that guild (regression: was reachable by any authenticated session for any guild)', async (t) => {

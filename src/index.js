@@ -4,9 +4,10 @@ import { Client, Collection, Events, GatewayIntentBits, MessageFlags } from 'dis
 import { readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { sessions, pendingStore } from './sessions.js'
+import { sessions, pendingStore, recommendPendingStore, cancelPendingRecommendations } from './sessions.js'
 import { parseSearchCustomId } from './views.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
+import { handleRecommendChoice, RECOMMEND_CUSTOM_ID_PREFIX } from './recommendFlow.js'
 import { loadSettings } from './settings.js'
 import { cleanupStaleTempDir } from './normalize.js'
 import { startBotApi } from './botApi.js'
@@ -68,6 +69,10 @@ client.on(Events.InteractionCreate, async interaction => {
   if (interaction.customId?.startsWith('qedit_')) {
     return handleQueueEditorInteraction(interaction, sessions)
   }
+
+  if (interaction.isButton() && interaction.customId.startsWith(`${RECOMMEND_CUSTOM_ID_PREFIX}_`)) {
+    return handleRecommendChoice(interaction, sessions, recommendPendingStore)
+  }
 })
 
 client.on(Events.VoiceStateUpdate, async (oldState) => {
@@ -85,6 +90,7 @@ client.on(Events.VoiceStateUpdate, async (oldState) => {
   if (humans.size === 0) {
     console.log(`[VoiceState] All humans left ${channel.name}, auto-disconnecting`)
     sessions.delete(oldState.guild.id)
+    cancelPendingRecommendations(oldState.guild.id)
     session.player.stop().catch(() => {})
     session.connection.destroy()
   }

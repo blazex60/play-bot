@@ -68,9 +68,10 @@ export async function importEditRoutes(app, { db, botClient, searchYoutube } = {
 
       const { youtubeResult, spotifyTrack } = request.body ?? {}
       const result = youtubeResult
-        ? resolveYoutubeTrack(youtubeResult, { requestedBy: user.discordId })
+        ? resolveYoutubeTrack(youtubeResult, { requestedBy: user.username, requestedById: user.discordId })
         : await matchSpotifyTrack(spotifyTrack ?? { title: existing.source_title, artist: existing.source_artist }, {
-          requestedBy: user.discordId,
+          requestedBy: user.username,
+          requestedById: user.discordId,
           searchYoutube: search,
         })
 

@@ -11,7 +11,9 @@ export async function queueRoutes(app, { botClient } = {}) {
       if (!botClient) throw new Error('botClient is required for queue routes')
 
       await requireBotPermission({ botClient, guildId, userId: user.discordId })
-      const result = await callBot(botClient, 'POST', `/queue/${encodeURIComponent(guildId)}/${action}`, request.body ?? {})
+      // Same as control.js: the bot API requires body.userId, and it must
+      // come from the authenticated session, not the client-supplied body.
+      const result = await callBot(botClient, 'POST', `/queue/${encodeURIComponent(guildId)}/${action}`, { ...request.body, userId: user.discordId })
       return reply.send(result ?? { ok: true })
     } catch (error) {
       return bindRouteError(reply, error)

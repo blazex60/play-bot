@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { checkSameVoiceChannel } from '../permissions.js'
+import { cancelPendingRecommendations } from '../sessions.js'
 
 export default {
   data: new SlashCommandBuilder().setName('leave').setDescription('ボットをVCから退出させます'),
@@ -9,6 +10,7 @@ export default {
     if (!session) return interaction.reply({ content: '❌ ボットはVCにいません', flags: MessageFlags.Ephemeral })
     if (!checkSameVoiceChannel(interaction, session)) return
     sessions.delete(interaction.guildId)
+    cancelPendingRecommendations(interaction.guildId)
     session.connection.destroy()
     await interaction.reply(`👋 ${interaction.member.displayName} がボットをVCから退出させました`)
   },

@@ -1,7 +1,10 @@
 import Fastify from 'fastify';
 
-import { getOrCreateSession } from './sessions.js';
+import { getOrCreateSession, cancelPendingRecommendations, bumpPlanToken } from './sessions.js';
 import { resolveWebPermission } from './webPermission.js';
+import { getGuildSettings, setAutoplayMode, setPersonalize } from './settings.js';
+
+const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 
 const DEFAULT_BOT_API_PORT = 8787;
 const LOOPBACK_HOST = '127.0.0.1';
@@ -22,14 +25,19 @@ function getBearerToken(request) {
   return token;
 }
 
-function serializeSession(session) {
-  if (!session) return { active: false };
+function serializeSession(session, guildId = session?.guildId) {
+  // autoplayMode/personalize are guild-level settings, not session state, so
+  // they're reported even when the bot isn't currently in a VC for the guild.
+  const settings = guildId ? getGuildSettings(guildId) : {};
+  const autoplaySettings = { autoplayMode: settings.autoplayMode ?? 'off', personalize: settings.personalize ?? false };
+  if (!session) return { active: false, ...autoplaySettings };
   return {
     active: true,
     current: session.queue.current,
     upcoming: session.queue.upcoming(),
     playerStatus: session.player.status ?? 'unknown',
     loopMode: session.queue.loopMode,
+    ...autoplaySettings,
   };
 }
 
@@ -113,7 +121,7 @@ export function buildBotApi({
   app.get('/healthz', async () => ({ ok: true }));
 
   app.get('/state/:guildId', async (request) => {
-    return serializeSession(sessions.get(request.params.guildId));
+    return serializeSession(sessions.get(request.params.guildId), request.params.guildId);
   });
 
   app.get('/permission', async (request, reply) => {
@@ -129,12 +137,39 @@ export function buildBotApi({
     const userId = requireBodyUserId(request, reply);
     if (!userId) return;
     const guildId = request.params.guildId;
+    const action = request.params.action;
+
+    // autoplayMode/personalize are guild-level settings, not playback state,
+    // so they must be configurable even when the bot has no active session
+    // for the guild (unlike every other action below, which mutates a live
+    // player/queue and therefore requires one).
+    if (action === 'autoplay') {
+      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+      if (!permission) return;
+      const { mode, personalize } = request.body ?? {};
+      if (mode !== undefined) {
+        if (!AUTOPLAY_MODES.has(mode)) {
+          reply.code(400).send({ error: 'invalid_autoplay_mode' });
+          return;
+        }
+        await setAutoplayMode(guildId, mode);
+      }
+      if (personalize !== undefined) {
+        await setPersonalize(guildId, personalize === true);
+      }
+      // Queue-exhaustion planning already in flight read the old settings
+      // before its first await; invalidate it so it can't act on values the
+      // user just changed from the dashboard.
+      bumpPlanToken(guildId);
+      return { ok: true, state: serializeSession(sessions.get(guildId), guildId) };
+    }
+
     const session = requireSession(sessions, guildId, reply);
     if (!session) return;
     const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
     if (!permission) return;
 
-    switch (request.params.action) {
+    switch (action) {
       case 'pause':
         return { ok: session.player.pause(), state: serializeSession(session) };
       case 'resume':
@@ -144,6 +179,11 @@ export function buildBotApi({
         return { ok: true, state: serializeSession(session) };
       case 'stop':
         await session.player.stop();
+        // Mirror commands/stop.js: invalidate any in-flight autoplay
+        // planning and drop pending recommendation prompts, or a
+        // continuation resolving after this stop could undo it.
+        bumpPlanToken(guildId);
+        cancelPendingRecommendations(guildId);
         return { ok: true, state: serializeSession(session) };
       case 'volume': {
         const level = Number(request.body?.level);

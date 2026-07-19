@@ -16,6 +16,7 @@ import {
 const RECONNECT_GRACE = 5000;
 const WATCHDOG_INTERVAL = 10_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
+const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -26,6 +27,9 @@ export class GuildPlayer {
   #connection;
   #queue;
   #onDisconnect;
+  #handleQueueExhausted;
+  #queueExhaustedTimeoutMs;
+  #recordPlayFn;
   #audioPlayer;
   #forceSkip = false;
   #hadError = false;
@@ -45,6 +49,9 @@ export class GuildPlayer {
     connection,
     queue,
     onDisconnect,
+    handleQueueExhausted = null,
+    queueExhaustedTimeoutMs = QUEUE_EXHAUSTED_TIMEOUT,
+    recordPlayFn = null,
     audioPlayer = createAudioPlayer(),
     createAudioResourceFn = createAudioResource,
     resolveAudioStreamFn = resolveAudioStream,
@@ -53,6 +60,9 @@ export class GuildPlayer {
     this.#connection = connection;
     this.#queue = queue;
     this.#onDisconnect = onDisconnect;
+    this.#handleQueueExhausted = handleQueueExhausted;
+    this.#queueExhaustedTimeoutMs = queueExhaustedTimeoutMs;
+    this.#recordPlayFn = recordPlayFn;
     this.#audioPlayer = audioPlayer;
     this.#createAudioResource = createAudioResourceFn;
     this.#resolveAudioStream = resolveAudioStreamFn;
@@ -115,6 +125,22 @@ export class GuildPlayer {
 
     this.#audioPlayer.play(resource);
     this.#prefetchUpcoming();
+    this.#recordPlay(track);
+  }
+
+  #recordPlay(track) {
+    if (!this.#recordPlayFn || !track.requestedById) return;
+    this.#recordPlayFn({
+      guildId: this.#guildId,
+      discordUserId: track.requestedById,
+      username: track.requestedBy,
+      trackTitle: track.title,
+      trackUrl: track.webpageUrl,
+      videoId: track.videoId,
+      channel: track.channel,
+    }).catch((err) => {
+      console.error('[GuildPlayer] recordPlayFn failed:', err.message);
+    });
   }
 
   pause() {
@@ -171,14 +197,43 @@ export class GuildPlayer {
       return;
     }
 
+    const finishedTrack = track;
     const shouldForceAdvance = this.#hadError;
     this.#hadError = false;
     const nextTrack = this.#queue.next({ forceAdvance: shouldForceAdvance });
     if (nextTrack === null) {
+      // Stop the stall watchdog before handing off: nothing is playing right
+      // now either way, and a handler that starts a new track (auto mode) or
+      // waits on a user pick (recommend mode) needs a clean slate rather than
+      // an interval left ticking against an idle player forever.
       this.#clearWatchdog();
+      const handled = await this.#tryHandleQueueExhausted(finishedTrack);
+      if (handled) return;
       await this.#onDisconnect();
     } else {
       await this.playNext();
+    }
+  }
+
+  async #tryHandleQueueExhausted(finishedTrack) {
+    if (!this.#handleQueueExhausted) return false;
+    // planAutoTrack/planRecommendations await yt-dlp and fetch calls with no
+    // timeout of their own; without a bound here, a hang there would leave
+    // the player idle forever since the watchdog was already cleared.
+    let timeoutHandle;
+    const timeout = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(
+        () => reject(new Error('handleQueueExhausted timed out')),
+        this.#queueExhaustedTimeoutMs
+      );
+    });
+    try {
+      return await Promise.race([this.#handleQueueExhausted(finishedTrack), timeout]);
+    } catch (err) {
+      console.error('[GuildPlayer] handleQueueExhausted error:', err);
+      return false;
+    } finally {
+      clearTimeout(timeoutHandle);
     }
   }
 
