@@ -24,11 +24,14 @@ export function registerDemoAuthRoutes(app, { db, config } = {}) {
   const deleteSessionsByUserId = db.prepare('DELETE FROM web_sessions WHERE discord_user_id = ?')
   const deleteServiceLinksByUserId = db.prepare('DELETE FROM service_links WHERE discord_user_id = ?')
   const deleteOauthStatesByUserId = db.prepare('DELETE FROM oauth_states WHERE discord_user_id = ?')
+  // user_playlist_tracks cascades via ON DELETE CASCADE.
+  const deletePlaylistsByUserId = db.prepare('DELETE FROM user_playlists WHERE discord_user_id = ?')
 
   if (!config.demoLogin.enabled) {
     deleteSessionsByUserId.run(config.demoLogin.discordId)
     deleteServiceLinksByUserId.run(config.demoLogin.discordId)
     deleteOauthStatesByUserId.run(config.demoLogin.discordId)
+    deletePlaylistsByUserId.run(config.demoLogin.discordId)
   }
 
   const failuresByIp = new Map()
@@ -93,10 +96,11 @@ export function registerDemoAuthRoutes(app, { db, config } = {}) {
     upsertUser.run(config.demoLogin.discordId, config.demoLogin.username, now, now)
     // The demo account is a single fixed ID shared by every reviewer, so a new
     // login must not inherit a previous reviewer's session, in-flight OAuth
-    // consent, or linked YouTube/Spotify account.
+    // consent, linked YouTube/Spotify account, or saved playlists.
     deleteSessionsByUserId.run(config.demoLogin.discordId)
     deleteServiceLinksByUserId.run(config.demoLogin.discordId)
     deleteOauthStatesByUserId.run(config.demoLogin.discordId)
+    deletePlaylistsByUserId.run(config.demoLogin.discordId)
     createUserSession({ db, config, reply, discordId: config.demoLogin.discordId, now })
     return reply.redirect('/dashboard')
   })

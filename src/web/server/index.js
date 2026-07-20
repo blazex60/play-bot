@@ -19,6 +19,7 @@ import { controlRoutes } from './routes/control.js'
 import { queueRoutes } from './routes/queue.js'
 import { importRoutes } from './routes/import.js'
 import { importEditRoutes } from './routes/import-edit.js'
+import { playlistsRoutes } from './routes/playlists.js'
 import { internalRoutes } from './routes/internal.js'
 
 const thisDir = dirname(fileURLToPath(import.meta.url))
@@ -107,6 +108,7 @@ export async function buildWebServer({
     await authenticated.register(queueRoutes, { botClient })
     await authenticated.register(importRoutes, { db: database, botClient })
     await authenticated.register(importEditRoutes, { db: database, botClient })
+    await authenticated.register(playlistsRoutes, { db: database, botClient })
   })
 
   if (existsSync(webDist)) {

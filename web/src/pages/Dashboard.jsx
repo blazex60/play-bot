@@ -5,6 +5,7 @@ import '../dashboard.css'
 import { AutoplayPanel } from '../components/AutoplayPanel.jsx'
 import { MatchReview } from '../components/MatchReview.jsx'
 import { NowPlaying } from '../components/NowPlaying.jsx'
+import { PlaylistBuilder } from '../components/PlaylistBuilder.jsx'
 import { PlaylistPanel } from '../components/PlaylistPanel.jsx'
 import { QueueList } from '../components/QueueList.jsx'
 import { TransportControls } from '../components/TransportControls.jsx'
@@ -46,6 +47,17 @@ export function Dashboard() {
   const [searchQuery, setSearchQuery] = useState('')
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
+  const [savedPlaylists, setSavedPlaylists] = useState(/** @type {import('../api/client.js').SavedPlaylist[]} */ ([]))
+  const [selectedSavedPlaylist, setSelectedSavedPlaylist] = useState(
+    /** @type {import('../api/client.js').SavedPlaylist | null} */ (null)
+  )
+  const [newPlaylistName, setNewPlaylistName] = useState('')
+  const [renameValue, setRenameValue] = useState('')
+  const [trackUrl, setTrackUrl] = useState('')
+  const [trackSearchQuery, setTrackSearchQuery] = useState('')
+  const [trackSearchResults, setTrackSearchResults] = useState(
+    /** @type {import('../api/client.js').SavedPlaylistTrack[]} */ ([])
+  )
 
   const queue = useMemo(() => state.upcoming ?? state.queue ?? [], [state])
   const autoplayMode = state.autoplayMode ?? 'off'
@@ -68,6 +80,17 @@ export function Dashboard() {
     }
   }, [guildId, showError])
 
+  const refreshSavedPlaylists = useCallback(async () => {
+    try {
+      const payload = await api.mySavedPlaylists()
+      if (typeof payload === 'object' && payload !== null && 'playlists' in payload && Array.isArray(payload.playlists)) {
+        setSavedPlaylists(payload.playlists)
+      }
+    } catch (error) {
+      showError(error)
+    }
+  }, [showError])
+
   useEffect(() => {
     api.me().then((payload) => {
       if (typeof payload === 'object' && payload !== null && 'user' in payload) {
@@ -75,7 +98,8 @@ export function Dashboard() {
       }
     }).catch(showError)
     api.links().then((payload) => setLinks(normalizeLinks(payload))).catch(showError)
-  }, [showError])
+    refreshSavedPlaylists()
+  }, [showError, refreshSavedPlaylists])
 
   useEffect(() => {
     if (!guildId) return undefined
@@ -214,6 +238,114 @@ export function Dashboard() {
     }, '曲を差し替えました')
   }
 
+  /** @param {unknown} tracks */
+  function updateSelectedTracks(tracks) {
+    if (!Array.isArray(tracks)) return
+    setSelectedSavedPlaylist((current) => (current ? { ...current, tracks } : current))
+  }
+
+  async function createSavedPlaylist() {
+    const name = newPlaylistName.trim()
+    if (!name) return
+    await runAction(async () => {
+      await api.createSavedPlaylist(name)
+      setNewPlaylistName('')
+      await refreshSavedPlaylists()
+    }, 'プレイリストを作成しました')
+  }
+
+  /** @param {import('../api/client.js').SavedPlaylist} playlist */
+  async function selectSavedPlaylist(playlist) {
+    await runAction(async () => {
+      const detail = /** @type {import('../api/client.js').SavedPlaylist} */ (await api.savedPlaylist(playlist.id))
+      setSelectedSavedPlaylist(detail)
+      setRenameValue(detail.name)
+      setTrackSearchResults([])
+    }, 'プレイリストを読み込みました')
+  }
+
+  async function renameSavedPlaylist() {
+    if (!selectedSavedPlaylist) return
+    const name = renameValue.trim()
+    if (!name) return
+    await runAction(async () => {
+      await api.renameSavedPlaylist(selectedSavedPlaylist.id, name)
+      setSelectedSavedPlaylist((current) => (current ? { ...current, name } : current))
+      await refreshSavedPlaylists()
+    }, 'プレイリスト名を変更しました')
+  }
+
+  async function deleteSavedPlaylist() {
+    if (!selectedSavedPlaylist) return
+    if (!window.confirm(`「${selectedSavedPlaylist.name}」を削除しますか?`)) return
+    await runAction(async () => {
+      await api.deleteSavedPlaylist(selectedSavedPlaylist.id)
+      setSelectedSavedPlaylist(null)
+      await refreshSavedPlaylists()
+    }, 'プレイリストを削除しました')
+  }
+
+  async function addTrackByUrl() {
+    if (!selectedSavedPlaylist) return
+    const url = trackUrl.trim()
+    if (!url) return
+    await runAction(async () => {
+      const payload = await api.addSavedPlaylistTrack(selectedSavedPlaylist.id, { url })
+      updateSelectedTracks(/** @type {{ tracks?: unknown }} */ (payload)?.tracks)
+      setTrackUrl('')
+      await refreshSavedPlaylists()
+    }, '曲を追加しました')
+  }
+
+  async function searchSavedPlaylistTracks() {
+    if (!selectedSavedPlaylist) return
+    const query = trackSearchQuery.trim()
+    if (!query) return
+    await runAction(async () => {
+      const payload = await api.searchSavedPlaylistTrack(selectedSavedPlaylist.id, query)
+      const results = typeof payload === 'object' && payload !== null && 'results' in payload && Array.isArray(payload.results)
+        ? payload.results
+        : []
+      setTrackSearchResults(results)
+    }, '候補を取得しました')
+  }
+
+  /** @param {import('../api/client.js').SavedPlaylistTrack} track */
+  async function addTrackFromSearchResult(track) {
+    if (!selectedSavedPlaylist) return
+    await runAction(async () => {
+      const payload = await api.addSavedPlaylistTrack(selectedSavedPlaylist.id, { track })
+      updateSelectedTracks(/** @type {{ tracks?: unknown }} */ (payload)?.tracks)
+      await refreshSavedPlaylists()
+    }, '曲を追加しました')
+  }
+
+  /** @param {number} trackId */
+  async function removeSavedPlaylistTrack(trackId) {
+    if (!selectedSavedPlaylist) return
+    await runAction(async () => {
+      const payload = await api.removeSavedPlaylistTrack(selectedSavedPlaylist.id, trackId)
+      updateSelectedTracks(/** @type {{ tracks?: unknown }} */ (payload)?.tracks)
+      await refreshSavedPlaylists()
+    }, '曲を削除しました')
+  }
+
+  /** @param {number} fromIndex @param {number} toIndex */
+  async function moveSavedPlaylistTrack(fromIndex, toIndex) {
+    if (!selectedSavedPlaylist) return
+    await runAction(async () => {
+      const payload = await api.moveSavedPlaylistTrack(selectedSavedPlaylist.id, fromIndex, toIndex)
+      updateSelectedTracks(/** @type {{ tracks?: unknown }} */ (payload)?.tracks)
+    }, 'プレイリストを並べ替えました')
+  }
+
+  async function queueSavedPlaylist() {
+    if (!selectedSavedPlaylist || !guildId) return
+    await runAction(async () => {
+      await api.queueSavedPlaylist(selectedSavedPlaylist.id, guildId)
+    }, 'プレイリストをキューに追加しました')
+  }
+
   return (
     <main className="dashboard-shell">
       <header className="app-header">
@@ -279,6 +411,31 @@ export function Dashboard() {
           onQueryChange={setSearchQuery}
           onSearch={searchReplacement}
           onReplace={replaceTrack}
+        />
+        <PlaylistBuilder
+          playlists={savedPlaylists}
+          selectedPlaylist={selectedSavedPlaylist}
+          newPlaylistName={newPlaylistName}
+          onNewPlaylistNameChange={setNewPlaylistName}
+          onCreate={createSavedPlaylist}
+          onSelect={selectSavedPlaylist}
+          renameValue={renameValue}
+          onRenameValueChange={setRenameValue}
+          onRename={renameSavedPlaylist}
+          onDelete={deleteSavedPlaylist}
+          trackUrl={trackUrl}
+          onTrackUrlChange={setTrackUrl}
+          onAddByUrl={addTrackByUrl}
+          trackSearchQuery={trackSearchQuery}
+          onTrackSearchQueryChange={setTrackSearchQuery}
+          onSearchTracks={searchSavedPlaylistTracks}
+          searchResults={trackSearchResults}
+          onAddFromSearchResult={addTrackFromSearchResult}
+          onMoveTrack={moveSavedPlaylistTrack}
+          onRemoveTrack={removeSavedPlaylistTrack}
+          onQueueToGuild={queueSavedPlaylist}
+          canQueue={Boolean(guildId)}
+          busy={busy}
         />
       </div>
     </main>

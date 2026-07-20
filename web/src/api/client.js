@@ -8,6 +8,8 @@ const JSON_HEADERS = { 'content-type': 'application/json' }
  * @typedef {{ id: string, name: string, trackCount?: number, tracks?: { total?: number } }} Playlist
  * @typedef {{ jobId: number, status: string, matchedCount?: number, failedCount?: number }} ImportJob
  * @typedef {{ id: number, source_title: string, source_artist?: string, matched_title?: string, match_status: string, replacement?: unknown }} ImportTrack
+ * @typedef {{ id: number, name: string, trackCount?: number, createdAt?: number, updatedAt?: number, tracks?: SavedPlaylistTrack[] }} SavedPlaylist
+ * @typedef {{ id: number, position?: number, title: string, webpageUrl: string, duration?: number | null, thumbnail?: string | null, videoId?: string | null, channel?: string | null }} SavedPlaylistTrack
  * @typedef {{ method?: string, body?: unknown }} RequestOptions
  */
 
@@ -109,5 +111,30 @@ export const api = {
   /** @param {number} trackId @param {unknown} body */
   replaceImportTrack: (trackId, body) =>
     request(`/api/import/tracks/${encodeURIComponent(trackId)}/replace`, { method: 'POST', body }),
+  mySavedPlaylists: () => request('/api/playlists/mine'),
+  /** @param {string} name */
+  createSavedPlaylist: (name) => request('/api/playlists/mine', { method: 'POST', body: { name } }),
+  /** @param {number} id */
+  savedPlaylist: (id) => request(`/api/playlists/mine/${encodeURIComponent(id)}`),
+  /** @param {number} id @param {string} name */
+  renameSavedPlaylist: (id, name) =>
+    request(`/api/playlists/mine/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name } }),
+  /** @param {number} id */
+  deleteSavedPlaylist: (id) => request(`/api/playlists/mine/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** @param {number} id @param {string} query */
+  searchSavedPlaylistTrack: (id, query) =>
+    request(`/api/playlists/mine/${encodeURIComponent(id)}/search`, { method: 'POST', body: { query } }),
+  /** @param {number} id @param {{ url?: string, track?: unknown }} body */
+  addSavedPlaylistTrack: (id, body) =>
+    request(`/api/playlists/mine/${encodeURIComponent(id)}/tracks`, { method: 'POST', body }),
+  /** @param {number} id @param {number} trackId */
+  removeSavedPlaylistTrack: (id, trackId) =>
+    request(`/api/playlists/mine/${encodeURIComponent(id)}/tracks/${encodeURIComponent(trackId)}`, { method: 'DELETE' }),
+  /** @param {number} id @param {number} fromIndex @param {number} toIndex */
+  moveSavedPlaylistTrack: (id, fromIndex, toIndex) =>
+    request(`/api/playlists/mine/${encodeURIComponent(id)}/tracks/move`, { method: 'POST', body: { fromIndex, toIndex } }),
+  /** @param {number} id @param {string} guildId */
+  queueSavedPlaylist: (id, guildId) =>
+    request(`/api/playlists/mine/${encodeURIComponent(id)}/queue`, { method: 'POST', body: { guildId } }),
   logout: () => request('/auth/logout', { method: 'POST' }),
 }

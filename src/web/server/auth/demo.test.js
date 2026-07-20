@@ -101,6 +101,20 @@ test('Demo login clears the previous demo session, pending OAuth states, and ser
     'demo-pending-state', 'google-review-demo', 'youtube', 'verifier', '/callback/youtube', Date.now(), Date.now() + 600_000,
     'other-user-pending-state', 'other-user', 'youtube', 'verifier', '/callback/youtube', Date.now(), Date.now() + 600_000
   )
+  db.prepare(`
+    INSERT INTO user_playlists (id, discord_user_id, name, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)
+  `).run(
+    1, 'google-review-demo', 'Prior reviewer playlist', Date.now(), Date.now(),
+    2, 'other-user', 'Other user playlist', Date.now(), Date.now()
+  )
+  db.prepare(`
+    INSERT INTO user_playlist_tracks (playlist_id, position, title, webpage_url, added_at)
+    VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)
+  `).run(
+    1, 0, 'Secret Track', 'https://www.youtube.com/watch?v=aaaaaaaaaaa', Date.now(),
+    2, 0, 'Other Track', 'https://www.youtube.com/watch?v=bbbbbbbbbbb', Date.now()
+  )
 
   const response = await app.inject({
     method: 'POST',
@@ -129,6 +143,17 @@ test('Demo login clears the previous demo session, pending OAuth states, and ser
       .get('google-review-demo').count,
     0
   )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM user_playlists WHERE discord_user_id = ?')
+      .get('google-review-demo').count,
+    0,
+    'a new demo login must not expose the previous reviewer\'s saved playlists'
+  )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM user_playlist_tracks WHERE playlist_id = 1').get().count,
+    0,
+    'playlist tracks must cascade-delete with the playlist'
+  )
 
   assert.equal(
     db.prepare('SELECT COUNT(*) AS count FROM service_links WHERE discord_user_id = ?')
@@ -142,6 +167,11 @@ test('Demo login clears the previous demo session, pending OAuth states, and ser
   )
   assert.equal(
     db.prepare('SELECT COUNT(*) AS count FROM oauth_states WHERE discord_user_id = ?')
+      .get('other-user').count,
+    1
+  )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM user_playlists WHERE discord_user_id = ?')
       .get('other-user').count,
     1
   )
@@ -183,6 +213,13 @@ test('Disabling demo login at startup deletes existing demo sessions, pending OA
     'demo-pending-state', 'google-review-demo', 'youtube', 'verifier', '/callback/youtube', Date.now(), Date.now() + 600_000,
     'other-user-pending-state', 'other-user', 'youtube', 'verifier', '/callback/youtube', Date.now(), Date.now() + 600_000
   )
+  db.prepare(`
+    INSERT INTO user_playlists (id, discord_user_id, name, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)
+  `).run(
+    1, 'google-review-demo', 'Prior reviewer playlist', Date.now(), Date.now(),
+    2, 'other-user', 'Other user playlist', Date.now(), Date.now()
+  )
 
   const config = createTestConfig()
   const app = await buildApp({ db, config })
@@ -203,6 +240,12 @@ test('Disabling demo login at startup deletes existing demo sessions, pending OA
       .get('google-review-demo').count,
     0
   )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM user_playlists WHERE discord_user_id = ?')
+      .get('google-review-demo').count,
+    0,
+    'disabling demo login must also purge leftover demo playlists'
+  )
 
   assert.equal(
     db.prepare('SELECT COUNT(*) AS count FROM web_sessions WHERE discord_user_id = ?')
@@ -216,6 +259,11 @@ test('Disabling demo login at startup deletes existing demo sessions, pending OA
   )
   assert.equal(
     db.prepare('SELECT COUNT(*) AS count FROM oauth_states WHERE discord_user_id = ?')
+      .get('other-user').count,
+    1
+  )
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM user_playlists WHERE discord_user_id = ?')
       .get('other-user').count,
     1
   )
