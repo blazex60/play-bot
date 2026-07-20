@@ -49,7 +49,7 @@ export function PlaylistPanel(props) {
     <section className="panel playlist-panel" aria-labelledby="playlist-title">
       <div className="section-heading">
         <p className="eyebrow">Playlists</p>
-        <h2 id="playlist-title">プレイリスト取り込み</h2>
+        <h2 id="playlist-title">【BETA】プレイリスト取り込み</h2>
       </div>
       <div className="service-tabs" role="tablist" aria-label="連携サービス">
         {SERVICES.map((service) => {
