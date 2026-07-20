@@ -34,6 +34,7 @@ function makeSession({ voiceChannelId = 'vc-1' } = {}) {
   return {
     connection: { joinConfig: { channelId: voiceChannelId } },
     queue,
+    planToken: 0,
     player: {
       async playNext() { playNextCalls.push(true) },
       playNextCalls,
@@ -235,6 +236,101 @@ test("postRecommendations: a still-pending prompt's timeout must not tear the se
   releaseDeferUpdate()
   await pickPromise
   assert.equal(session.queue.current.videoId, 'v1', "u1's pick should still succeed once unblocked")
+})
+
+test('handleRecommendChoice: does not enqueue or start playback if /leave removes the session while the pick is in flight', async () => {
+  const pendingStore = new PendingChoiceStore()
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+
+  let releaseDeferUpdate
+  const deferGate = new Promise((resolve) => { releaseDeferUpdate = resolve })
+  const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1' })
+  interaction.deferUpdate = async () => { await deferGate }
+  const pickPromise = handleRecommendChoice(interaction, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // /leave lands while the pick is still awaiting deferUpdate.
+  sessions.delete('g1')
+  session.connection.destroy = () => {}
+
+  releaseDeferUpdate()
+  await pickPromise
+
+  assert.equal(session.queue.isEmpty, true, 'must not enqueue onto a session that /leave already tore down')
+  assert.equal(session.player.playNextCalls.length, 0)
+  assert.equal(interaction.replies.at(-1)?.content, '❌ セッションが終了しています')
+})
+
+test('handleRecommendChoice: does not enqueue or start playback if /stop bumps planToken while the pick is in flight', async () => {
+  const pendingStore = new PendingChoiceStore()
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+
+  let releaseDeferUpdate
+  const deferGate = new Promise((resolve) => { releaseDeferUpdate = resolve })
+  const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1' })
+  interaction.deferUpdate = async () => { await deferGate }
+  const pickPromise = handleRecommendChoice(interaction, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // /stop lands while the pick is still awaiting deferUpdate: same session
+  // object and guild map entry, but its planToken is bumped and the queue
+  // it manages has already been cleared.
+  session.planToken += 1
+
+  releaseDeferUpdate()
+  await pickPromise
+
+  assert.equal(session.queue.isEmpty, true, 'must not enqueue onto a session /stop already reset')
+  assert.equal(session.player.playNextCalls.length, 0)
+  assert.equal(interaction.replies.at(-1)?.content, '❌ セッションが終了しています')
+})
+
+test('handleRecommendChoice: retriggers the teardown check if an in-flight pick fails after its guild ran out of pending prompts', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const channel = makeChannel()
+  const pendingStore = new PendingChoiceStore()
+  const plans = [
+    { userId: 'u1', candidates: [makeCandidate('v1')] },
+    { userId: 'u2', candidates: [makeCandidate('v2')] },
+  ]
+  let onTimeoutCalls = 0
+  await postRecommendations({
+    channel, guildId: 'g1', plans, pendingStore,
+    onTimeout: async () => { onTimeoutCalls += 1 },
+  })
+
+  // u1 starts picking their own prompt but it's paused mid-flight, same as
+  // the previous test — except this time the pick will fail instead of
+  // succeeding once unblocked (e.g. a Discord REST error from deferUpdate).
+  const deferError = new Error('Discord REST failure')
+  let rejectDeferUpdate
+  const deferGate = new Promise((_resolve, reject) => { rejectDeferUpdate = reject })
+  const interactionA = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-0', userId: 'u1', voiceChannelId: 'vc-1' })
+  interactionA.deferUpdate = async () => { await deferGate }
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+  const pickPromise = handleRecommendChoice(interactionA, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // u2's prompt times out while u1's pick is in flight — must not tear down yet.
+  t.mock.timers.tick(RECOMMEND_TIMEOUT_MS)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(onTimeoutCalls, 0)
+
+  // The in-flight pick now fails before ever reaching queue.add. Nothing is
+  // pending and nothing is in flight anymore for g1, so this must retrigger
+  // the same teardown check the expired prompt's own timeout deferred.
+  rejectDeferUpdate(deferError)
+  await assert.rejects(pickPromise, deferError)
+  assert.equal(onTimeoutCalls, 1, 'a failed in-flight pick must still retrigger the deferred teardown check')
+  assert.equal(session.queue.isEmpty, true, 'nothing should have been enqueued by the failed pick')
 })
 
 test('postRecommendations: disables and drops a message whose send resolves after the guild was torn down mid-loop', async () => {

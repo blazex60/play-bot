@@ -52,6 +52,30 @@ function hasInFlightPick(guildId) {
   return (guildsWithInFlightPick.get(guildId) ?? 0) > 0
 }
 
+// The onTimeout callback most recently registered for a guild's recommend
+// round, so a pick that finishes (or fails) after the round's own prompts
+// have all already expired can still trigger it — see reconsiderTeardown.
+const guildOnTimeoutCallbacks = new Map()
+
+// Re-runs the same "nothing left pending for this guild" teardown decision a
+// prompt's own timeout would have made, for the case where that timeout
+// already fired and deferred to an in-flight pick (via hasInFlightPick)
+// that then finishes without ever calling queue.add — e.g. deferUpdate()
+// rejects, or the interaction handler throws before enqueueing. Without
+// this, nothing would ever re-check afterward and the session would stay
+// connected with an empty queue indefinitely. Safe to call unconditionally:
+// onTimeout itself no-ops once the queue is non-empty or the plan is stale.
+async function reconsiderTeardown(guildId, pendingStore) {
+  if (hasPendingForGuild(pendingStore, guildId) || hasInFlightPick(guildId)) return
+  const onTimeout = guildOnTimeoutCallbacks.get(guildId)
+  if (!onTimeout) return
+  try {
+    await onTimeout()
+  } catch (err) {
+    console.error('[recommendFlow] onTimeout failed:', err.message)
+  }
+}
+
 // Bumped by cancelRecommendations so postRecommendations can notice, right
 // after a channel.send() resolves, that the guild's session was torn down
 // while that send was still in flight.
@@ -87,6 +111,7 @@ export function cancelRecommendations(guildId, pendingStore) {
 export async function postRecommendations({ client, channel, guildId, plans, pendingStore, onTimeout, voiceChannel }) {
   let postedCount = 0
   const startGeneration = currentCancelGeneration(guildId)
+  if (onTimeout) guildOnTimeoutCallbacks.set(guildId, onTimeout)
 
   for (const { userId, candidates } of plans) {
     if (!candidates.length) continue
@@ -164,6 +189,14 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   if (!session) {
     return interaction.reply({ content: '❌ セッションが終了しています', flags: MessageFlags.Ephemeral })
   }
+  // Snapshot enough to detect /stop or a disconnect (VC empty, /leave,
+  // watchdog) landing during the awaits below — same staleness pattern
+  // handleQueueExhausted uses. markPickInFlight only stops THIS pick's own
+  // guild from tearing itself down over "nothing pending"; it does nothing
+  // to protect against an unrelated teardown that happens anyway while this
+  // pick is mid-flight.
+  const planTokenAtClaim = session.planToken
+  const isSessionStale = () => sessions.get(entry.guildId) !== session || session.planToken !== planTokenAtClaim
   // The target user may have left the VC after the prompt was posted while
   // other listeners kept the session alive; re-check membership the same way
   // every other playback-affecting command does before honoring the pick.
@@ -196,6 +229,15 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
     } catch {
       // Already gone, or the bot lacks permission — not worth failing the pick over.
     }
+
+    if (isSessionStale()) {
+      // /stop or a disconnect landed while deferUpdate()/message.delete()
+      // were in flight; the session this pick read is gone or was reset, so
+      // don't resurrect playback on top of it.
+      await interaction.followUp({ content: '❌ セッションが終了しています', flags: MessageFlags.Ephemeral }).catch(() => {})
+      return
+    }
+
     // Recommendation candidates start with requestedById: null (they came from
     // the bot's own suggestion, not a request), which would make GuildPlayer
     // skip recording the play. Attribute it to the picker now so recommend-mode
@@ -213,5 +255,6 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
     if (wasEmpty) await session.player.playNext()
   } finally {
     clearPickInFlight(entry.guildId)
+    await reconsiderTeardown(entry.guildId, pendingStore)
   }
 }
