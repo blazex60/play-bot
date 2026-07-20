@@ -23,7 +23,9 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
-    command: tunnel --no-autoupdate --url http://127.0.0.1:${WEB_PORT:-3000}
+    env_file:
+      - .env
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     network_mode: "host"
     depends_on:
       - music-web
