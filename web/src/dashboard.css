@@ -129,7 +129,8 @@
     "now      queue"
     "controls queue"
     "playlist playlist"
-    "review   review";
+    "review   review"
+    "builder  builder";
 }
 
 .now-playing { grid-area: now; }
@@ -137,6 +138,7 @@
 .queue-panel { grid-area: queue; display: flex; flex-direction: column; }
 .playlist-panel { grid-area: playlist; }
 .review-panel { grid-area: review; }
+.playlist-builder-panel { grid-area: builder; }
 
 .section-heading {
   margin-bottom: 16px;
@@ -477,6 +479,56 @@
   text-transform: uppercase;
 }
 
+.playlist-create-form,
+.playlist-rename-form,
+.playlist-track-url-form,
+.playlist-track-search-form {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin-top: 14px;
+}
+
+.playlist-rename-form {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.playlist-detail {
+  display: grid;
+  gap: 4px;
+  margin-top: 16px;
+}
+
+.playlist-search-results {
+  display: grid;
+  gap: 6px;
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+
+.playlist-search-results li {
+  align-items: center;
+  background: var(--bg-surface-raised);
+  border-radius: 8px;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 8px 10px;
+}
+
+.playlist-search-results li span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.playlist-builder-panel > .primary {
+  margin-top: 16px;
+  width: 100%;
+}
+
 @media (max-width: 860px) {
   .dashboard-shell {
     padding: 16px 16px 48px;
@@ -500,7 +552,15 @@
       "controls"
       "queue"
       "playlist"
-      "review";
+      "review"
+      "builder";
+  }
+
+  .playlist-create-form,
+  .playlist-rename-form,
+  .playlist-track-url-form,
+  .playlist-track-search-form {
+    grid-template-columns: 1fr;
   }
 
   .track-hero {
