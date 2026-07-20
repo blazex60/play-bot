@@ -32,14 +32,15 @@ function hasPendingForGuild(pendingStore, guildId) {
 
 // Cancels every still-pending recommendation message for a guild: clears
 // timeouts, drops the pendingStore entries, and disables the posted buttons.
-// Used both when one user's pick wins (the rest lose) and when the session
-// is torn down (VC empty, /stop, watchdog) while recommendations are open.
-export function cancelRecommendations(guildId, pendingStore, { skipMessageId = null } = {}) {
+// Used when the session is torn down (VC empty, /stop, watchdog) while
+// recommendations are open. A single user picking their own recommendation
+// does NOT go through this — each listener's prompt is independent, so one
+// person's pick must not disable anyone else's.
+export function cancelRecommendations(guildId, pendingStore) {
   for (const [messageId, entry] of pendingStore.entries()) {
     if (entry.guildId !== guildId) continue
     clearTimeout(entry.timeoutHandle)
     pendingStore.delete(messageId)
-    if (messageId === skipMessageId) continue
     disableMessage(entry.message).catch(() => {})
   }
 }
@@ -49,18 +50,9 @@ export function cancelRecommendations(guildId, pendingStore, { skipMessageId = n
 // (e.g. the remembered text channel was deleted or the bot lost permission).
 export async function postRecommendations({ client, channel, guildId, plans, pendingStore, onTimeout }) {
   let postedCount = 0
-  // Each channel.send() below is awaited sequentially, so a user can already
-  // pick (and cancelRecommendations the whole round) before every prompt has
-  // even been posted. Track the first message we store and treat its
-  // disappearance from pendingStore as "the round is already over" — cheap
-  // to check and equivalent to checking every entry, since cancellation
-  // always clears a guild's entries as one atomic sweep.
-  let firstPostedMessageId = null
-  const roundAlreadyOver = () => firstPostedMessageId !== null && !pendingStore.get(firstPostedMessageId)
 
   for (const { userId, candidates } of plans) {
     if (!candidates.length) continue
-    if (roundAlreadyOver()) break
 
     const embed = new EmbedBuilder()
       .setTitle('🎵 次の曲のおすすめ')
@@ -82,13 +74,6 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
       continue
     }
 
-    if (roundAlreadyOver()) {
-      // Someone picked while this exact send was in flight; don't leave a
-      // second live, pickable prompt around after the round already ended.
-      disableMessage(message).catch(() => {})
-      continue
-    }
-
     const entry = { guildId, targetUserId: userId, candidates, message, timeoutHandle: null }
     entry.timeoutHandle = setTimeout(async () => {
       pendingStore.delete(message.id)
@@ -103,7 +88,6 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
     }, RECOMMEND_TIMEOUT_MS)
 
     pendingStore.set(message.id, entry)
-    if (firstPostedMessageId === null) firstPostedMessageId = message.id
     postedCount += 1
   }
   return postedCount
@@ -134,15 +118,17 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   // they rejoin and try again, instead of silently expiring the prompt.
   if (!checkInVoiceChannel(interaction, session)) return
 
-  // Claim the whole guild's recommendation round synchronously, before any
-  // await: two users clicking different prompts in the same tick would
-  // otherwise both pass every check above and both enqueue a track, since
-  // neither yields control until here. Node never interleaves another
-  // interaction handler's synchronous prefix with this one, so whichever
-  // handler reaches this line first wins the round; a handler that runs
-  // after will find its own entry.get() already gone. This also disables
-  // the clicked message itself (it's included in the guild's entries).
-  cancelRecommendations(entry.guildId, pendingStore, { skipMessageId: interaction.message.id })
+  // Claim this user's own prompt synchronously, before any await: a double
+  // click on the same message in the same tick would otherwise pass every
+  // check above twice, since neither invocation yields control until here.
+  // Node never interleaves another interaction handler's synchronous prefix
+  // with this one, so whichever handler reaches this line first wins; a
+  // second handler for the same message will find entry.get() already gone
+  // at the top of this function. Other users' prompts are untouched — each
+  // listener's recommendation is independent, so this pick must not affect
+  // anyone else's.
+  clearTimeout(entry.timeoutHandle)
+  pendingStore.delete(interaction.message.id)
 
   await interaction.deferUpdate()
   // Mirror /play's search flow: the picked prompt is single-use, so remove it

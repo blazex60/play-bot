@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { GuildQueue, createTrack } from './queue.js'
 import { PendingChoiceStore } from './views.js'
-import { cancelRecommendations, handleRecommendChoice, postRecommendations } from './recommendFlow.js'
+import { handleRecommendChoice, postRecommendations } from './recommendFlow.js'
 
 function makeCandidate(videoId) {
   return createTrack({ title: videoId, webpageUrl: `https://example.com/${videoId}`, duration: 60, videoId })
@@ -90,43 +90,6 @@ test('postRecommendations: skips plans with no candidates', async () => {
   assert.equal(channel.sent.length, 0)
 })
 
-test('postRecommendations: discards a message whose send resolves after the round already won', async (t) => {
-  const pendingStore = new PendingChoiceStore()
-  let resolveSecondSend
-  const secondSendGate = new Promise((resolve) => { resolveSecondSend = resolve })
-  let sendCount = 0
-  const channel = {
-    async send() {
-      sendCount += 1
-      if (sendCount === 1) return makeSentMessage('msg-1')
-      await secondSendGate
-      return makeSentMessage('msg-2')
-    },
-  }
-  const plans = [
-    { userId: 'u1', candidates: [makeCandidate('v1')] },
-    { userId: 'u2', candidates: [makeCandidate('v2')] },
-  ]
-
-  const postPromise = postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
-
-  await new Promise((resolve) => setTimeout(resolve, 10))
-  assert.ok(pendingStore.get('msg-1'), 'first message should already be stored while the second send is still pending')
-  t.after(() => {
-    const entry = pendingStore.get('msg-1')
-    if (entry) clearTimeout(entry.timeoutHandle)
-  })
-
-  // Simulate the first message's pick winning the round while the second
-  // send is still in flight.
-  cancelRecommendations('g1', pendingStore)
-  resolveSecondSend()
-
-  const postedCount = await postPromise
-  assert.equal(postedCount, 1, 'the late-arriving message must not count as posted')
-  assert.equal(pendingStore.get('msg-2'), null, 'the late message must not be left as a live, pickable entry')
-})
-
 test('handleRecommendChoice: rejects a click from someone other than the target user', async () => {
   const pendingStore = new PendingChoiceStore()
   pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
@@ -203,10 +166,12 @@ function makeSentMessage(id) {
   return { id, components: [{ components: [{ setDisabled() {} }] }], deleteCalls: 0, async edit() {}, async delete() { this.deleteCalls += 1 } }
 }
 
-test('handleRecommendChoice: two users clicking different prompts in the same guild at once, only one wins', async () => {
+test('handleRecommendChoice: two users clicking their own prompts at once, both succeed independently', async () => {
   const pendingStore = new PendingChoiceStore()
-  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
-  pendingStore.set('msg-2', { guildId: 'g1', targetUserId: 'u2', candidates: [makeCandidate('v2')], message: makeSentMessage('msg-2'), timeoutHandle: null })
+  const messageA = makeSentMessage('msg-1')
+  const messageB = makeSentMessage('msg-2')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: messageA, timeoutHandle: null })
+  pendingStore.set('msg-2', { guildId: 'g1', targetUserId: 'u2', candidates: [makeCandidate('v2')], message: messageB, timeoutHandle: null })
   const session = makeSession({ voiceChannelId: 'vc-1' })
   const sessions = new Map([['g1', session]])
 
@@ -214,13 +179,18 @@ test('handleRecommendChoice: two users clicking different prompts in the same gu
   const interactionB = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-2', userId: 'u2', voiceChannelId: 'vc-1' })
 
   // Both handlers start "simultaneously" (neither has awaited anything yet
-  // when the other starts), matching two near-simultaneous button clicks.
+  // when the other starts), matching two near-simultaneous button clicks on
+  // two different users' own prompts.
   await Promise.all([
     handleRecommendChoice(interactionA, sessions, pendingStore),
     handleRecommendChoice(interactionB, sessions, pendingStore),
   ])
 
-  assert.equal(session.player.playNextCalls.length, 1, 'exactly one pick should win the round')
+  assert.equal(session.player.playNextCalls.length, 1, 'only the first pick (empty queue) should start playback')
   const queued = [session.queue.current, ...session.queue.upcoming()].filter(Boolean)
-  assert.equal(queued.length, 1, 'only the winning pick should be enqueued')
+  assert.deepEqual(queued.map((t) => t.videoId).sort(), ['v1', 'v2'], 'both picks should be enqueued since neither cancels the other')
+  assert.equal(messageA.deleteCalls, 1, "u1's own prompt should be consumed by their pick")
+  assert.equal(messageB.deleteCalls, 1, "u2's own prompt should be consumed by their pick")
+  assert.equal(pendingStore.get('msg-1'), null)
+  assert.equal(pendingStore.get('msg-2'), null)
 })
