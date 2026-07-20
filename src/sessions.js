@@ -36,8 +36,14 @@ export function hasAutoplayContinuationBeenUsed(session) {
   return session?.autoplayContinuationUsed === true
 }
 
-export function markAutoplayContinuationUsed(session) {
-  if (session) session.autoplayContinuationUsed = true
+export function claimAutoplayContinuation(session) {
+  if (!session || session.autoplayContinuationUsed === true) return false
+  session.autoplayContinuationUsed = true
+  return true
+}
+
+export function releaseAutoplayContinuation(session) {
+  if (session) session.autoplayContinuationUsed = false
 }
 
 export async function getOrCreateSession({ guildId, guild, channel, textChannelId = null }) {
@@ -86,7 +92,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   const handleQueueExhausted = async (lastTrack) => {
     const session = sessions.get(guildId)
     if (!session) return false
-    if (hasAutoplayContinuationBeenUsed(session)) return false
+    if (!claimAutoplayContinuation(session)) return false
     // planAutoTrack/planRecommendations do multi-second async work (history
     // fetch, yt-dlp). /stop can clear the queue in that window without
     // deleting the session, which would otherwise make queue.isEmpty look
@@ -96,64 +102,81 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     const isStale = () => sessions.get(guildId) !== session || session.planToken !== planToken
 
     const voiceChannel = guild.channels.cache.get(connection.joinConfig.channelId)
-    if (!voiceChannel) return false
-
-    const autoTrack = await planAutoTrack({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
-    if (isStale()) return false
-    if (autoTrack) {
-      // A manual /play may have already re-filled and started the queue
-      // while we were waiting, so only auto-start playback if still idle.
-      markAutoplayContinuationUsed(session)
-      const wasEmpty = queue.isEmpty
-      queue.add(autoTrack)
-      if (wasEmpty) await session.player.playNext()
-      if (getGuildSettings(guildId).autoNotify === true) {
-        const textChannelId = session.textChannelId
-        const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
-        if (textChannel) {
-          await textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
-            console.error('[sessions] failed to post autoplay notification:', err.message)
-          })
-        }
-      }
-      return true
+    if (!voiceChannel) {
+      releaseAutoplayContinuation(session)
+      return false
     }
 
-    const plans = await planRecommendations({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
-    if (isStale()) return false
-    if (plans && plans.length > 0) {
-      const textChannelId = session.textChannelId
-      const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
-      if (!textChannel) return false
-      const postedCount = await postRecommendations({
-        client: guild.client,
-        channel: textChannel,
-        guildId,
-        plans,
-        queue,
-        player: session.player,
-        pendingStore: recommendPendingStore,
-        onTimeout: async () => {
-          // A manual /play may have started a track while this prompt sat
-          // unanswered; only the shared onDisconnect path should tear the
-          // session down, and only if nothing is actually playing/queued.
-          if (!queue.isEmpty || isStale()) return
-          await onDisconnect()
-        },
-      })
+    try {
+      const autoTrack = await planAutoTrack({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
       if (isStale()) {
-        // /stop (or similar) can land while channel.send() calls were still
-        // in flight above: the messages already got posted with live
-        // buttons before we knew to cancel them. Undo that now rather than
-        // leaving a pickable prompt that could revive playback post-stop.
-        cancelRecommendations(guildId, recommendPendingStore)
+        releaseAutoplayContinuation(session)
         return false
       }
-      if (postedCount > 0) markAutoplayContinuationUsed(session)
-      return postedCount > 0
-    }
+      if (autoTrack) {
+        // A manual /play may have already re-filled and started the queue
+        // while we were waiting, so only auto-start playback if still idle.
+        const wasEmpty = queue.isEmpty
+        queue.add(autoTrack)
+        if (wasEmpty) await session.player.playNext()
+        if (getGuildSettings(guildId).autoNotify === true) {
+          const textChannelId = session.textChannelId
+          const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
+          if (textChannel) {
+            await textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
+              console.error('[sessions] failed to post autoplay notification:', err.message)
+            })
+          }
+        }
+        return true
+      }
 
-    return false
+      const plans = await planRecommendations({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
+      if (isStale()) {
+        releaseAutoplayContinuation(session)
+        return false
+      }
+      if (plans && plans.length > 0) {
+        const textChannelId = session.textChannelId
+        const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
+        if (!textChannel) {
+          releaseAutoplayContinuation(session)
+          return false
+        }
+        const postedCount = await postRecommendations({
+          client: guild.client,
+          channel: textChannel,
+          guildId,
+          plans,
+          queue,
+          player: session.player,
+          pendingStore: recommendPendingStore,
+          onTimeout: async () => {
+            // A manual /play may have started a track while this prompt sat
+            // unanswered; only the shared onDisconnect path should tear the
+            // session down, and only if nothing is actually playing/queued.
+            if (!queue.isEmpty || isStale()) return
+            await onDisconnect()
+          },
+        })
+        if (isStale()) {
+          // /stop (or similar) can land while channel.send() calls were still
+          // in flight above: the messages already got posted with live
+          // buttons before we knew to cancel them. Undo that now rather than
+          // leaving a pickable prompt that could revive playback post-stop.
+          cancelRecommendations(guildId, recommendPendingStore)
+          releaseAutoplayContinuation(session)
+          return false
+        }
+        if (postedCount > 0) return true
+      }
+
+      releaseAutoplayContinuation(session)
+      return false
+    } catch (err) {
+      releaseAutoplayContinuation(session)
+      throw err
+    }
   }
 
   const player = new GuildPlayer({
