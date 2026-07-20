@@ -50,6 +50,25 @@ export function createMemoryDb() {
       track_url TEXT NOT NULL,
       played_at INTEGER NOT NULL
     );
+    CREATE TABLE user_playlists (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      discord_user_id TEXT NOT NULL REFERENCES discord_users(discord_id),
+      name TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE user_playlist_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      playlist_id INTEGER NOT NULL REFERENCES user_playlists(id) ON DELETE CASCADE,
+      position INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      webpage_url TEXT NOT NULL,
+      duration INTEGER,
+      thumbnail TEXT,
+      video_id TEXT,
+      channel TEXT,
+      added_at INTEGER NOT NULL
+    );
   `)
   return db
 }
