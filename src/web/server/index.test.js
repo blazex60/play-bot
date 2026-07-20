@@ -305,6 +305,7 @@ test('authenticated user can create, edit, reorder, and queue a saved playlist',
     discordToken: { access_token: 'discord-access' },
     discordUser: { id: 'u1', username: 'lemitsu' },
     botResponses: {
+      '/state/g1': { body: { active: true, current: null, upcoming: [], playerStatus: 'idle', loopMode: 'off' } },
       '/permission': { body: { basic: true, extended: false } },
       '/import/g1/enqueue': { body: { ok: true, enqueuedCount: 2, matchedCount: 2, failedCount: 0 } },
     },
@@ -393,6 +394,49 @@ test('authenticated user can create, edit, reorder, and queue a saved playlist',
   assert.equal(del.statusCode, 200)
   const listAfterDelete = await app.inject({ method: 'GET', url: '/api/playlists/mine', headers: { cookie } })
   assert.equal(listAfterDelete.json().playlists.length, 0)
+})
+
+test('queueing a saved playlist into a guild with no active bot session skips the permission check (regression: a user starting playback for the first time was wrongly 403d)', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {
+      // No '/permission' entry: if the route calls it, createRoutedFetch throws
+      // "Unexpected fetch call", failing this test loudly.
+      '/state/g2': { body: { active: false, autoplayMode: 'off', personalize: false } },
+      '/import/g2/enqueue': { body: { ok: true, enqueuedCount: 1, matchedCount: 1, failedCount: 0 } },
+    },
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  const createResponse = await app.inject({
+    method: 'POST',
+    url: '/api/playlists/mine',
+    headers: { cookie },
+    payload: { name: 'Solo BGM' },
+  })
+  const playlist = createResponse.json()
+
+  await app.inject({
+    method: 'POST',
+    url: `/api/playlists/mine/${playlist.id}/tracks`,
+    headers: { cookie },
+    payload: { track: { title: 'Track A', webpageUrl: 'https://www.youtube.com/watch?v=aaaaaaaaaaa', videoId: 'aaaaaaaaaaa' } },
+  })
+
+  const queue = await app.inject({
+    method: 'POST',
+    url: `/api/playlists/mine/${playlist.id}/queue`,
+    headers: { cookie },
+    payload: { guildId: 'g2' },
+  })
+  assert.equal(queue.statusCode, 200, 'must not require bot permission when there is no live session to protect')
+  assert.equal(queue.json().enqueuedCount, 1)
 })
 
 test('/api/playlists/mine/:id only exposes the requesting user\'s own playlist (regression: IDOR across saved playlists)', async (t) => {

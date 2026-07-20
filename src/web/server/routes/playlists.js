@@ -335,7 +335,15 @@ export async function playlistsRoutes(app, {
       const rows = getPlaylistTracks(db, playlist.id)
       if (rows.length === 0) return reply.code(400).send({ error: 'playlist_empty' })
 
-      await requireBotPermission({ botClient, guildId, userId: user.discordId })
+      // Only gate on bot-permission (VC co-presence/Admin) when the guild already
+      // has a live session to protect. When there is none, /import/:guildId/enqueue
+      // on the bot side self-services session creation from the requester's own
+      // current voice channel (see botApi.js), so requiring permission here would
+      // wrongly 403 a user who is simply starting playback for the first time.
+      const state = await callBot(botClient, 'GET', `/state/${encodeURIComponent(guildId)}`)
+      if (state?.active) {
+        await requireBotPermission({ botClient, guildId, userId: user.discordId })
+      }
 
       const tracks = rows.map((row) => createTrack({
         title: row.title,
