@@ -286,26 +286,6 @@
   color: #fff;
 }
 
-.volume-control {
-  display: grid;
-  gap: 8px;
-  margin-top: 18px;
-}
-
-.volume-control span {
-  color: var(--text-muted);
-  font-size: 0.82rem;
-  font-weight: 600;
-}
-
-.volume-control input[type="range"] {
-  accent-color: var(--accent);
-  background: transparent;
-  height: 20px;
-  min-height: 0;
-  padding: 0;
-}
-
 .queue-list,
 .review-list {
   display: grid;

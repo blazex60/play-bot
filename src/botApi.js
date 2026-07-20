@@ -185,19 +185,6 @@ export function buildBotApi({
         bumpPlanToken(guildId);
         cancelPendingRecommendations(guildId);
         return { ok: true, state: serializeSession(session) };
-      case 'volume': {
-        const level = Number(request.body?.level);
-        if (!Number.isFinite(level)) {
-          reply.code(400).send({ error: 'level_required' });
-          return;
-        }
-        if (typeof session.player.setVolume !== 'function') {
-          reply.code(501).send({ error: 'volume_not_supported' });
-          return;
-        }
-        session.player.setVolume(level);
-        return { ok: true, state: serializeSession(session) };
-      }
       default:
         reply.code(404).send({ error: 'unknown_action' });
     }

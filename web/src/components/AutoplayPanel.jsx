@@ -13,6 +13,10 @@ export function AutoplayPanel(props) {
         <p className="eyebrow">Autoplay</p>
         <h2 id="autoplay-title">自動再生</h2>
       </div>
+      <div className="vc-status-chip">
+        <span className="status-dot" aria-hidden="true" />
+        自動再生: {MODES.find((item) => item.value === mode)?.label ?? mode} / パーソナライズ: {personalize ? 'ON' : 'OFF'}
+      </div>
       <div className="transport-dock" role="group" aria-label="自動再生モード">
         {MODES.map(({ value, label }) => (
           <button

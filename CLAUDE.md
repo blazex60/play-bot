@@ -70,7 +70,7 @@ Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用
 
 ### Web UI scope
 
-Dashboard は single-screen 構成。Now playing、transport controls、volume slider、queue reorder/remove、YouTube playlist browser、import panel、post-import match review を表示する。Spotify と Apple Music は disabled の「準備中」だけを表示し、機能リンクは作らない。
+Dashboard は single-screen 構成。Now playing、transport controls、queue reorder/remove、YouTube playlist browser、import panel、post-import match review を表示する。Spotify と Apple Music は disabled の「準備中」だけを表示し、機能リンクは作らない。
 
 **Spotify が disabled な理由**: Spotify は 2026年2月の仕様変更で Development Mode アプリの認可ユーザー数上限が 5 人に制限された（以前は 25 人）。個人用途の音楽 Bot でこの上限を超える見込みが高いため、UI 上のリンクボタンのみ無効化している。バックエンドの OAuth ルート（`src/web/server/auth/spotify.js`）・DB スキーマ（`service_links` の `spotify` 行）・import パイプラインはそのまま残しており、将来的に有効化する場合は `web/src/components/PlaylistPanel.jsx` の `SERVICES`/`DISABLED_SERVICES` を戻すだけで復活できる。
 

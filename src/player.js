@@ -40,7 +40,6 @@ export class GuildPlayer {
   #prefetchTrack = null;
   #prefetchPromise = null;
   #currentResource = null;
-  #volume = 1;
   #createAudioResource;
   #resolveAudioStream;
 
@@ -94,7 +93,8 @@ export class GuildPlayer {
       return;
     }
 
-    const resource = this.#applyVolume(await this.#createResource(track));
+    const resource = await this.#createResource(track);
+    this.#currentResource = resource;
 
     // stop()/skip() may have been issued while the resource was being
     // prepared (download + loudnorm analysis can take several seconds).
@@ -153,13 +153,6 @@ export class GuildPlayer {
 
   resume() {
     return this.#audioPlayer.unpause();
-  }
-
-  setVolume(level) {
-    const volume = Math.min(2, Math.max(0, Number(level)));
-    this.#volume = Number.isFinite(volume) ? volume : 1;
-    this.#currentResource?.volume?.setVolume(this.#volume);
-    return this.#volume;
   }
 
   async skip() {
@@ -241,7 +234,6 @@ export class GuildPlayer {
     const stream = this.#resolveAudioStream(track.webpageUrl);
     return this.#createAudioResource(stream, {
       inputType: StreamType.Arbitrary,
-      inlineVolume: true,
     });
   }
 
@@ -267,12 +259,6 @@ export class GuildPlayer {
       console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err);
       return this.#createFallbackResource(track);
     }
-  }
-
-  #applyVolume(resource) {
-    this.#currentResource = resource;
-    resource.volume?.setVolume(this.#volume);
-    return resource;
   }
 
   async #getPrefetchedOrFetch(track) {

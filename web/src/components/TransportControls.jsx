@@ -1,6 +1,6 @@
-/** @param {{ busy: boolean, volume: number, onAction: (action: string) => void, onVolumeChange: (level: number) => void }} props */
+/** @param {{ busy: boolean, onAction: (action: string) => void }} props */
 export function TransportControls(props) {
-  const { busy, volume, onAction, onVolumeChange } = props
+  const { busy, onAction } = props
   return (
     <section className="panel controls-panel" aria-labelledby="transport-title">
       <div className="section-heading">
@@ -21,18 +21,6 @@ export function TransportControls(props) {
           Stop
         </button>
       </div>
-      <label className="volume-control">
-        <span>音量 {Math.round(volume * 100)}%</span>
-        <input
-          type="range"
-          min="0"
-          max="2"
-          step="0.05"
-          value={volume}
-          onChange={(event) => onVolumeChange(Number(event.target.value))}
-          disabled={busy}
-        />
-      </label>
     </section>
   )
 }

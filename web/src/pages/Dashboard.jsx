@@ -44,7 +44,6 @@ export function Dashboard() {
   const [importJob, setImportJob] = useState(/** @type {import('../api/client.js').ImportJob | null} */ (null))
   const [reviewTracks, setReviewTracks] = useState(/** @type {import('../api/client.js').ImportTrack[]} */ ([]))
   const [searchQuery, setSearchQuery] = useState('')
-  const [volume, setVolume] = useState(1)
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState('')
 
@@ -116,7 +115,7 @@ export function Dashboard() {
 
   /** @param {string} action */
   function control(action) {
-    return runAction(() => api.control(guildId, action, action === 'volume' ? { level: volume } : {}), '操作を送信しました')
+    return runAction(() => api.control(guildId, action, {}), '操作を送信しました')
   }
 
   /** @param {string} mode */
@@ -127,12 +126,6 @@ export function Dashboard() {
   /** @param {boolean} enabled */
   function setPersonalizeAction(enabled) {
     return runAction(() => api.control(guildId, 'autoplay', { personalize: enabled }), 'パーソナライズを更新しました')
-  }
-
-  /** @param {number} level */
-  function changeVolume(level) {
-    setVolume(level)
-    return runAction(() => api.control(guildId, 'volume', { level }), '音量を更新しました')
   }
 
   /** @param {number} fromIndex @param {number} toIndex */
@@ -256,7 +249,7 @@ export function Dashboard() {
 
       <div className="dashboard-grid">
         <NowPlaying state={state} />
-        <TransportControls busy={busy || !guildId} volume={volume} onAction={control} onVolumeChange={changeVolume} />
+        <TransportControls busy={busy || !guildId} onAction={control} />
         <AutoplayPanel
           mode={autoplayMode}
           personalize={personalize}

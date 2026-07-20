@@ -12,7 +12,7 @@
 | File | Description |
 |------|--------------|
 | `NowPlaying.jsx` | 現在再生中トラックの表示（`PlaybackState` を受け取る） |
-| `TransportControls.jsx` | pause/resume/skip/stop ボタンと volume slider |
+| `TransportControls.jsx` | pause/resume/skip/stop ボタン |
 | `QueueList.jsx` | キュー一覧。並び替え（`onMove`）・削除（`onRemove`）操作 |
 | `PlaylistPanel.jsx` | YouTube プレイリスト選択・import 開始 UI。`SERVICES`（有効: YouTube のみ）と `DISABLED_SERVICES`（Spotify, Apple Music を「準備中」表示）を分離管理 |
 | `MatchReview.jsx` | import 後の YouTube マッチング結果レビュー。検索クエリ変更・再検索・置換操作 |

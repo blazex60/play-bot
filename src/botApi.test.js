@@ -42,9 +42,6 @@ function makeSession({ channelId = 'voice-1' } = {}) {
       async stop() {
         calls.push('stop');
       },
-      setVolume(level) {
-        calls.push(['volume', level]);
-      },
       async playNext() {
         calls.push('playNext');
       },
@@ -146,15 +143,6 @@ test('bot API control and queue endpoints mutate the session when permitted', as
     });
     assert.equal(pause.statusCode, 200);
     assert.equal(session.player.calls[0], 'pause');
-
-    const volume = await app.inject({
-      method: 'POST',
-      url: '/control/guild-1/volume',
-      headers: authHeaders(),
-      payload: { userId: 'user-1', level: 0.5 },
-    });
-    assert.equal(volume.statusCode, 200);
-    assert.deepEqual(session.player.calls[1], ['volume', 0.5]);
 
     const remove = await app.inject({
       method: 'POST',

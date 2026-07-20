@@ -54,16 +54,9 @@ function makePlayer({ audioPlayer = makeAudioPlayer(), handleQueueExhausted, onD
       return { url }
     },
     createAudioResourceFn(stream, options) {
-      const volumeCalls = []
       const resource = {
         stream,
         options,
-        volumeCalls,
-        volume: {
-          setVolume(level) {
-            volumeCalls.push(level)
-          },
-        },
         playStream: {
           destroy() {},
         },
@@ -84,22 +77,15 @@ test('GuildPlayer.status reflects the audio player state', () => {
   assert.equal(player.status, AudioPlayerStatus.Playing)
 })
 
-test('GuildPlayer.setVolume clamps and applies to current inline-volume resource', async () => {
+test('GuildPlayer.playNext creates a resource and tracks it as the current resource', async () => {
   const { player, audioPlayer, resources } = makePlayer()
 
-  assert.equal(player.setVolume(1.5), 1.5)
   await player.playNext()
 
   assert.equal(audioPlayer.resource, resources[0])
   assert.deepEqual(resources[0].options, {
     inputType: StreamType.Arbitrary,
-    inlineVolume: true,
   })
-  assert.deepEqual(resources[0].volumeCalls, [1.5])
-
-  assert.equal(player.setVolume(3), 2)
-  assert.equal(player.setVolume(-1), 0)
-  assert.deepEqual(resources[0].volumeCalls, [1.5, 2, 0])
 
   await player.stop()
 })
