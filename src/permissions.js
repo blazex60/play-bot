@@ -20,16 +20,23 @@ export function checkSameVoiceChannel(interaction, session) {
 }
 
 // Like checkSameVoiceChannel, but without the "same text channel as the VC"
-// requirement. Recommendation prompts are posted to session.textChannelId,
-// which is wherever /play was last invoked and often isn't the VC's own
-// chat, so enforcing inChat here would reject a legitimate click from the
-// correct user still sitting in the right VC.
-export function checkInVoiceChannel(interaction, session) {
+// requirement. Recommendation prompts are now sent as DMs, so there's no
+// shared guild text channel to compare against — only VC membership matters.
+// Async because a DM-originated interaction has no interaction.member (no
+// guild context), so the member has to be fetched from the guild instead.
+export async function checkInVoiceChannel(interaction, session) {
   const targetChannelId = session
     ? session.connection.joinConfig.channelId
-    : interaction.member.voice?.channelId
+    : interaction.member?.voice?.channelId
   if (!targetChannelId) return true
-  const inVoice = interaction.member.voice.channelId === targetChannelId
+
+  let member = interaction.member
+  if (!member) {
+    const guild = interaction.client.guilds.cache.get(session.connection.joinConfig.guildId)
+    member = guild ? await guild.members.fetch(interaction.user.id).catch(() => null) : null
+  }
+
+  const inVoice = member?.voice.channelId === targetChannelId
   if (!inVoice) {
     const payload = { content: '❌ ボイスチャンネルに参加してから操作してください', flags: MessageFlags.Ephemeral }
     if (interaction.deferred || interaction.replied) {

@@ -30,6 +30,16 @@ function hasPendingForGuild(pendingStore, guildId) {
   return false
 }
 
+// A repeated round (someone's pick finished quickly while others' prompts
+// from an earlier round are still live) must not stack a second DM on top
+// of a user's still-unanswered one.
+function hasPendingForUser(pendingStore, guildId, userId) {
+  for (const [, entry] of pendingStore.entries()) {
+    if (entry.guildId === guildId && entry.targetUserId === userId) return true
+  }
+  return false
+}
+
 // Guilds with a pick currently being processed, from the moment
 // handleRecommendChoice claims its prompt until the chosen track has been
 // enqueued. Prompts are independent now, so another user's prompt can still
@@ -107,8 +117,8 @@ export function cancelRecommendations(guildId, pendingStore) {
 
 // Returns the number of recommendation messages actually posted, so callers
 // can tell "posted but nobody has picked yet" apart from "every send failed"
-// (e.g. the remembered text channel was deleted or the bot lost permission).
-export async function postRecommendations({ client, channel, guildId, plans, pendingStore, onTimeout, voiceChannel }) {
+// (e.g. everyone's DMs are closed to the bot).
+export async function postRecommendations({ client, guildId, guildName, plans, pendingStore, onTimeout, voiceChannel }) {
   let postedCount = 0
   const startGeneration = currentCancelGeneration(guildId)
   if (onTimeout) guildOnTimeoutCallbacks.set(guildId, onTimeout)
@@ -122,11 +132,16 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
     // took at the start, so a prompt for "the room you just left" doesn't
     // show up after the fact.
     if (voiceChannel && !voiceChannel.members.has(userId)) continue
+    // Recommend mode now loops for as long as the session lives, so a fast
+    // pick by one user can trigger a fresh round while another user's prompt
+    // from the previous round is still open. Don't stack a second DM on top
+    // of it — let their existing prompt run its course first.
+    if (hasPendingForUser(pendingStore, guildId, userId)) continue
 
     const embed = new EmbedBuilder()
-      .setTitle('🎵 次の曲のおすすめ')
+      .setTitle(`🎵 ${guildName ?? 'サーバー'} の次の曲のおすすめ`)
       .setDescription(
-        `<@${userId}> さん、次に聴きたい曲を選んでください:\n` +
+        '次に聴きたい曲を選んでください:\n' +
         candidates.map((track, i) => `${i + 1}. ${track.title}`).join('\n')
       )
 
@@ -137,9 +152,10 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
 
     let message
     try {
-      message = await channel.send({ embeds: [embed], components })
+      const user = await client.users.fetch(userId)
+      message = await user.send({ embeds: [embed], components })
     } catch (err) {
-      console.error('[recommendFlow] failed to post recommendation:', err.message)
+      console.error('[recommendFlow] failed to DM recommendation:', err.message)
       continue
     }
 
@@ -202,7 +218,9 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   // every other playback-affecting command does before honoring the pick.
   // Checked before consuming the entry so a legitimate click still works if
   // they rejoin and try again, instead of silently expiring the prompt.
-  if (!checkInVoiceChannel(interaction, session)) return
+  // Prompts are DMs now, so this click carries no guild/member context —
+  // checkInVoiceChannel resolves the member itself in that case.
+  if (!(await checkInVoiceChannel(interaction, session))) return
 
   // Claim this user's own prompt synchronously, before any await: a double
   // click on the same message in the same tick would otherwise pass every

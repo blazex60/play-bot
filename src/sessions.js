@@ -32,6 +32,13 @@ export function bumpPlanToken(guildId) {
   if (session) session.planToken += 1
 }
 
+// This is a re-entrancy lock for a single in-flight queue-exhaustion round,
+// not a "used up" marker: it's claimed at the start of handleQueueExhausted
+// and always released once that round's planning/posting settles (success
+// or failure), so the next queue-exhaustion event can claim it again. Autoplay
+// and recommend mode both keep continuing for as long as the session (i.e.
+// the bot's current VC connection) lives — only /leave or the VC emptying
+// out ends it.
 export function hasAutoplayContinuationBeenUsed(session) {
   return session?.autoplayContinuationUsed === true
 }
@@ -101,18 +108,12 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     const planToken = session.planToken
     const isStale = () => sessions.get(guildId) !== session || session.planToken !== planToken
 
-    const voiceChannel = guild.channels.cache.get(connection.joinConfig.channelId)
-    if (!voiceChannel) {
-      releaseAutoplayContinuation(session)
-      return false
-    }
-
     try {
+      const voiceChannel = guild.channels.cache.get(connection.joinConfig.channelId)
+      if (!voiceChannel) return false
+
       const autoTrack = await planAutoTrack({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
-      if (isStale()) {
-        releaseAutoplayContinuation(session)
-        return false
-      }
+      if (isStale()) return false
       if (autoTrack) {
         // A manual /play may have already re-filled and started the queue
         // while we were waiting, so only auto-start playback if still idle.
@@ -132,21 +133,12 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
       }
 
       const plans = await planRecommendations({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
-      if (isStale()) {
-        releaseAutoplayContinuation(session)
-        return false
-      }
+      if (isStale()) return false
       if (plans && plans.length > 0) {
-        const textChannelId = session.textChannelId
-        const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
-        if (!textChannel) {
-          releaseAutoplayContinuation(session)
-          return false
-        }
         const postedCount = await postRecommendations({
           client: guild.client,
-          channel: textChannel,
           guildId,
+          guildName: guild.name,
           plans,
           queue,
           player: session.player,
@@ -154,29 +146,32 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
           voiceChannel,
           onTimeout: async () => {
             // A manual /play may have started a track while this prompt sat
-            // unanswered; only the shared onDisconnect path should tear the
-            // session down, and only if nothing is actually playing/queued.
+            // unanswered — only end the session if nothing is actually
+            // playing/queued and this round is still the live one.
             if (!queue.isEmpty || isStale()) return
-            await onDisconnect()
+            // Nobody picked anything: keep the bot in the VC and show a
+            // fresh round (current VC membership, current preferences)
+            // instead of disconnecting. Only /leave or the VC emptying out
+            // should end the session now — see handleQueueExhausted's own
+            // lock release below, which is what makes this re-entry legal.
+            const continued = await handleQueueExhausted(lastTrack)
+            if (!continued) await onDisconnect()
           },
         })
         if (isStale()) {
-          // /stop (or similar) can land while channel.send() calls were still
-          // in flight above: the messages already got posted with live
-          // buttons before we knew to cancel them. Undo that now rather than
-          // leaving a pickable prompt that could revive playback post-stop.
+          // /stop (or similar) can land while sends were still in flight
+          // above: the messages already got posted with live buttons before
+          // we knew to cancel them. Undo that now rather than leaving a
+          // pickable prompt that could revive playback post-stop.
           cancelRecommendations(guildId, recommendPendingStore)
-          releaseAutoplayContinuation(session)
           return false
         }
         if (postedCount > 0) return true
       }
 
-      releaseAutoplayContinuation(session)
       return false
-    } catch (err) {
+    } finally {
       releaseAutoplayContinuation(session)
-      throw err
     }
   }
 
