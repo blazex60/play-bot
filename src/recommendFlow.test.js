@@ -154,7 +154,7 @@ test('handleRecommendChoice: rejects and preserves the entry if the target user 
 
 test('handleRecommendChoice: honors a pick from a text channel other than the VC (regression: recommend prompts posted outside the VC chat were unclickable)', async () => {
   const pendingStore = new PendingChoiceStore()
-  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
   const session = makeSession({ voiceChannelId: 'vc-1' })
   const sessions = new Map([['g1', session]])
   // The recommendation was posted to session.textChannelId (wherever /play
@@ -170,7 +170,8 @@ test('handleRecommendChoice: honors a pick from a text channel other than the VC
 
 test('handleRecommendChoice: valid pick on an empty queue starts playback', async () => {
   const pendingStore = new PendingChoiceStore()
-  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
   const session = makeSession({ voiceChannelId: 'vc-1' })
   const sessions = new Map([['g1', session]])
   const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1' })
@@ -180,11 +181,13 @@ test('handleRecommendChoice: valid pick on an empty queue starts playback', asyn
   assert.equal(session.queue.current.videoId, 'v1')
   assert.equal(session.player.playNextCalls.length, 1)
   assert.equal(pendingStore.get('msg-1'), null, 'entry must be consumed after a successful pick')
+  assert.equal(message.deleteCalls, 1, 'the picked message should be deleted, matching /play search behavior')
+  assert.match(interaction.replies[0], /^✅ .+ がキューに追加しました: \*\*v1\*\* \(/, 'a /play-style confirmation should be posted')
 })
 
 test('handleRecommendChoice: does not restart playback if the queue was already non-empty', async () => {
   const pendingStore = new PendingChoiceStore()
-  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
   const session = makeSession({ voiceChannelId: 'vc-1' })
   session.queue.add(makeCandidate('already-playing')) // a manual /play landed while the pick was pending
   const sessions = new Map([['g1', session]])
@@ -197,7 +200,7 @@ test('handleRecommendChoice: does not restart playback if the queue was already 
 })
 
 function makeSentMessage(id) {
-  return { id, components: [{ components: [{ setDisabled() {} }] }], async edit() {} }
+  return { id, components: [{ components: [{ setDisabled() {} }] }], deleteCalls: 0, async edit() {}, async delete() { this.deleteCalls += 1 } }
 }
 
 test('handleRecommendChoice: two users clicking different prompts in the same guild at once, only one wins', async () => {

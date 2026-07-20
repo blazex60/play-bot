@@ -6,6 +6,14 @@ import { createTrack } from './queue.js'
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
 const RECOMMEND_TIMEOUT_MS = 5 * 60 * 1000
 
+export function fmtDuration(seconds) {
+  if (seconds == null) return '不明'
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = seconds % 60
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`
+}
+
 async function disableMessage(message) {
   const disabledRows = message.components.map((row) => {
     const builder = ActionRowBuilder.from(row)
@@ -26,11 +34,12 @@ function hasPendingForGuild(pendingStore, guildId) {
 // timeouts, drops the pendingStore entries, and disables the posted buttons.
 // Used both when one user's pick wins (the rest lose) and when the session
 // is torn down (VC empty, /stop, watchdog) while recommendations are open.
-export function cancelRecommendations(guildId, pendingStore) {
+export function cancelRecommendations(guildId, pendingStore, { skipMessageId = null } = {}) {
   for (const [messageId, entry] of pendingStore.entries()) {
     if (entry.guildId !== guildId) continue
     clearTimeout(entry.timeoutHandle)
     pendingStore.delete(messageId)
+    if (messageId === skipMessageId) continue
     disableMessage(entry.message).catch(() => {})
   }
 }
@@ -133,9 +142,16 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   // handler reaches this line first wins the round; a handler that runs
   // after will find its own entry.get() already gone. This also disables
   // the clicked message itself (it's included in the guild's entries).
-  cancelRecommendations(entry.guildId, pendingStore)
+  cancelRecommendations(entry.guildId, pendingStore, { skipMessageId: interaction.message.id })
 
   await interaction.deferUpdate()
+  // Mirror /play's search flow: the picked prompt is single-use, so remove it
+  // instead of leaving it around disabled like the other candidates' prompts.
+  try {
+    await entry.message.delete()
+  } catch {
+    // Already gone, or the bot lacks permission — not worth failing the pick over.
+  }
   // Recommendation candidates start with requestedById: null (they came from
   // the bot's own suggestion, not a request), which would make GuildPlayer
   // skip recording the play. Attribute it to the picker now so recommend-mode
@@ -147,5 +163,8 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   })
   const wasEmpty = session.queue.isEmpty
   session.queue.add(chosenTrack)
+  // Same confirmation format as /play's search picker, so a recommend pick
+  // reads identically to a manual search pick in the channel.
+  await interaction.followUp(`✅ ${chosenTrack.requestedBy} がキューに追加しました: **${chosenTrack.title}** (${fmtDuration(chosenTrack.duration)})`)
   if (wasEmpty) await session.player.playNext()
 }

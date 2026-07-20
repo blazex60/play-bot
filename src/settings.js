@@ -18,6 +18,7 @@ function normalizeRecord(record) {
     normalize: record?.normalize === true,
     autoplayMode: AUTOPLAY_MODES.has(record?.autoplayMode) ? record.autoplayMode : 'off',
     personalize: record?.personalize === true,
+    autoNotify: record?.autoNotify === true,
   }
 }
 
@@ -46,7 +47,7 @@ export function loadSettings() {
 export function getGuildSettings(guildId) {
   ensureLoaded()
   const settings = guildSettings.get(guildId)
-  return settings ? { ...settings } : { normalize: false, autoplayMode: 'off', personalize: false }
+  return settings ? { ...settings } : { normalize: false, autoplayMode: 'off', personalize: false, autoNotify: false }
 }
 
 async function writeSettings() {
@@ -75,6 +76,10 @@ export function setAutoplayMode(guildId, mode) {
 
 export function setPersonalize(guildId, enabled) {
   return updateGuildSettings(guildId, { personalize: enabled === true })
+}
+
+export function setAutoNotify(guildId, enabled) {
+  return updateGuildSettings(guildId, { autoNotify: enabled === true })
 }
 
 export function configureSettingsPathForTest(filePath) {

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
   buildDecayedVector,
+  formatAutoAddNotification,
   planAutoTrack,
   planRecommendations,
   topEntries,
@@ -293,4 +294,9 @@ test('planRecommendations: skips users with no resolvable candidates', async () 
     })
     assert.deepEqual(plans, [])
   })
+})
+
+test('formatAutoAddNotification: includes the title and formatted duration', () => {
+  const message = formatAutoAddNotification({ title: 'Some Song', duration: 100 })
+  assert.equal(message, '🔀 自動再生: **Some Song** (1:40) をキューに追加しました')
 })

@@ -11,6 +11,7 @@ import {
   setAutoplayMode,
   setNormalize,
   setPersonalize,
+  setAutoNotify,
 } from './settings.js'
 
 async function withTempSettings(fn) {
@@ -28,18 +29,18 @@ test('settings: missing file defaults normalize/autoplayMode/personalize', async
   await withTempSettings(async ({ filePath }) => {
     loadSettings()
     assert.equal(existsSync(filePath), false)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'off', personalize: false })
+    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'off', personalize: false, autoNotify: false })
   })
 })
 
 test('settings: setNormalize persists and loadSettings restores values', async () => {
   await withTempSettings(async ({ filePath }) => {
     await setNormalize('guild-1', true)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'off', personalize: false })
+    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'off', personalize: false, autoNotify: false })
 
     configureSettingsPathForTest(filePath)
     loadSettings()
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'off', personalize: false })
+    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'off', personalize: false, autoNotify: false })
   })
 })
 
@@ -50,8 +51,8 @@ test('settings: atomic write leaves a valid JSON settings file', async () => {
 
     const raw = await readFile(filePath, 'utf8')
     assert.deepEqual(JSON.parse(raw), {
-      'guild-1': { normalize: true, autoplayMode: 'off', personalize: false },
-      'guild-2': { normalize: false, autoplayMode: 'off', personalize: false },
+      'guild-1': { normalize: true, autoplayMode: 'off', personalize: false, autoNotify: false },
+      'guild-2': { normalize: false, autoplayMode: 'off', personalize: false, autoNotify: false },
     })
 
     const files = await readdir(join(dir, 'data'))
@@ -72,7 +73,20 @@ test('settings: setAutoplayMode rejects invalid modes by falling back to off', a
 test('settings: setPersonalize toggles independently of other fields', async () => {
   await withTempSettings(async () => {
     await setPersonalize('guild-1', true)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'off', personalize: true })
+    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'off', personalize: true, autoNotify: false })
+  })
+})
+
+test('settings: setAutoNotify persists and defaults to off', async () => {
+  await withTempSettings(async ({ filePath }) => {
+    assert.equal(getGuildSettings('guild-1').autoNotify, false)
+
+    await setAutoNotify('guild-1', true)
+    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'off', personalize: false, autoNotify: true })
+
+    configureSettingsPathForTest(filePath)
+    loadSettings()
+    assert.equal(getGuildSettings('guild-1').autoNotify, true)
   })
 })
 
@@ -81,10 +95,11 @@ test('settings: setters merge instead of clobbering other fields (regression)', 
     await setAutoplayMode('guild-1', 'auto')
     await setPersonalize('guild-1', true)
     await setNormalize('guild-1', true)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'auto', personalize: true })
+    await setAutoNotify('guild-1', true)
+    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'auto', personalize: true, autoNotify: true })
 
     // setNormalize must not wipe autoplay fields set earlier, and vice versa.
     await setNormalize('guild-1', false)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'auto', personalize: true })
+    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'auto', personalize: true, autoNotify: true })
   })
 })

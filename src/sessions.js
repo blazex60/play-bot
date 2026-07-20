@@ -3,8 +3,9 @@ import { GuildQueue } from './queue.js'
 import { GuildPlayer } from './player.js'
 import { PendingChoiceStore } from './views.js'
 import { createWebClient } from './webClient.js'
-import { planAutoTrack, planRecommendations } from './autoplay.js'
+import { planAutoTrack, planRecommendations, formatAutoAddNotification } from './autoplay.js'
 import { cancelRecommendations, postRecommendations } from './recommendFlow.js'
+import { getGuildSettings } from './settings.js'
 
 // Map<guildId, { guildId, connection, player, queue, textChannelId, planToken }>
 export const sessions = new Map()
@@ -96,6 +97,15 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
       const wasEmpty = queue.isEmpty
       queue.add(autoTrack)
       if (wasEmpty) await session.player.playNext()
+      if (getGuildSettings(guildId).autoNotify === true) {
+        const textChannelId = session.textChannelId
+        const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
+        if (textChannel) {
+          await textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
+            console.error('[sessions] failed to post autoplay notification:', err.message)
+          })
+        }
+      }
       return true
     }
 

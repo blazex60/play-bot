@@ -1,6 +1,7 @@
 import { getGuildSettings } from './settings.js'
 import { resolveRelated } from './search.js'
 import { createTrack } from './queue.js'
+import { fmtDuration } from './recommendFlow.js'
 
 export const HALF_LIFE_DAYS = 14
 export const STABLE_MIN_WEIGHT = 3.0
@@ -68,6 +69,10 @@ function toAutoplayTrack(candidate) {
     videoId: candidate.videoId,
     channel: candidate.channel,
   })
+}
+
+export function formatAutoAddNotification(track) {
+  return `🔀 自動再生: **${track.title}** (${fmtDuration(track.duration)}) をキューに追加しました`
 }
 
 // Finds the videoId that appears in the most stable users' own top-K

@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
-import { setAutoplayMode, setPersonalize } from '../settings.js'
+import { setAutoplayMode, setPersonalize, setAutoNotify } from '../settings.js'
 import { bumpPlanToken } from '../sessions.js'
 
 const MODE_LABELS = { off: 'オフ', auto: '自動', recommend: 'おすすめ' }
@@ -31,6 +31,14 @@ export default {
         .addBooleanOption((opt) =>
           opt.setName('value').setDescription('パーソナライズを有効にするか').setRequired(true)
         )
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('notify')
+        .setDescription('自動追加時に通知を送るか切り替えます')
+        .addBooleanOption((opt) =>
+          opt.setName('value').setDescription('自動追加通知を有効にするか').setRequired(true)
+        )
     ),
 
   async execute(interaction) {
@@ -56,6 +64,16 @@ export default {
       bumpPlanToken(interaction.guildId)
       await interaction.reply({
         content: `✅ パーソナライズを **${enabled ? '有効' : '無効'}** にしました`,
+        flags: MessageFlags.Ephemeral,
+      })
+      return
+    }
+
+    if (subcommand === 'notify') {
+      const enabled = interaction.options.getBoolean('value', true)
+      await setAutoNotify(interaction.guildId, enabled)
+      await interaction.reply({
+        content: `✅ 自動追加通知を **${enabled ? '有効' : '無効'}** にしました`,
         flags: MessageFlags.Ephemeral,
       })
     }
