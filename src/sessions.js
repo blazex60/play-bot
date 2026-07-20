@@ -7,7 +7,7 @@ import { planAutoTrack, planRecommendations, formatAutoAddNotification } from '.
 import { cancelRecommendations, postRecommendations } from './recommendFlow.js'
 import { getGuildSettings } from './settings.js'
 
-// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken }>
+// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed }>
 export const sessions = new Map()
 export const pendingStore = new PendingChoiceStore()
 export const recommendPendingStore = new PendingChoiceStore()
@@ -30,6 +30,14 @@ export function cancelPendingRecommendations(guildId) {
 export function bumpPlanToken(guildId) {
   const session = sessions.get(guildId)
   if (session) session.planToken += 1
+}
+
+export function hasAutoplayContinuationBeenUsed(session) {
+  return session?.autoplayContinuationUsed === true
+}
+
+export function markAutoplayContinuationUsed(session) {
+  if (session) session.autoplayContinuationUsed = true
 }
 
 export async function getOrCreateSession({ guildId, guild, channel, textChannelId = null }) {
@@ -78,6 +86,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   const handleQueueExhausted = async (lastTrack) => {
     const session = sessions.get(guildId)
     if (!session) return false
+    if (hasAutoplayContinuationBeenUsed(session)) return false
     // planAutoTrack/planRecommendations do multi-second async work (history
     // fetch, yt-dlp). /stop can clear the queue in that window without
     // deleting the session, which would otherwise make queue.isEmpty look
@@ -94,6 +103,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     if (autoTrack) {
       // A manual /play may have already re-filled and started the queue
       // while we were waiting, so only auto-start playback if still idle.
+      markAutoplayContinuationUsed(session)
       const wasEmpty = queue.isEmpty
       queue.add(autoTrack)
       if (wasEmpty) await session.player.playNext()
@@ -139,6 +149,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
         cancelRecommendations(guildId, recommendPendingStore)
         return false
       }
+      if (postedCount > 0) markAutoplayContinuationUsed(session)
       return postedCount > 0
     }
 
@@ -158,7 +169,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   // that starts playback with no /play command in the picture) still gets
   // somewhere to post recommend-mode choices instead of recommend mode
   // silently falling through to a disconnect at the next queue exhaustion.
-  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0 }
+  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0, autoplayContinuationUsed: false }
   sessions.set(guildId, session)
   return session
 }
