@@ -47,14 +47,6 @@ export function createWebConfig(env = process.env) {
         userUrl: 'https://discord.com/api/users/@me',
         scope: 'identify',
       },
-      spotify: {
-        clientId: env.SPOTIFY_CLIENT_ID,
-        clientSecret: env.SPOTIFY_CLIENT_SECRET,
-        redirectUri: buildUrl(publicBaseUrl, '/auth/spotify/callback'),
-        authorizeUrl: 'https://accounts.spotify.com/authorize',
-        tokenUrl: 'https://accounts.spotify.com/api/token',
-        scope: 'playlist-read-private playlist-read-collaborative',
-      },
       youtube: {
         clientId: env.GOOGLE_CLIENT_ID,
         clientSecret: env.GOOGLE_CLIENT_SECRET,

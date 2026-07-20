@@ -122,7 +122,7 @@ test('authenticated session can read state/links/permission and issue control+qu
   assert.equal(links.statusCode, 200)
   assert.deepEqual(
     links.json().services.map((s) => s.service).sort(),
-    ['spotify', 'youtube']
+    ['youtube']
   )
 
   const permission = await app.inject({ method: 'GET', url: '/api/permission?guildId=g1', headers: { cookie } })

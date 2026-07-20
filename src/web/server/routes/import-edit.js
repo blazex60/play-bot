@@ -1,4 +1,4 @@
-import { matchSpotifyTrack, resolveYoutubeTrack, toImportTrackRow } from '../matching.js'
+import { resolveYoutubeTrack, toImportTrackRow } from '../matching.js'
 import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { bindRouteError, callBot, getSessionUser, requireBotPermission } from './route-utils.js'
 
@@ -66,14 +66,10 @@ export async function importEditRoutes(app, { db, botClient, searchYoutube } = {
 
       await requireBotPermission({ botClient, guildId: existing.guild_id, userId: user.discordId })
 
-      const { youtubeResult, spotifyTrack } = request.body ?? {}
-      const result = youtubeResult
-        ? resolveYoutubeTrack(youtubeResult, { requestedBy: user.username, requestedById: user.discordId })
-        : await matchSpotifyTrack(spotifyTrack ?? { title: existing.source_title, artist: existing.source_artist }, {
-          requestedBy: user.username,
-          requestedById: user.discordId,
-          searchYoutube: search,
-        })
+      const { youtubeResult } = request.body ?? {}
+      if (!youtubeResult) return reply.code(400).send({ error: 'missing_youtube_result' })
+
+      const result = resolveYoutubeTrack(youtubeResult, { requestedBy: user.username, requestedById: user.discordId })
 
       if (!result.track) return reply.code(404).send({ error: result.reason ?? 'no_match' })
 

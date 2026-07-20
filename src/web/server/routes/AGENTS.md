@@ -15,7 +15,7 @@
 | `state.js` | `GET /api/state/:guildId`（再生状態取得）, `GET /api/permission`（VC 同席/Admin 権限判定） |
 | `control.js` | `POST /api/guilds/:guildId/control/:action`（`pause`/`resume`/`skip`/`stop`） |
 | `queue.js` | `POST /api/guilds/:guildId/queue/:action`（`remove`/`move`） |
-| `links.js` | `GET /api/links` 相当 — Spotify/YouTube の連携状態一覧（`service_links` テーブル参照） |
+| `links.js` | `GET /api/links` 相当 — YouTube の連携状態一覧（`service_links` テーブル参照） |
 | `import.js` | プレイリスト import ジョブの開始。`services/` でプレイリストを取得し `matching.js` で YouTube にマッチングして `import_jobs`/`import_tracks` に書き込む |
 | `import-edit.js` | import 後の手動マッチ修正（`match review`）。`matched_url`/`matched_title`/`match_status` を更新 |
 

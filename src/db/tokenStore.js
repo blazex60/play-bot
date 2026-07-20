@@ -15,14 +15,6 @@ function refreshKey(userId, service) {
 }
 
 function getRefreshConfig(service) {
-  if (service === 'spotify') {
-    return {
-      url: 'https://accounts.spotify.com/api/token',
-      clientId: process.env.SPOTIFY_CLIENT_ID,
-      clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
-      authStyle: 'basic',
-    }
-  }
   if (service === 'youtube') {
     return {
       url: 'https://oauth2.googleapis.com/token',

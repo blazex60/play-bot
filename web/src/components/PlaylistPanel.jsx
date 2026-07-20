@@ -2,16 +2,6 @@ const SERVICES = [
   { id: 'youtube', label: 'YouTube' },
 ]
 
-// Spotify is temporarily disabled in the UI: Spotify's Development Mode app
-// quota was tightened to 5 authorized users per Client ID (Feb 2026 policy
-// change), which is too restrictive for general use. The backend OAuth
-// routes, DB schema, and import pipeline are left intact so this can be
-// re-enabled later without further backend work.
-const DISABLED_SERVICES = [
-  { id: 'spotify', label: 'Spotify', reason: '準備中' },
-  { id: 'apple', label: 'Apple Music', reason: '準備中' },
-]
-
 /**
  * @param {{
  *   links: import('../api/client.js').ServiceLink[],
@@ -68,12 +58,6 @@ export function PlaylistPanel(props) {
             </button>
           )
         })}
-        {DISABLED_SERVICES.map((service) => (
-          <button key={service.id} type="button" disabled aria-disabled="true" className="disabled-service">
-            {service.label}
-            <span>{service.reason}</span>
-          </button>
-        ))}
       </div>
       {!isLinked ? (
         <div className="inline-warning">

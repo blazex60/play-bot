@@ -1,5 +1,4 @@
 import { resolveImportTracks, toImportTrackRow } from '../matching.js'
-import { listSpotifyPlaylistTracks } from '../services/spotify.js'
 import { listYoutubePlaylistTracks } from '../services/youtube.js'
 import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission } from './route-utils.js'
 
@@ -44,9 +43,6 @@ function failImportJob(db, jobId, { matchedCount = 0, failedCount = 0 } = {}) {
 }
 
 async function listPlaylistTracks({ service, userId, playlistId, services }) {
-  if (service === 'spotify') {
-    return (services?.spotify?.listPlaylistTracks ?? listSpotifyPlaylistTracks)(userId, playlistId)
-  }
   if (service === 'youtube') {
     return (services?.youtube?.listPlaylistTracks ?? listYoutubePlaylistTracks)(userId, playlistId)
   }
@@ -62,7 +58,7 @@ async function enqueueImport(botClient, guildId, payload) {
   return callBot(botClient, 'POST', `/import/${encodeURIComponent(guildId)}/enqueue`, payload)
 }
 
-export async function importRoutes(app, { db, botClient, services, searchYoutube } = {}) {
+export async function importRoutes(app, { db, botClient, services } = {}) {
   app.post('/api/import/:guildId', async (request, reply) => {
     let jobId = null
     try {
@@ -93,7 +89,6 @@ export async function importRoutes(app, { db, botClient, services, searchYoutube
         tracks: providerTracks,
         requestedBy: user.username,
         requestedById: user.discordId,
-        searchYoutube,
       })
 
       const matchedTracks = []

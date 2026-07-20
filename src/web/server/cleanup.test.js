@@ -15,11 +15,11 @@ test('sweepExpiredRows deletes expired OAuth states and web sessions only', (t) 
   db.prepare(`
     INSERT INTO oauth_states (state, discord_user_id, service, code_verifier, redirect_after, created_at, expires_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run('expired-state', 'u123', 'spotify', null, '/', now - 20_000, now - 1)
+  `).run('expired-state', 'u123', 'youtube', null, '/', now - 20_000, now - 1)
   db.prepare(`
     INSERT INTO oauth_states (state, discord_user_id, service, code_verifier, redirect_after, created_at, expires_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run('fresh-state', 'u123', 'spotify', null, '/', now, now + 60_000)
+  `).run('fresh-state', 'u123', 'youtube', null, '/', now, now + 60_000)
   db.prepare(`
     INSERT INTO web_sessions (session_id, discord_user_id, created_at, expires_at)
     VALUES (?, ?, ?, ?)

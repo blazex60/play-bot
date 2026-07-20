@@ -1,9 +1,8 @@
 import { deleteServiceLink } from '../../../db/tokenStore.js'
-import { listSpotifyPlaylists } from '../services/spotify.js'
 import { listYoutubePlaylists } from '../services/youtube.js'
 import { bindRouteError, getSessionUser } from './route-utils.js'
 
-const SERVICES = ['spotify', 'youtube']
+const SERVICES = ['youtube']
 
 function serviceStatus(db, userId, service) {
   const row = db.prepare(`
@@ -36,10 +35,6 @@ export async function linksRoutes(app, { db, services, authBasePath = '/auth' } 
     try {
       const user = getSessionUser(request)
       const { service } = request.params
-      if (service === 'spotify') {
-        const playlists = await (services?.spotify?.listPlaylists ?? listSpotifyPlaylists)(user.discordId)
-        return reply.send({ playlists })
-      }
       if (service === 'youtube') {
         const playlists = await (services?.youtube?.listPlaylists ?? listYoutubePlaylists)(user.discordId)
         return reply.send({ playlists })

@@ -55,7 +55,7 @@ docker compose up --build
 `docker-compose.yml` は同じ image から `music-bot` と `music-web` を別 process として起動する。
 
 - `music-bot`: Discord client、VC connection、`sessions` Map、`GuildPlayer`、`GuildQueue` を保持する。`src/botApi.js` は `127.0.0.1:${BOT_API_PORT}` に bind し、`BOT_API_TOKEN` bearer なしの呼び出しを拒否する
-- `music-web`: `node src/web/server/index.js` で起動する。React dashboard を `web/dist` から配信し、Discord/Spotify/YouTube OAuth、cookie session、encrypted token store、import history を SQLite に書く
+- `music-web`: `node src/web/server/index.js` で起動する。React dashboard を `web/dist` から配信し、Discord/YouTube OAuth、cookie session、encrypted token store、import history を SQLite に書く
 - `cloudflared`: `WEB_PORT` だけを tunnel する。Bot API port は絶対に tunnel しない
 
 Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用で、Bot のライブ操作は internal HTTP API 経由に限定する。
@@ -66,13 +66,11 @@ Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用
 - `/login` Discord OAuth entry
 - `/callback/*` OAuth callback fallback screen
 - `/api/*` authenticated dashboard data/control routes
-- `/auth/discord`, `/auth/spotify`, `/auth/youtube` OAuth routes
+- `/auth/discord`, `/auth/youtube` OAuth routes
 
 ### Web UI scope
 
-Dashboard は single-screen 構成。Now playing、transport controls、queue reorder/remove、YouTube playlist browser、import panel、post-import match review を表示する。Spotify と Apple Music は disabled の「準備中」だけを表示し、機能リンクは作らない。
-
-**Spotify が disabled な理由**: Spotify は 2026年2月の仕様変更で Development Mode アプリの認可ユーザー数上限が 5 人に制限された（以前は 25 人）。個人用途の音楽 Bot でこの上限を超える見込みが高いため、UI 上のリンクボタンのみ無効化している。バックエンドの OAuth ルート（`src/web/server/auth/spotify.js`）・DB スキーマ（`service_links` の `spotify` 行）・import パイプラインはそのまま残しており、将来的に有効化する場合は `web/src/components/PlaylistPanel.jsx` の `SERVICES`/`DISABLED_SERVICES` を戻すだけで復活できる。
+Dashboard は single-screen 構成。Now playing、transport controls、queue reorder/remove、YouTube playlist browser、import panel、post-import match review を表示する。プレイリスト連携は YouTube のみサポートする。Spotify（2026年2月の仕様変更で Development Mode アプリの認可ユーザー数上限が 5 人に縮小されたため）と Apple Music は OAuth ルート・DB 上のトークン・import パイプラインを含めて削除済み。
 
 **YouTube の OAuth スコープ**: `https://www.googleapis.com/auth/youtube.readonly`（`src/web/server/config.js`）。自分の非公開プレイリストの一覧・中身の読み取りのみに必要な最小権限で、書き込み系スコープは不要。ただし Google の「Testing」公開ステータスのままだと（1）テストユーザー数が最大100人、（2）各ユーザーの認可が7日で失効し再連携が必要、という制約がある。ユーザー数や運用期間次第では Google の App Verification（本番公開のための審査）が必要になる場合がある。
 
@@ -119,6 +117,6 @@ resolveAudioStream(url)  →  yt-dlp stdout  →  createAudioResource(stream)
 ## シークレット管理
 
 - `DISCORD_TOKEN` / `CLIENT_ID` は必ず `.env` に書く
-- Web UI では `DISCORD_CLIENT_SECRET`, `SPOTIFY_CLIENT_SECRET`, `GOOGLE_CLIENT_SECRET`, `WEB_SESSION_SECRET`, `BOT_API_TOKEN`, `MUSICBOT_TOKEN_ENC_KEY` も `.env` のみ
+- Web UI では `DISCORD_CLIENT_SECRET`, `GOOGLE_CLIENT_SECRET`, `WEB_SESSION_SECRET`, `BOT_API_TOKEN`, `MUSICBOT_TOKEN_ENC_KEY` も `.env` のみ
 - OAuth redirect URI は `PUBLIC_BASE_URL` から導出する。Discord だけ `DISCORD_OAUTH_REDIRECT` で明示 override 可能
 - ソースコードにシークレットを書かない

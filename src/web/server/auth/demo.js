@@ -96,7 +96,7 @@ export function registerDemoAuthRoutes(app, { db, config } = {}) {
     upsertUser.run(config.demoLogin.discordId, config.demoLogin.username, now, now)
     // The demo account is a single fixed ID shared by every reviewer, so a new
     // login must not inherit a previous reviewer's session, in-flight OAuth
-    // consent, linked YouTube/Spotify account, or saved playlists.
+    // consent, linked YouTube account, or saved playlists.
     deleteSessionsByUserId.run(config.demoLogin.discordId)
     deleteServiceLinksByUserId.run(config.demoLogin.discordId)
     deleteOauthStatesByUserId.run(config.demoLogin.discordId)

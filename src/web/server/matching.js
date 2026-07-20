@@ -1,5 +1,4 @@
 import { createTrack } from '../../queue.js'
-import { searchYoutube as defaultSearchYoutube } from '../../search.js'
 
 function pickThumbnail(entry) {
   if (entry?.thumbnail) return entry.thumbnail
@@ -18,50 +17,6 @@ function youtubeWatchUrl(entry) {
   const videoId = entry?.contentDetails?.videoId ?? entry?.snippet?.resourceId?.videoId ?? entry?.id?.videoId ?? entry?.id
   if (videoId) return `https://www.youtube.com/watch?v=${videoId}`
   return null
-}
-
-export function buildSpotifySearchQuery(track) {
-  const title = track.title ?? track.name ?? ''
-  const artist = track.artist ?? track.artists?.map((item) => item.name).filter(Boolean).join(' ') ?? ''
-  return [title, artist].filter(Boolean).join(' ').trim()
-}
-
-export async function matchSpotifyTrack(track, { requestedBy, requestedById = null, searchYoutube = defaultSearchYoutube } = {}) {
-  const query = buildSpotifySearchQuery(track)
-  if (!query) {
-    return {
-      status: 'failed',
-      source: track,
-      track: null,
-      reason: 'missing_spotify_title',
-    }
-  }
-
-  const [first] = await searchYoutube(query)
-  const webpageUrl = youtubeWatchUrl(first)
-  if (!first || !webpageUrl) {
-    return {
-      status: 'failed',
-      source: track,
-      track: null,
-      reason: 'no_youtube_match',
-    }
-  }
-
-  return {
-    status: 'matched',
-    source: track,
-    track: createTrack({
-      title: first.title ?? query,
-      webpageUrl,
-      duration: first.duration ?? null,
-      requestedBy,
-      requestedById,
-      thumbnail: pickThumbnail(first),
-      videoId: first.id ?? null,
-      channel: first.channel ?? first.uploader ?? null,
-    }),
-  }
 }
 
 export function resolveYoutubeTrack(item, { requestedBy, requestedById = null } = {}) {
@@ -91,15 +46,7 @@ export function resolveYoutubeTrack(item, { requestedBy, requestedById = null } 
   }
 }
 
-export async function resolveImportTracks({ service, tracks, requestedBy, requestedById = null, searchYoutube = defaultSearchYoutube }) {
-  if (service === 'spotify') {
-    const resolved = []
-    for (const track of tracks) {
-      resolved.push(await matchSpotifyTrack(track, { requestedBy, requestedById, searchYoutube }))
-    }
-    return resolved
-  }
-
+export async function resolveImportTracks({ service, tracks, requestedBy, requestedById = null }) {
   if (service === 'youtube') {
     return tracks.map((track) => resolveYoutubeTrack(track, { requestedBy, requestedById }))
   }

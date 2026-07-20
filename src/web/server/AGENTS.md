@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`music-web` process 本体。Fastify server の起動、Discord/Spotify/YouTube OAuth、cookie ベースの session、暗号化トークンストア、プレイリスト import パイプラインを SQLite に書き込む。ビルド済み React dashboard（`web/dist`）を static ファイルとして配信する。`music-bot` process とは完全に別プロセスとして起動され（`docker-compose.yml`）、両者は `botClient.js`（loopback HTTP + bearer token）でのみ通信する。
+`music-web` process 本体。Fastify server の起動、Discord/YouTube OAuth、cookie ベースの session、暗号化トークンストア、プレイリスト import パイプラインを SQLite に書き込む。ビルド済み React dashboard（`web/dist`）を static ファイルとして配信する。`music-bot` process とは完全に別プロセスとして起動され（`docker-compose.yml`）、両者は `botClient.js`（loopback HTTP + bearer token）でのみ通信する。
 
 ## Key Files
 
@@ -14,7 +14,7 @@
 | `index.js` | エントリーポイント（`node src/web/server/index.js`）。Fastify 初期化、cookie/static plugin 登録、`runMigrations`、各 route 群と OAuth route の登録、cleanup job の起動 |
 | `config.js` | 全環境変数を1箇所に集約する `createWebConfig(env)`。`PUBLIC_BASE_URL` から OAuth redirect URI を導出（Discord のみ `DISCORD_OAUTH_REDIRECT` で override 可） |
 | `botClient.js` | Bot process の internal API（`src/botApi.js`）を呼ぶ HTTP クライアント。`BotApiError` を投げる |
-| `matching.js` | Spotify/YouTube のプレイリストトラックを YouTube 検索結果とマッチングするロジック（`resolveImportTracks`, `matchSpotifyTrack` 等） |
+| `matching.js` | YouTube のプレイリストトラックを YouTube 検索結果とマッチングするロジック（`resolveImportTracks` 等） |
 | `cleanup.js` | 期限切れ `oauth_states` / `web_sessions` を定期削除するジョブ（`startCleanupJob`, 既定 10 分間隔） |
 | `testSupport.js` | テスト用インメモリ SQLite（`createMemoryDb`）とスキーマ定義 |
 
@@ -22,10 +22,10 @@
 
 | Directory | Purpose |
 |-----------|---------|
-| `auth/` | Discord/Spotify/YouTube OAuth（authorize/callback）route と PKCE/state ヘルパー（see `auth/AGENTS.md`） |
+| `auth/` | Discord/YouTube OAuth（authorize/callback）route と PKCE/state ヘルパー（see `auth/AGENTS.md`） |
 | `middleware/` | `requireAuth` — cookie session を検証する Fastify middleware（see `middleware/AGENTS.md`） |
 | `routes/` | `/api/*` の認証必須ダッシュボード API route 群（see `routes/AGENTS.md`） |
-| `services/` | Spotify Web API / YouTube Data API の薄いクライアント（see `services/AGENTS.md`） |
+| `services/` | YouTube Data API の薄いクライアント（see `services/AGENTS.md`） |
 
 ## For AI Agents
 

@@ -406,10 +406,6 @@
   font-size: 0.76rem;
 }
 
-.disabled-service {
-  opacity: 0.5;
-}
-
 .inline-warning {
   align-items: center;
   background: var(--warning-soft);

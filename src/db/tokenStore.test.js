@@ -18,8 +18,8 @@ let tempDir
 
 beforeEach(async () => {
   process.env.MUSICBOT_TOKEN_ENC_KEY = KEY
-  process.env.SPOTIFY_CLIENT_ID = 'spotify-client'
-  process.env.SPOTIFY_CLIENT_SECRET = 'spotify-secret'
+  process.env.GOOGLE_CLIENT_ID = 'google-client'
+  process.env.GOOGLE_CLIENT_SECRET = 'google-secret'
   tempDir = await mkdtemp(join(tmpdir(), 'musicbot-token-store-'))
   configureDatabasePathForTest(join(tempDir, 'musicbot.db'))
   runMigrations()
@@ -38,7 +38,7 @@ afterEach(async () => {
 test('getValidAccessToken: returns active unexpired token without refresh', async () => {
   upsertServiceLink({
     userId: 'user-1',
-    service: 'spotify',
+    service: 'youtube',
     accessToken: 'access-live',
     refreshToken: 'refresh-live',
     tokenExpiresAt: Date.now() + 600_000,
@@ -52,14 +52,14 @@ test('getValidAccessToken: returns active unexpired token without refresh', asyn
     },
   })
 
-  assert.equal(await getValidAccessToken('user-1', 'spotify'), 'access-live')
+  assert.equal(await getValidAccessToken('user-1', 'youtube'), 'access-live')
   assert.equal(calls, 0)
 })
 
 test('getValidAccessToken: concurrent expired reads share one refresh', async () => {
   upsertServiceLink({
     userId: 'user-1',
-    service: 'spotify',
+    service: 'youtube',
     accessToken: 'access-old',
     refreshToken: 'refresh-old',
     tokenExpiresAt: Date.now() - 1,
@@ -77,7 +77,7 @@ test('getValidAccessToken: concurrent expired reads share one refresh', async ()
             access_token: 'access-new',
             refresh_token: 'refresh-new',
             expires_in: 3600,
-            scope: 'playlist-read-private',
+            scope: 'https://www.googleapis.com/auth/youtube.readonly',
           }
         },
       }
@@ -85,8 +85,8 @@ test('getValidAccessToken: concurrent expired reads share one refresh', async ()
   })
 
   const [left, right] = await Promise.all([
-    getValidAccessToken('user-1', 'spotify'),
-    getValidAccessToken('user-1', 'spotify'),
+    getValidAccessToken('user-1', 'youtube'),
+    getValidAccessToken('user-1', 'youtube'),
   ])
 
   assert.equal(left, 'access-new')
@@ -97,7 +97,7 @@ test('getValidAccessToken: concurrent expired reads share one refresh', async ()
     SELECT access_token_enc, refresh_token_enc, status
     FROM service_links
     WHERE discord_user_id = ? AND service = ?
-  `).get('user-1', 'spotify')
+  `).get('user-1', 'youtube')
 
   assert.equal(row.status, 'active')
   assert.equal(decrypt(row.access_token_enc), 'access-new')
@@ -107,7 +107,7 @@ test('getValidAccessToken: concurrent expired reads share one refresh', async ()
 test('getValidAccessToken: decrypt failure marks link needs_relink', async () => {
   upsertServiceLink({
     userId: 'user-1',
-    service: 'spotify',
+    service: 'youtube',
     accessToken: 'access-live',
     refreshToken: 'refresh-live',
     tokenExpiresAt: Date.now() + 600_000,
@@ -117,13 +117,13 @@ test('getValidAccessToken: decrypt failure marks link needs_relink', async () =>
     UPDATE service_links
     SET access_token_enc = ?
     WHERE discord_user_id = ? AND service = ?
-  `).run(Buffer.from('tampered'), 'user-1', 'spotify')
+  `).run(Buffer.from('tampered'), 'user-1', 'youtube')
 
-  assert.equal(await getValidAccessToken('user-1', 'spotify'), null)
+  assert.equal(await getValidAccessToken('user-1', 'youtube'), null)
 
   const row = getDatabase().prepare(`
     SELECT status FROM service_links
     WHERE discord_user_id = ? AND service = ?
-  `).get('user-1', 'spotify')
+  `).get('user-1', 'youtube')
   assert.equal(row.status, 'needs_relink')
 })

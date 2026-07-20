@@ -11,7 +11,7 @@
 
 | File | Description |
 |------|--------------|
-| `001_init.sql` | 初期スキーマ: `discord_users`, `web_sessions`, `service_links`（Spotify/YouTube 連携トークン）, `oauth_states`, `import_jobs`, `import_tracks` |
+| `001_init.sql` | 初期スキーマ: `discord_users`, `web_sessions`, `service_links`（YouTube 連携トークン。CHECK 制約は過去の名残で `spotify` も許可しているが、バックエンド削除によりコードから書き込まれることはない）, `oauth_states`, `import_jobs`, `import_tracks` |
 
 ## For AI Agents
 

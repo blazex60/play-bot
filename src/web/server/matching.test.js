@@ -1,62 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  buildSpotifySearchQuery,
-  matchSpotifyTrack,
   resolveImportTracks,
   resolveYoutubeTrack,
   toImportTrackRow,
 } from './matching.js'
-
-test('buildSpotifySearchQuery: title and artist become the YouTube query', () => {
-  assert.equal(
-    buildSpotifySearchQuery({ title: 'Song Title', artist: 'Artist Name' }),
-    'Song Title Artist Name'
-  )
-})
-
-test('matchSpotifyTrack: uses first YouTube result and returns createTrack shape', async () => {
-  const calls = []
-  const result = await matchSpotifyTrack(
-    { title: 'Song Title', artist: 'Artist Name', sourceUrl: 'https://open.spotify.com/track/1' },
-    {
-      requestedBy: 'user-1',
-      searchYoutube: async (query) => {
-        calls.push(query)
-        return [{
-          id: 'youtube-id',
-          title: 'Matched Video',
-          duration: 123,
-          thumbnail: 'https://img.example/thumb.jpg',
-        }]
-      },
-    }
-  )
-
-  assert.deepEqual(calls, ['Song Title Artist Name'])
-  assert.equal(result.status, 'matched')
-  assert.deepEqual(result.track, {
-    title: 'Matched Video',
-    webpageUrl: 'https://www.youtube.com/watch?v=youtube-id',
-    duration: 123,
-    requestedBy: 'user-1',
-    requestedById: null,
-    thumbnail: 'https://img.example/thumb.jpg',
-    videoId: 'youtube-id',
-    channel: null,
-  })
-})
-
-test('matchSpotifyTrack: no search results returns a failed result', async () => {
-  const result = await matchSpotifyTrack(
-    { title: 'Missing Song', artist: 'Unknown Artist' },
-    { requestedBy: 'user-1', searchYoutube: async () => [] }
-  )
-
-  assert.equal(result.status, 'failed')
-  assert.equal(result.track, null)
-  assert.equal(result.reason, 'no_youtube_match')
-})
 
 test('resolveYoutubeTrack: playlist item resolves directly without search', () => {
   const result = resolveYoutubeTrack({

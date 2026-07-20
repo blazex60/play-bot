@@ -85,8 +85,6 @@ export function createTestConfig(overrides = {}) {
     BOT_API_TOKEN: 'bot-secret',
     DISCORD_CLIENT_ID: 'discord-client',
     DISCORD_CLIENT_SECRET: 'discord-secret',
-    SPOTIFY_CLIENT_ID: 'spotify-client',
-    SPOTIFY_CLIENT_SECRET: 'spotify-secret',
     GOOGLE_CLIENT_ID: 'google-client',
     GOOGLE_CLIENT_SECRET: 'google-secret',
     ...overrides,
