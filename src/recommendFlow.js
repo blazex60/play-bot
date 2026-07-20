@@ -4,7 +4,7 @@ import { checkInVoiceChannel } from './permissions.js'
 import { createTrack } from './queue.js'
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
-const RECOMMEND_TIMEOUT_MS = 5 * 60 * 1000
+export const RECOMMEND_TIMEOUT_MS = 5 * 60 * 1000
 
 export function fmtDuration(seconds) {
   if (seconds == null) return '不明'
@@ -30,6 +30,41 @@ function hasPendingForGuild(pendingStore, guildId) {
   return false
 }
 
+// Guilds with a pick currently being processed, from the moment
+// handleRecommendChoice claims its prompt until the chosen track has been
+// enqueued. Prompts are independent now, so another user's prompt can still
+// be live and time out while this one is mid-flight; without this guard,
+// that timeout's "nothing left pending" check would race the in-flight pick
+// and could tear the session down before its track is actually queued.
+const guildsWithInFlightPick = new Map()
+
+function markPickInFlight(guildId) {
+  guildsWithInFlightPick.set(guildId, (guildsWithInFlightPick.get(guildId) ?? 0) + 1)
+}
+
+function clearPickInFlight(guildId) {
+  const remaining = (guildsWithInFlightPick.get(guildId) ?? 0) - 1
+  if (remaining > 0) guildsWithInFlightPick.set(guildId, remaining)
+  else guildsWithInFlightPick.delete(guildId)
+}
+
+function hasInFlightPick(guildId) {
+  return (guildsWithInFlightPick.get(guildId) ?? 0) > 0
+}
+
+// Bumped by cancelRecommendations so postRecommendations can notice, right
+// after a channel.send() resolves, that the guild's session was torn down
+// while that send was still in flight.
+const guildCancelGeneration = new Map()
+
+function bumpCancelGeneration(guildId) {
+  guildCancelGeneration.set(guildId, (guildCancelGeneration.get(guildId) ?? 0) + 1)
+}
+
+function currentCancelGeneration(guildId) {
+  return guildCancelGeneration.get(guildId) ?? 0
+}
+
 // Cancels every still-pending recommendation message for a guild: clears
 // timeouts, drops the pendingStore entries, and disables the posted buttons.
 // Used when the session is torn down (VC empty, /stop, watchdog) while
@@ -37,6 +72,7 @@ function hasPendingForGuild(pendingStore, guildId) {
 // does NOT go through this — each listener's prompt is independent, so one
 // person's pick must not disable anyone else's.
 export function cancelRecommendations(guildId, pendingStore) {
+  bumpCancelGeneration(guildId)
   for (const [messageId, entry] of pendingStore.entries()) {
     if (entry.guildId !== guildId) continue
     clearTimeout(entry.timeoutHandle)
@@ -48,11 +84,19 @@ export function cancelRecommendations(guildId, pendingStore) {
 // Returns the number of recommendation messages actually posted, so callers
 // can tell "posted but nobody has picked yet" apart from "every send failed"
 // (e.g. the remembered text channel was deleted or the bot lost permission).
-export async function postRecommendations({ client, channel, guildId, plans, pendingStore, onTimeout }) {
+export async function postRecommendations({ client, channel, guildId, plans, pendingStore, onTimeout, voiceChannel }) {
   let postedCount = 0
+  const startGeneration = currentCancelGeneration(guildId)
 
   for (const { userId, candidates } of plans) {
     if (!candidates.length) continue
+    // Planning (history fetch, yt-dlp lookups) and the sequential sends
+    // above this plan in the loop can together take long enough for this
+    // user to have already left the VC; re-check live membership right
+    // before posting instead of trusting the snapshot planRecommendations
+    // took at the start, so a prompt for "the room you just left" doesn't
+    // show up after the fact.
+    if (voiceChannel && !voiceChannel.members.has(userId)) continue
 
     const embed = new EmbedBuilder()
       .setTitle('🎵 次の曲のおすすめ')
@@ -74,11 +118,20 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
       continue
     }
 
+    if (currentCancelGeneration(guildId) !== startGeneration) {
+      // The session was torn down (e.g. /stop) while this send was still in
+      // flight, after cancelRecommendations already swept whatever was in
+      // pendingStore. Don't leave this fresh message as a live, pickable
+      // prompt, and don't bother posting to the rest of the plans either.
+      disableMessage(message).catch(() => {})
+      break
+    }
+
     const entry = { guildId, targetUserId: userId, candidates, message, timeoutHandle: null }
     entry.timeoutHandle = setTimeout(async () => {
       pendingStore.delete(message.id)
       await disableMessage(message).catch(() => {})
-      if (!hasPendingForGuild(pendingStore, guildId) && onTimeout) {
+      if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && onTimeout) {
         try {
           await onTimeout()
         } catch (err) {
@@ -129,28 +182,36 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   // anyone else's.
   clearTimeout(entry.timeoutHandle)
   pendingStore.delete(interaction.message.id)
+  // Held until the chosen track is actually enqueued below, so another still-
+  // live prompt's timeout can't decide "nothing pending, tear the session
+  // down" while this pick is between claiming its entry and finishing.
+  markPickInFlight(entry.guildId)
 
-  await interaction.deferUpdate()
-  // Mirror /play's search flow: the picked prompt is single-use, so remove it
-  // instead of leaving it around disabled like the other candidates' prompts.
   try {
-    await entry.message.delete()
-  } catch {
-    // Already gone, or the bot lacks permission — not worth failing the pick over.
+    await interaction.deferUpdate()
+    // Mirror /play's search flow: the picked prompt is single-use, so remove it
+    // instead of leaving it around disabled like the other candidates' prompts.
+    try {
+      await entry.message.delete()
+    } catch {
+      // Already gone, or the bot lacks permission — not worth failing the pick over.
+    }
+    // Recommendation candidates start with requestedById: null (they came from
+    // the bot's own suggestion, not a request), which would make GuildPlayer
+    // skip recording the play. Attribute it to the picker now so recommend-mode
+    // picks actually feed back into that user's personalization history.
+    const chosenTrack = createTrack({
+      ...track,
+      requestedBy: interaction.member?.displayName ?? interaction.user.username,
+      requestedById: interaction.user.id,
+    })
+    const wasEmpty = session.queue.isEmpty
+    session.queue.add(chosenTrack)
+    // Same confirmation format as /play's search picker, so a recommend pick
+    // reads identically to a manual search pick in the channel.
+    await interaction.followUp(`✅ ${chosenTrack.requestedBy} がキューに追加しました: **${chosenTrack.title}** (${fmtDuration(chosenTrack.duration)})`)
+    if (wasEmpty) await session.player.playNext()
+  } finally {
+    clearPickInFlight(entry.guildId)
   }
-  // Recommendation candidates start with requestedById: null (they came from
-  // the bot's own suggestion, not a request), which would make GuildPlayer
-  // skip recording the play. Attribute it to the picker now so recommend-mode
-  // picks actually feed back into that user's personalization history.
-  const chosenTrack = createTrack({
-    ...track,
-    requestedBy: interaction.member?.displayName ?? interaction.user.username,
-    requestedById: interaction.user.id,
-  })
-  const wasEmpty = session.queue.isEmpty
-  session.queue.add(chosenTrack)
-  // Same confirmation format as /play's search picker, so a recommend pick
-  // reads identically to a manual search pick in the channel.
-  await interaction.followUp(`✅ ${chosenTrack.requestedBy} がキューに追加しました: **${chosenTrack.title}** (${fmtDuration(chosenTrack.duration)})`)
-  if (wasEmpty) await session.player.playNext()
 }

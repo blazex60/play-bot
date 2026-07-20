@@ -151,6 +151,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
           queue,
           player: session.player,
           pendingStore: recommendPendingStore,
+          voiceChannel,
           onTimeout: async () => {
             // A manual /play may have started a track while this prompt sat
             // unanswered; only the shared onDisconnect path should tear the
