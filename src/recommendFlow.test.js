@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { GuildQueue, createTrack } from './queue.js'
 import { PendingChoiceStore } from './views.js'
-import { cancelRecommendations, handleRecommendChoice, postRecommendations } from './recommendFlow.js'
+import { cancelRecommendations, handleRecommendChoice, postRecommendations, RECOMMEND_TIMEOUT_MS } from './recommendFlow.js'
 
 function makeCandidate(videoId) {
   return createTrack({ title: videoId, webpageUrl: `https://example.com/${videoId}`, duration: 60, videoId })
@@ -34,6 +34,7 @@ function makeSession({ voiceChannelId = 'vc-1' } = {}) {
   return {
     connection: { joinConfig: { channelId: voiceChannelId } },
     queue,
+    planToken: 0,
     player: {
       async playNext() { playNextCalls.push(true) },
       playNextCalls,
@@ -88,43 +89,6 @@ test('postRecommendations: skips plans with no candidates', async () => {
   const count = await postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
   assert.equal(count, 0)
   assert.equal(channel.sent.length, 0)
-})
-
-test('postRecommendations: discards a message whose send resolves after the round already won', async (t) => {
-  const pendingStore = new PendingChoiceStore()
-  let resolveSecondSend
-  const secondSendGate = new Promise((resolve) => { resolveSecondSend = resolve })
-  let sendCount = 0
-  const channel = {
-    async send() {
-      sendCount += 1
-      if (sendCount === 1) return makeSentMessage('msg-1')
-      await secondSendGate
-      return makeSentMessage('msg-2')
-    },
-  }
-  const plans = [
-    { userId: 'u1', candidates: [makeCandidate('v1')] },
-    { userId: 'u2', candidates: [makeCandidate('v2')] },
-  ]
-
-  const postPromise = postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
-
-  await new Promise((resolve) => setTimeout(resolve, 10))
-  assert.ok(pendingStore.get('msg-1'), 'first message should already be stored while the second send is still pending')
-  t.after(() => {
-    const entry = pendingStore.get('msg-1')
-    if (entry) clearTimeout(entry.timeoutHandle)
-  })
-
-  // Simulate the first message's pick winning the round while the second
-  // send is still in flight.
-  cancelRecommendations('g1', pendingStore)
-  resolveSecondSend()
-
-  const postedCount = await postPromise
-  assert.equal(postedCount, 1, 'the late-arriving message must not count as posted')
-  assert.equal(pendingStore.get('msg-2'), null, 'the late message must not be left as a live, pickable entry')
 })
 
 test('handleRecommendChoice: rejects a click from someone other than the target user', async () => {
@@ -203,10 +167,12 @@ function makeSentMessage(id) {
   return { id, components: [{ components: [{ setDisabled() {} }] }], deleteCalls: 0, async edit() {}, async delete() { this.deleteCalls += 1 } }
 }
 
-test('handleRecommendChoice: two users clicking different prompts in the same guild at once, only one wins', async () => {
+test('handleRecommendChoice: two users clicking their own prompts at once, both succeed independently', async () => {
   const pendingStore = new PendingChoiceStore()
-  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
-  pendingStore.set('msg-2', { guildId: 'g1', targetUserId: 'u2', candidates: [makeCandidate('v2')], message: makeSentMessage('msg-2'), timeoutHandle: null })
+  const messageA = makeSentMessage('msg-1')
+  const messageB = makeSentMessage('msg-2')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: messageA, timeoutHandle: null })
+  pendingStore.set('msg-2', { guildId: 'g1', targetUserId: 'u2', candidates: [makeCandidate('v2')], message: messageB, timeoutHandle: null })
   const session = makeSession({ voiceChannelId: 'vc-1' })
   const sessions = new Map([['g1', session]])
 
@@ -214,13 +180,206 @@ test('handleRecommendChoice: two users clicking different prompts in the same gu
   const interactionB = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-2', userId: 'u2', voiceChannelId: 'vc-1' })
 
   // Both handlers start "simultaneously" (neither has awaited anything yet
-  // when the other starts), matching two near-simultaneous button clicks.
+  // when the other starts), matching two near-simultaneous button clicks on
+  // two different users' own prompts.
   await Promise.all([
     handleRecommendChoice(interactionA, sessions, pendingStore),
     handleRecommendChoice(interactionB, sessions, pendingStore),
   ])
 
-  assert.equal(session.player.playNextCalls.length, 1, 'exactly one pick should win the round')
+  assert.equal(session.player.playNextCalls.length, 1, 'only the first pick (empty queue) should start playback')
   const queued = [session.queue.current, ...session.queue.upcoming()].filter(Boolean)
-  assert.equal(queued.length, 1, 'only the winning pick should be enqueued')
+  assert.deepEqual(queued.map((t) => t.videoId).sort(), ['v1', 'v2'], 'both picks should be enqueued since neither cancels the other')
+  assert.equal(messageA.deleteCalls, 1, "u1's own prompt should be consumed by their pick")
+  assert.equal(messageB.deleteCalls, 1, "u2's own prompt should be consumed by their pick")
+  assert.equal(pendingStore.get('msg-1'), null)
+  assert.equal(pendingStore.get('msg-2'), null)
+})
+
+test("postRecommendations: a still-pending prompt's timeout must not tear the session down while another user's pick is in flight", async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const channel = makeChannel()
+  const pendingStore = new PendingChoiceStore()
+  const plans = [
+    { userId: 'u1', candidates: [makeCandidate('v1')] },
+    { userId: 'u2', candidates: [makeCandidate('v2')] },
+  ]
+  let onTimeoutCalls = 0
+  await postRecommendations({
+    channel, guildId: 'g1', plans, pendingStore,
+    onTimeout: async () => { onTimeoutCalls += 1 },
+  })
+  // makeChannel names messages msg-0, msg-1 in send order, matching plans order.
+  assert.ok(pendingStore.get('msg-0'), "u1's prompt should be pending")
+  assert.ok(pendingStore.get('msg-1'), "u2's prompt should be pending")
+
+  // u1 starts picking their own prompt but the handler is paused mid-flight
+  // (deferUpdate never resolves), simulating a pick that's claimed its entry
+  // but hasn't enqueued a track yet.
+  let releaseDeferUpdate
+  const deferGate = new Promise((resolve) => { releaseDeferUpdate = resolve })
+  const interactionA = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-0', userId: 'u1', voiceChannelId: 'vc-1' })
+  interactionA.deferUpdate = async () => { await deferGate }
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+  const pickPromise = handleRecommendChoice(interactionA, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(pendingStore.get('msg-0'), null, "u1's own entry should already be claimed")
+
+  // u2's prompt now times out. Since pendingStore has nothing left for g1
+  // and u1's pick is still in flight, onTimeout must not fire.
+  t.mock.timers.tick(RECOMMEND_TIMEOUT_MS)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(onTimeoutCalls, 0, 'onTimeout must not fire while a pick for this guild is still in flight')
+
+  releaseDeferUpdate()
+  await pickPromise
+  assert.equal(session.queue.current.videoId, 'v1', "u1's pick should still succeed once unblocked")
+})
+
+test('handleRecommendChoice: does not enqueue or start playback if /leave removes the session while the pick is in flight', async () => {
+  const pendingStore = new PendingChoiceStore()
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+
+  let releaseDeferUpdate
+  const deferGate = new Promise((resolve) => { releaseDeferUpdate = resolve })
+  const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1' })
+  interaction.deferUpdate = async () => { await deferGate }
+  const pickPromise = handleRecommendChoice(interaction, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // /leave lands while the pick is still awaiting deferUpdate.
+  sessions.delete('g1')
+  session.connection.destroy = () => {}
+
+  releaseDeferUpdate()
+  await pickPromise
+
+  assert.equal(session.queue.isEmpty, true, 'must not enqueue onto a session that /leave already tore down')
+  assert.equal(session.player.playNextCalls.length, 0)
+  assert.equal(interaction.replies.at(-1)?.content, '❌ セッションが終了しています')
+})
+
+test('handleRecommendChoice: does not enqueue or start playback if /stop bumps planToken while the pick is in flight', async () => {
+  const pendingStore = new PendingChoiceStore()
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+
+  let releaseDeferUpdate
+  const deferGate = new Promise((resolve) => { releaseDeferUpdate = resolve })
+  const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1' })
+  interaction.deferUpdate = async () => { await deferGate }
+  const pickPromise = handleRecommendChoice(interaction, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // /stop lands while the pick is still awaiting deferUpdate: same session
+  // object and guild map entry, but its planToken is bumped and the queue
+  // it manages has already been cleared.
+  session.planToken += 1
+
+  releaseDeferUpdate()
+  await pickPromise
+
+  assert.equal(session.queue.isEmpty, true, 'must not enqueue onto a session /stop already reset')
+  assert.equal(session.player.playNextCalls.length, 0)
+  assert.equal(interaction.replies.at(-1)?.content, '❌ セッションが終了しています')
+})
+
+test('handleRecommendChoice: retriggers the teardown check if an in-flight pick fails after its guild ran out of pending prompts', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const channel = makeChannel()
+  const pendingStore = new PendingChoiceStore()
+  const plans = [
+    { userId: 'u1', candidates: [makeCandidate('v1')] },
+    { userId: 'u2', candidates: [makeCandidate('v2')] },
+  ]
+  let onTimeoutCalls = 0
+  await postRecommendations({
+    channel, guildId: 'g1', plans, pendingStore,
+    onTimeout: async () => { onTimeoutCalls += 1 },
+  })
+
+  // u1 starts picking their own prompt but it's paused mid-flight, same as
+  // the previous test — except this time the pick will fail instead of
+  // succeeding once unblocked (e.g. a Discord REST error from deferUpdate).
+  const deferError = new Error('Discord REST failure')
+  let rejectDeferUpdate
+  const deferGate = new Promise((_resolve, reject) => { rejectDeferUpdate = reject })
+  const interactionA = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-0', userId: 'u1', voiceChannelId: 'vc-1' })
+  interactionA.deferUpdate = async () => { await deferGate }
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+  const pickPromise = handleRecommendChoice(interactionA, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // u2's prompt times out while u1's pick is in flight — must not tear down yet.
+  t.mock.timers.tick(RECOMMEND_TIMEOUT_MS)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(onTimeoutCalls, 0)
+
+  // The in-flight pick now fails before ever reaching queue.add. Nothing is
+  // pending and nothing is in flight anymore for g1, so this must retrigger
+  // the same teardown check the expired prompt's own timeout deferred.
+  rejectDeferUpdate(deferError)
+  await assert.rejects(pickPromise, deferError)
+  assert.equal(onTimeoutCalls, 1, 'a failed in-flight pick must still retrigger the deferred teardown check')
+  assert.equal(session.queue.isEmpty, true, 'nothing should have been enqueued by the failed pick')
+})
+
+test('postRecommendations: disables and drops a message whose send resolves after the guild was torn down mid-loop', async () => {
+  const pendingStore = new PendingChoiceStore()
+  let resolveSecondSend
+  const secondSendGate = new Promise((resolve) => { resolveSecondSend = resolve })
+  let sendCount = 0
+  const channel = {
+    async send() {
+      sendCount += 1
+      if (sendCount === 1) return makeSentMessage('msg-1')
+      await secondSendGate
+      return makeSentMessage('msg-2')
+    },
+  }
+  const plans = [
+    { userId: 'u1', candidates: [makeCandidate('v1')] },
+    { userId: 'u2', candidates: [makeCandidate('v2')] },
+  ]
+
+  const postPromise = postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
+
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.ok(pendingStore.get('msg-1'), 'first message should already be stored while the second send is still pending')
+
+  // Simulate the session being torn down (e.g. /stop) while the second send
+  // is still in flight — unlike a per-user pick, this must sweep everything
+  // and be noticed by the send that's still pending.
+  cancelRecommendations('g1', pendingStore)
+  resolveSecondSend()
+
+  const postedCount = await postPromise
+  assert.equal(postedCount, 1, 'the late-arriving message must not count as posted')
+  assert.equal(pendingStore.get('msg-2'), null, 'the late message must not be left as a live, pickable entry')
+})
+
+test('postRecommendations: skips a plan for a user no longer in the voice channel by send time', async (t) => {
+  const channel = makeChannel()
+  const pendingStore = new PendingChoiceStore()
+  const voiceChannel = { members: new Map([['u1', {}]]) } // u2 already left the VC
+  const plans = [
+    { userId: 'u1', candidates: [makeCandidate('v1')] },
+    { userId: 'u2', candidates: [makeCandidate('v2')] },
+  ]
+  const count = await postRecommendations({ channel, guildId: 'g1', plans, pendingStore, voiceChannel })
+  t.after(() => {
+    for (const [, entry] of pendingStore.entries()) clearTimeout(entry.timeoutHandle)
+  })
+  assert.equal(count, 1, 'only the still-present user should get a prompt')
+  assert.equal(channel.sent.length, 1)
+  assert.ok(!channel.sent[0].payload.embeds[0].data.description.includes('u2'), "u2, who left, must not be addressed")
 })
