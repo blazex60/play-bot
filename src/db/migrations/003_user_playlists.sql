@@ -22,5 +22,5 @@ CREATE TABLE IF NOT EXISTS user_playlist_tracks (
   added_at     INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_user_playlist_tracks_playlist
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_playlist_tracks_playlist
   ON user_playlist_tracks(playlist_id, position);

@@ -8,6 +8,14 @@ function parseId(value) {
   return Number.isInteger(id) ? id : null
 }
 
+function isHttpUrl(value) {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol)
+  } catch {
+    return false
+  }
+}
+
 function serializePlaylistRow(row) {
   return {
     id: row.id,
@@ -131,6 +139,13 @@ function moveTrack(db, playlistId, fromIndex, toIndex) {
   const [moved] = rows.splice(fromIndex, 1)
   rows.splice(toIndex, 0, moved)
   const reorder = db.transaction((ordered) => {
+    // Two-phase: position is UNIQUE per playlist, so reassigning final values
+    // directly can collide with another row's still-current position (e.g.
+    // swapping two adjacent tracks). Stage everything to negative, collision-free
+    // slots first, then assign the real 0..n-1 positions.
+    ordered.forEach((row, index) => {
+      db.prepare('UPDATE user_playlist_tracks SET position = ? WHERE id = ?').run(-(index + 1), row.id)
+    })
     ordered.forEach((row, index) => {
       db.prepare('UPDATE user_playlist_tracks SET position = ? WHERE id = ?').run(index, row.id)
     })
@@ -155,8 +170,8 @@ async function resolveTrackInput(body, { user, resolveMetadataFn }) {
 
   if (body?.track && typeof body.track === 'object') {
     const { title, webpageUrl } = body.track
-    if (!title || !webpageUrl) {
-      const error = new Error('track.title and track.webpageUrl are required')
+    if (!title || !webpageUrl || !isHttpUrl(webpageUrl)) {
+      const error = new Error('track.title and a valid http(s) track.webpageUrl are required')
       error.statusCode = 400
       error.code = 'invalid_track'
       throw error

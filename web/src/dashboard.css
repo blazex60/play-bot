@@ -524,7 +524,7 @@
   white-space: nowrap;
 }
 
-.playlist-builder-panel > .primary {
+.playlist-detail > .primary {
   margin-top: 16px;
   width: 100%;
 }

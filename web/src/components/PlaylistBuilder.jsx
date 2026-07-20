@@ -72,6 +72,7 @@ export function PlaylistBuilder(props) {
           value={newPlaylistName}
           onChange={(event) => onNewPlaylistNameChange(event.target.value)}
           placeholder="新しいプレイリスト名"
+          aria-label="新しいプレイリスト名"
         />
         <button type="submit" disabled={busy || !newPlaylistName.trim()}>
           作成
@@ -107,7 +108,11 @@ export function PlaylistBuilder(props) {
               onRename()
             }}
           >
-            <input value={renameValue} onChange={(event) => onRenameValueChange(event.target.value)} />
+            <input
+              value={renameValue}
+              onChange={(event) => onRenameValueChange(event.target.value)}
+              aria-label="プレイリスト名を変更"
+            />
             <button type="submit" disabled={busy || !renameValue.trim()}>
               名前を変更
             </button>
@@ -157,6 +162,7 @@ export function PlaylistBuilder(props) {
               value={trackUrl}
               onChange={(event) => onTrackUrlChange(event.target.value)}
               placeholder="YouTube の URL"
+              aria-label="曲を追加する YouTube の URL"
             />
             <button type="submit" disabled={busy || !trackUrl.trim()}>
               追加
@@ -174,6 +180,7 @@ export function PlaylistBuilder(props) {
               value={trackSearchQuery}
               onChange={(event) => onTrackSearchQueryChange(event.target.value)}
               placeholder="曲名で検索"
+              aria-label="曲名で検索"
             />
             <button type="submit" disabled={busy || !trackSearchQuery.trim()}>
               検索

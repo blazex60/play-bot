@@ -329,6 +329,14 @@ test('authenticated user can create, edit, reorder, and queue a saved playlist',
   assert.equal(list.statusCode, 200)
   assert.equal(list.json().playlists.length, 1)
 
+  const rejectedTrack = await app.inject({
+    method: 'POST',
+    url: `/api/playlists/mine/${playlist.id}/tracks`,
+    headers: { cookie },
+    payload: { track: { title: 'Malicious', webpageUrl: 'javascript:alert(1)' } },
+  })
+  assert.equal(rejectedTrack.statusCode, 400, 'must reject a track.webpageUrl that is not an http(s) URL (regression: unvalidated URL could be stored and later fed to yt-dlp)')
+
   const addFirst = await app.inject({
     method: 'POST',
     url: `/api/playlists/mine/${playlist.id}/tracks`,
@@ -467,4 +475,16 @@ test('/api/playlists/mine/:id only exposes the requesting user\'s own playlist (
     headers: { cookie },
   })
   assert.equal(response.statusCode, 404, 'must not expose another user\'s saved playlist')
+
+  const deleteResponse = await app.inject({
+    method: 'DELETE',
+    url: `/api/playlists/mine/${otherPlaylist.lastInsertRowid}`,
+    headers: { cookie },
+  })
+  assert.equal(deleteResponse.statusCode, 404, 'must not allow deleting another user\'s saved playlist')
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS count FROM user_playlists WHERE id = ?').get(otherPlaylist.lastInsertRowid).count,
+    1,
+    'the other user\'s playlist row must still exist'
+  )
 })

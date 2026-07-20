@@ -284,6 +284,7 @@ export function Dashboard() {
 
   async function deleteSavedPlaylist() {
     if (!selectedSavedPlaylist) return
+    if (!window.confirm(`「${selectedSavedPlaylist.name}」を削除しますか?`)) return
     await runAction(async () => {
       await api.deleteSavedPlaylist(selectedSavedPlaylist.id)
       setSelectedSavedPlaylist(null)
