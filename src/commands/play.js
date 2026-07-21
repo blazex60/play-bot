@@ -3,7 +3,7 @@ import { createTrack } from '../queue.js'
 import { searchYoutube, resolveMetadata, isPlaylistUrl, resolveFlatPlaylist, PLAYLIST_LIMIT } from '../search.js'
 import { createSearchResultComponents } from '../views.js'
 import { getOrCreateSession, pendingStore, webClient } from '../sessions.js'
-import { checkSameVoiceChannel, checkCommandAllowed, replyFlags } from '../permissions.js'
+import { checkSameVoiceChannel, checkCommandAllowed, replyFlags, sendVisibleFollowUp } from '../permissions.js'
 
 function fmtDuration(seconds) {
   if (seconds == null) return '不明'
@@ -52,13 +52,13 @@ export default {
           }))
         } catch (err) {
           await interaction.deleteReply().catch(() => {})
-          await interaction.followUp({ content: `❌ プレイリストの取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+          await sendVisibleFollowUp(interaction, `❌ プレイリストの取得に失敗しました: ${err.message}`, { flags: MessageFlags.Ephemeral })
           return false
         }
 
         if (!tracks.length) {
           await interaction.deleteReply().catch(() => {})
-          await interaction.followUp({ content: '❌ プレイリストに動画が見つかりませんでした', flags: MessageFlags.Ephemeral })
+          await sendVisibleFollowUp(interaction, '❌ プレイリストに動画が見つかりませんでした', { flags: MessageFlags.Ephemeral })
           return false
         }
 
@@ -67,7 +67,7 @@ export default {
           session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
         } catch (err) {
           await interaction.deleteReply().catch(() => {})
-          await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+          await sendVisibleFollowUp(interaction, `❌ VCへの接続に失敗しました: ${err.message}`, { flags: MessageFlags.Ephemeral })
           return false
         }
 
@@ -88,7 +88,7 @@ export default {
         info = await resolveMetadata(query, { requestedBy: interaction.member.displayName, requestedById: interaction.member.id })
       } catch (err) {
         await interaction.deleteReply().catch(() => {})
-        await interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+        await sendVisibleFollowUp(interaction, `❌ 取得に失敗しました: ${err.message}`, { flags: MessageFlags.Ephemeral })
         return false
       }
 
@@ -97,7 +97,7 @@ export default {
         session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
       } catch (err) {
         await interaction.deleteReply().catch(() => {})
-        await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+        await sendVisibleFollowUp(interaction, `❌ VCへの接続に失敗しました: ${err.message}`, { flags: MessageFlags.Ephemeral })
         return false
       }
 
@@ -181,7 +181,11 @@ export default {
       await interaction.deleteReply().catch(() => {})
       const wasEmpty = session.queue.isEmpty
       session.queue.add(createTrack(info))
-      await interaction.followUp({ content: `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, ...replyFlags(interaction.guildId, 'play') })
+      // A plain followUp here would silently stay ephemeral regardless of
+      // the 'play' visibility setting — this is the *first* followUp sent
+      // on this interaction, and Discord ignores its flags in that case
+      // (see sendVisibleFollowUp's doc comment).
+      await sendVisibleFollowUp(interaction, `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, replyFlags(interaction.guildId, 'play'))
       if (wasEmpty) await session.player.playNext()
       logSelect(true)
     }

@@ -1,5 +1,5 @@
-import { SlashCommandBuilder, MessageFlags } from 'discord.js'
-import { replyFlags } from '../permissions.js'
+import { SlashCommandBuilder } from 'discord.js'
+import { replyFlags, sendVisibleFollowUp } from '../permissions.js'
 
 const BITRATE_BY_TIER = { 0: 96_000, 1: 128_000, 2: 256_000, 3: 384_000 }
 
@@ -32,8 +32,9 @@ export default {
     const suffix = kbps !== null && target < kbps * 1000 ? `（Tier${tier} 上限に丸めました）` : ''
     // The deferred reply above is always ephemeral so error paths stay
     // personal; the success message's visibility is configurable, so it's
-    // sent as an independent followUp after dropping the ephemeral one.
+    // sent via sendVisibleFollowUp (a plain followUp would silently stay
+    // ephemeral regardless of flags — see its doc comment).
     await interaction.deleteReply().catch(() => {})
-    await interaction.followUp({ content: `✅ ビットレートを **${target / 1000}kbps** に設定しました${suffix}`, ...replyFlags(interaction.guildId, 'bitrate') })
+    await sendVisibleFollowUp(interaction, `✅ ビットレートを **${target / 1000}kbps** に設定しました${suffix}`, replyFlags(interaction.guildId, 'bitrate'))
   },
 }

@@ -64,6 +64,28 @@ export function replyFlags(guildId, commandName) {
     : {}
 }
 
+// Sends a message whose visibility must reflect `targetFlags`, after an
+// interaction that has already been deferred/replied. Discord ignores the
+// `flags` passed to the *first* followUp message sent for an interaction —
+// it always inherits the original response's ephemeral state
+// (discord/discord-api-docs#3466) — regardless of which way the mismatch
+// goes. `interaction.ephemeral` (set by discord.js from the original
+// deferReply/reply flags) tells us that actual state. When targetFlags
+// already matches it, a plain followUp is enough; otherwise a throwaway
+// followUp matching the original state is burned first (then deleted) so
+// the real message lands as the *second* followUp, which is free to set its
+// own visibility.
+export async function sendVisibleFollowUp(interaction, content, targetFlags) {
+  const wantsEphemeral = Boolean(targetFlags.flags)
+  if (wantsEphemeral === interaction.ephemeral) {
+    return interaction.followUp({ content, ...targetFlags })
+  }
+  const throwawayFlags = interaction.ephemeral ? { flags: MessageFlags.Ephemeral } : {}
+  const throwaway = await interaction.followUp({ content: '\u200B', ...throwawayFlags })
+  await interaction.deleteReply(throwaway.id).catch(() => {})
+  return interaction.followUp({ content, ...targetFlags })
+}
+
 export function checkSameVoiceChannel(interaction, session) {
   const targetChannelId = session
     ? session.connection.joinConfig.channelId

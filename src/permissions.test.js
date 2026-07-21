@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { MessageFlags } from 'discord.js'
 import { configureSettingsPathForTest, setDefaultCommandPermission, setUserCommandPermission, setCommandVisibility } from './settings.js'
-import { checkCommandAllowed, replyFlags, getEffectiveCommandVisibility } from './permissions.js'
+import { checkCommandAllowed, replyFlags, getEffectiveCommandVisibility, sendVisibleFollowUp } from './permissions.js'
 
 async function withTempSettings(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'music-bot-permissions-test-'))
@@ -29,6 +29,28 @@ function fakeInteraction({ guildId = 'guild-1', userId = 'user-1', commandName =
     reply: async (payload) => { calls.reply.push(payload); return payload },
     followUp: async (payload) => { calls.followUp.push(payload); return payload },
     calls,
+  }
+}
+
+// Models the discord.js quirk exercised by sendVisibleFollowUp: the first
+// followUp sent for an interaction ignores its own flags and always lands
+// with whatever ephemeral state `ephemeral` (set from the original
+// deferReply/reply) already has — only the second followUp onward is free.
+function fakeDeferredInteraction(ephemeral) {
+  const calls = { followUp: [], deleteReply: [] }
+  let followUpCount = 0
+  let nextMessageId = 1
+  return {
+    ephemeral,
+    calls,
+    followUp: async (payload) => {
+      followUpCount += 1
+      const actualEphemeral = followUpCount === 1 ? ephemeral : Boolean(payload.flags)
+      const message = { id: String(nextMessageId++), content: payload.content, ephemeral: actualEphemeral }
+      calls.followUp.push({ payload, actualEphemeral })
+      return message
+    },
+    deleteReply: async (messageId) => { calls.deleteReply.push(messageId) },
   }
 }
 
@@ -97,4 +119,36 @@ test('replyFlags: guild override changes effective visibility', async () => {
     await setCommandVisibility('guild-1', 'nowplaying', 'public')
     assert.deepEqual(replyFlags('guild-1', 'nowplaying'), {})
   })
+})
+
+test('sendVisibleFollowUp: sends a single followUp when the target visibility already matches the deferred state', async () => {
+  const interaction = fakeDeferredInteraction(true)
+  const message = await sendVisibleFollowUp(interaction, 'hello', { flags: MessageFlags.Ephemeral })
+  assert.equal(interaction.calls.followUp.length, 1)
+  assert.equal(interaction.calls.deleteReply.length, 0)
+  assert.equal(message.content, 'hello')
+  assert.equal(message.ephemeral, true)
+})
+
+test('sendVisibleFollowUp: burns a throwaway followUp to make a public message land after an ephemeral defer', async () => {
+  const interaction = fakeDeferredInteraction(true)
+  const message = await sendVisibleFollowUp(interaction, 'public result', {})
+  assert.equal(interaction.calls.followUp.length, 2)
+  // The first followUp is forced ephemeral regardless of the flags we asked
+  // for, matching the real Discord quirk this is working around.
+  assert.equal(interaction.calls.followUp[0].actualEphemeral, true)
+  assert.equal(interaction.calls.deleteReply.length, 1)
+  assert.equal(interaction.calls.deleteReply[0], '1')
+  assert.equal(interaction.calls.followUp[1].actualEphemeral, false)
+  assert.equal(message.content, 'public result')
+  assert.equal(message.ephemeral, false)
+})
+
+test('sendVisibleFollowUp: burns a throwaway followUp to make an ephemeral message land after a public defer', async () => {
+  const interaction = fakeDeferredInteraction(false)
+  const message = await sendVisibleFollowUp(interaction, 'personal result', { flags: MessageFlags.Ephemeral })
+  assert.equal(interaction.calls.followUp.length, 2)
+  assert.equal(interaction.calls.followUp[0].actualEphemeral, false)
+  assert.equal(interaction.calls.followUp[1].actualEphemeral, true)
+  assert.equal(message.ephemeral, true)
 })
