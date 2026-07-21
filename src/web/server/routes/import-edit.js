@@ -1,6 +1,6 @@
 import { resolveYoutubeTrack, toImportTrackRow } from '../matching.js'
 import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
-import { bindRouteError, callBot, getSessionUser, requireBotPermission } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, requireBotPermission, requireCommandPermission } from './route-utils.js'
 
 function getImportTrack(db, trackId) {
   return db.prepare(`
@@ -65,6 +65,8 @@ export async function importEditRoutes(app, { db, botClient, searchYoutube } = {
       if (!existing) return reply.code(404).send({ error: 'import_track_not_found' })
 
       await requireBotPermission({ botClient, guildId: existing.guild_id, userId: user.discordId })
+      // Replacing a match re-enqueues a track, same as /play.
+      await requireCommandPermission({ botClient, guildId: existing.guild_id, userId: user.discordId, command: 'play' })
 
       const { youtubeResult } = request.body ?? {}
       if (!youtubeResult) return reply.code(400).send({ error: 'missing_youtube_result' })

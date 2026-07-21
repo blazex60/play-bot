@@ -1,7 +1,7 @@
 import { createTrack } from '../../../queue.js'
 import { resolveMetadata as defaultResolveMetadata, searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
-import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission } from './route-utils.js'
 
 function parseId(value) {
   const id = Number.parseInt(value, 10)
@@ -359,6 +359,11 @@ export async function playlistsRoutes(app, {
       if (state?.active) {
         await requireBotPermission({ botClient, guildId, userId: user.discordId })
       }
+      // Unlike the bot-permission check above, the 'play' command permission
+      // isn't about VC co-presence — it applies whether or not a session
+      // already exists, including this route's own no-session case (which
+      // starts a brand new session, the same as /play would).
+      await requireCommandPermission({ botClient, guildId, userId: user.discordId, command: 'play' })
 
       const tracks = rows.map((row) => createTrack({
         title: row.title,

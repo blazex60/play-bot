@@ -256,6 +256,104 @@ test('/api/import/jobs/:jobId/tracks only returns tracks for the requesting user
   assert.equal(response.statusCode, 404, 'must not expose another user\'s import job tracks')
 })
 
+test('POST /api/import/:guildId is blocked for a user denied the play command (regression: import enqueue bypassed the permission matrix)', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {
+      '/permission': { body: { basic: true, extended: false } },
+      '/command-permission': { body: { allowed: false } },
+    },
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/import/g1',
+    headers: { cookie },
+    payload: { service: 'youtube', playlistId: 'pl1' },
+  })
+  assert.equal(response.statusCode, 403, 'a user denied /play must not be able to import a playlist either')
+})
+
+test('POST /api/import/tracks/:trackId/replace is blocked for a user denied the play command', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {
+      '/permission': { body: { basic: true, extended: false } },
+      '/command-permission': { body: { allowed: false } },
+    },
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  const job = db.prepare(`
+    INSERT INTO import_jobs (discord_user_id, guild_id, service, playlist_id, playlist_name, created_at)
+    VALUES ('u1', 'g1', 'youtube', 'pl1', 'My playlist', ?)
+  `).run(Date.now())
+  const track = db.prepare(`
+    INSERT INTO import_tracks (job_id, position, source_title, match_status)
+    VALUES (?, 0, 'Some Track', 'failed')
+  `).run(job.lastInsertRowid)
+
+  const response = await app.inject({
+    method: 'POST',
+    url: `/api/import/tracks/${track.lastInsertRowid}/replace`,
+    headers: { cookie },
+    payload: { youtubeResult: { title: 'Replacement', webpage_url: 'https://example.com/replacement' } },
+  })
+  assert.equal(response.statusCode, 403, 'a user denied /play must not be able to replace an import match either')
+})
+
+test('POST /api/playlists/mine/:id/queue is blocked for a user denied the play command, even with no active session', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {
+      '/state/g2': { body: { active: false } },
+      '/command-permission': { body: { allowed: false } },
+    },
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  const createResponse = await app.inject({
+    method: 'POST',
+    url: '/api/playlists/mine',
+    headers: { cookie },
+    payload: { name: 'Solo BGM' },
+  })
+  const playlist = createResponse.json()
+  await app.inject({
+    method: 'POST',
+    url: `/api/playlists/mine/${playlist.id}/tracks`,
+    headers: { cookie },
+    payload: { track: { title: 'Track A', webpageUrl: 'https://www.youtube.com/watch?v=aaaaaaaaaaa', videoId: 'aaaaaaaaaaa' } },
+  })
+
+  const queue = await app.inject({
+    method: 'POST',
+    url: `/api/playlists/mine/${playlist.id}/queue`,
+    headers: { cookie },
+    payload: { guildId: 'g2' },
+  })
+  assert.equal(queue.statusCode, 403, 'a user denied /play must not be able to start a new session via a saved playlist either')
+})
+
 test('/api/permission ignores a client-supplied userId and always uses the session user', async (t) => {
   const db = createMemoryDb()
   t.after(() => db.close())
@@ -360,6 +458,7 @@ test('authenticated user can create, edit, reorder, and queue a saved playlist',
     botResponses: {
       '/state/g1': { body: { active: true, current: null, upcoming: [], playerStatus: 'idle', loopMode: 'off' } },
       '/permission': { body: { basic: true, extended: false } },
+      '/command-permission': { body: { allowed: true } },
       '/import/g1/enqueue': { body: { ok: true, enqueuedCount: 2, matchedCount: 2, failedCount: 0 } },
     },
   })
@@ -466,8 +565,11 @@ test('queueing a saved playlist into a guild with no active bot session skips th
     discordUser: { id: 'u1', username: 'lemitsu' },
     botResponses: {
       // No '/permission' entry: if the route calls it, createRoutedFetch throws
-      // "Unexpected fetch call", failing this test loudly.
+      // "Unexpected fetch call", failing this test loudly. '/command-permission'
+      // is still called unconditionally though (unlike '/permission'), since a
+      // 'play' denial must block even a first-time, no-session queue request.
       '/state/g2': { body: { active: false, autoplayMode: 'off', personalize: false } },
+      '/command-permission': { body: { allowed: true } },
       '/import/g2/enqueue': { body: { ok: true, enqueuedCount: 1, matchedCount: 1, failedCount: 0 } },
     },
   })

@@ -1,6 +1,6 @@
 import { resolveImportTracks, toImportTrackRow } from '../matching.js'
 import { listYoutubePlaylistTracks } from '../services/youtube.js'
-import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission } from './route-utils.js'
 
 function insertImportJob(db, { userId, guildId, service, playlistId, playlistName, totalCount }) {
   const result = db.prepare(`
@@ -73,6 +73,9 @@ export async function importRoutes(app, { db, botClient, services } = {}) {
       }
 
       await requireBotPermission({ botClient, guildId, userId: user.discordId })
+      // Importing a playlist enqueues tracks the same as /play, so a user
+      // denied that command must not be able to bypass it via import either.
+      await requireCommandPermission({ botClient, guildId, userId: user.discordId, command: 'play' })
 
       const providerTracks = await listPlaylistTracks({ service, userId: user.discordId, playlistId, services })
       jobId = insertImportJob(db, {
