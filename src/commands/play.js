@@ -2,7 +2,7 @@ import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { createTrack } from '../queue.js'
 import { searchYoutube, resolveMetadata, isPlaylistUrl, resolveFlatPlaylist, PLAYLIST_LIMIT } from '../search.js'
 import { createSearchResultComponents } from '../views.js'
-import { getOrCreateSession, pendingStore } from '../sessions.js'
+import { getOrCreateSession, pendingStore, webClient } from '../sessions.js'
 import { checkSameVoiceChannel, checkCommandAllowed, replyFlags } from '../permissions.js'
 
 function fmtDuration(seconds) {
@@ -122,15 +122,36 @@ export default {
     const msg = await interaction.editReply({ content: '🔍 検索結果:', components })
 
     const onSelect = async entry => {
+      // The initial /play execute() returns null for the keyword-search
+      // path (see below) precisely so index.js skips logging a "success" —
+      // the real outcome of this command only exists once a result is
+      // picked, so this callback is the one place that can log it.
+      const logSelect = (success, detail) => webClient.logOperation({
+        guildId: interaction.guildId,
+        discordUserId: interaction.user.id,
+        username: interaction.user.username,
+        source: 'command',
+        action: 'play',
+        success,
+        detail,
+      })
+
       // The keyword-search panel is ephemeral and can sit around for a while
       // before the user clicks a result, so re-check 'play' permission here
       // too — the initial checkCommandAllowed in index.js only guarded the
       // slash command dispatch, not this later button click.
-      if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'play')) return
-      if (!checkSameVoiceChannel(interaction, sessions.get(interaction.guildId))) return
+      if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'play')) {
+        logSelect(false, 'blocked')
+        return
+      }
+      if (!checkSameVoiceChannel(interaction, sessions.get(interaction.guildId))) {
+        logSelect(false, 'not_in_voice')
+        return
+      }
       const url = entry.url || entry.webpage_url
       if (!url) {
         await interaction.followUp({ content: '❌ URLを取得できませんでした', flags: MessageFlags.Ephemeral })
+        logSelect(false, 'no_url')
         return
       }
       let info
@@ -138,6 +159,7 @@ export default {
         info = await resolveMetadata(url, { requestedBy: interaction.member.displayName, requestedById: interaction.member.id })
       } catch (err) {
         await interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+        logSelect(false, err.message)
         return
       }
       let session
@@ -145,6 +167,7 @@ export default {
         session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
       } catch (err) {
         await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
+        logSelect(false, err.message)
         return
       }
       await interaction.deleteReply().catch(() => {})
@@ -152,8 +175,13 @@ export default {
       session.queue.add(createTrack(info))
       await interaction.followUp({ content: `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, ...replyFlags(interaction.guildId, 'play') })
       if (wasEmpty) await session.player.playNext()
+      logSelect(true)
     }
 
     pendingStore.set(msg.id, { results, onSelect })
+    // The real outcome isn't known yet (nothing has been enqueued) — signal
+    // index.js to skip logging entirely rather than record a false "success"
+    // for a search panel the user might never act on.
+    return null
   },
 }

@@ -63,8 +63,13 @@ client.on(Events.InteractionCreate, async interaction => {
       // replied to (not playing, empty queue, etc.) so the operation log
       // reflects what actually happened rather than "the handler didn't
       // throw" — every command file that has such a path returns false there.
+      // `null` means "outcome not known yet" (e.g. /play's keyword search
+      // just shows a panel; the real result is logged later from onSelect)
+      // and is skipped entirely rather than logged as a success.
       const result = await command.execute(interaction, sessions)
-      logOperation(result !== false)
+      if (result !== null) {
+        logOperation(result !== false)
+      }
     } catch (err) {
       console.error(`[${interaction.commandName}] error:`, err)
       logOperation(false, err.message)
