@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
-import { checkSameVoiceChannel } from '../permissions.js'
+import { checkSameVoiceChannel, replyFlags } from '../permissions.js'
 import { cancelPendingRecommendations } from '../sessions.js'
 
 export default {
@@ -7,11 +7,14 @@ export default {
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ ボットはVCにいません', flags: MessageFlags.Ephemeral })
-    if (!checkSameVoiceChannel(interaction, session)) return
+    if (!session) {
+      await interaction.reply({ content: '❌ ボットはVCにいません', flags: MessageFlags.Ephemeral })
+      return false
+    }
+    if (!checkSameVoiceChannel(interaction, session)) return false
     sessions.delete(interaction.guildId)
     cancelPendingRecommendations(interaction.guildId)
     session.connection.destroy()
-    await interaction.reply(`👋 ${interaction.member.displayName} がボットをVCから退出させました`)
+    await interaction.reply({ content: `👋 ${interaction.member.displayName} がボットをVCから退出させました`, ...replyFlags(interaction.guildId, 'leave') })
   },
 }

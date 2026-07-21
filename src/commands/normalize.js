@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { setNormalize } from '../settings.js'
+import { replyFlags } from '../permissions.js'
 
 export default {
   data: new SlashCommandBuilder()
@@ -14,7 +15,7 @@ export default {
     await setNormalize(interaction.guildId, enabled)
     await interaction.reply({
       content: `✅ ノーマライズを **${enabled ? '有効' : '無効'}** にしました`,
-      flags: MessageFlags.Ephemeral,
+      ...replyFlags(interaction.guildId, 'normalize'),
     })
   },
 }

@@ -1,7 +1,7 @@
 import { createTrack } from '../../../queue.js'
 import { resolveMetadata as defaultResolveMetadata, searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
-import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 function parseId(value) {
   const id = Number.parseInt(value, 10)
@@ -339,12 +339,14 @@ export async function playlistsRoutes(app, {
   })
 
   app.post('/api/playlists/mine/:id/queue', async (request, reply) => {
+    let user
+    let guildId
     try {
-      const user = getSessionUser(request)
+      user = getSessionUser(request)
       if (!db) throw new Error('db is required for playlist routes')
       if (!botClient) throw new Error('botClient is required for playlist routes')
       const playlist = getOwnedPlaylist(db, user.discordId, parseId(request.params.id))
-      const guildId = typeof request.body?.guildId === 'string' ? request.body.guildId : ''
+      guildId = typeof request.body?.guildId === 'string' ? request.body.guildId : ''
       if (!guildId) return reply.code(400).send({ error: 'guildId_required' })
 
       const rows = getPlaylistTracks(db, playlist.id)
@@ -359,6 +361,11 @@ export async function playlistsRoutes(app, {
       if (state?.active) {
         await requireBotPermission({ botClient, guildId, userId: user.discordId })
       }
+      // Unlike the bot-permission check above, the 'play' command permission
+      // isn't about VC co-presence — it applies whether or not a session
+      // already exists, including this route's own no-session case (which
+      // starts a brand new session, the same as /play would).
+      await requireCommandPermission({ botClient, guildId, userId: user.discordId, command: 'play' })
 
       const tracks = rows.map((row) => createTrack({
         title: row.title,
@@ -382,8 +389,30 @@ export async function playlistsRoutes(app, {
         throw error
       })
 
-      return reply.send({ ok: true, enqueuedCount: botResponse?.enqueuedCount ?? tracks.length })
+      const enqueuedCount = botResponse?.enqueuedCount ?? tracks.length
+      recordOperationLog(db, {
+        guildId,
+        discordUserId: user.discordId,
+        username: user.username,
+        source: 'control',
+        action: 'playlist_queue',
+        detail: JSON.stringify({ playlistId: playlist.id, enqueuedCount }),
+        success: true,
+      })
+
+      return reply.send({ ok: true, enqueuedCount })
     } catch (error) {
+      if (db && user && guildId) {
+        recordOperationLog(db, {
+          guildId,
+          discordUserId: user.discordId,
+          username: user.username,
+          source: 'control',
+          action: 'playlist_queue',
+          detail: error.message,
+          success: false,
+        })
+      }
       return bindRouteError(reply, error)
     }
   })

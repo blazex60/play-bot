@@ -10,6 +10,10 @@ const JSON_HEADERS = { 'content-type': 'application/json' }
  * @typedef {{ id: number, source_title: string, source_artist?: string, matched_title?: string, match_status: string, replacement?: unknown }} ImportTrack
  * @typedef {{ id: number, name: string, trackCount?: number, createdAt?: number, updatedAt?: number, tracks?: SavedPlaylistTrack[] }} SavedPlaylist
  * @typedef {{ id: number, position?: number, title: string, webpageUrl: string, duration?: number | null, thumbnail?: string | null, videoId?: string | null, channel?: string | null }} SavedPlaylistTrack
+ * @typedef {{ discordId: string, username: string }} KnownUser
+ * @typedef {{ commands: string[], defaults: Record<string, string>, overrides: Record<string, Record<string, string>>, knownUsers: KnownUser[] }} AdminPermissions
+ * @typedef {Record<string, string>} AdminVisibility
+ * @typedef {{ id: number, discordUserId?: string | null, username?: string | null, source: string, action: string, detail?: string | null, success: boolean, createdAt: number }} OperationLogEntry
  * @typedef {{ method?: string, body?: unknown }} RequestOptions
  */
 
@@ -137,4 +141,20 @@ export const api = {
   queueSavedPlaylist: (id, guildId) =>
     request(`/api/playlists/mine/${encodeURIComponent(id)}/queue`, { method: 'POST', body: { guildId } }),
   logout: () => request('/auth/logout', { method: 'POST' }),
+  /** @param {string} guildId @returns {Promise<AdminPermissions>} */
+  adminPermissions: (guildId) => request(`/api/admin/${encodeURIComponent(guildId)}/permissions`),
+  /** @param {string} guildId @param {string} command @param {'allow'|'deny'} value */
+  setDefaultCommandPermission: (guildId, command, value) =>
+    request(`/api/admin/${encodeURIComponent(guildId)}/permissions/default`, { method: 'POST', body: { command, value } }),
+  /** @param {string} guildId @param {string} userId @param {string} command @param {'allow'|'deny'|null} value */
+  setUserCommandPermission: (guildId, userId, command, value) =>
+    request(`/api/admin/${encodeURIComponent(guildId)}/permissions/user`, { method: 'POST', body: { userId, command, value } }),
+  /** @param {string} guildId @returns {Promise<AdminVisibility>} */
+  adminVisibility: (guildId) => request(`/api/admin/${encodeURIComponent(guildId)}/visibility`),
+  /** @param {string} guildId @param {string} command @param {'public'|'personal'} value */
+  setCommandVisibility: (guildId, command, value) =>
+    request(`/api/admin/${encodeURIComponent(guildId)}/visibility`, { method: 'POST', body: { command, value } }),
+  /** @param {string} guildId @param {{ limit?: number, before?: number }} [params] */
+  adminLogs: (guildId, params = {}) =>
+    request(`/api/admin/${encodeURIComponent(guildId)}/logs?${searchParams(params)}`),
 }

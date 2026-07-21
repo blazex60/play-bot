@@ -2,7 +2,17 @@ import Fastify from 'fastify';
 
 import { getOrCreateSession, cancelPendingRecommendations, bumpPlanToken } from './sessions.js';
 import { resolveWebPermission } from './webPermission.js';
-import { getGuildSettings, setAutoplayMode, setPersonalize } from './settings.js';
+import {
+  getGuildSettings,
+  setAutoplayMode,
+  setPersonalize,
+  getCommandPermissions,
+  setDefaultCommandPermission,
+  setUserCommandPermission,
+  setCommandVisibility,
+  resolveCommandPermission,
+} from './settings.js';
+import { getEffectiveCommandVisibility } from './permissions.js';
 
 const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 
@@ -56,6 +66,22 @@ async function resolvePermission({ client, sessions, guildId, userId, adminRoleI
   });
 }
 
+// Mirrors permissions.js#checkCommandAllowed's decision (admin-role bypass,
+// then the per-user/default allow-deny matrix) but as a plain boolean check
+// with no interaction to reply on. Enforced directly by every mutating
+// endpoint below (not just exposed via GET /command-permission for the web
+// dashboard's own pre-checks) so a command denial can't be bypassed by any
+// caller of this API, present or future, regardless of what the web layer
+// remembers to check. member can be passed in to reuse an already-fetched
+// one instead of triggering a second REST lookup for the same user.
+async function resolveCommandAllowed({ client, guildId, userId, command, adminRoleId, member }) {
+  if (!member) {
+    ({ member } = await fetchMember(client, guildId, userId));
+  }
+  if (adminRoleId && member.roles.cache.has(adminRoleId)) return true;
+  return resolveCommandPermission(guildId, userId, command) !== 'deny';
+}
+
 function requireBodyUserId(request, reply) {
   const userId = request.body?.userId;
   if (typeof userId !== 'string' || userId.length === 0) {
@@ -74,13 +100,41 @@ function requireSession(sessions, guildId, reply) {
   return session;
 }
 
-async function requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply }) {
+// command is optional: when given, this also enforces the per-command
+// allow/deny matrix (same one Discord slash commands go through), so a
+// denied command can't be reached via any HTTP action that maps to it.
+async function requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command }) {
   const permission = await resolvePermission({ client, sessions, guildId, userId, adminRoleId });
   if (!permission.allowed) {
     reply.code(403).send({ error: 'forbidden', permission });
     return null;
   }
+  if (command && !(await resolveCommandAllowed({ client, guildId, userId, command, adminRoleId }))) {
+    reply.code(403).send({ error: 'forbidden', reason: 'command_denied' });
+    return null;
+  }
   return permission;
+}
+
+// Admin-only endpoints (command permission matrix, reply visibility) always
+// re-verify the caller has the guild's admin role, never the weaker
+// basic (in-VC) permission that requireAllowed accepts.
+async function requireAdmin({ client, sessions, guildId, userId, adminRoleId, reply }) {
+  const permission = await resolvePermission({ client, sessions, guildId, userId, adminRoleId });
+  if (!permission.extended) {
+    reply.code(403).send({ error: 'forbidden', permission });
+    return null;
+  }
+  return permission;
+}
+
+function requireAdminUserId(request, reply) {
+  const adminUserId = request.body?.adminUserId ?? request.query?.adminUserId;
+  if (typeof adminUserId !== 'string' || adminUserId.length === 0) {
+    reply.code(400).send({ error: 'adminUserId_required' });
+    return null;
+  }
+  return adminUserId;
 }
 
 async function enqueueTracks(session, tracks) {
@@ -105,6 +159,7 @@ export function buildBotApi({
   token = process.env.BOT_API_TOKEN,
   adminRoleId = process.env.ADMIN_ROLE_ID,
   getOrCreateSessionFn = getOrCreateSession,
+  commandNames = [],
 } = {}) {
   if (!client) throw new Error('buildBotApi requires client');
   if (!sessions) throw new Error('buildBotApi requires sessions');
@@ -133,6 +188,16 @@ export function buildBotApi({
     return resolvePermission({ client, sessions, guildId, userId, adminRoleId });
   });
 
+  app.get('/command-permission', async (request, reply) => {
+    const { guildId, userId, command } = request.query;
+    if (typeof guildId !== 'string' || typeof userId !== 'string' || typeof command !== 'string') {
+      reply.code(400).send({ error: 'guildId_userId_and_command_required' });
+      return;
+    }
+    const allowed = await resolveCommandAllowed({ client, guildId, userId, command, adminRoleId });
+    return { allowed };
+  });
+
   app.post('/control/:guildId/:action', async (request, reply) => {
     const userId = requireBodyUserId(request, reply);
     if (!userId) return;
@@ -144,7 +209,7 @@ export function buildBotApi({
     // for the guild (unlike every other action below, which mutates a live
     // player/queue and therefore requires one).
     if (action === 'autoplay') {
-      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: 'autoplay' });
       if (!permission) return;
       const { mode, personalize } = request.body ?? {};
       if (mode !== undefined) {
@@ -166,7 +231,7 @@ export function buildBotApi({
 
     const session = requireSession(sessions, guildId, reply);
     if (!session) return;
-    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: action });
     if (!permission) return;
 
     switch (action) {
@@ -196,7 +261,7 @@ export function buildBotApi({
     const guildId = request.params.guildId;
     const session = requireSession(sessions, guildId, reply);
     if (!session) return;
-    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: 'queue' });
     if (!permission) return;
 
     if (request.params.action === 'remove') {
@@ -225,12 +290,22 @@ export function buildBotApi({
 
     let session = sessions.get(guildId);
     if (session) {
-      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: 'play' });
       if (!permission) return;
       return enqueueTracks(session, tracks);
     }
 
     const { guild, member } = await fetchMember(client, guildId, userId);
+    // No live session yet means requireAllowed's VC/admin check above never
+    // ran for this branch either — but 'play' being denied must still block
+    // starting a brand new session the same way it blocks adding to an
+    // existing one. member is reused here (not re-fetched) since it was
+    // already looked up just above for the VC-membership check below.
+    const allowed = await resolveCommandAllowed({ client, guildId, userId, command: 'play', adminRoleId, member });
+    if (!allowed) {
+      reply.code(403).send({ error: 'forbidden', reason: 'command_denied' });
+      return;
+    }
     const channel = member.voice?.channel;
     if (!channel) {
       reply.code(409).send({ error: 'user_not_in_voice' });
@@ -239,6 +314,83 @@ export function buildBotApi({
 
     session = await getOrCreateSessionFn({ guildId, guild, channel });
     return enqueueTracks(session, tracks);
+  });
+
+  function requireKnownCommand(command, reply) {
+    if (typeof command !== 'string' || !commandNames.includes(command)) {
+      reply.code(400).send({ error: 'unknown_command' });
+      return false;
+    }
+    return true;
+  }
+
+  app.get('/admin/:guildId/permissions', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const { defaults, overrides } = getCommandPermissions(guildId);
+    return { commands: commandNames, defaults, overrides };
+  });
+
+  app.post('/admin/:guildId/permissions/default', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const { command, value } = request.body ?? {};
+    if (!requireKnownCommand(command, reply)) return;
+    if (value !== 'allow' && value !== 'deny') {
+      reply.code(400).send({ error: 'invalid_permission_value' });
+      return;
+    }
+    await setDefaultCommandPermission(guildId, command, value);
+    return { ok: true };
+  });
+
+  app.post('/admin/:guildId/permissions/user', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const { userId, command, value } = request.body ?? {};
+    if (typeof userId !== 'string' || userId.length === 0) {
+      reply.code(400).send({ error: 'userId_required' });
+      return;
+    }
+    if (!requireKnownCommand(command, reply)) return;
+    if (value !== 'allow' && value !== 'deny' && value !== null) {
+      reply.code(400).send({ error: 'invalid_permission_value' });
+      return;
+    }
+    await setUserCommandPermission(guildId, userId, command, value);
+    return { ok: true };
+  });
+
+  app.get('/admin/:guildId/visibility', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const visibility = Object.fromEntries(
+      commandNames.map((name) => [name, getEffectiveCommandVisibility(guildId, name)])
+    );
+    return visibility;
+  });
+
+  app.post('/admin/:guildId/visibility', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const { command, value } = request.body ?? {};
+    if (!requireKnownCommand(command, reply)) return;
+    if (value !== 'public' && value !== 'personal') {
+      reply.code(400).send({ error: 'invalid_visibility_value' });
+      return;
+    }
+    await setCommandVisibility(guildId, command, value);
+    return { ok: true };
   });
 
   return app;

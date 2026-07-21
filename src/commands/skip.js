@@ -1,15 +1,18 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
-import { checkSameVoiceChannel } from '../permissions.js'
+import { checkSameVoiceChannel, replyFlags } from '../permissions.js'
 
 export default {
   data: new SlashCommandBuilder().setName('skip').setDescription('現在の曲をスキップします'),
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
-    if (!checkSameVoiceChannel(interaction, session)) return
+    if (!session) {
+      await interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
+      return false
+    }
+    if (!checkSameVoiceChannel(interaction, session)) return false
     const title = session.queue.current?.title ?? '不明'
     await session.player.skip()
-    await interaction.reply(`⏭️ ${interaction.member.displayName} がスキップしました: **${title}**`)
+    await interaction.reply({ content: `⏭️ ${interaction.member.displayName} がスキップしました: **${title}**`, ...replyFlags(interaction.guildId, 'skip') })
   },
 }

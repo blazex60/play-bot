@@ -4,13 +4,14 @@ import { Client, Collection, Events, GatewayIntentBits, MessageFlags } from 'dis
 import { readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { sessions, pendingStore, recommendPendingStore, cancelPendingRecommendations } from './sessions.js'
+import { sessions, pendingStore, recommendPendingStore, cancelPendingRecommendations, webClient } from './sessions.js'
 import { parseSearchCustomId } from './views.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
 import { handleRecommendChoice, RECOMMEND_CUSTOM_ID_PREFIX } from './recommendFlow.js'
 import { loadSettings } from './settings.js'
 import { cleanupStaleTempDir } from './normalize.js'
 import { startBotApi } from './botApi.js'
+import { checkCommandAllowed } from './permissions.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -31,7 +32,7 @@ for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js'))) {
 
 client.once(Events.ClientReady, c => {
   console.log(`Bot ready: ${c.user.tag} (id=${c.user.id})`)
-  startBotApi({ client, sessions }).catch(err => {
+  startBotApi({ client, sessions, commandNames: [...commands.keys()] }).catch(err => {
     console.error('[bot-api] failed to start:', err)
     process.exitCode = 1
   })
@@ -41,10 +42,37 @@ client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isChatInputCommand()) {
     const command = commands.get(interaction.commandName)
     if (!command) return
+
+    const logOperation = (success, detail) => webClient.logOperation({
+      guildId: interaction.guildId,
+      discordUserId: interaction.user.id,
+      username: interaction.user.username,
+      source: 'command',
+      action: interaction.commandName,
+      success,
+      detail,
+    })
+
+    if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID)) {
+      logOperation(false, 'blocked')
+      return
+    }
+
     try {
-      await command.execute(interaction, sessions)
+      // Commands return `false` on an expected-failure path they've already
+      // replied to (not playing, empty queue, etc.) so the operation log
+      // reflects what actually happened rather than "the handler didn't
+      // throw" — every command file that has such a path returns false there.
+      // `null` means "outcome not known yet" (e.g. /play's keyword search
+      // just shows a panel; the real result is logged later from onSelect)
+      // and is skipped entirely rather than logged as a success.
+      const result = await command.execute(interaction, sessions)
+      if (result !== null) {
+        logOperation(result !== false)
+      }
     } catch (err) {
       console.error(`[${interaction.commandName}] error:`, err)
+      logOperation(false, err.message)
       const reply = { content: '❌ コマンドの実行中にエラーが発生しました', flags: MessageFlags.Ephemeral }
       if (interaction.replied || interaction.deferred) {
         await interaction.followUp(reply).catch(() => {})
@@ -62,7 +90,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!pending) return interaction.reply({ content: '❌ 検索セッションが期限切れです', flags: MessageFlags.Ephemeral })
     pendingStore.delete(interaction.message.id)
     await interaction.deferUpdate()
-    await pending.onSelect(pending.results[index])
+    await pending.onSelect(pending.results[index], interaction)
     return
   }
 

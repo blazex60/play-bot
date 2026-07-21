@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js'
 import { LoopMode } from '../queue.js'
+import { replyFlags } from '../permissions.js'
 
 const LOOP_LABELS = {
   [LoopMode.OFF]: 'オフ',
@@ -20,9 +21,15 @@ export default {
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
+    if (!session) {
+      await interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
+      return false
+    }
     const track = session.queue.current
-    if (!track) return interaction.reply({ content: '📭 現在再生中の曲はありません', flags: MessageFlags.Ephemeral })
+    if (!track) {
+      await interaction.reply({ content: '📭 現在再生中の曲はありません', flags: MessageFlags.Ephemeral })
+      return false
+    }
 
     const embed = new EmbedBuilder()
       .setTitle('🎵 Now Playing')
@@ -34,6 +41,6 @@ export default {
         { name: 'ループ', value: LOOP_LABELS[session.queue.loopMode], inline: true },
       )
     if (track.thumbnail) embed.setThumbnail(track.thumbnail)
-    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral })
+    await interaction.reply({ embeds: [embed], ...replyFlags(interaction.guildId, 'nowplaying') })
   },
 }

@@ -1,6 +1,7 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { setAutoplayMode, setPersonalize, setAutoNotify } from '../settings.js'
 import { bumpPlanToken } from '../sessions.js'
+import { replyFlags } from '../permissions.js'
 
 const MODE_LABELS = { off: 'オフ', auto: '自動', recommend: 'おすすめ' }
 
@@ -53,7 +54,7 @@ export default {
       bumpPlanToken(interaction.guildId)
       await interaction.reply({
         content: `✅ 自動再生モードを **${MODE_LABELS[mode]}** にしました`,
-        flags: MessageFlags.Ephemeral,
+        ...replyFlags(interaction.guildId, 'autoplay'),
       })
       return
     }
@@ -64,7 +65,7 @@ export default {
       bumpPlanToken(interaction.guildId)
       await interaction.reply({
         content: `✅ パーソナライズを **${enabled ? '有効' : '無効'}** にしました`,
-        flags: MessageFlags.Ephemeral,
+        ...replyFlags(interaction.guildId, 'autoplay'),
       })
       return
     }
@@ -74,7 +75,7 @@ export default {
       await setAutoNotify(interaction.guildId, enabled)
       await interaction.reply({
         content: `✅ 自動追加通知を **${enabled ? '有効' : '無効'}** にしました`,
-        flags: MessageFlags.Ephemeral,
+        ...replyFlags(interaction.guildId, 'autoplay'),
       })
     }
   },

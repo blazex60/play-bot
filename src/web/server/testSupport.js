@@ -73,6 +73,19 @@ export function createMemoryDb() {
     );
     CREATE UNIQUE INDEX idx_user_playlist_tracks_playlist
       ON user_playlist_tracks(playlist_id, position);
+    CREATE TABLE operation_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      guild_id TEXT NOT NULL,
+      discord_user_id TEXT,
+      username TEXT,
+      source TEXT NOT NULL CHECK (source IN ('command','control','admin')),
+      action TEXT NOT NULL,
+      detail TEXT,
+      success INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX idx_operation_logs_guild
+      ON operation_logs(guild_id, id DESC);
   `)
   return db
 }

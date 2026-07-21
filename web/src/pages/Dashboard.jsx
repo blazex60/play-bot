@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 
 import { api, ApiError } from '../api/client.js'
 import '../dashboard.css'
@@ -37,6 +38,7 @@ function normalizeState(payload) {
 export function Dashboard() {
   const [guildId, setGuildId] = useState(initialGuildId)
   const [user, setUser] = useState(/** @type {import('../api/client.js').User | null} */ (null))
+  const [permission, setPermission] = useState(/** @type {{ extended?: boolean } | null} */ (null))
   const [state, setState] = useState(/** @type {import('../api/client.js').PlaybackState} */ ({ active: false, upcoming: [] }))
   const [links, setLinks] = useState(/** @type {import('../api/client.js').ServiceLink[]} */ ([]))
   const [playlists, setPlaylists] = useState(/** @type {import('../api/client.js').Playlist[]} */ ([]))
@@ -108,6 +110,14 @@ export function Dashboard() {
     const timer = window.setInterval(refreshState, 5_000)
     return () => window.clearInterval(timer)
   }, [guildId, refreshState])
+
+  useEffect(() => {
+    if (!guildId) {
+      setPermission(null)
+      return
+    }
+    api.permission({ guildId }).then((payload) => setPermission(/** @type {{ extended?: boolean }} */ (payload))).catch(() => setPermission(null))
+  }, [guildId])
 
   /** @param {() => Promise<void>} work @param {string} successMessage */
   async function runAction(work, successMessage) {
@@ -363,6 +373,9 @@ export function Dashboard() {
             </span>
             <span className="user-name">{user?.username ?? user?.discordId ?? 'ログイン確認中'}</span>
           </span>
+          {permission?.extended ? (
+            <Link className="ghost-button" to={`/admin?guildId=${encodeURIComponent(guildId)}`}>管理画面</Link>
+          ) : null}
           <button type="button" className="ghost-button" onClick={handleLogout}>Logout</button>
         </div>
       </header>
