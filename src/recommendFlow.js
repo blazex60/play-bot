@@ -115,13 +115,14 @@ export function cancelRecommendations(guildId, pendingStore) {
   }
 }
 
-// (Re)arms an entry's expiry timer. Used both when a prompt is first posted
-// and when handleRecommendChoice restores one after a failed VC check —
-// that restore can happen after the entry's original timer already fired
-// (it isn't cleared until the check succeeds, by design), so reusing it
-// would leave the restored entry with nothing left to ever expire it.
+// Arms an entry's one-shot expiry timer. handleRecommendChoice checks
+// entry.expired (set synchronously, before any await, the moment this fires)
+// to decide whether a claimed-then-failed-VC-check entry is still restorable
+// — the timer is deliberately left running during that VC check rather than
+// cleared, so this can still fire while the entry is claimed.
 function scheduleExpiry(entry, pendingStore, guildId, onTimeout) {
   entry.timeoutHandle = setTimeout(async () => {
+    entry.expired = true
     pendingStore.delete(entry.message.id)
     await disableMessage(entry.message).catch(() => {})
     if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && onTimeout) {
@@ -187,7 +188,7 @@ export async function postRecommendations({ client, guildId, guildName, plans, p
       break
     }
 
-    const entry = { guildId, targetUserId: userId, candidates, message, timeoutHandle: null }
+    const entry = { guildId, targetUserId: userId, candidates, message, timeoutHandle: null, expired: false }
     scheduleExpiry(entry, pendingStore, guildId, onTimeout)
 
     pendingStore.set(message.id, entry)
@@ -268,15 +269,17 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
       // it anyway would resurrect a prompt for a session that's already
       // been stopped/torn down, and a later click on it could enqueue a
       // track despite the stop. Only restore if nothing changed out from
-      // under us.
-      if (!isSessionStale()) {
-        // The entry's own timer may have already fired while we were
-        // awaiting the membership check (it isn't cleared until the check
-        // succeeds — see below), so re-arm a fresh one rather than trusting
-        // one that may already be spent; otherwise the restored prompt
-        // could linger in pendingStore with nothing left to ever expire it.
-        clearTimeout(entry.timeoutHandle)
-        scheduleExpiry(entry, pendingStore, entry.guildId, guildOnTimeoutCallbacks.get(entry.guildId))
+      // under us, and only if the entry's own deadline hasn't already
+      // fired: that timer isn't cleared until this check succeeds (see
+      // below), so it can fire while we're still awaiting it, already
+      // disabling the message and marking entry.expired. Restoring a
+      // spent entry here — with or without a fresh timer — would either
+      // linger forever or race a still-running old callback that deletes
+      // it and disables the message out from under this restore; simplest
+      // and correct is to just not restore it, matching the ordinary
+      // expiry path (the finally block's reconsiderTeardown below will
+      // still notice and run onTimeout immediately if warranted).
+      if (!isSessionStale() && !entry.expired) {
         pendingStore.set(interaction.message.id, entry)
       }
       return

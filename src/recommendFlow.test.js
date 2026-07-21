@@ -145,19 +145,17 @@ test('handleRecommendChoice: rejects a click from someone other than the target 
   assert.ok(pendingStore.get('msg-1'), 'entry must remain so the actual target user can still pick')
 })
 
-test('handleRecommendChoice: rejects and preserves the entry if the target user left the VC', async (t) => {
+test('handleRecommendChoice: rejects and preserves the entry if the target user left the VC', async () => {
   const pendingStore = new PendingChoiceStore()
-  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null, expired: false })
   const session = makeSession({ voiceChannelId: 'vc-1' })
   const sessions = new Map([['g1', session]])
   const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-2', interactionChannelId: 'vc-1' })
 
   await handleRecommendChoice(interaction, sessions, pendingStore)
-  t.after(() => clearTimeout(pendingStore.get('msg-1')?.timeoutHandle))
 
   assert.equal(session.player.playNextCalls.length, 0, 'must not start playback for a user no longer in the VC')
   assert.ok(pendingStore.get('msg-1'), 'entry must survive a failed VC check so a legitimate retry still works')
-  assert.ok(pendingStore.get('msg-1').timeoutHandle, 'the restored entry must have a fresh, live timeout, not a spent one')
 })
 
 test('handleRecommendChoice: honors a real DM pick (interaction.member absent, resolved via guild.members.fetch)', async () => {
@@ -240,6 +238,61 @@ test('handleRecommendChoice: does not resurrect a prompt if /stop bumps planToke
 
   assert.equal(pendingStore.get('msg-1'), null, 'a prompt must not be resurrected for a session /stop already reset')
   assert.equal(session.queue.isEmpty, true)
+})
+
+test('handleRecommendChoice: does not restore an entry whose own deadline already fired while the membership check was in flight (regression: would otherwise delay the next round by a full timeout, or race a stale expiry callback)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const client = makeClient()
+  const pendingStore = new PendingChoiceStore()
+  const plans = [{ userId: 'u1', candidates: [makeCandidate('v1')] }]
+  let onTimeoutCalls = 0
+  await postRecommendations({
+    client, guildId: 'g1', plans, pendingStore,
+    onTimeout: async () => { onTimeoutCalls += 1 },
+  })
+  const messageId = client.sent[0].message.id
+
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
+  const sessions = new Map([['g1', session]])
+
+  let resolveFetch
+  const fetchGate = new Promise((resolve) => { resolveFetch = resolve })
+  const dmClient = {
+    guilds: {
+      cache: new Map([['g1', { members: { async fetch() { return fetchGate } } }]]),
+    },
+  }
+  const interaction = {
+    customId: 'autoplay_0',
+    message: { id: messageId },
+    user: { id: 'u1' },
+    member: null,
+    client: dmClient,
+    deferred: false,
+    replied: false,
+    replies: [],
+    async reply(payload) { this.replies.push(payload); this.replied = true },
+    async followUp(payload) { this.replies.push(payload) },
+    async deferUpdate() { this.deferred = true },
+  }
+
+  const pickPromise = handleRecommendChoice(interaction, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // The prompt's own 5-minute deadline fires while the membership check is
+  // still in flight — it isn't cleared until that check succeeds, by design.
+  t.mock.timers.tick(RECOMMEND_TIMEOUT_MS)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(onTimeoutCalls, 0, 'must not fire yet — this pick is still in flight (markPickInFlight)')
+
+  // The membership check now resolves: the user has left the VC.
+  resolveFetch({ voice: { channelId: 'vc-2' } })
+  await pickPromise
+
+  assert.equal(pendingStore.get(messageId), null, 'an already-expired prompt must not be resurrected')
+  assert.equal(onTimeoutCalls, 1, 'the deferred continuation/teardown check must run immediately, not after another full timeout')
 })
 
 test('handleRecommendChoice: valid pick on an empty queue starts playback', async () => {
