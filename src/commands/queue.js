@@ -8,7 +8,8 @@ export default {
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
     if (!session || session.queue.isEmpty) {
-      return interaction.reply({ content: '📭 キューは空です', flags: MessageFlags.Ephemeral })
+      await interaction.reply({ content: '📭 キューは空です', flags: MessageFlags.Ephemeral })
+      return false
     }
     await interaction.reply({ ...buildQueueEditorPayload(session.queue, { page: 0 }), ...replyFlags(interaction.guildId, 'queue') })
   },

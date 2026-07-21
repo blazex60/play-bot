@@ -1,5 +1,10 @@
 import { nowUnix, recordOperationLog } from './route-utils.js'
 
+// Mirrors the operation_logs CHECK(source IN (...)) constraint. recordOperationLog
+// only console.errors on an insert failure (never rethrows), so without this
+// the route would return 200 while a bad source silently dropped the row.
+const VALID_LOG_SOURCES = new Set(['command', 'control', 'admin'])
+
 function getBearerToken(request) {
   const header = request.headers.authorization
   if (typeof header !== 'string') return null
@@ -47,6 +52,9 @@ export async function internalRoutes(app, { db, token } = {}) {
     const { guildId, discordUserId, username, source, action, detail, success } = request.body ?? {}
     if (!guildId || !source || !action) {
       return reply.code(400).send({ error: 'missing_fields' })
+    }
+    if (!VALID_LOG_SOURCES.has(source)) {
+      return reply.code(400).send({ error: 'invalid_source' })
     }
     recordOperationLog(db, { guildId, discordUserId, username, source, action, detail, success: success !== false })
     return reply.send({ ok: true })

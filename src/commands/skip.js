@@ -6,8 +6,11 @@ export default {
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
-    if (!checkSameVoiceChannel(interaction, session)) return
+    if (!session) {
+      await interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
+      return false
+    }
+    if (!checkSameVoiceChannel(interaction, session)) return false
     const title = session.queue.current?.title ?? '不明'
     await session.player.skip()
     await interaction.reply({ content: `⏭️ ${interaction.member.displayName} がスキップしました: **${title}**`, ...replyFlags(interaction.guildId, 'skip') })

@@ -10,5 +10,8 @@ CREATE TABLE IF NOT EXISTS operation_logs (
   created_at      INTEGER NOT NULL
 );
 
+-- Indexed on id (not created_at): the admin log listing paginates and sorts
+-- by id DESC (see routes/admin.js), and id is already a strictly increasing
+-- proxy for insertion order.
 CREATE INDEX IF NOT EXISTS idx_operation_logs_guild
-  ON operation_logs(guild_id, created_at DESC);
+  ON operation_logs(guild_id, id DESC);

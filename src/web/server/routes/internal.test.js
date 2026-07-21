@@ -174,7 +174,7 @@ test('POST /internal/operation-log upserts discord_users and inserts an operatio
   assert.equal(rows[0].success, 1)
 })
 
-test('POST /internal/operation-log records a blocked command without a discord_users row when success is false', async (t) => {
+test('POST /internal/operation-log records a blocked/failed command with success: false, still upserting the discord_users row', async (t) => {
   const { app, db, config } = await setup(t)
   const response = await app.inject({
     method: 'POST',
@@ -187,6 +187,20 @@ test('POST /internal/operation-log records a blocked command without a discord_u
   assert.equal(rows.length, 1)
   assert.equal(rows[0].success, 0)
   assert.equal(rows[0].detail, 'blocked')
+  const user = db.prepare('SELECT * FROM discord_users WHERE discord_id = ?').get('u2')
+  assert.ok(user, 'discord_users is upserted regardless of success, same as play-history')
+})
+
+test('POST /internal/operation-log rejects a source outside the operation_logs CHECK constraint', async (t) => {
+  const { app, config } = await setup(t)
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/operation-log',
+    headers: authHeaders(config),
+    payload: { guildId: 'g1', discordUserId: 'u1', source: 'bogus', action: 'skip' },
+  })
+  assert.equal(response.statusCode, 400)
+  assert.equal(response.json().error, 'invalid_source')
 })
 
 test('POST /internal/operation-log rejects a payload missing required fields', async (t) => {

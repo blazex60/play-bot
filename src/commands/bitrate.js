@@ -15,7 +15,8 @@ export default {
     await interaction.deferReply({ ephemeral: true })
     const member = interaction.member
     if (!member.voice?.channel) {
-      return interaction.editReply({ content: '❌ まずVCに参加してください' })
+      await interaction.editReply({ content: '❌ まずVCに参加してください' })
+      return false
     }
     const channel = member.voice.channel
     const tier = interaction.guild.premiumTier
@@ -25,7 +26,8 @@ export default {
     try {
       await channel.setBitrate(target)
     } catch {
-      return interaction.editReply({ content: '❌ チャンネルの編集権限がありません' })
+      await interaction.editReply({ content: '❌ チャンネルの編集権限がありません' })
+      return false
     }
     const suffix = kbps !== null && target < kbps * 1000 ? `（Tier${tier} 上限に丸めました）` : ''
     // The deferred reply above is always ephemeral so error paths stay

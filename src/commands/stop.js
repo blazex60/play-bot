@@ -7,8 +7,11 @@ export default {
 
   async execute(interaction, sessions) {
     const session = sessions.get(interaction.guildId)
-    if (!session) return interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
-    if (!checkSameVoiceChannel(interaction, session)) return
+    if (!session) {
+      await interaction.reply({ content: '❌ 再生中の曲がありません', flags: MessageFlags.Ephemeral })
+      return false
+    }
+    if (!checkSameVoiceChannel(interaction, session)) return false
     await session.player.stop()
     // Invalidate any in-flight autoplay planning for this session: without
     // this, a queue-exhaustion continuation resolving after the stop would

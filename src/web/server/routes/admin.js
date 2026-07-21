@@ -30,9 +30,10 @@ export async function adminRoutes(app, { db, botClient } = {}) {
   })
 
   app.post('/api/admin/:guildId/permissions/default', async (request, reply) => {
+    const { guildId } = request.params
+    let user
     try {
-      const user = getSessionUser(request)
-      const { guildId } = request.params
+      user = getSessionUser(request)
       await requireAdminPermission({ botClient, guildId, userId: user.discordId })
       const { command, value } = request.body ?? {}
       const result = await callBot(botClient, 'POST', `/admin/${encodeURIComponent(guildId)}/permissions/default`, { adminUserId: user.discordId, command, value })
@@ -47,14 +48,26 @@ export async function adminRoutes(app, { db, botClient } = {}) {
       })
       return reply.send(result ?? { ok: true })
     } catch (error) {
+      if (user) {
+        recordOperationLog(db, {
+          guildId,
+          discordUserId: user.discordId,
+          username: user.username,
+          source: 'admin',
+          action: 'set_default_permission',
+          detail: error.message,
+          success: false,
+        })
+      }
       return bindRouteError(reply, error)
     }
   })
 
   app.post('/api/admin/:guildId/permissions/user', async (request, reply) => {
+    const { guildId } = request.params
+    let user
     try {
-      const user = getSessionUser(request)
-      const { guildId } = request.params
+      user = getSessionUser(request)
       await requireAdminPermission({ botClient, guildId, userId: user.discordId })
       const { userId, command, value } = request.body ?? {}
       const result = await callBot(botClient, 'POST', `/admin/${encodeURIComponent(guildId)}/permissions/user`, { adminUserId: user.discordId, userId, command, value })
@@ -69,6 +82,17 @@ export async function adminRoutes(app, { db, botClient } = {}) {
       })
       return reply.send(result ?? { ok: true })
     } catch (error) {
+      if (user) {
+        recordOperationLog(db, {
+          guildId,
+          discordUserId: user.discordId,
+          username: user.username,
+          source: 'admin',
+          action: 'set_user_permission',
+          detail: error.message,
+          success: false,
+        })
+      }
       return bindRouteError(reply, error)
     }
   })
@@ -86,9 +110,10 @@ export async function adminRoutes(app, { db, botClient } = {}) {
   })
 
   app.post('/api/admin/:guildId/visibility', async (request, reply) => {
+    const { guildId } = request.params
+    let user
     try {
-      const user = getSessionUser(request)
-      const { guildId } = request.params
+      user = getSessionUser(request)
       await requireAdminPermission({ botClient, guildId, userId: user.discordId })
       const { command, value } = request.body ?? {}
       const result = await callBot(botClient, 'POST', `/admin/${encodeURIComponent(guildId)}/visibility`, { adminUserId: user.discordId, command, value })
@@ -103,6 +128,17 @@ export async function adminRoutes(app, { db, botClient } = {}) {
       })
       return reply.send(result ?? { ok: true })
     } catch (error) {
+      if (user) {
+        recordOperationLog(db, {
+          guildId,
+          discordUserId: user.discordId,
+          username: user.username,
+          source: 'admin',
+          action: 'set_command_visibility',
+          detail: error.message,
+          success: false,
+        })
+      }
       return bindRouteError(reply, error)
     }
   })

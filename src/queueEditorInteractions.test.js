@@ -24,7 +24,7 @@ function makeSession({ channelId = 'voice-1' } = {}) {
   return { connection: { joinConfig: { channelId } }, queue }
 }
 
-function fakeInteraction({ customId, guildId = 'guild-1', userId = 'user-1', channelId = 'voice-1', roles = [] } = {}) {
+function fakeInteraction({ customId, kind = 'button', guildId = 'guild-1', userId = 'user-1', channelId = 'voice-1', roles = [] } = {}) {
   const calls = { reply: [], followUp: [], update: [] }
   return {
     customId,
@@ -34,9 +34,9 @@ function fakeInteraction({ customId, guildId = 'guild-1', userId = 'user-1', cha
     member: { roles: { cache: { has: (id) => roles.includes(id) } }, voice: { channelId } },
     deferred: false,
     replied: false,
-    isButton: () => true,
-    isStringSelectMenu: () => false,
-    isModalSubmit: () => false,
+    isButton: () => kind === 'button',
+    isStringSelectMenu: () => kind === 'select',
+    isModalSubmit: () => kind === 'modal',
     reply: async (payload) => { calls.reply.push(payload); return payload },
     followUp: async (payload) => { calls.followUp.push(payload); return payload },
     update: async (payload) => { calls.update.push(payload); return payload },
@@ -56,6 +56,35 @@ test('handleQueueEditorInteraction: a user denied the queue command cannot remov
     assert.equal(interaction.calls.reply.length, 1, 'must reply with a denial instead of silently doing nothing')
     assert.equal(interaction.calls.update.length, 0, 'must not touch the queue editor message')
     assert.equal(session.queue.upcoming().length, 1, 'must not remove the track (regression: qedit_ actions bypassed checkCommandAllowed)')
+  })
+})
+
+test('handleQueueEditorInteraction: a user denied the queue command cannot reorder via the select menu', async () => {
+  await withTempSettings(async () => {
+    await setDefaultCommandPermission('guild-1', 'queue', 'deny')
+    const session = makeSession()
+    const sessions = new Map([['guild-1', session]])
+    const interaction = fakeInteraction({ customId: 'qedit_select_p0', kind: 'select' })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.reply.length, 1, 'must reply with a denial')
+    assert.equal(interaction.calls.update.length, 0, 'must not touch the queue editor message')
+  })
+})
+
+test('handleQueueEditorInteraction: a user denied the queue command cannot jump via the modal submit', async () => {
+  await withTempSettings(async () => {
+    await setDefaultCommandPermission('guild-1', 'queue', 'deny')
+    const session = makeSession()
+    const sessions = new Map([['guild-1', session]])
+    const interaction = fakeInteraction({ customId: 'qedit_jumpmodal_p0_i0', kind: 'modal' })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.reply.length, 1, 'must reply with a denial')
+    assert.equal(interaction.calls.update.length, 0, 'must not move the track')
+    assert.equal(session.queue.upcoming().length, 1, 'queue must be unchanged')
   })
 })
 

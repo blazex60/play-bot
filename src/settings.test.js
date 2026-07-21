@@ -131,7 +131,7 @@ test('settings: setters merge instead of clobbering other fields (regression)', 
 })
 
 test('settings: setDefaultCommandPermission and setUserCommandPermission resolve with override precedence', async () => {
-  await withTempSettings(async () => {
+  await withTempSettings(async ({ filePath }) => {
     assert.equal(resolveCommandPermission('guild-1', 'user-1', 'bitrate'), 'allow')
 
     await setDefaultCommandPermission('guild-1', 'bitrate', 'deny')
@@ -144,14 +144,25 @@ test('settings: setDefaultCommandPermission and setUserCommandPermission resolve
     // Clearing the override falls back to the guild default again.
     await setUserCommandPermission('guild-1', 'user-1', 'bitrate', null)
     assert.equal(resolveCommandPermission('guild-1', 'user-1', 'bitrate'), 'deny')
+
+    // Round-trip through disk to exercise normalizeCommandPermissions, the
+    // same path settings.js hits on process restart.
+    configureSettingsPathForTest(filePath)
+    loadSettings()
+    assert.equal(resolveCommandPermission('guild-1', 'user-1', 'bitrate'), 'deny')
+    assert.equal(resolveCommandPermission('guild-1', 'user-2', 'bitrate'), 'deny')
   })
 })
 
 test('settings: setCommandVisibility persists per-command overrides', async () => {
-  await withTempSettings(async () => {
+  await withTempSettings(async ({ filePath }) => {
     assert.deepEqual(getCommandVisibilitySettings('guild-1'), {})
 
     await setCommandVisibility('guild-1', 'play', 'personal')
+
+    // Round-trip through disk to exercise normalizeCommandVisibility.
+    configureSettingsPathForTest(filePath)
+    loadSettings()
     assert.deepEqual(getCommandVisibilitySettings('guild-1'), { play: 'personal' })
   })
 })

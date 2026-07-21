@@ -85,7 +85,7 @@ export function createMemoryDb() {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX idx_operation_logs_guild
-      ON operation_logs(guild_id, created_at DESC);
+      ON operation_logs(guild_id, id DESC);
   `)
   return db
 }

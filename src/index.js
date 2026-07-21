@@ -59,8 +59,12 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
     try {
-      await command.execute(interaction, sessions)
-      logOperation(true)
+      // Commands return `false` on an expected-failure path they've already
+      // replied to (not playing, empty queue, etc.) so the operation log
+      // reflects what actually happened rather than "the handler didn't
+      // throw" — every command file that has such a path returns false there.
+      const result = await command.execute(interaction, sessions)
+      logOperation(result !== false)
     } catch (err) {
       console.error(`[${interaction.commandName}] error:`, err)
       logOperation(false, err.message)
