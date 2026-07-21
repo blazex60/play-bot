@@ -99,7 +99,14 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   const handleQueueExhausted = async (lastTrack) => {
     const session = sessions.get(guildId)
     if (!session) return false
-    if (!claimAutoplayContinuation(session)) return false
+    // null (not false) means "someone else is already running a round for
+    // this guild" — distinct from a round that ran and genuinely found
+    // nothing to do. Two DM prompts from the same round expire within
+    // microtasks of each other in the common case (nobody answers), so both
+    // per-message timeouts can call onTimeout at nearly the same time; the
+    // caller must not treat "the other one already grabbed this" as failure
+    // and disconnect out from under the round that's actually in progress.
+    if (!claimAutoplayContinuation(session)) return null
     // planAutoTrack/planRecommendations do multi-second async work (history
     // fetch, yt-dlp). /stop can clear the queue in that window without
     // deleting the session, which would otherwise make queue.isEmpty look
@@ -153,7 +160,11 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
             // should end the session now — see handleQueueExhausted's own
             // lock release below, which is what makes this re-entry legal.
             const continued = await handleQueueExhausted(lastTrack)
-            if (!continued) await onDisconnect()
+            // continued === null means another overlapping timeout already
+            // claimed the lock and is handling this round itself; only a
+            // genuine `false` (a round that ran and found nothing to do)
+            // should tear the session down here.
+            if (continued === false) await onDisconnect()
           },
         })
         if (isStale()) {

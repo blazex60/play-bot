@@ -115,6 +115,25 @@ export function cancelRecommendations(guildId, pendingStore) {
   }
 }
 
+// (Re)arms an entry's expiry timer. Used both when a prompt is first posted
+// and when handleRecommendChoice restores one after a failed VC check —
+// that restore can happen after the entry's original timer already fired
+// (it isn't cleared until the check succeeds, by design), so reusing it
+// would leave the restored entry with nothing left to ever expire it.
+function scheduleExpiry(entry, pendingStore, guildId, onTimeout) {
+  entry.timeoutHandle = setTimeout(async () => {
+    pendingStore.delete(entry.message.id)
+    await disableMessage(entry.message).catch(() => {})
+    if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && onTimeout) {
+      try {
+        await onTimeout()
+      } catch (err) {
+        console.error('[recommendFlow] onTimeout failed:', err.message)
+      }
+    }
+  }, RECOMMEND_TIMEOUT_MS)
+}
+
 // Returns the number of recommendation messages actually posted, so callers
 // can tell "posted but nobody has picked yet" apart from "every send failed"
 // (e.g. everyone's DMs are closed to the bot).
@@ -169,17 +188,7 @@ export async function postRecommendations({ client, guildId, guildName, plans, p
     }
 
     const entry = { guildId, targetUserId: userId, candidates, message, timeoutHandle: null }
-    entry.timeoutHandle = setTimeout(async () => {
-      pendingStore.delete(message.id)
-      await disableMessage(message).catch(() => {})
-      if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && onTimeout) {
-        try {
-          await onTimeout()
-        } catch (err) {
-          console.error('[recommendFlow] onTimeout failed:', err.message)
-        }
-      }
-    }, RECOMMEND_TIMEOUT_MS)
+    scheduleExpiry(entry, pendingStore, guildId, onTimeout)
 
     pendingStore.set(message.id, entry)
     postedCount += 1
@@ -252,7 +261,24 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
     // after rejoining the VC) still works instead of the prompt silently
     // expiring.
     if (!(await checkInVoiceChannel(interaction, session))) {
-      pendingStore.set(interaction.message.id, entry)
+      // /stop, /leave, or the VC emptying out may have cancelled this
+      // guild's recommendations while we were awaiting the membership check
+      // above — cancelRecommendations couldn't see this entry since it was
+      // already claimed (removed from pendingStore) when it ran. Restoring
+      // it anyway would resurrect a prompt for a session that's already
+      // been stopped/torn down, and a later click on it could enqueue a
+      // track despite the stop. Only restore if nothing changed out from
+      // under us.
+      if (!isSessionStale()) {
+        // The entry's own timer may have already fired while we were
+        // awaiting the membership check (it isn't cleared until the check
+        // succeeds — see below), so re-arm a fresh one rather than trusting
+        // one that may already be spent; otherwise the restored prompt
+        // could linger in pendingStore with nothing left to ever expire it.
+        clearTimeout(entry.timeoutHandle)
+        scheduleExpiry(entry, pendingStore, entry.guildId, guildOnTimeoutCallbacks.get(entry.guildId))
+        pendingStore.set(interaction.message.id, entry)
+      }
       return
     }
     clearTimeout(entry.timeoutHandle)

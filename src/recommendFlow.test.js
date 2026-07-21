@@ -145,7 +145,7 @@ test('handleRecommendChoice: rejects a click from someone other than the target 
   assert.ok(pendingStore.get('msg-1'), 'entry must remain so the actual target user can still pick')
 })
 
-test('handleRecommendChoice: rejects and preserves the entry if the target user left the VC', async () => {
+test('handleRecommendChoice: rejects and preserves the entry if the target user left the VC', async (t) => {
   const pendingStore = new PendingChoiceStore()
   pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
   const session = makeSession({ voiceChannelId: 'vc-1' })
@@ -153,9 +153,11 @@ test('handleRecommendChoice: rejects and preserves the entry if the target user 
   const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-2', interactionChannelId: 'vc-1' })
 
   await handleRecommendChoice(interaction, sessions, pendingStore)
+  t.after(() => clearTimeout(pendingStore.get('msg-1')?.timeoutHandle))
 
   assert.equal(session.player.playNextCalls.length, 0, 'must not start playback for a user no longer in the VC')
   assert.ok(pendingStore.get('msg-1'), 'entry must survive a failed VC check so a legitimate retry still works')
+  assert.ok(pendingStore.get('msg-1').timeoutHandle, 'the restored entry must have a fresh, live timeout, not a spent one')
 })
 
 test('handleRecommendChoice: honors a real DM pick (interaction.member absent, resolved via guild.members.fetch)', async () => {
@@ -193,6 +195,51 @@ test('handleRecommendChoice: honors a real DM pick (interaction.member absent, r
 
   assert.equal(session.queue.current.videoId, 'v1', 'the pick must succeed via the fetched-member fallback')
   assert.equal(session.player.playNextCalls.length, 1)
+})
+
+test('handleRecommendChoice: does not resurrect a prompt if /stop bumps planToken while the membership check is in flight and it then fails', async (t) => {
+  const pendingStore = new PendingChoiceStore()
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
+  const sessions = new Map([['g1', session]])
+
+  // The membership fetch resolves the user as no longer in the VC (they
+  // left), but not before /stop bumps the session's planToken while the
+  // fetch is still in flight — simulating cancelRecommendations having
+  // already swept pendingStore (this entry just wasn't in it yet, since it
+  // was already claimed).
+  const client = {
+    guilds: {
+      cache: new Map([['g1', {
+        members: {
+          async fetch() {
+            session.planToken += 1
+            return { voice: { channelId: 'vc-2' } } // left the bot's VC
+          },
+        },
+      }]]),
+    },
+  }
+  const interaction = {
+    customId: 'autoplay_0',
+    message: { id: 'msg-1' },
+    user: { id: 'u1' },
+    member: null,
+    client,
+    deferred: false,
+    replied: false,
+    replies: [],
+    async reply(payload) { this.replies.push(payload); this.replied = true },
+    async followUp(payload) { this.replies.push(payload) },
+    async deferUpdate() { this.deferred = true },
+  }
+
+  await handleRecommendChoice(interaction, sessions, pendingStore)
+  t.after(() => clearTimeout(pendingStore.get('msg-1')?.timeoutHandle))
+
+  assert.equal(pendingStore.get('msg-1'), null, 'a prompt must not be resurrected for a session /stop already reset')
+  assert.equal(session.queue.isEmpty, true)
 })
 
 test('handleRecommendChoice: valid pick on an empty queue starts playback', async () => {
