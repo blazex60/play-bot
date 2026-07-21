@@ -128,6 +128,7 @@
   grid-template-areas:
     "now      queue"
     "controls queue"
+    "autoplay queue"
     "playlist playlist"
     "review   review"
     "builder  builder";
@@ -135,6 +136,7 @@
 
 .now-playing { grid-area: now; }
 .controls-panel { grid-area: controls; }
+.autoplay-panel { grid-area: autoplay; }
 .queue-panel { grid-area: queue; display: flex; flex-direction: column; }
 .playlist-panel { grid-area: playlist; }
 .review-panel { grid-area: review; }
@@ -295,6 +297,13 @@
   list-style: none;
   margin: 0;
   padding: 0;
+}
+
+.queue-list {
+  max-height: 420px;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
 }
 
 .queue-item,
@@ -526,6 +535,7 @@
     grid-template-areas:
       "now"
       "controls"
+      "autoplay"
       "queue"
       "playlist"
       "review"
