@@ -1,6 +1,6 @@
 import { resolveImportTracks, toImportTrackRow } from '../matching.js'
 import { listYoutubePlaylistTracks } from '../services/youtube.js'
-import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 function insertImportJob(db, { userId, guildId, service, playlistId, playlistName, totalCount }) {
   const result = db.prepare(`
@@ -61,9 +61,10 @@ async function enqueueImport(botClient, guildId, payload) {
 export async function importRoutes(app, { db, botClient, services } = {}) {
   app.post('/api/import/:guildId', async (request, reply) => {
     let jobId = null
+    let user
+    const { guildId } = request.params
     try {
-      const user = getSessionUser(request)
-      const { guildId } = request.params
+      user = getSessionUser(request)
       const { service, playlistId, playlistName } = request.body ?? {}
 
       if (!db) throw new Error('db is required for import routes')
@@ -117,10 +118,31 @@ export async function importRoutes(app, { db, botClient, services } = {}) {
       const status = failedCount > 0 ? 'partial' : 'completed'
       completeImportJob(db, jobId, { matchedCount, failedCount, status })
 
+      recordOperationLog(db, {
+        guildId,
+        discordUserId: user.discordId,
+        username: user.username,
+        source: 'control',
+        action: 'import',
+        detail: JSON.stringify({ service, playlistId, matchedCount, failedCount }),
+        success: true,
+      })
+
       return reply.send({ jobId, status, matchedCount, failedCount })
     } catch (error) {
       if (jobId !== null) {
         failImportJob(db, jobId)
+      }
+      if (db && user) {
+        recordOperationLog(db, {
+          guildId,
+          discordUserId: user.discordId,
+          username: user.username,
+          source: 'control',
+          action: 'import',
+          detail: error.message,
+          success: false,
+        })
       }
       return bindRouteError(reply, error)
     }

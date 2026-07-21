@@ -279,6 +279,10 @@ test('POST /api/import/:guildId is blocked for a user denied the play command (r
     payload: { service: 'youtube', playlistId: 'pl1' },
   })
   assert.equal(response.statusCode, 403, 'a user denied /play must not be able to import a playlist either')
+
+  const logs = db.prepare(`SELECT * FROM operation_logs WHERE guild_id = 'g1' AND action = 'import'`).all()
+  assert.equal(logs.length, 1, 'the denied import attempt must still be recorded in the admin audit log')
+  assert.equal(logs[0].success, 0)
 })
 
 test('POST /api/import/tracks/:trackId/replace is blocked for a user denied the play command', async (t) => {
@@ -313,6 +317,10 @@ test('POST /api/import/tracks/:trackId/replace is blocked for a user denied the 
     payload: { youtubeResult: { title: 'Replacement', webpage_url: 'https://example.com/replacement' } },
   })
   assert.equal(response.statusCode, 403, 'a user denied /play must not be able to replace an import match either')
+
+  const logs = db.prepare(`SELECT * FROM operation_logs WHERE guild_id = 'g1' AND action = 'import_replace'`).all()
+  assert.equal(logs.length, 1, 'the denied replace attempt must still be recorded in the admin audit log')
+  assert.equal(logs[0].success, 0)
 })
 
 test('POST /api/playlists/mine/:id/queue is blocked for a user denied the play command, even with no active session', async (t) => {
@@ -352,6 +360,10 @@ test('POST /api/playlists/mine/:id/queue is blocked for a user denied the play c
     payload: { guildId: 'g2' },
   })
   assert.equal(queue.statusCode, 403, 'a user denied /play must not be able to start a new session via a saved playlist either')
+
+  const logs = db.prepare(`SELECT * FROM operation_logs WHERE guild_id = 'g2' AND action = 'playlist_queue'`).all()
+  assert.equal(logs.length, 1, 'the denied playlist-queue attempt must still be recorded in the admin audit log')
+  assert.equal(logs[0].success, 0)
 })
 
 test('/api/permission ignores a client-supplied userId and always uses the session user', async (t) => {

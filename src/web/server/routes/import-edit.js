@@ -1,6 +1,6 @@
 import { resolveYoutubeTrack, toImportTrackRow } from '../matching.js'
 import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
-import { bindRouteError, callBot, getSessionUser, requireBotPermission, requireCommandPermission } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 function getImportTrack(db, trackId) {
   return db.prepare(`
@@ -56,12 +56,14 @@ export async function importEditRoutes(app, { db, botClient, searchYoutube } = {
   })
 
   app.post('/api/import/tracks/:trackId/replace', async (request, reply) => {
+    let user
+    let existing
     try {
-      const user = getSessionUser(request)
+      user = getSessionUser(request)
       if (!db) throw new Error('db is required for import edit routes')
       if (!botClient) throw new Error('botClient is required for import edit routes')
 
-      const existing = getImportTrack(db, request.params.trackId)
+      existing = getImportTrack(db, request.params.trackId)
       if (!existing) return reply.code(404).send({ error: 'import_track_not_found' })
 
       await requireBotPermission({ botClient, guildId: existing.guild_id, userId: user.discordId })
@@ -83,8 +85,29 @@ export async function importEditRoutes(app, { db, botClient, searchYoutube } = {
         tracks: [result.track],
       })
 
+      recordOperationLog(db, {
+        guildId: existing.guild_id,
+        discordUserId: user.discordId,
+        username: user.username,
+        source: 'control',
+        action: 'import_replace',
+        detail: JSON.stringify({ trackId: existing.id, title: result.track.title }),
+        success: true,
+      })
+
       return reply.send({ track: result.track })
     } catch (error) {
+      if (db && user && existing) {
+        recordOperationLog(db, {
+          guildId: existing.guild_id,
+          discordUserId: user.discordId,
+          username: user.username,
+          source: 'control',
+          action: 'import_replace',
+          detail: error.message,
+          success: false,
+        })
+      }
       return bindRouteError(reply, error)
     }
   })
