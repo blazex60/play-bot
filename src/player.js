@@ -42,6 +42,10 @@ export class GuildPlayer {
   #currentResource = null;
   #createAudioResource;
   #resolveAudioStream;
+  #handlingAfter = false;
+  #handlingAfterPlayback = 0;
+  #pendingAfter = false;
+  #playbackCount = 0;
 
   constructor({
     guildId,
@@ -67,9 +71,7 @@ export class GuildPlayer {
     this.#resolveAudioStream = resolveAudioStreamFn;
 
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
-      this.#handleAfter().catch(err => {
-        console.error('[GuildPlayer] handleAfter error:', err);
-      });
+      this.#advanceAfterPlayback();
     });
 
     this.#audioPlayer.on('stateChange', (oldState, newState) => {
@@ -81,6 +83,24 @@ export class GuildPlayer {
     this.#audioPlayer.on('error', err => {
       console.error('[GuildPlayer] audioPlayer error:', err);
       this.#hadError = true;
+      const failedTrack = this.#queue.current;
+
+      // A stream error does not reliably produce an Idle event (for example,
+      // when yt-dlp cannot read a private or deleted video). Stop explicitly
+      // so the failed track is advanced instead of leaving the queue stuck.
+      this.#audioPlayer.stop();
+
+      // Some AudioPlayer implementations do not emit Idle synchronously from
+      // stop(). Give an emitted Idle handler precedence, then advance here as
+      // a fallback once the player is confirmed idle.
+      queueMicrotask(() => {
+        if (
+          this.#audioPlayer.state.status === AudioPlayerStatus.Idle &&
+          this.#queue.current === failedTrack
+        ) {
+          this.#advanceAfterPlayback();
+        }
+      });
     });
 
     this.#connection.subscribe(this.#audioPlayer);
@@ -123,6 +143,7 @@ export class GuildPlayer {
 
     this.#resetWatchdog();
 
+    this.#playbackCount += 1;
     this.#audioPlayer.play(resource);
     this.#prefetchUpcoming();
     this.#recordPlay(track);
@@ -167,6 +188,37 @@ export class GuildPlayer {
     this.#clearWatchdog();
     await this.#cleanupCurrentTempFile();
     this.#discardPrefetch();
+  }
+
+  #advanceAfterPlayback() {
+    if (this.#handlingAfter) {
+      // A newly started track can fail while an exhausted-queue continuation
+      // is still planning. Preserve that transition so it is handled after
+      // the active handoff, but ignore duplicate events from the playback it
+      // is already handling. Comparing playback instances (rather than tracks)
+      // also preserves an error from a TRACK-loop replay of the same track.
+      if (this.#playbackCount !== this.#handlingAfterPlayback) {
+        this.#pendingAfter = true;
+      }
+      return;
+    }
+    this.#handlingAfter = true;
+    this.#drainAfterPlayback()
+      .catch(err => {
+        console.error('[GuildPlayer] handleAfter error:', err);
+      })
+      .finally(() => {
+        this.#handlingAfter = false;
+        this.#handlingAfterPlayback = 0;
+      });
+  }
+
+  async #drainAfterPlayback() {
+    do {
+      this.#pendingAfter = false;
+      this.#handlingAfterPlayback = this.#playbackCount;
+      await this.#handleAfter();
+    } while (this.#pendingAfter);
   }
 
   async #handleAfter() {
