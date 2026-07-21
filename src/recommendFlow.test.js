@@ -2,28 +2,34 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { GuildQueue, createTrack } from './queue.js'
 import { PendingChoiceStore } from './views.js'
-import { cancelRecommendations, handleRecommendChoice, postRecommendations, RECOMMEND_TIMEOUT_MS } from './recommendFlow.js'
+import { cancelRecommendations, handleRecommendChoice, hasPendingForGuild, postRecommendations, RECOMMEND_TIMEOUT_MS } from './recommendFlow.js'
 
 function makeCandidate(videoId) {
   return createTrack({ title: videoId, webpageUrl: `https://example.com/${videoId}`, duration: 60, videoId })
 }
 
-function makeChannel({ sendFails = false } = {}) {
+function makeSentMessage(id) {
+  return { id, components: [{ components: [{ setDisabled() {} }] }], editCalls: [], deleteCalls: 0, async edit(update) { this.editCalls.push(update) }, async delete() { this.deleteCalls += 1 } }
+}
+
+// Recommend prompts are DMs now, so posting them goes through
+// client.users.fetch(userId).send(...) instead of a shared channel.
+function makeClient({ sendFails = false } = {}) {
   const sent = []
   return {
     sent,
-    async send(payload) {
-      if (sendFails) throw new Error('missing permission')
-      const message = {
-        id: `msg-${sent.length}`,
-        components: [{ components: [{ setDisabled() {} }] }],
-        editCalls: [],
-        async edit(update) {
-          this.editCalls.push(update)
-        },
-      }
-      sent.push({ payload, message })
-      return message
+    users: {
+      async fetch(userId) {
+        return {
+          id: userId,
+          async send(payload) {
+            if (sendFails) throw new Error('Cannot send messages to this user')
+            const message = makeSentMessage(`msg-${sent.length}`)
+            sent.push({ userId, payload, message })
+            return message
+          },
+        }
+      },
     },
   }
 }
@@ -60,35 +66,71 @@ function makeInteraction({ customId, messageId, userId, voiceChannelId, interact
 }
 
 test('postRecommendations: returns the count of successfully posted messages', async (t) => {
-  const channel = makeChannel()
+  const client = makeClient()
   const pendingStore = new PendingChoiceStore()
   const plans = [
     { userId: 'u1', candidates: [makeCandidate('v1')] },
     { userId: 'u2', candidates: [makeCandidate('v2')] },
   ]
-  const count = await postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
+  const count = await postRecommendations({ client, guildId: 'g1', plans, pendingStore })
   t.after(() => {
     for (const [, entry] of pendingStore.entries()) clearTimeout(entry.timeoutHandle)
   })
   assert.equal(count, 2)
-  assert.equal(channel.sent.length, 2)
+  assert.equal(client.sent.length, 2)
 })
 
-test('postRecommendations: returns 0 when every send fails, without throwing', async () => {
-  const channel = makeChannel({ sendFails: true })
+test('postRecommendations: returns 0 when every DM fails, without throwing', async () => {
+  const client = makeClient({ sendFails: true })
   const pendingStore = new PendingChoiceStore()
   const plans = [{ userId: 'u1', candidates: [makeCandidate('v1')] }]
-  const count = await postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
+  const count = await postRecommendations({ client, guildId: 'g1', plans, pendingStore })
   assert.equal(count, 0)
 })
 
 test('postRecommendations: skips plans with no candidates', async () => {
-  const channel = makeChannel()
+  const client = makeClient()
   const pendingStore = new PendingChoiceStore()
   const plans = [{ userId: 'u1', candidates: [] }]
-  const count = await postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
+  const count = await postRecommendations({ client, guildId: 'g1', plans, pendingStore })
   assert.equal(count, 0)
-  assert.equal(channel.sent.length, 0)
+  assert.equal(client.sent.length, 0)
+})
+
+test('postRecommendations: skips a user who already has a live pending prompt for this guild', async (t) => {
+  const client = makeClient()
+  const pendingStore = new PendingChoiceStore()
+  // Simulates a fast repeat round: u1's earlier prompt is still unanswered
+  // when a fresh round fires for the same guild.
+  pendingStore.set('existing-msg', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('old')], message: makeSentMessage('existing-msg'), timeoutHandle: null })
+  const plans = [
+    { userId: 'u1', candidates: [makeCandidate('v1')] },
+    { userId: 'u2', candidates: [makeCandidate('v2')] },
+  ]
+  const count = await postRecommendations({ client, guildId: 'g1', plans, pendingStore })
+  t.after(() => {
+    for (const [, entry] of pendingStore.entries()) clearTimeout(entry.timeoutHandle)
+  })
+  assert.equal(count, 1, 'only u2, who had no live prompt, should get a new DM')
+  assert.deepEqual(client.sent.map((s) => s.userId), ['u2'])
+})
+
+test('postRecommendations: returns 0 while a live prompt still exists for the guild (the sole plan was a dedup skip, not a total failure)', async (t) => {
+  // sessions.js's handleQueueExhausted relies on this distinction: a
+  // postedCount of 0 here must not be treated the same as "nobody could be
+  // reached at all" — hasPendingForGuild(pendingStore, guildId) tells it an
+  // earlier round's DM is still answerable, so it should keep the session
+  // alive instead of disconnecting and cancelling that still-valid prompt.
+  const client = makeClient()
+  const pendingStore = new PendingChoiceStore()
+  pendingStore.set('existing-msg', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('old')], message: makeSentMessage('existing-msg'), timeoutHandle: null })
+  const plans = [{ userId: 'u1', candidates: [makeCandidate('v1')] }]
+  const count = await postRecommendations({ client, guildId: 'g1', plans, pendingStore })
+  t.after(() => {
+    for (const [, entry] of pendingStore.entries()) clearTimeout(entry.timeoutHandle)
+  })
+  assert.equal(count, 0)
+  assert.equal(hasPendingForGuild(pendingStore, 'g1'), true, "u1's earlier prompt is still live and answerable")
 })
 
 test('handleRecommendChoice: rejects a click from someone other than the target user', async () => {
@@ -105,7 +147,7 @@ test('handleRecommendChoice: rejects a click from someone other than the target 
 
 test('handleRecommendChoice: rejects and preserves the entry if the target user left the VC', async () => {
   const pendingStore = new PendingChoiceStore()
-  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null })
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null, expired: false })
   const session = makeSession({ voiceChannelId: 'vc-1' })
   const sessions = new Map([['g1', session]])
   const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-2', interactionChannelId: 'vc-1' })
@@ -116,20 +158,141 @@ test('handleRecommendChoice: rejects and preserves the entry if the target user 
   assert.ok(pendingStore.get('msg-1'), 'entry must survive a failed VC check so a legitimate retry still works')
 })
 
-test('handleRecommendChoice: honors a pick from a text channel other than the VC (regression: recommend prompts posted outside the VC chat were unclickable)', async () => {
+test('handleRecommendChoice: honors a real DM pick (interaction.member absent, resolved via guild.members.fetch)', async () => {
   const pendingStore = new PendingChoiceStore()
   pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
   const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
   const sessions = new Map([['g1', session]])
-  // The recommendation was posted to session.textChannelId (wherever /play
-  // was invoked), which is often a normal text channel distinct from the
-  // VC's own chat channel — simulated here via interactionChannelId.
-  const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1', interactionChannelId: 'general-text-channel' })
+
+  // A real DM-originated click carries no interaction.member at all (DMs
+  // have no guild context), so checkInVoiceChannel must fall back to
+  // fetching the member from the guild to confirm they're still in the VC.
+  const member = { voice: { channelId: 'vc-1' } }
+  const client = {
+    guilds: {
+      cache: new Map([['g1', { members: { async fetch() { return member } } }]]),
+    },
+  }
+  const replies = []
+  const interaction = {
+    customId: 'autoplay_0',
+    message: { id: 'msg-1' },
+    user: { id: 'u1' },
+    member: null,
+    client,
+    deferred: false,
+    replied: false,
+    replies,
+    async reply(payload) { replies.push(payload); this.replied = true },
+    async followUp(payload) { replies.push(payload) },
+    async deferUpdate() { this.deferred = true },
+  }
 
   await handleRecommendChoice(interaction, sessions, pendingStore)
 
-  assert.equal(session.queue.current.videoId, 'v1', 'the pick must succeed even though it was clicked from a non-VC text channel')
+  assert.equal(session.queue.current.videoId, 'v1', 'the pick must succeed via the fetched-member fallback')
   assert.equal(session.player.playNextCalls.length, 1)
+})
+
+test('handleRecommendChoice: does not resurrect a prompt if /stop bumps planToken while the membership check is in flight and it then fails', async (t) => {
+  const pendingStore = new PendingChoiceStore()
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
+  const sessions = new Map([['g1', session]])
+
+  // The membership fetch resolves the user as no longer in the VC (they
+  // left), but not before /stop bumps the session's planToken while the
+  // fetch is still in flight — simulating cancelRecommendations having
+  // already swept pendingStore (this entry just wasn't in it yet, since it
+  // was already claimed).
+  const client = {
+    guilds: {
+      cache: new Map([['g1', {
+        members: {
+          async fetch() {
+            session.planToken += 1
+            return { voice: { channelId: 'vc-2' } } // left the bot's VC
+          },
+        },
+      }]]),
+    },
+  }
+  const interaction = {
+    customId: 'autoplay_0',
+    message: { id: 'msg-1' },
+    user: { id: 'u1' },
+    member: null,
+    client,
+    deferred: false,
+    replied: false,
+    replies: [],
+    async reply(payload) { this.replies.push(payload); this.replied = true },
+    async followUp(payload) { this.replies.push(payload) },
+    async deferUpdate() { this.deferred = true },
+  }
+
+  await handleRecommendChoice(interaction, sessions, pendingStore)
+  t.after(() => clearTimeout(pendingStore.get('msg-1')?.timeoutHandle))
+
+  assert.equal(pendingStore.get('msg-1'), null, 'a prompt must not be resurrected for a session /stop already reset')
+  assert.equal(session.queue.isEmpty, true)
+})
+
+test('handleRecommendChoice: does not restore an entry whose own deadline already fired while the membership check was in flight (regression: would otherwise delay the next round by a full timeout, or race a stale expiry callback)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const client = makeClient()
+  const pendingStore = new PendingChoiceStore()
+  const plans = [{ userId: 'u1', candidates: [makeCandidate('v1')] }]
+  let onTimeoutCalls = 0
+  await postRecommendations({
+    client, guildId: 'g1', plans, pendingStore,
+    onTimeout: async () => { onTimeoutCalls += 1 },
+  })
+  const messageId = client.sent[0].message.id
+
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
+  const sessions = new Map([['g1', session]])
+
+  let resolveFetch
+  const fetchGate = new Promise((resolve) => { resolveFetch = resolve })
+  const dmClient = {
+    guilds: {
+      cache: new Map([['g1', { members: { async fetch() { return fetchGate } } }]]),
+    },
+  }
+  const interaction = {
+    customId: 'autoplay_0',
+    message: { id: messageId },
+    user: { id: 'u1' },
+    member: null,
+    client: dmClient,
+    deferred: false,
+    replied: false,
+    replies: [],
+    async reply(payload) { this.replies.push(payload); this.replied = true },
+    async followUp(payload) { this.replies.push(payload) },
+    async deferUpdate() { this.deferred = true },
+  }
+
+  const pickPromise = handleRecommendChoice(interaction, sessions, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // The prompt's own 5-minute deadline fires while the membership check is
+  // still in flight — it isn't cleared until that check succeeds, by design.
+  t.mock.timers.tick(RECOMMEND_TIMEOUT_MS)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(onTimeoutCalls, 0, 'must not fire yet — this pick is still in flight (markPickInFlight)')
+
+  // The membership check now resolves: the user has left the VC.
+  resolveFetch({ voice: { channelId: 'vc-2' } })
+  await pickPromise
+
+  assert.equal(pendingStore.get(messageId), null, 'an already-expired prompt must not be resurrected')
+  assert.equal(onTimeoutCalls, 1, 'the deferred continuation/teardown check must run immediately, not after another full timeout')
 })
 
 test('handleRecommendChoice: valid pick on an empty queue starts playback', async () => {
@@ -163,10 +326,6 @@ test('handleRecommendChoice: does not restart playback if the queue was already 
   assert.deepEqual(session.queue.upcoming().map((t) => t.videoId), ['v1'], 'picked track should be appended instead')
 })
 
-function makeSentMessage(id) {
-  return { id, components: [{ components: [{ setDisabled() {} }] }], deleteCalls: 0, async edit() {}, async delete() { this.deleteCalls += 1 } }
-}
-
 test('handleRecommendChoice: two users clicking their own prompts at once, both succeed independently', async () => {
   const pendingStore = new PendingChoiceStore()
   const messageA = makeSentMessage('msg-1')
@@ -196,9 +355,105 @@ test('handleRecommendChoice: two users clicking their own prompts at once, both 
   assert.equal(pendingStore.get('msg-2'), null)
 })
 
+test('handleRecommendChoice: two rapid clicks on the same DM prompt must not double-enqueue (regression: async VC check raced the entry claim)', async () => {
+  const pendingStore = new PendingChoiceStore()
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
+  const sessions = new Map([['g1', session]])
+
+  // Prompts are DMs now, so a real click carries no interaction.member —
+  // checkInVoiceChannel has to await a guild.members.fetch instead. Simulate
+  // that round-trip taking long enough for a second, near-simultaneous click
+  // to start running before the first one has claimed the entry.
+  const member = { voice: { channelId: 'vc-1' } }
+  const client = {
+    guilds: {
+      cache: new Map([['g1', {
+        members: {
+          async fetch() {
+            await new Promise((resolve) => setImmediate(resolve))
+            return member
+          },
+        },
+      }]]),
+    },
+  }
+
+  function makeDmInteraction() {
+    const replies = []
+    return {
+      customId: 'autoplay_0',
+      message: { id: 'msg-1' },
+      user: { id: 'u1' },
+      member: null,
+      client,
+      deferred: false,
+      replied: false,
+      replies,
+      async reply(payload) { replies.push(payload); this.replied = true },
+      async followUp(payload) { replies.push(payload) },
+      async deferUpdate() { this.deferred = true },
+    }
+  }
+
+  await Promise.all([
+    handleRecommendChoice(makeDmInteraction(), sessions, pendingStore),
+    handleRecommendChoice(makeDmInteraction(), sessions, pendingStore),
+  ])
+
+  const queued = [session.queue.current, ...session.queue.upcoming()].filter(Boolean)
+  assert.equal(queued.length, 1, 'the track must be enqueued exactly once even though both clicks raced past the async VC check')
+  assert.equal(session.player.playNextCalls.length, 1)
+})
+
+test('handleRecommendChoice: acknowledges the interaction before the membership fetch (regression: a slow REST lookup could expire the interaction token)', async () => {
+  const pendingStore = new PendingChoiceStore()
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
+  const sessions = new Map([['g1', session]])
+
+  const callOrder = []
+  const member = { voice: { channelId: 'vc-1' } }
+  const client = {
+    guilds: {
+      cache: new Map([['g1', {
+        members: {
+          async fetch() {
+            callOrder.push('members.fetch')
+            await new Promise((resolve) => setImmediate(resolve))
+            return member
+          },
+        },
+      }]]),
+    },
+  }
+  const interaction = {
+    customId: 'autoplay_0',
+    message: { id: 'msg-1' },
+    user: { id: 'u1' },
+    member: null,
+    client,
+    deferred: false,
+    replied: false,
+    replies: [],
+    async reply(payload) { this.replies.push(payload); this.replied = true },
+    async followUp(payload) { this.replies.push(payload) },
+    async deferUpdate() { callOrder.push('deferUpdate'); this.deferred = true },
+  }
+
+  await handleRecommendChoice(interaction, sessions, pendingStore)
+
+  assert.deepEqual(callOrder, ['deferUpdate', 'members.fetch'], 'the interaction must be acknowledged before the REST membership lookup starts, not after')
+  assert.equal(session.queue.current.videoId, 'v1')
+})
+
 test("postRecommendations: a still-pending prompt's timeout must not tear the session down while another user's pick is in flight", async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
-  const channel = makeChannel()
+  const client = makeClient()
   const pendingStore = new PendingChoiceStore()
   const plans = [
     { userId: 'u1', candidates: [makeCandidate('v1')] },
@@ -206,10 +461,10 @@ test("postRecommendations: a still-pending prompt's timeout must not tear the se
   ]
   let onTimeoutCalls = 0
   await postRecommendations({
-    channel, guildId: 'g1', plans, pendingStore,
+    client, guildId: 'g1', plans, pendingStore,
     onTimeout: async () => { onTimeoutCalls += 1 },
   })
-  // makeChannel names messages msg-0, msg-1 in send order, matching plans order.
+  // makeClient names messages msg-0, msg-1 in send order, matching plans order.
   assert.ok(pendingStore.get('msg-0'), "u1's prompt should be pending")
   assert.ok(pendingStore.get('msg-1'), "u2's prompt should be pending")
 
@@ -293,7 +548,7 @@ test('handleRecommendChoice: does not enqueue or start playback if /stop bumps p
 
 test('handleRecommendChoice: retriggers the teardown check if an in-flight pick fails after its guild ran out of pending prompts', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
-  const channel = makeChannel()
+  const client = makeClient()
   const pendingStore = new PendingChoiceStore()
   const plans = [
     { userId: 'u1', candidates: [makeCandidate('v1')] },
@@ -301,7 +556,7 @@ test('handleRecommendChoice: retriggers the teardown check if an in-flight pick 
   ]
   let onTimeoutCalls = 0
   await postRecommendations({
-    channel, guildId: 'g1', plans, pendingStore,
+    client, guildId: 'g1', plans, pendingStore,
     onTimeout: async () => { onTimeoutCalls += 1 },
   })
 
@@ -338,12 +593,19 @@ test('postRecommendations: disables and drops a message whose send resolves afte
   let resolveSecondSend
   const secondSendGate = new Promise((resolve) => { resolveSecondSend = resolve })
   let sendCount = 0
-  const channel = {
-    async send() {
-      sendCount += 1
-      if (sendCount === 1) return makeSentMessage('msg-1')
-      await secondSendGate
-      return makeSentMessage('msg-2')
+  const client = {
+    users: {
+      async fetch(userId) {
+        return {
+          id: userId,
+          async send() {
+            sendCount += 1
+            if (sendCount === 1) return makeSentMessage('msg-1')
+            await secondSendGate
+            return makeSentMessage('msg-2')
+          },
+        }
+      },
     },
   }
   const plans = [
@@ -351,7 +613,7 @@ test('postRecommendations: disables and drops a message whose send resolves afte
     { userId: 'u2', candidates: [makeCandidate('v2')] },
   ]
 
-  const postPromise = postRecommendations({ channel, guildId: 'g1', plans, pendingStore })
+  const postPromise = postRecommendations({ client, guildId: 'g1', plans, pendingStore })
 
   await new Promise((resolve) => setTimeout(resolve, 10))
   assert.ok(pendingStore.get('msg-1'), 'first message should already be stored while the second send is still pending')
@@ -368,18 +630,18 @@ test('postRecommendations: disables and drops a message whose send resolves afte
 })
 
 test('postRecommendations: skips a plan for a user no longer in the voice channel by send time', async (t) => {
-  const channel = makeChannel()
+  const client = makeClient()
   const pendingStore = new PendingChoiceStore()
   const voiceChannel = { members: new Map([['u1', {}]]) } // u2 already left the VC
   const plans = [
     { userId: 'u1', candidates: [makeCandidate('v1')] },
     { userId: 'u2', candidates: [makeCandidate('v2')] },
   ]
-  const count = await postRecommendations({ channel, guildId: 'g1', plans, pendingStore, voiceChannel })
+  const count = await postRecommendations({ client, guildId: 'g1', plans, pendingStore, voiceChannel })
   t.after(() => {
     for (const [, entry] of pendingStore.entries()) clearTimeout(entry.timeoutHandle)
   })
   assert.equal(count, 1, 'only the still-present user should get a prompt')
-  assert.equal(channel.sent.length, 1)
-  assert.ok(!channel.sent[0].payload.embeds[0].data.description.includes('u2'), "u2, who left, must not be addressed")
+  assert.equal(client.sent.length, 1)
+  assert.equal(client.sent[0].userId, 'u1')
 })

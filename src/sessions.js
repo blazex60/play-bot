@@ -4,7 +4,7 @@ import { GuildPlayer } from './player.js'
 import { PendingChoiceStore } from './views.js'
 import { createWebClient } from './webClient.js'
 import { planAutoTrack, planRecommendations, formatAutoAddNotification } from './autoplay.js'
-import { cancelRecommendations, postRecommendations } from './recommendFlow.js'
+import { cancelRecommendations, hasPendingForGuild, postRecommendations } from './recommendFlow.js'
 import { getGuildSettings } from './settings.js'
 
 // Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed }>
@@ -32,6 +32,13 @@ export function bumpPlanToken(guildId) {
   if (session) session.planToken += 1
 }
 
+// This is a re-entrancy lock for a single in-flight queue-exhaustion round,
+// not a "used up" marker: it's claimed at the start of handleQueueExhausted
+// and always released once that round's planning/posting settles (success
+// or failure), so the next queue-exhaustion event can claim it again. Autoplay
+// and recommend mode both keep continuing for as long as the session (i.e.
+// the bot's current VC connection) lives — only /leave or the VC emptying
+// out ends it.
 export function hasAutoplayContinuationBeenUsed(session) {
   return session?.autoplayContinuationUsed === true
 }
@@ -92,7 +99,14 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   const handleQueueExhausted = async (lastTrack) => {
     const session = sessions.get(guildId)
     if (!session) return false
-    if (!claimAutoplayContinuation(session)) return false
+    // null (not false) means "someone else is already running a round for
+    // this guild" — distinct from a round that ran and genuinely found
+    // nothing to do. Two DM prompts from the same round expire within
+    // microtasks of each other in the common case (nobody answers), so both
+    // per-message timeouts can call onTimeout at nearly the same time; the
+    // caller must not treat "the other one already grabbed this" as failure
+    // and disconnect out from under the round that's actually in progress.
+    if (!claimAutoplayContinuation(session)) return null
     // planAutoTrack/planRecommendations do multi-second async work (history
     // fetch, yt-dlp). /stop can clear the queue in that window without
     // deleting the session, which would otherwise make queue.isEmpty look
@@ -101,18 +115,12 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     const planToken = session.planToken
     const isStale = () => sessions.get(guildId) !== session || session.planToken !== planToken
 
-    const voiceChannel = guild.channels.cache.get(connection.joinConfig.channelId)
-    if (!voiceChannel) {
-      releaseAutoplayContinuation(session)
-      return false
-    }
-
     try {
+      const voiceChannel = guild.channels.cache.get(connection.joinConfig.channelId)
+      if (!voiceChannel) return false
+
       const autoTrack = await planAutoTrack({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
-      if (isStale()) {
-        releaseAutoplayContinuation(session)
-        return false
-      }
+      if (isStale()) return false
       if (autoTrack) {
         // A manual /play may have already re-filled and started the queue
         // while we were waiting, so only auto-start playback if still idle.
@@ -132,51 +140,55 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
       }
 
       const plans = await planRecommendations({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
-      if (isStale()) {
-        releaseAutoplayContinuation(session)
-        return false
-      }
+      if (isStale()) return false
       if (plans && plans.length > 0) {
-        const textChannelId = session.textChannelId
-        const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
-        if (!textChannel) {
-          releaseAutoplayContinuation(session)
-          return false
-        }
         const postedCount = await postRecommendations({
           client: guild.client,
-          channel: textChannel,
           guildId,
+          guildName: guild.name,
           plans,
-          queue,
-          player: session.player,
           pendingStore: recommendPendingStore,
           voiceChannel,
           onTimeout: async () => {
             // A manual /play may have started a track while this prompt sat
-            // unanswered; only the shared onDisconnect path should tear the
-            // session down, and only if nothing is actually playing/queued.
+            // unanswered — only end the session if nothing is actually
+            // playing/queued and this round is still the live one.
             if (!queue.isEmpty || isStale()) return
-            await onDisconnect()
+            // Nobody picked anything: keep the bot in the VC and show a
+            // fresh round (current VC membership, current preferences)
+            // instead of disconnecting. Only /leave or the VC emptying out
+            // should end the session now — see handleQueueExhausted's own
+            // lock release below, which is what makes this re-entry legal.
+            const continued = await handleQueueExhausted(lastTrack)
+            // continued === null means another overlapping timeout already
+            // claimed the lock and is handling this round itself; only a
+            // genuine `false` (a round that ran and found nothing to do)
+            // should tear the session down here.
+            if (continued === false) await onDisconnect()
           },
         })
         if (isStale()) {
-          // /stop (or similar) can land while channel.send() calls were still
-          // in flight above: the messages already got posted with live
-          // buttons before we knew to cancel them. Undo that now rather than
-          // leaving a pickable prompt that could revive playback post-stop.
+          // /stop (or similar) can land while sends were still in flight
+          // above: the messages already got posted with live buttons before
+          // we knew to cancel them. Undo that now rather than leaving a
+          // pickable prompt that could revive playback post-stop.
           cancelRecommendations(guildId, recommendPendingStore)
-          releaseAutoplayContinuation(session)
           return false
         }
         if (postedCount > 0) return true
       }
 
-      releaseAutoplayContinuation(session)
+      // This round may have posted nothing new — e.g. the only human left in
+      // the VC already had a live DM from an earlier round and got skipped
+      // by postRecommendations' own dedup — while that earlier DM is still a
+      // perfectly valid, answerable prompt. Treat that as a handled
+      // exhaustion instead of falling through to onDisconnect and cancelling
+      // a prompt someone can still pick.
+      if (hasPendingForGuild(recommendPendingStore, guildId)) return true
+
       return false
-    } catch (err) {
+    } finally {
       releaseAutoplayContinuation(session)
-      throw err
     }
   }
 

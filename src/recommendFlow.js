@@ -23,9 +23,19 @@ async function disableMessage(message) {
   await message.edit({ components: disabledRows })
 }
 
-function hasPendingForGuild(pendingStore, guildId) {
+export function hasPendingForGuild(pendingStore, guildId) {
   for (const [, entry] of pendingStore.entries()) {
     if (entry.guildId === guildId) return true
+  }
+  return false
+}
+
+// A repeated round (someone's pick finished quickly while others' prompts
+// from an earlier round are still live) must not stack a second DM on top
+// of a user's still-unanswered one.
+function hasPendingForUser(pendingStore, guildId, userId) {
+  for (const [, entry] of pendingStore.entries()) {
+    if (entry.guildId === guildId && entry.targetUserId === userId) return true
   }
   return false
 }
@@ -105,10 +115,30 @@ export function cancelRecommendations(guildId, pendingStore) {
   }
 }
 
+// Arms an entry's one-shot expiry timer. handleRecommendChoice checks
+// entry.expired (set synchronously, before any await, the moment this fires)
+// to decide whether a claimed-then-failed-VC-check entry is still restorable
+// — the timer is deliberately left running during that VC check rather than
+// cleared, so this can still fire while the entry is claimed.
+function scheduleExpiry(entry, pendingStore, guildId, onTimeout) {
+  entry.timeoutHandle = setTimeout(async () => {
+    entry.expired = true
+    pendingStore.delete(entry.message.id)
+    await disableMessage(entry.message).catch(() => {})
+    if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && onTimeout) {
+      try {
+        await onTimeout()
+      } catch (err) {
+        console.error('[recommendFlow] onTimeout failed:', err.message)
+      }
+    }
+  }, RECOMMEND_TIMEOUT_MS)
+}
+
 // Returns the number of recommendation messages actually posted, so callers
 // can tell "posted but nobody has picked yet" apart from "every send failed"
-// (e.g. the remembered text channel was deleted or the bot lost permission).
-export async function postRecommendations({ client, channel, guildId, plans, pendingStore, onTimeout, voiceChannel }) {
+// (e.g. everyone's DMs are closed to the bot).
+export async function postRecommendations({ client, guildId, guildName, plans, pendingStore, onTimeout, voiceChannel }) {
   let postedCount = 0
   const startGeneration = currentCancelGeneration(guildId)
   if (onTimeout) guildOnTimeoutCallbacks.set(guildId, onTimeout)
@@ -122,11 +152,16 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
     // took at the start, so a prompt for "the room you just left" doesn't
     // show up after the fact.
     if (voiceChannel && !voiceChannel.members.has(userId)) continue
+    // Recommend mode now loops for as long as the session lives, so a fast
+    // pick by one user can trigger a fresh round while another user's prompt
+    // from the previous round is still open. Don't stack a second DM on top
+    // of it — let their existing prompt run its course first.
+    if (hasPendingForUser(pendingStore, guildId, userId)) continue
 
     const embed = new EmbedBuilder()
-      .setTitle('🎵 次の曲のおすすめ')
+      .setTitle(`🎵 ${guildName ?? 'サーバー'} の次の曲のおすすめ`)
       .setDescription(
-        `<@${userId}> さん、次に聴きたい曲を選んでください:\n` +
+        '次に聴きたい曲を選んでください:\n' +
         candidates.map((track, i) => `${i + 1}. ${track.title}`).join('\n')
       )
 
@@ -137,9 +172,10 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
 
     let message
     try {
-      message = await channel.send({ embeds: [embed], components })
+      const user = await client.users.fetch(userId)
+      message = await user.send({ embeds: [embed], components })
     } catch (err) {
-      console.error('[recommendFlow] failed to post recommendation:', err.message)
+      console.error('[recommendFlow] failed to DM recommendation:', err.message)
       continue
     }
 
@@ -152,18 +188,8 @@ export async function postRecommendations({ client, channel, guildId, plans, pen
       break
     }
 
-    const entry = { guildId, targetUserId: userId, candidates, message, timeoutHandle: null }
-    entry.timeoutHandle = setTimeout(async () => {
-      pendingStore.delete(message.id)
-      await disableMessage(message).catch(() => {})
-      if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && onTimeout) {
-        try {
-          await onTimeout()
-        } catch (err) {
-          console.error('[recommendFlow] onTimeout failed:', err.message)
-        }
-      }
-    }, RECOMMEND_TIMEOUT_MS)
+    const entry = { guildId, targetUserId: userId, candidates, message, timeoutHandle: null, expired: false }
+    scheduleExpiry(entry, pendingStore, guildId, onTimeout)
 
     pendingStore.set(message.id, entry)
     postedCount += 1
@@ -197,31 +223,69 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   // pick is mid-flight.
   const planTokenAtClaim = session.planToken
   const isSessionStale = () => sessions.get(entry.guildId) !== session || session.planToken !== planTokenAtClaim
-  // The target user may have left the VC after the prompt was posted while
-  // other listeners kept the session alive; re-check membership the same way
-  // every other playback-affecting command does before honoring the pick.
-  // Checked before consuming the entry so a legitimate click still works if
-  // they rejoin and try again, instead of silently expiring the prompt.
-  if (!checkInVoiceChannel(interaction, session)) return
 
-  // Claim this user's own prompt synchronously, before any await: a double
-  // click on the same message in the same tick would otherwise pass every
-  // check above twice, since neither invocation yields control until here.
-  // Node never interleaves another interaction handler's synchronous prefix
-  // with this one, so whichever handler reaches this line first wins; a
-  // second handler for the same message will find entry.get() already gone
-  // at the top of this function. Other users' prompts are untouched — each
-  // listener's recommendation is independent, so this pick must not affect
-  // anyone else's.
-  clearTimeout(entry.timeoutHandle)
+  // Claim this user's own prompt synchronously, before ANY await — including
+  // checkInVoiceChannel just below, which now awaits a guild-member fetch
+  // for DM-originated clicks (prompts are DMs, so interaction.member is
+  // absent). A double click on the same message would otherwise both read
+  // this same entry, both await past the VC check, and both proceed to
+  // queue.add, enqueueing the track twice. Node never interleaves another
+  // interaction handler's synchronous prefix with this one, so whichever
+  // handler reaches this line first wins; a second handler for the same
+  // message will find entry.get() already gone at the top of this function.
+  // Other users' prompts are untouched — each listener's recommendation is
+  // independent, so this pick must not affect anyone else's. The timeout is
+  // deliberately left running (not cleared) here so that if the VC check
+  // below fails and the entry is put back, its original deadline still
+  // applies unchanged.
   pendingStore.delete(interaction.message.id)
-  // Held until the chosen track is actually enqueued below, so another still-
-  // live prompt's timeout can't decide "nothing pending, tear the session
-  // down" while this pick is between claiming its entry and finishing.
+  // Held until the chosen track is actually enqueued below (or this pick
+  // bails out), so another still-live prompt's timeout can't decide "nothing
+  // pending, tear the session down" while this pick is mid-flight — which
+  // now includes the VC-membership await, not just deferUpdate() onward.
   markPickInFlight(entry.guildId)
 
   try {
+    // Acknowledge the interaction before the VC-membership check below,
+    // which now awaits a REST guild-member fetch for DM-originated clicks.
+    // Discord invalidates the interaction token ~3s after receipt; doing the
+    // fetch first risked that window expiring under a REST slowdown, leaving
+    // the user with a failed interaction and their pick never processed.
+    // checkInVoiceChannel already sends its rejection via followUp once the
+    // interaction is deferred, so this ordering doesn't change that path.
     await interaction.deferUpdate()
+
+    // The target user may have left the VC after the prompt was posted while
+    // other listeners kept the session alive; re-check membership the same
+    // way every other playback-affecting command does before honoring the
+    // pick. Restore the entry if this fails so a legitimate retry (e.g.
+    // after rejoining the VC) still works instead of the prompt silently
+    // expiring.
+    if (!(await checkInVoiceChannel(interaction, session))) {
+      // /stop, /leave, or the VC emptying out may have cancelled this
+      // guild's recommendations while we were awaiting the membership check
+      // above — cancelRecommendations couldn't see this entry since it was
+      // already claimed (removed from pendingStore) when it ran. Restoring
+      // it anyway would resurrect a prompt for a session that's already
+      // been stopped/torn down, and a later click on it could enqueue a
+      // track despite the stop. Only restore if nothing changed out from
+      // under us, and only if the entry's own deadline hasn't already
+      // fired: that timer isn't cleared until this check succeeds (see
+      // below), so it can fire while we're still awaiting it, already
+      // disabling the message and marking entry.expired. Restoring a
+      // spent entry here — with or without a fresh timer — would either
+      // linger forever or race a still-running old callback that deletes
+      // it and disables the message out from under this restore; simplest
+      // and correct is to just not restore it, matching the ordinary
+      // expiry path (the finally block's reconsiderTeardown below will
+      // still notice and run onTimeout immediately if warranted).
+      if (!isSessionStale() && !entry.expired) {
+        pendingStore.set(interaction.message.id, entry)
+      }
+      return
+    }
+    clearTimeout(entry.timeoutHandle)
+
     // Mirror /play's search flow: the picked prompt is single-use, so remove it
     // instead of leaving it around disabled like the other candidates' prompts.
     try {
