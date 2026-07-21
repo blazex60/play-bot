@@ -23,17 +23,20 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
 
   const session = sessions.get(interaction.guildId)
 
+  // The editor's buttons/select/modal all act on the queue (or navigate a
+  // view of it), so they're gated by the same 'queue' command permission as
+  // /queue itself — otherwise a user denied /queue could still reach these
+  // actions through an editor message that's already on screen. This
+  // includes qedit_close: when /queue is public, the panel is visible to
+  // (and clickable by) anyone in the channel, not just its original poster,
+  // so a denied user must not be able to dismiss someone else's panel either.
+  if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'queue')) return
+
   if (interaction.isButton() && action === 'qedit_close') {
     if (!checkSameVoiceChannel(interaction, session)) return
     await interaction.deferUpdate()
     return interaction.message.delete().catch(() => {})
   }
-
-  // The editor's buttons/select/modal all mutate the queue (or navigate a
-  // view of it), so they're gated by the same 'queue' command permission as
-  // /queue itself — otherwise a user denied /queue could still reach these
-  // mutating actions through an editor message that's already on screen.
-  if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'queue')) return
 
   if (!session || session.queue.isEmpty) {
     return interaction.reply({ content: '📭 キューは空です', flags: MessageFlags.Ephemeral })

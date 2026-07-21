@@ -101,7 +101,7 @@ test('handleQueueEditorInteraction: an allowed user can still remove a track via
   })
 })
 
-test('handleQueueEditorInteraction: closing the editor is still allowed even when queue is denied', async () => {
+test('handleQueueEditorInteraction: a user denied the queue command cannot close someone else\'s public panel', async () => {
   await withTempSettings(async () => {
     await setDefaultCommandPermission('guild-1', 'queue', 'deny')
     const session = makeSession()
@@ -114,6 +114,23 @@ test('handleQueueEditorInteraction: closing the editor is still allowed even whe
 
     await handleQueueEditorInteraction(interaction, sessions)
 
-    assert.equal(deleted, true, 'closing the panel is not a queue mutation and should not require queue permission')
+    assert.equal(deleted, false, 'a denied user must not be able to dismiss a public queue panel (regression: qedit_close bypassed checkCommandAllowed)')
+    assert.equal(interaction.calls.reply.length, 1, 'must reply with a denial')
+  })
+})
+
+test('handleQueueEditorInteraction: an allowed user can close the editor', async () => {
+  await withTempSettings(async () => {
+    const session = makeSession()
+    session.connection.destroy = () => {}
+    const sessions = new Map([['guild-1', session]])
+    let deleted = false
+    const interaction = fakeInteraction({ customId: 'qedit_close_p0' })
+    interaction.deferUpdate = async () => {}
+    interaction.message = { delete: async () => { deleted = true } }
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(deleted, true)
   })
 })

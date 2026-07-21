@@ -8,7 +8,20 @@ export async function controlRoutes(app, { botClient, db } = {}) {
     let user
     try {
       user = getSessionUser(request)
-      if (!CONTROL_ACTIONS.has(action)) return reply.code(404).send({ error: 'unknown_control_action' })
+      if (!CONTROL_ACTIONS.has(action)) {
+        if (db) {
+          recordOperationLog(db, {
+            guildId,
+            discordUserId: user.discordId,
+            username: user.username,
+            source: 'control',
+            action,
+            detail: 'unknown_control_action',
+            success: false,
+          })
+        }
+        return reply.code(404).send({ error: 'unknown_control_action' })
+      }
       if (!botClient) throw new Error('botClient is required for control routes')
 
       await requireBotPermission({ botClient, guildId, userId: user.discordId })
@@ -24,7 +37,10 @@ export async function controlRoutes(app, { botClient, db } = {}) {
           username: user.username,
           source: 'control',
           action,
-          detail: JSON.stringify(request.body ?? {}),
+          // Log the effective payload (post userId-override), not the raw
+          // client body — a client could otherwise set its own userId in
+          // the body and have it logged even though it was never honored.
+          detail: JSON.stringify({ ...(request.body ?? {}), userId: user.discordId }),
           // pause/resume can report ok: false (e.g. "not currently playing")
           // without throwing, so the bot API's own result decides success,
           // not just whether callBot resolved.
@@ -33,9 +49,8 @@ export async function controlRoutes(app, { botClient, db } = {}) {
       }
       return reply.send(responseBody)
     } catch (error) {
-      // Denied permission / unknown action / bot API failure all land here —
-      // record it so the audit trail also captures failed attempts, not only
-      // successful ones.
+      // Denied permission / bot API failure land here — record it so the
+      // audit trail also captures failed attempts, not only successful ones.
       if (db && user) {
         recordOperationLog(db, {
           guildId,

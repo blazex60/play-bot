@@ -25,23 +25,22 @@ export default {
     const query = interaction.options.getString('query')
     const isUrl = query.startsWith('http://') || query.startsWith('https://')
 
+    // VC所属チェックは同期的で即終了するため、後続の非同期処理に必要な
+    // deferReplyより前に行う(他のVC操作コマンドと同じ「先頭でガード」の順序)。
+    // まだdeferしていないので checkSameVoiceChannel は interaction.reply を使う。
+    const member = interaction.member
+    if (!member.voice?.channel) {
+      await interaction.reply({ content: '❌ まずVCに参加してください', flags: MessageFlags.Ephemeral })
+      return false
+    }
+    const channel = member.voice.channel
+    if (!checkSameVoiceChannel(interaction, sessions.get(interaction.guildId))) return false
+
     // URL直接再生は play の表示設定に従ってdefer(ephemeralは defer 時点で
     // 固定され、後から followUp で覆せないため)。キーワード検索は常に
     // ephemeral（検索パネルを本人のみ表示・操作させるためで、表示設定とは無関係）
     const playVisibility = replyFlags(interaction.guildId, 'play')
     await interaction.deferReply(isUrl ? playVisibility : { ephemeral: true })
-
-    const member = interaction.member
-    if (!member.voice?.channel) {
-      if (isUrl) {
-        await interaction.followUp({ content: '❌ まずVCに参加してください', flags: MessageFlags.Ephemeral })
-      } else {
-        await interaction.editReply({ content: '❌ まずVCに参加してください' })
-      }
-      return false
-    }
-    const channel = member.voice.channel
-    if (!checkSameVoiceChannel(interaction, sessions.get(interaction.guildId))) return false
 
     if (isUrl) {
       if (isPlaylistUrl(query)) {
@@ -52,11 +51,13 @@ export default {
             requestedById: interaction.member.id,
           }))
         } catch (err) {
+          await interaction.deleteReply().catch(() => {})
           await interaction.followUp({ content: `❌ プレイリストの取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
           return false
         }
 
         if (!tracks.length) {
+          await interaction.deleteReply().catch(() => {})
           await interaction.followUp({ content: '❌ プレイリストに動画が見つかりませんでした', flags: MessageFlags.Ephemeral })
           return false
         }
@@ -65,6 +66,7 @@ export default {
         try {
           session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
         } catch (err) {
+          await interaction.deleteReply().catch(() => {})
           await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
           return false
         }
@@ -85,6 +87,7 @@ export default {
       try {
         info = await resolveMetadata(query, { requestedBy: interaction.member.displayName, requestedById: interaction.member.id })
       } catch (err) {
+        await interaction.deleteReply().catch(() => {})
         await interaction.followUp({ content: `❌ 取得に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         return false
       }
@@ -93,6 +96,7 @@ export default {
       try {
         session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
       } catch (err) {
+        await interaction.deleteReply().catch(() => {})
         await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         return false
       }
@@ -121,7 +125,11 @@ export default {
     const components = createSearchResultComponents(results)
     const msg = await interaction.editReply({ content: '🔍 検索結果:', components })
 
-    const onSelect = async entry => {
+    // buttonInteraction is the later button click that picks a search
+    // result — a distinct interaction from the /play command interaction
+    // captured above, and its member/roles reflect state at click time
+    // rather than a potentially stale snapshot from when /play was invoked.
+    const onSelect = async (entry, buttonInteraction) => {
       // The initial /play execute() returns null for the keyword-search
       // path (see below) precisely so index.js skips logging a "success" —
       // the real outcome of this command only exists once a result is
@@ -140,11 +148,11 @@ export default {
       // before the user clicks a result, so re-check 'play' permission here
       // too — the initial checkCommandAllowed in index.js only guarded the
       // slash command dispatch, not this later button click.
-      if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'play')) {
+      if (!checkCommandAllowed(buttonInteraction, process.env.ADMIN_ROLE_ID, 'play')) {
         logSelect(false, 'blocked')
         return
       }
-      if (!checkSameVoiceChannel(interaction, sessions.get(interaction.guildId))) {
+      if (!checkSameVoiceChannel(buttonInteraction, sessions.get(interaction.guildId))) {
         logSelect(false, 'not_in_voice')
         return
       }

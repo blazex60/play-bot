@@ -90,7 +90,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (!pending) return interaction.reply({ content: '❌ 検索セッションが期限切れです', flags: MessageFlags.Ephemeral })
     pendingStore.delete(interaction.message.id)
     await interaction.deferUpdate()
-    await pending.onSelect(pending.results[index])
+    await pending.onSelect(pending.results[index], interaction)
     return
   }
 

@@ -8,7 +8,20 @@ export async function queueRoutes(app, { botClient, db } = {}) {
     let user
     try {
       user = getSessionUser(request)
-      if (!QUEUE_ACTIONS.has(action)) return reply.code(404).send({ error: 'unknown_queue_action' })
+      if (!QUEUE_ACTIONS.has(action)) {
+        if (db) {
+          recordOperationLog(db, {
+            guildId,
+            discordUserId: user.discordId,
+            username: user.username,
+            source: 'control',
+            action: `queue:${action}`,
+            detail: 'unknown_queue_action',
+            success: false,
+          })
+        }
+        return reply.code(404).send({ error: 'unknown_queue_action' })
+      }
       if (!botClient) throw new Error('botClient is required for queue routes')
 
       await requireBotPermission({ botClient, guildId, userId: user.discordId })
@@ -23,7 +36,10 @@ export async function queueRoutes(app, { botClient, db } = {}) {
           username: user.username,
           source: 'control',
           action: `queue:${action}`,
-          detail: JSON.stringify(request.body ?? {}),
+          // Log the effective payload, not the raw client body — see
+          // control.js for why (a client-supplied userId could otherwise
+          // contradict discordUserId in the log).
+          detail: JSON.stringify({ ...(request.body ?? {}), userId: user.discordId }),
           // remove/move report ok: false for an out-of-range index without
           // throwing, so the bot API's own result decides success.
           success: responseBody.ok !== false,
