@@ -213,32 +213,41 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   // pick is mid-flight.
   const planTokenAtClaim = session.planToken
   const isSessionStale = () => sessions.get(entry.guildId) !== session || session.planToken !== planTokenAtClaim
-  // The target user may have left the VC after the prompt was posted while
-  // other listeners kept the session alive; re-check membership the same way
-  // every other playback-affecting command does before honoring the pick.
-  // Checked before consuming the entry so a legitimate click still works if
-  // they rejoin and try again, instead of silently expiring the prompt.
-  // Prompts are DMs now, so this click carries no guild/member context —
-  // checkInVoiceChannel resolves the member itself in that case.
-  if (!(await checkInVoiceChannel(interaction, session))) return
 
-  // Claim this user's own prompt synchronously, before any await: a double
-  // click on the same message in the same tick would otherwise pass every
-  // check above twice, since neither invocation yields control until here.
-  // Node never interleaves another interaction handler's synchronous prefix
-  // with this one, so whichever handler reaches this line first wins; a
-  // second handler for the same message will find entry.get() already gone
-  // at the top of this function. Other users' prompts are untouched — each
-  // listener's recommendation is independent, so this pick must not affect
-  // anyone else's.
-  clearTimeout(entry.timeoutHandle)
+  // Claim this user's own prompt synchronously, before ANY await — including
+  // checkInVoiceChannel just below, which now awaits a guild-member fetch
+  // for DM-originated clicks (prompts are DMs, so interaction.member is
+  // absent). A double click on the same message would otherwise both read
+  // this same entry, both await past the VC check, and both proceed to
+  // queue.add, enqueueing the track twice. Node never interleaves another
+  // interaction handler's synchronous prefix with this one, so whichever
+  // handler reaches this line first wins; a second handler for the same
+  // message will find entry.get() already gone at the top of this function.
+  // Other users' prompts are untouched — each listener's recommendation is
+  // independent, so this pick must not affect anyone else's. The timeout is
+  // deliberately left running (not cleared) here so that if the VC check
+  // below fails and the entry is put back, its original deadline still
+  // applies unchanged.
   pendingStore.delete(interaction.message.id)
-  // Held until the chosen track is actually enqueued below, so another still-
-  // live prompt's timeout can't decide "nothing pending, tear the session
-  // down" while this pick is between claiming its entry and finishing.
+  // Held until the chosen track is actually enqueued below (or this pick
+  // bails out), so another still-live prompt's timeout can't decide "nothing
+  // pending, tear the session down" while this pick is mid-flight — which
+  // now includes the VC-membership await, not just deferUpdate() onward.
   markPickInFlight(entry.guildId)
 
   try {
+    // The target user may have left the VC after the prompt was posted while
+    // other listeners kept the session alive; re-check membership the same
+    // way every other playback-affecting command does before honoring the
+    // pick. Restore the entry if this fails so a legitimate retry (e.g.
+    // after rejoining the VC) still works instead of the prompt silently
+    // expiring.
+    if (!(await checkInVoiceChannel(interaction, session))) {
+      pendingStore.set(interaction.message.id, entry)
+      return
+    }
+    clearTimeout(entry.timeoutHandle)
+
     await interaction.deferUpdate()
     // Mirror /play's search flow: the picked prompt is single-use, so remove it
     // instead of leaving it around disabled like the other candidates' prompts.

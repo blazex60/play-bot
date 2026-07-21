@@ -217,6 +217,59 @@ test('handleRecommendChoice: two users clicking their own prompts at once, both 
   assert.equal(pendingStore.get('msg-2'), null)
 })
 
+test('handleRecommendChoice: two rapid clicks on the same DM prompt must not double-enqueue (regression: async VC check raced the entry claim)', async () => {
+  const pendingStore = new PendingChoiceStore()
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
+  const sessions = new Map([['g1', session]])
+
+  // Prompts are DMs now, so a real click carries no interaction.member —
+  // checkInVoiceChannel has to await a guild.members.fetch instead. Simulate
+  // that round-trip taking long enough for a second, near-simultaneous click
+  // to start running before the first one has claimed the entry.
+  const member = { voice: { channelId: 'vc-1' } }
+  const client = {
+    guilds: {
+      cache: new Map([['g1', {
+        members: {
+          async fetch() {
+            await new Promise((resolve) => setImmediate(resolve))
+            return member
+          },
+        },
+      }]]),
+    },
+  }
+
+  function makeDmInteraction() {
+    const replies = []
+    return {
+      customId: 'autoplay_0',
+      message: { id: 'msg-1' },
+      user: { id: 'u1' },
+      member: null,
+      client,
+      deferred: false,
+      replied: false,
+      replies,
+      async reply(payload) { replies.push(payload); this.replied = true },
+      async followUp(payload) { replies.push(payload) },
+      async deferUpdate() { this.deferred = true },
+    }
+  }
+
+  await Promise.all([
+    handleRecommendChoice(makeDmInteraction(), sessions, pendingStore),
+    handleRecommendChoice(makeDmInteraction(), sessions, pendingStore),
+  ])
+
+  const queued = [session.queue.current, ...session.queue.upcoming()].filter(Boolean)
+  assert.equal(queued.length, 1, 'the track must be enqueued exactly once even though both clicks raced past the async VC check')
+  assert.equal(session.player.playNextCalls.length, 1)
+})
+
 test("postRecommendations: a still-pending prompt's timeout must not tear the session down while another user's pick is in flight", async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const client = makeClient()
