@@ -23,6 +23,7 @@ export function Landing() {
       <header className="landing-nav" aria-label="Play-bot navigation">
         <Link className="brand-link" to="/">Play-bot</Link>
         <nav className="landing-nav-actions" aria-label="Primary navigation">
+          <Link to="/help">ヘルプ</Link>
           <Link to="/login">ログイン</Link>
           <Link className="primary-link" to="/dashboard">Dashboard</Link>
         </nav>

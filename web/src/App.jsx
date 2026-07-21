@@ -3,6 +3,7 @@ import { BrowserRouter, Link, Route, Routes, useLocation } from 'react-router-do
 
 import { Admin } from './pages/Admin.jsx'
 import { Dashboard } from './pages/Dashboard.jsx'
+import { Help } from './pages/Help.jsx'
 import { Landing } from './pages/Landing.jsx'
 import './styles.css'
 
@@ -94,6 +95,7 @@ export function App() {
         <Route path="/" element={<Landing />} />
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/admin" element={<Admin />} />
+        <Route path="/help" element={<Help />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/login/demo" element={<DemoLoginPage />} />
         <Route path="/callback/*" element={<CallbackPage />} />
