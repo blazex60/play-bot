@@ -1,6 +1,6 @@
 import { MessageFlags, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } from 'discord.js'
 import { buildQueueEditorPayload } from './queueEditorView.js'
-import { checkSameVoiceChannel } from './permissions.js'
+import { checkSameVoiceChannel, checkCommandAllowed } from './permissions.js'
 
 const CUSTOM_ID_RE = /^(qedit_[a-z]+)_p(\d+)(?:_i(\d+))?$/
 
@@ -28,6 +28,12 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
     await interaction.deferUpdate()
     return interaction.message.delete().catch(() => {})
   }
+
+  // The editor's buttons/select/modal all mutate the queue (or navigate a
+  // view of it), so they're gated by the same 'queue' command permission as
+  // /queue itself — otherwise a user denied /queue could still reach these
+  // mutating actions through an editor message that's already on screen.
+  if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'queue')) return
 
   if (!session || session.queue.isEmpty) {
     return interaction.reply({ content: '📭 キューは空です', flags: MessageFlags.Ephemeral })

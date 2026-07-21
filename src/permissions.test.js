@@ -71,6 +71,16 @@ test('checkCommandAllowed: admin role bypasses a deny setting', async () => {
   })
 })
 
+test('checkCommandAllowed: an explicit commandName overrides interaction.commandName (component interactions have none)', async () => {
+  await withTempSettings(async () => {
+    await setDefaultCommandPermission('guild-1', 'queue', 'deny')
+    // Simulates a button/select/modal interaction: no commandName of its own.
+    const interaction = fakeInteraction({ commandName: null })
+    assert.equal(checkCommandAllowed(interaction, undefined, 'queue'), false)
+    assert.equal(interaction.calls.reply.length, 1)
+  })
+})
+
 test('replyFlags: falls back to hardcoded default visibility per command', async () => {
   await withTempSettings(async () => {
     assert.deepEqual(replyFlags('guild-1', 'skip'), {})

@@ -25,9 +25,15 @@ function hasAdminRole(interaction, adminRoleId) {
   return Boolean(adminRoleId && interaction.member?.roles?.cache?.has?.(adminRoleId))
 }
 
-export function checkCommandAllowed(interaction, adminRoleId) {
+// commandName defaults to the slash command being invoked, but callers that
+// gate a *component* interaction belonging to a command (e.g. the /queue
+// editor's buttons) must pass it explicitly — button/select/modal
+// interactions have no interaction.commandName of their own, so without an
+// explicit override a denied user's queue-editor clicks would silently skip
+// the permission check entirely.
+export function checkCommandAllowed(interaction, adminRoleId, commandName = interaction.commandName) {
   if (hasAdminRole(interaction, adminRoleId)) return true
-  const permission = resolveCommandPermission(interaction.guildId, interaction.user.id, interaction.commandName)
+  const permission = resolveCommandPermission(interaction.guildId, interaction.user.id, commandName)
   if (permission === 'deny') {
     const payload = { content: '❌ このコマンドの実行は制限されています', flags: MessageFlags.Ephemeral }
     if (interaction.deferred || interaction.replied) {
