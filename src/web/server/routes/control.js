@@ -1,4 +1,4 @@
-import { bindRouteError, callBot, getSessionUser, requireBotPermission, recordOperationLog } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 const CONTROL_ACTIONS = new Set(['pause', 'resume', 'skip', 'stop', 'autoplay'])
 
@@ -25,6 +25,10 @@ export async function controlRoutes(app, { botClient, db } = {}) {
       if (!botClient) throw new Error('botClient is required for control routes')
 
       await requireBotPermission({ botClient, guildId, userId: user.discordId })
+      // Control action names match their equivalent slash command 1:1
+      // (pause/resume/skip/stop/autoplay), so the same admin-configured
+      // per-command permission matrix applies here.
+      await requireCommandPermission({ botClient, guildId, userId: user.discordId, command: action })
       // The bot API requires body.userId on every control action; always use
       // the authenticated session user rather than trusting a client-
       // supplied value, matching /api/permission's convention.

@@ -111,6 +111,7 @@ test('authenticated session can read state/links/permission and issue control+qu
     botResponses: {
       '/state/g1': { body: { current: null, upcoming: [], playerStatus: 'idle', loopMode: 'off' } },
       '/permission': { body: { basic: true, extended: false } },
+      '/command-permission': { body: { allowed: true } },
       '/control/g1/pause': { body: { ok: true } },
       '/queue/g1/remove': { body: { ok: true } },
     },
@@ -158,6 +159,52 @@ test('authenticated session can read state/links/permission and issue control+qu
   const queueRequest = fetchImpl.requests.find((r) => r.href.endsWith('/queue/g1/remove'))
   assert.equal(JSON.parse(queueRequest.options.body).userId, 'u1', 'queue route must inject the authenticated session user id')
   assert.equal(JSON.parse(queueRequest.options.body).index, 0, 'queue route must still forward the rest of the request body')
+})
+
+test('/api/guilds/:guildId/control/:action is blocked for a command the admin panel denied (regression: dashboard controls bypassed the per-command permission matrix)', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {
+      '/permission': { body: { basic: true, extended: false } },
+      '/command-permission': { body: { allowed: false } },
+    },
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  const control = await app.inject({ method: 'POST', url: '/api/guilds/g1/control/pause', headers: { cookie } })
+  assert.equal(control.statusCode, 403, 'a user denied /pause must not be able to pause via the dashboard either')
+  assert.equal(fetchImpl.requests.some((r) => r.href.endsWith('/control/g1/pause')), false, 'must not reach the bot API control action once the command permission check fails')
+
+  const logs = db.prepare(`SELECT * FROM operation_logs WHERE guild_id = 'g1'`).all()
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].success, 0)
+})
+
+test('/api/guilds/:guildId/queue/:action is blocked for a denied queue command', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const fetchImpl = createRoutedFetch({
+    discordToken: { access_token: 'discord-access' },
+    discordUser: { id: 'u1', username: 'lemitsu' },
+    botResponses: {
+      '/permission': { body: { basic: true, extended: false } },
+      '/command-permission': { body: { allowed: false } },
+    },
+  })
+  const app = await buildWebServer({ config, db, fetchImpl, logger: false, startCleanup: false })
+  t.after(() => app.close())
+  const cookie = await loginAndGetCookie(app)
+
+  const queue = await app.inject({ method: 'POST', url: '/api/guilds/g1/queue/remove', headers: { cookie }, payload: { index: 0 } })
+  assert.equal(queue.statusCode, 403)
+  assert.equal(fetchImpl.requests.some((r) => r.href.endsWith('/queue/g1/remove')), false)
 })
 
 test('/api/state/:guildId requires bot permission for that guild (regression: was reachable by any authenticated session for any guild)', async (t) => {

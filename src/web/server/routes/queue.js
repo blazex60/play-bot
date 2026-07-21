@@ -1,4 +1,4 @@
-import { bindRouteError, callBot, getSessionUser, requireBotPermission, recordOperationLog } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 const QUEUE_ACTIONS = new Set(['remove', 'move'])
 
@@ -25,6 +25,9 @@ export async function queueRoutes(app, { botClient, db } = {}) {
       if (!botClient) throw new Error('botClient is required for queue routes')
 
       await requireBotPermission({ botClient, guildId, userId: user.discordId })
+      // Both queue actions (remove/move) fall under the 'queue' command
+      // permission — the same one gating /queue and its editor buttons.
+      await requireCommandPermission({ botClient, guildId, userId: user.discordId, command: 'queue' })
       // Same as control.js: the bot API requires body.userId, and it must
       // come from the authenticated session, not the client-supplied body.
       const result = await callBot(botClient, 'POST', `/queue/${encodeURIComponent(guildId)}/${action}`, { ...request.body, userId: user.discordId })

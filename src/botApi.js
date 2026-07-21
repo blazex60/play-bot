@@ -10,6 +10,7 @@ import {
   setDefaultCommandPermission,
   setUserCommandPermission,
   setCommandVisibility,
+  resolveCommandPermission,
 } from './settings.js';
 import { getEffectiveCommandVisibility } from './permissions.js';
 
@@ -63,6 +64,17 @@ async function resolvePermission({ client, sessions, guildId, userId, adminRoleI
     session: sessions.get(guildId),
     adminRoleId,
   });
+}
+
+// Mirrors permissions.js#checkCommandAllowed's decision (admin-role bypass,
+// then the per-user/default allow-deny matrix) but as a plain boolean check
+// with no interaction to reply on — used by the dashboard's control/queue
+// routes so a command denial can't be bypassed by using the web UI instead
+// of the equivalent slash command.
+async function resolveCommandAllowed({ client, guildId, userId, command, adminRoleId }) {
+  const { member } = await fetchMember(client, guildId, userId);
+  if (adminRoleId && member.roles.cache.has(adminRoleId)) return true;
+  return resolveCommandPermission(guildId, userId, command) !== 'deny';
 }
 
 function requireBodyUserId(request, reply) {
@@ -162,6 +174,16 @@ export function buildBotApi({
       return;
     }
     return resolvePermission({ client, sessions, guildId, userId, adminRoleId });
+  });
+
+  app.get('/command-permission', async (request, reply) => {
+    const { guildId, userId, command } = request.query;
+    if (typeof guildId !== 'string' || typeof userId !== 'string' || typeof command !== 'string') {
+      reply.code(400).send({ error: 'guildId_userId_and_command_required' });
+      return;
+    }
+    const allowed = await resolveCommandAllowed({ client, guildId, userId, command, adminRoleId });
+    return { allowed };
   });
 
   app.post('/control/:guildId/:action', async (request, reply) => {

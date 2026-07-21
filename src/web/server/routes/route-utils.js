@@ -47,6 +47,20 @@ export async function requireAdminPermission({ botClient, guildId, userId }) {
   return permission
 }
 
+// A user denied a command via the admin permission matrix must not be able
+// to perform its equivalent action from the dashboard either (e.g. denied
+// /pause but clicking the Pause button) — requireBotPermission above only
+// checks VC-membership/admin-role, not the per-command allow/deny matrix.
+export async function requireCommandPermission({ botClient, guildId, userId, command }) {
+  const result = await callBot(botClient, 'GET', `/command-permission?guildId=${encodeURIComponent(guildId)}&userId=${encodeURIComponent(userId)}&command=${encodeURIComponent(command)}`)
+  if (!result?.allowed) {
+    const error = new Error('Forbidden')
+    error.statusCode = 403
+    throw error
+  }
+  return result
+}
+
 export function bindRouteError(reply, error) {
   const statusCode = error.statusCode ?? error.status ?? 500
   return reply.code(statusCode).send({

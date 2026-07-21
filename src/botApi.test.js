@@ -17,6 +17,12 @@ async function withTempSettings(fn) {
     await fn();
   } finally {
     await rm(dir, { recursive: true, force: true });
+    // settings.js's guildSettings Map is module-level state shared by every
+    // test in this file, several of which reuse guildId 'guild-1' without
+    // going through withTempSettings themselves — reset it here (not just
+    // delete the now-unused temp dir) so a permission set above can't leak
+    // into whichever test happens to run next.
+    configureSettingsPathForTest(join(dir, 'data', 'guild-settings-unused.json'));
   }
 }
 
@@ -309,5 +315,66 @@ test('bot API admin visibility endpoints read effective values and write overrid
       });
       assert.deepEqual(after.json(), { skip: 'public', nowplaying: 'public' });
     });
+  });
+});
+
+test('GET /command-permission reports allowed by default and denied once the admin panel sets a deny', async () => {
+  await withTempSettings(async () => {
+    const members = [makeMember({ userId: 'admin-1', roles: ['admin'] }), makeMember({ userId: 'user-1', roles: [] })];
+    await withApp({ members, commandNames: ['pause'] }, async app => {
+      const beforeDeny = await app.inject({
+        method: 'GET',
+        url: '/command-permission?guildId=guild-1&userId=user-1&command=pause',
+        headers: authHeaders(),
+      });
+      assert.equal(beforeDeny.statusCode, 200);
+      assert.deepEqual(beforeDeny.json(), { allowed: true });
+
+      await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/permissions/default',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'pause', value: 'deny' },
+      });
+
+      const afterDeny = await app.inject({
+        method: 'GET',
+        url: '/command-permission?guildId=guild-1&userId=user-1&command=pause',
+        headers: authHeaders(),
+      });
+      assert.deepEqual(afterDeny.json(), { allowed: false }, 'a dashboard action for a denied command must not be reported as allowed');
+    });
+  });
+});
+
+test('GET /command-permission: an admin-role member always bypasses a deny', async () => {
+  await withTempSettings(async () => {
+    const members = [makeMember({ userId: 'admin-1', roles: ['admin'] })];
+    await withApp({ members, adminRoleId: 'admin', commandNames: ['pause'] }, async app => {
+      await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/permissions/default',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'pause', value: 'deny' },
+      });
+
+      const response = await app.inject({
+        method: 'GET',
+        url: '/command-permission?guildId=guild-1&userId=admin-1&command=pause',
+        headers: authHeaders(),
+      });
+      assert.deepEqual(response.json(), { allowed: true }, 'admin-role holders must bypass a command deny, same as checkCommandAllowed on the Discord side');
+    });
+  });
+});
+
+test('GET /command-permission requires guildId, userId, and command', async () => {
+  await withApp({}, async app => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/command-permission?guildId=guild-1&userId=user-1',
+      headers: authHeaders(),
+    });
+    assert.equal(response.statusCode, 400);
   });
 });
