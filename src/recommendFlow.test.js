@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { GuildQueue, createTrack } from './queue.js'
 import { PendingChoiceStore } from './views.js'
-import { cancelRecommendations, handleRecommendChoice, postRecommendations, RECOMMEND_TIMEOUT_MS } from './recommendFlow.js'
+import { cancelRecommendations, handleRecommendChoice, hasPendingForGuild, postRecommendations, RECOMMEND_TIMEOUT_MS } from './recommendFlow.js'
 
 function makeCandidate(videoId) {
   return createTrack({ title: videoId, webpageUrl: `https://example.com/${videoId}`, duration: 60, videoId })
@@ -113,6 +113,24 @@ test('postRecommendations: skips a user who already has a live pending prompt fo
   })
   assert.equal(count, 1, 'only u2, who had no live prompt, should get a new DM')
   assert.deepEqual(client.sent.map((s) => s.userId), ['u2'])
+})
+
+test('postRecommendations: returns 0 while a live prompt still exists for the guild (the sole plan was a dedup skip, not a total failure)', async (t) => {
+  // sessions.js's handleQueueExhausted relies on this distinction: a
+  // postedCount of 0 here must not be treated the same as "nobody could be
+  // reached at all" — hasPendingForGuild(pendingStore, guildId) tells it an
+  // earlier round's DM is still answerable, so it should keep the session
+  // alive instead of disconnecting and cancelling that still-valid prompt.
+  const client = makeClient()
+  const pendingStore = new PendingChoiceStore()
+  pendingStore.set('existing-msg', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('old')], message: makeSentMessage('existing-msg'), timeoutHandle: null })
+  const plans = [{ userId: 'u1', candidates: [makeCandidate('v1')] }]
+  const count = await postRecommendations({ client, guildId: 'g1', plans, pendingStore })
+  t.after(() => {
+    for (const [, entry] of pendingStore.entries()) clearTimeout(entry.timeoutHandle)
+  })
+  assert.equal(count, 0)
+  assert.equal(hasPendingForGuild(pendingStore, 'g1'), true, "u1's earlier prompt is still live and answerable")
 })
 
 test('handleRecommendChoice: rejects a click from someone other than the target user', async () => {
@@ -268,6 +286,49 @@ test('handleRecommendChoice: two rapid clicks on the same DM prompt must not dou
   const queued = [session.queue.current, ...session.queue.upcoming()].filter(Boolean)
   assert.equal(queued.length, 1, 'the track must be enqueued exactly once even though both clicks raced past the async VC check')
   assert.equal(session.player.playNextCalls.length, 1)
+})
+
+test('handleRecommendChoice: acknowledges the interaction before the membership fetch (regression: a slow REST lookup could expire the interaction token)', async () => {
+  const pendingStore = new PendingChoiceStore()
+  const message = makeSentMessage('msg-1')
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message, timeoutHandle: null })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
+  const sessions = new Map([['g1', session]])
+
+  const callOrder = []
+  const member = { voice: { channelId: 'vc-1' } }
+  const client = {
+    guilds: {
+      cache: new Map([['g1', {
+        members: {
+          async fetch() {
+            callOrder.push('members.fetch')
+            await new Promise((resolve) => setImmediate(resolve))
+            return member
+          },
+        },
+      }]]),
+    },
+  }
+  const interaction = {
+    customId: 'autoplay_0',
+    message: { id: 'msg-1' },
+    user: { id: 'u1' },
+    member: null,
+    client,
+    deferred: false,
+    replied: false,
+    replies: [],
+    async reply(payload) { this.replies.push(payload); this.replied = true },
+    async followUp(payload) { this.replies.push(payload) },
+    async deferUpdate() { callOrder.push('deferUpdate'); this.deferred = true },
+  }
+
+  await handleRecommendChoice(interaction, sessions, pendingStore)
+
+  assert.deepEqual(callOrder, ['deferUpdate', 'members.fetch'], 'the interaction must be acknowledged before the REST membership lookup starts, not after')
+  assert.equal(session.queue.current.videoId, 'v1')
 })
 
 test("postRecommendations: a still-pending prompt's timeout must not tear the session down while another user's pick is in flight", async (t) => {

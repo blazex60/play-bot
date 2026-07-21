@@ -23,7 +23,7 @@ async function disableMessage(message) {
   await message.edit({ components: disabledRows })
 }
 
-function hasPendingForGuild(pendingStore, guildId) {
+export function hasPendingForGuild(pendingStore, guildId) {
   for (const [, entry] of pendingStore.entries()) {
     if (entry.guildId === guildId) return true
   }
@@ -236,6 +236,15 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
   markPickInFlight(entry.guildId)
 
   try {
+    // Acknowledge the interaction before the VC-membership check below,
+    // which now awaits a REST guild-member fetch for DM-originated clicks.
+    // Discord invalidates the interaction token ~3s after receipt; doing the
+    // fetch first risked that window expiring under a REST slowdown, leaving
+    // the user with a failed interaction and their pick never processed.
+    // checkInVoiceChannel already sends its rejection via followUp once the
+    // interaction is deferred, so this ordering doesn't change that path.
+    await interaction.deferUpdate()
+
     // The target user may have left the VC after the prompt was posted while
     // other listeners kept the session alive; re-check membership the same
     // way every other playback-affecting command does before honoring the
@@ -248,7 +257,6 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
     }
     clearTimeout(entry.timeoutHandle)
 
-    await interaction.deferUpdate()
     // Mirror /play's search flow: the picked prompt is single-use, so remove it
     // instead of leaving it around disabled like the other candidates' prompts.
     try {

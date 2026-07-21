@@ -4,7 +4,7 @@ import { GuildPlayer } from './player.js'
 import { PendingChoiceStore } from './views.js'
 import { createWebClient } from './webClient.js'
 import { planAutoTrack, planRecommendations, formatAutoAddNotification } from './autoplay.js'
-import { cancelRecommendations, postRecommendations } from './recommendFlow.js'
+import { cancelRecommendations, hasPendingForGuild, postRecommendations } from './recommendFlow.js'
 import { getGuildSettings } from './settings.js'
 
 // Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed }>
@@ -168,6 +168,14 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
         }
         if (postedCount > 0) return true
       }
+
+      // This round may have posted nothing new — e.g. the only human left in
+      // the VC already had a live DM from an earlier round and got skipped
+      // by postRecommendations' own dedup — while that earlier DM is still a
+      // perfectly valid, answerable prompt. Treat that as a handled
+      // exhaustion instead of falling through to onDisconnect and cancelling
+      // a prompt someone can still pick.
+      if (hasPendingForGuild(recommendPendingStore, guildId)) return true
 
       return false
     } finally {
