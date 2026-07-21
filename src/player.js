@@ -43,6 +43,8 @@ export class GuildPlayer {
   #createAudioResource;
   #resolveAudioStream;
   #handlingAfter = false;
+  #handlingAfterTrack = null;
+  #pendingAfter = false;
 
   constructor({
     guildId,
@@ -80,6 +82,7 @@ export class GuildPlayer {
     this.#audioPlayer.on('error', err => {
       console.error('[GuildPlayer] audioPlayer error:', err);
       this.#hadError = true;
+      const failedTrack = this.#queue.current;
 
       // A stream error does not reliably produce an Idle event (for example,
       // when yt-dlp cannot read a private or deleted video). Stop explicitly
@@ -90,7 +93,10 @@ export class GuildPlayer {
       // stop(). Give an emitted Idle handler precedence, then advance here as
       // a fallback once the player is confirmed idle.
       queueMicrotask(() => {
-        if (this.#audioPlayer.state.status === AudioPlayerStatus.Idle) {
+        if (
+          this.#audioPlayer.state.status === AudioPlayerStatus.Idle &&
+          this.#queue.current === failedTrack
+        ) {
           this.#advanceAfterPlayback();
         }
       });
@@ -183,15 +189,32 @@ export class GuildPlayer {
   }
 
   #advanceAfterPlayback() {
-    if (this.#handlingAfter) return;
+    if (this.#handlingAfter) {
+      // A newly started track can fail while an exhausted-queue continuation
+      // is still planning. Preserve that transition so it is handled after
+      // the active handoff, but ignore duplicate events for the same track.
+      if (this.#queue.current !== this.#handlingAfterTrack) {
+        this.#pendingAfter = true;
+      }
+      return;
+    }
     this.#handlingAfter = true;
-    this.#handleAfter()
+    this.#drainAfterPlayback()
       .catch(err => {
         console.error('[GuildPlayer] handleAfter error:', err);
       })
       .finally(() => {
         this.#handlingAfter = false;
+        this.#handlingAfterTrack = null;
       });
+  }
+
+  async #drainAfterPlayback() {
+    do {
+      this.#pendingAfter = false;
+      this.#handlingAfterTrack = this.#queue.current;
+      await this.#handleAfter();
+    } while (this.#pendingAfter);
   }
 
   async #handleAfter() {

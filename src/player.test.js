@@ -109,6 +109,42 @@ test('GuildPlayer: a stream error automatically skips an unplayable track', asyn
   await player.stop()
 })
 
+test('GuildPlayer: an error during an active handoff is advanced once it finishes', async () => {
+  const audioPlayer = makeAudioPlayer()
+  const originalPlay = audioPlayer.play
+  let failNextTrack = false
+  audioPlayer.play = function (resource) {
+    originalPlay.call(this, resource)
+    if (failNextTrack) {
+      failNextTrack = false
+      this.events.get('error')(new Error('Private video'))
+    }
+  }
+
+  const { player, resources, queue } = makePlayer({ audioPlayer, trackDuration: 3 })
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+  }))
+  queue.add(createTrack({
+    title: 'Track C',
+    webpageUrl: 'https://example.com/c',
+    duration: 60,
+  }))
+
+  await player.playNext()
+  failNextTrack = true
+  audioPlayer.events.get(AudioPlayerStatus.Idle)()
+
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(queue.current.title, 'Track C')
+  assert.equal(audioPlayer.resource, resources[2])
+  assert.equal(resources.length, 3)
+
+  await player.stop()
+})
+
 test('GuildPlayer: queue exhaustion with no handleQueueExhausted disconnects as before', async () => {
   let disconnected = false
   const onDisconnect = async () => { disconnected = true }
