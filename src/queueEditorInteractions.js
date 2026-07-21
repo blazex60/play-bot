@@ -1,6 +1,23 @@
 import { MessageFlags, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } from 'discord.js'
 import { buildQueueEditorPayload } from './queueEditorView.js'
 import { checkSameVoiceChannel, checkCommandAllowed } from './permissions.js'
+import { webClient } from './sessions.js'
+
+// Queue-editor moves/removes mutate the same queue /queue itself does, so
+// they're audited under the 'queue' action too — otherwise these edits would
+// be invisible in the admin dashboard's operation log even though the
+// equivalent dashboard queue actions are logged.
+function logQueueOp(interaction, success, detail) {
+  webClient.logOperation({
+    guildId: interaction.guildId,
+    discordUserId: interaction.user.id,
+    username: interaction.user.username,
+    source: 'command',
+    action: 'queue',
+    success,
+    detail,
+  })
+}
 
 const CUSTOM_ID_RE = /^(qedit_[a-z]+)_p(\d+)(?:_i(\d+))?$/
 
@@ -59,12 +76,14 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
     const len = queue.upcoming().length
     if (selectedIndex === null || selectedIndex < 0 || selectedIndex >= len) {
       await interaction.update(buildQueueEditorPayload(queue, { page, selectedIndex: null }))
+      logQueueOp(interaction, false, 'stale_index')
       return interaction.followUp({ content: '⚠️ キューが変更されました。もう一度選択してください', flags: MessageFlags.Ephemeral })
     }
     const toIndex = action === 'qedit_moveup' ? selectedIndex - 1
       : action === 'qedit_movedown' ? selectedIndex + 1
       : 0
     const moved = queue.moveUpcoming(selectedIndex, toIndex)
+    logQueueOp(interaction, moved, JSON.stringify({ action, fromIndex: selectedIndex, toIndex }))
     return interaction.update(buildQueueEditorPayload(queue, { page, selectedIndex: moved ? toIndex : selectedIndex }))
   }
 
@@ -72,9 +91,11 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
     const len = queue.upcoming().length
     if (selectedIndex === null || selectedIndex < 0 || selectedIndex >= len) {
       await interaction.update(buildQueueEditorPayload(queue, { page, selectedIndex: null }))
+      logQueueOp(interaction, false, 'stale_index')
       return interaction.followUp({ content: '⚠️ キューが変更されました。もう一度選択してください', flags: MessageFlags.Ephemeral })
     }
-    queue.removeUpcoming(selectedIndex)
+    const removed = queue.removeUpcoming(selectedIndex)
+    logQueueOp(interaction, removed, JSON.stringify({ action, selectedIndex }))
     const newLen = queue.upcoming().length
     const maxPage = Math.max(0, Math.ceil(newLen / 10) - 1)
     return interaction.update(buildQueueEditorPayload(queue, { page: Math.min(page, maxPage), selectedIndex: null }))
@@ -97,6 +118,7 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
     const len = queue.upcoming().length
     if (selectedIndex === null || selectedIndex < 0 || selectedIndex >= len) {
       await interaction.update(buildQueueEditorPayload(queue, { page, selectedIndex: null }))
+      logQueueOp(interaction, false, 'stale_index')
       return interaction.followUp({ content: '⚠️ キューが変更されました。もう一度選択してください', flags: MessageFlags.Ephemeral })
     }
     const n = parseInt(interaction.fields.getTextInputValue('qedit_jump_input'), 10)
@@ -104,7 +126,8 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
       return interaction.reply({ content: '❌ 無効な位置です', flags: MessageFlags.Ephemeral })
     }
     const toIndex = n - 1
-    queue.moveUpcoming(selectedIndex, toIndex)
+    const moved = queue.moveUpcoming(selectedIndex, toIndex)
+    logQueueOp(interaction, moved, JSON.stringify({ action, fromIndex: selectedIndex, toIndex }))
     return interaction.update(buildQueueEditorPayload(queue, { page, selectedIndex: toIndex }))
   }
 }

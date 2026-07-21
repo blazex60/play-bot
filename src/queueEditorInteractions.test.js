@@ -6,6 +6,18 @@ import { tmpdir } from 'node:os'
 import { configureSettingsPathForTest, setDefaultCommandPermission } from './settings.js'
 import { GuildQueue, createTrack } from './queue.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
+import { webClient } from './sessions.js'
+
+// webClient is a real singleton (it fails soft internally, so letting it
+// attempt an actual loopback fetch in tests is harmless — see the other
+// tests above), but asserting the audit-log call itself requires swapping
+// out logOperation for the duration of a test.
+function withLoggedOperations(fn) {
+  const calls = []
+  const original = webClient.logOperation
+  webClient.logOperation = async (payload) => { calls.push(payload) }
+  return fn(calls).finally(() => { webClient.logOperation = original })
+}
 
 async function withTempSettings(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'music-bot-qedit-test-'))
@@ -116,6 +128,77 @@ test('handleQueueEditorInteraction: a user denied the queue command cannot close
 
     assert.equal(deleted, false, 'a denied user must not be able to dismiss a public queue panel (regression: qedit_close bypassed checkCommandAllowed)')
     assert.equal(interaction.calls.reply.length, 1, 'must reply with a denial')
+  })
+})
+
+test('handleQueueEditorInteraction: removing a track via the editor records an operation log entry (regression: qedit_ mutations were absent from the admin audit log)', async () => {
+  await withTempSettings(async () => {
+    await withLoggedOperations(async (calls) => {
+      const session = makeSession()
+      const sessions = new Map([['guild-1', session]])
+      const interaction = fakeInteraction({ customId: 'qedit_remove_p0_i0' })
+
+      await handleQueueEditorInteraction(interaction, sessions)
+
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].action, 'queue')
+      assert.equal(calls[0].success, true)
+      assert.equal(calls[0].guildId, 'guild-1')
+      assert.equal(calls[0].discordUserId, 'user-1')
+    })
+  })
+})
+
+test('handleQueueEditorInteraction: moving a track via the editor records a successful operation log entry', async () => {
+  await withTempSettings(async () => {
+    await withLoggedOperations(async (calls) => {
+      const session = makeSession()
+      // makeSession() only has one upcoming track, and moving the sole
+      // upcoming track anywhere is always a no-op — add a second so
+      // qedit_movedown (index 0 -> 1) is a real, successful move.
+      session.queue.add(createTrack({ title: 'third', webpageUrl: 'https://example.com/third', duration: 60, requestedBy: 'tester' }))
+      const sessions = new Map([['guild-1', session]])
+      const interaction = fakeInteraction({ customId: 'qedit_movedown_p0_i0' })
+
+      await handleQueueEditorInteraction(interaction, sessions)
+
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].action, 'queue')
+      assert.equal(calls[0].success, true)
+    })
+  })
+})
+
+test('handleQueueEditorInteraction: a no-op move via the editor records a failed operation log entry', async () => {
+  await withTempSettings(async () => {
+    await withLoggedOperations(async (calls) => {
+      const session = makeSession()
+      const sessions = new Map([['guild-1', session]])
+      // makeSession() has exactly one upcoming track, so moving it to the
+      // front (already position 0) is a no-op moveUpcoming reports as failed.
+      const interaction = fakeInteraction({ customId: 'qedit_tofront_p0_i0' })
+
+      await handleQueueEditorInteraction(interaction, sessions)
+
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].action, 'queue')
+      assert.equal(calls[0].success, false)
+    })
+  })
+})
+
+test('handleQueueEditorInteraction: a denied user\'s removal attempt is not logged (checkCommandAllowed short-circuits first)', async () => {
+  await withTempSettings(async () => {
+    await setDefaultCommandPermission('guild-1', 'queue', 'deny')
+    await withLoggedOperations(async (calls) => {
+      const session = makeSession()
+      const sessions = new Map([['guild-1', session]])
+      const interaction = fakeInteraction({ customId: 'qedit_remove_p0_i0' })
+
+      await handleQueueEditorInteraction(interaction, sessions)
+
+      assert.equal(calls.length, 0)
+    })
   })
 })
 
