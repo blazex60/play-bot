@@ -156,6 +156,18 @@ export default {
         logSelect(false, 'not_in_voice')
         return
       }
+      // checkSameVoiceChannel only rejects a *mismatch* against an existing
+      // session; when there's no session yet it degenerately allows anything
+      // (it compares the clicker's own channel against itself), so the VC to
+      // actually join has to be read live from buttonInteraction — the outer
+      // `channel` captured back when /play was invoked can be stale (or the
+      // user may have left voice entirely) by the time a search result is picked.
+      const liveChannel = buttonInteraction.member.voice?.channel
+      if (!liveChannel) {
+        await interaction.followUp({ content: '❌ まずVCに参加してください', flags: MessageFlags.Ephemeral })
+        logSelect(false, 'not_in_voice')
+        return
+      }
       const url = entry.url || entry.webpage_url
       if (!url) {
         await interaction.followUp({ content: '❌ URLを取得できませんでした', flags: MessageFlags.Ephemeral })
@@ -172,7 +184,7 @@ export default {
       }
       let session
       try {
-        session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
+        session = await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel: liveChannel, textChannelId: interaction.channelId })
       } catch (err) {
         await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         logSelect(false, err.message)
