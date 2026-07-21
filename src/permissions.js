@@ -30,10 +30,13 @@ function hasAdminRole(interaction, adminRoleId) {
 // editor's buttons) must pass it explicitly — button/select/modal
 // interactions have no interaction.commandName of their own, so without an
 // explicit override a denied user's queue-editor clicks would silently skip
-// the permission check entirely.
-export function checkCommandAllowed(interaction, adminRoleId, commandName = interaction.commandName) {
+// the permission check entirely. guildId likewise defaults to
+// interaction.guildId but must be passed explicitly for DM-originated
+// interactions (e.g. autoplay recommendation picks), which have no guild
+// context of their own.
+export function checkCommandAllowed(interaction, adminRoleId, commandName = interaction.commandName, guildId = interaction.guildId) {
   if (hasAdminRole(interaction, adminRoleId)) return true
-  const permission = resolveCommandPermission(interaction.guildId, interaction.user.id, commandName)
+  const permission = resolveCommandPermission(guildId, interaction.user.id, commandName)
   if (permission === 'deny') {
     const payload = { content: '❌ このコマンドの実行は制限されています', flags: MessageFlags.Ephemeral }
     if (interaction.deferred || interaction.replied) {

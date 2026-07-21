@@ -1,6 +1,6 @@
 import { ActionRowBuilder, EmbedBuilder, MessageFlags } from 'discord.js'
 import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
-import { checkInVoiceChannel } from './permissions.js'
+import { checkInVoiceChannel, checkCommandAllowed } from './permissions.js'
 import { createTrack } from './queue.js'
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
@@ -254,6 +254,18 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
     // checkInVoiceChannel already sends its rejection via followUp once the
     // interaction is deferred, so this ordering doesn't change that path.
     await interaction.deferUpdate()
+
+    // A denied 'play' permission must block this pick too — otherwise an
+    // admin's denial is bypassed entirely through recommendation DMs, which
+    // dispatch here instead of through index.js's chat-input-command guard.
+    // guildId is passed explicitly since these are DM interactions with no
+    // guild context of their own (interaction.guildId is unset).
+    if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'play', entry.guildId)) {
+      if (!isSessionStale() && !entry.expired) {
+        pendingStore.set(interaction.message.id, entry)
+      }
+      return
+    }
 
     // The target user may have left the VC after the prompt was posted while
     // other listeners kept the session alive; re-check membership the same

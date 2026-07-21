@@ -65,13 +65,33 @@ describe('PermissionMatrix', () => {
     expect(onSetUserOverride).toHaveBeenCalledWith('u1', 'skip', null)
   })
 
-  it('adds a known user row by selecting them from the dropdown', async () => {
+  it('adds a known user row showing "inherit" for every command, without granting any permission', async () => {
     const onSetUserOverride = vi.fn()
     render(<PermissionMatrix {...baseProps({ onSetUserOverride })} />)
 
     const addSelect = assertElement(assertElement(screen.getByText('ユーザーを追加').parentElement).querySelector('select'))
     await userEvent.selectOptions(addSelect, 'u1')
 
-    expect(onSetUserOverride).toHaveBeenCalledWith('u1', 'skip', 'allow')
+    expect(screen.getByText('someone')).toBeTruthy()
+    expect(onSetUserOverride).not.toHaveBeenCalled()
+
+    const userRow = assertElement(screen.getByText('someone').closest('tr'))
+    for (const select of userRow.querySelectorAll('select')) {
+      expect(/** @type {HTMLSelectElement} */ (select).value).toBe('inherit')
+    }
+  })
+
+  it('persists a permission only once the admin picks a value for the newly added row', async () => {
+    const onSetUserOverride = vi.fn()
+    render(<PermissionMatrix {...baseProps({ onSetUserOverride })} />)
+
+    const addSelect = assertElement(assertElement(screen.getByText('ユーザーを追加').parentElement).querySelector('select'))
+    await userEvent.selectOptions(addSelect, 'u1')
+
+    const userRow = assertElement(screen.getByText('someone').closest('tr'))
+    const playSelect = assertElement(userRow.querySelectorAll('select')[1])
+    await userEvent.selectOptions(playSelect, 'deny')
+
+    expect(onSetUserOverride).toHaveBeenCalledWith('u1', 'play', 'deny')
   })
 })

@@ -1,8 +1,29 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { GuildQueue, createTrack } from './queue.js'
 import { PendingChoiceStore } from './views.js'
 import { cancelRecommendations, handleRecommendChoice, hasPendingForGuild, postRecommendations, RECOMMEND_TIMEOUT_MS } from './recommendFlow.js'
+import { configureSettingsPathForTest, setDefaultCommandPermission } from './settings.js'
+
+async function withTempSettings(fn) {
+  const dir = await mkdtemp(join(tmpdir(), 'music-bot-recommend-test-'))
+  configureSettingsPathForTest(join(dir, 'data', 'guild-settings.json'))
+  try {
+    await fn()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    // settings.js's guildSettings Map is module-level state shared by every
+    // test in this file; most of the other tests here use guildId 'g1'
+    // directly with no settings.js involvement at all and expect the
+    // default 'allow' permission, so this must reset the in-memory Map
+    // (not just delete the now-unused temp dir) or a 'g1' override set
+    // above would leak into whichever test happens to run next.
+    configureSettingsPathForTest(join(dir, 'data', 'guild-settings-unused.json'))
+  }
+}
 
 function makeCandidate(videoId) {
   return createTrack({ title: videoId, webpageUrl: `https://example.com/${videoId}`, duration: 60, videoId })
@@ -143,6 +164,23 @@ test('handleRecommendChoice: rejects a click from someone other than the target 
 
   assert.equal(interaction.replies[0].content, '❌ これはあなた宛のおすすめではありません')
   assert.ok(pendingStore.get('msg-1'), 'entry must remain so the actual target user can still pick')
+})
+
+test('handleRecommendChoice: a user denied the play command cannot enqueue a recommendation pick', async () => {
+  await withTempSettings(async () => {
+    await setDefaultCommandPermission('g1', 'play', 'deny')
+    const pendingStore = new PendingChoiceStore()
+    pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null, expired: false })
+    const session = makeSession({ voiceChannelId: 'vc-1' })
+    const sessions = new Map([['g1', session]])
+    const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1' })
+
+    await handleRecommendChoice(interaction, sessions, pendingStore)
+
+    assert.equal(session.queue.isEmpty, true, 'must not enqueue a pick for a user denied the play command (regression: recommend picks bypassed checkCommandAllowed)')
+    assert.equal(session.player.playNextCalls.length, 0)
+    assert.ok(pendingStore.get('msg-1'), 'entry must survive a permission denial so a legitimate retry still works after being un-denied')
+  })
 })
 
 test('handleRecommendChoice: rejects and preserves the entry if the target user left the VC', async () => {

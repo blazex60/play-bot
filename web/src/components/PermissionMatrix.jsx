@@ -1,3 +1,5 @@
+import { useState } from 'react'
+
 const DEFAULT_VALUES = ['allow', 'deny']
 const OVERRIDE_VALUES = ['inherit', 'allow', 'deny']
 
@@ -15,15 +17,19 @@ const OVERRIDE_VALUES = ['inherit', 'allow', 'deny']
 export function PermissionMatrix(props) {
   const { commands, defaults, overrides, knownUsers, busy, onSetDefault, onSetUserOverride } = props
   const overrideUserIds = Object.keys(overrides)
-  const addableUsers = knownUsers.filter((user) => !overrideUserIds.includes(user.discordId))
+  // Rows added but not yet given any per-command override: shown as all
+  // "inherit" until the admin actually picks a value for some command.
+  // Persisting an 'allow' for an arbitrary command the moment a row is
+  // added would silently grant that command even when the admin only
+  // meant to configure a different one for this user.
+  const [pendingUserIds, setPendingUserIds] = useState(/** @type {string[]} */ ([]))
+  const displayedUserIds = [...new Set([...overrideUserIds, ...pendingUserIds])]
+  const addableUsers = knownUsers.filter((user) => !displayedUserIds.includes(user.discordId))
 
   /** @param {string} discordId */
   function addUserRow(discordId) {
-    const firstCommand = commands[0]
-    if (!discordId || !firstCommand) return
-    // Adding a row is just setting the first command's override to 'allow';
-    // the row then appears because overrides[discordId] now exists.
-    onSetUserOverride(discordId, firstCommand, 'allow')
+    if (!discordId || displayedUserIds.includes(discordId)) return
+    setPendingUserIds((ids) => [...ids, discordId])
   }
 
   return (
@@ -62,7 +68,7 @@ export function PermissionMatrix(props) {
                 </td>
               ))}
             </tr>
-            {overrideUserIds.map((userId) => {
+            {displayedUserIds.map((userId) => {
               const known = knownUsers.find((user) => user.discordId === userId)
               return (
                 <tr key={userId}>
