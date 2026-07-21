@@ -68,11 +68,16 @@ async function resolvePermission({ client, sessions, guildId, userId, adminRoleI
 
 // Mirrors permissions.js#checkCommandAllowed's decision (admin-role bypass,
 // then the per-user/default allow-deny matrix) but as a plain boolean check
-// with no interaction to reply on — used by the dashboard's control/queue
-// routes so a command denial can't be bypassed by using the web UI instead
-// of the equivalent slash command.
-async function resolveCommandAllowed({ client, guildId, userId, command, adminRoleId }) {
-  const { member } = await fetchMember(client, guildId, userId);
+// with no interaction to reply on. Enforced directly by every mutating
+// endpoint below (not just exposed via GET /command-permission for the web
+// dashboard's own pre-checks) so a command denial can't be bypassed by any
+// caller of this API, present or future, regardless of what the web layer
+// remembers to check. member can be passed in to reuse an already-fetched
+// one instead of triggering a second REST lookup for the same user.
+async function resolveCommandAllowed({ client, guildId, userId, command, adminRoleId, member }) {
+  if (!member) {
+    ({ member } = await fetchMember(client, guildId, userId));
+  }
   if (adminRoleId && member.roles.cache.has(adminRoleId)) return true;
   return resolveCommandPermission(guildId, userId, command) !== 'deny';
 }
@@ -95,10 +100,17 @@ function requireSession(sessions, guildId, reply) {
   return session;
 }
 
-async function requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply }) {
+// command is optional: when given, this also enforces the per-command
+// allow/deny matrix (same one Discord slash commands go through), so a
+// denied command can't be reached via any HTTP action that maps to it.
+async function requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command }) {
   const permission = await resolvePermission({ client, sessions, guildId, userId, adminRoleId });
   if (!permission.allowed) {
     reply.code(403).send({ error: 'forbidden', permission });
+    return null;
+  }
+  if (command && !(await resolveCommandAllowed({ client, guildId, userId, command, adminRoleId }))) {
+    reply.code(403).send({ error: 'forbidden', reason: 'command_denied' });
     return null;
   }
   return permission;
@@ -197,7 +209,7 @@ export function buildBotApi({
     // for the guild (unlike every other action below, which mutates a live
     // player/queue and therefore requires one).
     if (action === 'autoplay') {
-      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: 'autoplay' });
       if (!permission) return;
       const { mode, personalize } = request.body ?? {};
       if (mode !== undefined) {
@@ -219,7 +231,7 @@ export function buildBotApi({
 
     const session = requireSession(sessions, guildId, reply);
     if (!session) return;
-    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: action });
     if (!permission) return;
 
     switch (action) {
@@ -249,7 +261,7 @@ export function buildBotApi({
     const guildId = request.params.guildId;
     const session = requireSession(sessions, guildId, reply);
     if (!session) return;
-    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: 'queue' });
     if (!permission) return;
 
     if (request.params.action === 'remove') {
@@ -278,12 +290,22 @@ export function buildBotApi({
 
     let session = sessions.get(guildId);
     if (session) {
-      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply });
+      const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: 'play' });
       if (!permission) return;
       return enqueueTracks(session, tracks);
     }
 
     const { guild, member } = await fetchMember(client, guildId, userId);
+    // No live session yet means requireAllowed's VC/admin check above never
+    // ran for this branch either — but 'play' being denied must still block
+    // starting a brand new session the same way it blocks adding to an
+    // existing one. member is reused here (not re-fetched) since it was
+    // already looked up just above for the VC-membership check below.
+    const allowed = await resolveCommandAllowed({ client, guildId, userId, command: 'play', adminRoleId, member });
+    if (!allowed) {
+      reply.code(403).send({ error: 'forbidden', reason: 'command_denied' });
+      return;
+    }
     const channel = member.voice?.channel;
     if (!channel) {
       reply.code(409).send({ error: 'user_not_in_voice' });

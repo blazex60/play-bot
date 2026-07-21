@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 
 import { buildBotApi } from './botApi.js';
 import { GuildQueue, createTrack } from './queue.js';
-import { configureSettingsPathForTest } from './settings.js';
+import { configureSettingsPathForTest, setDefaultCommandPermission } from './settings.js';
 
 const TOKEN = 'test-token';
 
@@ -177,6 +177,23 @@ test('bot API control and queue endpoints mutate the session when permitted', as
   });
 });
 
+test('bot API control/queue endpoints reject a denied command even though basic (in-VC) permission is granted', async () => {
+  await withTempSettings(async () => {
+    await setDefaultCommandPermission('guild-1', 'pause', 'deny');
+    const session = makeSession();
+    await withApp({ sessions: new Map([['guild-1', session]]) }, async app => {
+      const pause = await app.inject({
+        method: 'POST',
+        url: '/control/guild-1/pause',
+        headers: authHeaders(),
+        payload: { userId: 'user-1' },
+      });
+      assert.equal(pause.statusCode, 403, 'a denied command must be rejected even by the bot API itself, not just the dashboard route');
+      assert.equal(session.player.calls.length, 0, 'must not have paused');
+    });
+  });
+});
+
 test('bot API import with no session joins the acting user VC and enqueues', async () => {
   const sessions = new Map();
   let createdArgs;
@@ -200,6 +217,32 @@ test('bot API import with no session joins the acting user VC and enqueues', asy
     assert.equal(createdArgs.channel.id, 'voice-1');
     assert.equal(response.json().enqueuedCount, 1);
     assert.equal(createdSession.queue.upcoming().at(-1).title, 'imported');
+  });
+});
+
+test('bot API import with no session rejects a user denied the play command, even though they are in the VC', async () => {
+  await withTempSettings(async () => {
+    await setDefaultCommandPermission('guild-1', 'play', 'deny');
+    const sessions = new Map();
+    let createSessionCalled = false;
+    await withApp({
+      sessions,
+      getOrCreateSessionFn: async args => {
+        createSessionCalled = true;
+        const session = makeSession();
+        sessions.set(args.guildId, session);
+        return session;
+      },
+    }, async app => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/import/guild-1/enqueue',
+        headers: authHeaders(),
+        payload: { userId: 'user-1', tracks: [makeTrack('imported')] },
+      });
+      assert.equal(response.statusCode, 403, 'denied play must block starting a new session too, not just adding to an existing one');
+      assert.equal(createSessionCalled, false, 'must not have joined the VC / created a session');
+    });
   });
 });
 
