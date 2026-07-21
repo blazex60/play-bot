@@ -2,7 +2,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { AudioPlayerStatus, StreamType } from '@discordjs/voice'
 import { GuildPlayer } from './player.js'
-import { GuildQueue, createTrack } from './queue.js'
+import { GuildQueue, LoopMode, createTrack } from './queue.js'
+
+function nextTurn() {
+  return new Promise(resolve => setImmediate(resolve))
+}
 
 function makeAudioPlayer() {
   return {
@@ -113,15 +117,25 @@ test('GuildPlayer: an error during an active handoff is advanced once it finishe
   const audioPlayer = makeAudioPlayer()
   const originalPlay = audioPlayer.play
   let failNextTrack = false
+  let resolveTrackCPlayed
+  const trackCPlayed = new Promise(resolve => { resolveTrackCPlayed = resolve })
   audioPlayer.play = function (resource) {
     originalPlay.call(this, resource)
     if (failNextTrack) {
       failNextTrack = false
       this.events.get('error')(new Error('Private video'))
     }
+    if (resource.stream.url === 'https://example.com/c') resolveTrackCPlayed()
   }
 
-  const { player, resources, queue } = makePlayer({ audioPlayer, trackDuration: 3 })
+  let exhaustedCalls = 0
+  let disconnected = false
+  const { player, resources, queue } = makePlayer({
+    audioPlayer,
+    trackDuration: 3,
+    handleQueueExhausted: async () => { exhaustedCalls += 1; return false },
+    onDisconnect: async () => { disconnected = true },
+  })
   queue.add(createTrack({
     title: 'Track B',
     webpageUrl: 'https://example.com/b',
@@ -132,15 +146,57 @@ test('GuildPlayer: an error during an active handoff is advanced once it finishe
     webpageUrl: 'https://example.com/c',
     duration: 60,
   }))
+  queue.add(createTrack({
+    title: 'Track D',
+    webpageUrl: 'https://example.com/d',
+    duration: 60,
+  }))
 
   await player.playNext()
   failNextTrack = true
   audioPlayer.events.get(AudioPlayerStatus.Idle)()
 
-  await new Promise(resolve => setTimeout(resolve, 10))
+  await trackCPlayed
+  await nextTurn()
   assert.equal(queue.current.title, 'Track C')
   assert.equal(audioPlayer.resource, resources[2])
   assert.equal(resources.length, 3)
+  assert.equal(exhaustedCalls, 0)
+  assert.equal(disconnected, false)
+
+  await player.stop()
+})
+
+test('GuildPlayer: an error while replaying a looped track advances past it', async () => {
+  const audioPlayer = makeAudioPlayer()
+  const originalPlay = audioPlayer.play
+  let failReplay = false
+  let resolveTrackBPlayed
+  const trackBPlayed = new Promise(resolve => { resolveTrackBPlayed = resolve })
+  audioPlayer.play = function (resource) {
+    originalPlay.call(this, resource)
+    if (failReplay) {
+      failReplay = false
+      this.events.get('error')(new Error('Private video'))
+    }
+    if (resource.stream.url === 'https://example.com/b') resolveTrackBPlayed()
+  }
+
+  const { player, audioPlayer: playerAudio, queue } = makePlayer({ audioPlayer, trackDuration: 3 })
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+  }))
+  queue.loopMode = LoopMode.TRACK
+
+  await player.playNext()
+  failReplay = true
+  playerAudio.events.get(AudioPlayerStatus.Idle)()
+
+  await trackBPlayed
+  await nextTurn()
+  assert.equal(queue.current.title, 'Track B')
 
   await player.stop()
 })

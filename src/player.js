@@ -43,8 +43,9 @@ export class GuildPlayer {
   #createAudioResource;
   #resolveAudioStream;
   #handlingAfter = false;
-  #handlingAfterTrack = null;
+  #handlingAfterPlayback = 0;
   #pendingAfter = false;
+  #playbackCount = 0;
 
   constructor({
     guildId,
@@ -142,6 +143,7 @@ export class GuildPlayer {
 
     this.#resetWatchdog();
 
+    this.#playbackCount += 1;
     this.#audioPlayer.play(resource);
     this.#prefetchUpcoming();
     this.#recordPlay(track);
@@ -192,8 +194,10 @@ export class GuildPlayer {
     if (this.#handlingAfter) {
       // A newly started track can fail while an exhausted-queue continuation
       // is still planning. Preserve that transition so it is handled after
-      // the active handoff, but ignore duplicate events for the same track.
-      if (this.#queue.current !== this.#handlingAfterTrack) {
+      // the active handoff, but ignore duplicate events from the playback it
+      // is already handling. Comparing playback instances (rather than tracks)
+      // also preserves an error from a TRACK-loop replay of the same track.
+      if (this.#playbackCount !== this.#handlingAfterPlayback) {
         this.#pendingAfter = true;
       }
       return;
@@ -205,14 +209,14 @@ export class GuildPlayer {
       })
       .finally(() => {
         this.#handlingAfter = false;
-        this.#handlingAfterTrack = null;
+        this.#handlingAfterPlayback = 0;
       });
   }
 
   async #drainAfterPlayback() {
     do {
       this.#pendingAfter = false;
-      this.#handlingAfterTrack = this.#queue.current;
+      this.#handlingAfterPlayback = this.#playbackCount;
       await this.#handleAfter();
     } while (this.#pendingAfter);
   }
