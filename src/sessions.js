@@ -140,8 +140,6 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
           guildId,
           guildName: guild.name,
           plans,
-          queue,
-          player: session.player,
           pendingStore: recommendPendingStore,
           voiceChannel,
           onTimeout: async () => {

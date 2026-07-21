@@ -158,20 +158,40 @@ test('handleRecommendChoice: rejects and preserves the entry if the target user 
   assert.ok(pendingStore.get('msg-1'), 'entry must survive a failed VC check so a legitimate retry still works')
 })
 
-test('handleRecommendChoice: honors a pick even though the prompt now arrives via DM (no guild text channel involved)', async () => {
+test('handleRecommendChoice: honors a real DM pick (interaction.member absent, resolved via guild.members.fetch)', async () => {
   const pendingStore = new PendingChoiceStore()
   pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null })
   const session = makeSession({ voiceChannelId: 'vc-1' })
+  session.connection.joinConfig.guildId = 'g1'
   const sessions = new Map([['g1', session]])
-  // A DM-originated button click still carries interaction.member in these
-  // tests (the member lookup fallback in checkInVoiceChannel is only
-  // exercised when interaction.member is absent); channelId is irrelevant
-  // since checkInVoiceChannel never compares it.
-  const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1', interactionChannelId: 'dm-channel' })
+
+  // A real DM-originated click carries no interaction.member at all (DMs
+  // have no guild context), so checkInVoiceChannel must fall back to
+  // fetching the member from the guild to confirm they're still in the VC.
+  const member = { voice: { channelId: 'vc-1' } }
+  const client = {
+    guilds: {
+      cache: new Map([['g1', { members: { async fetch() { return member } } }]]),
+    },
+  }
+  const replies = []
+  const interaction = {
+    customId: 'autoplay_0',
+    message: { id: 'msg-1' },
+    user: { id: 'u1' },
+    member: null,
+    client,
+    deferred: false,
+    replied: false,
+    replies,
+    async reply(payload) { replies.push(payload); this.replied = true },
+    async followUp(payload) { replies.push(payload) },
+    async deferUpdate() { this.deferred = true },
+  }
 
   await handleRecommendChoice(interaction, sessions, pendingStore)
 
-  assert.equal(session.queue.current.videoId, 'v1', 'the pick must succeed regardless of which channel/DM it was clicked from')
+  assert.equal(session.queue.current.videoId, 'v1', 'the pick must succeed via the fetched-member fallback')
   assert.equal(session.player.playNextCalls.length, 1)
 })
 
