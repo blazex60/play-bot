@@ -90,6 +90,25 @@ test('GuildPlayer.playNext creates a resource and tracks it as the current resou
   await player.stop()
 })
 
+test('GuildPlayer: a stream error automatically skips an unplayable track', async () => {
+  const { player, audioPlayer, resources, queue } = makePlayer()
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+  }))
+
+  await player.playNext()
+  const errorHandler = audioPlayer.events.get('error')
+  errorHandler(new Error('Private video'))
+
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(queue.current.title, 'Track B')
+  assert.equal(audioPlayer.resource, resources[1])
+
+  await player.stop()
+})
+
 test('GuildPlayer: queue exhaustion with no handleQueueExhausted disconnects as before', async () => {
   let disconnected = false
   const onDisconnect = async () => { disconnected = true }

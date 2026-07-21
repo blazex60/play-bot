@@ -42,6 +42,7 @@ export class GuildPlayer {
   #currentResource = null;
   #createAudioResource;
   #resolveAudioStream;
+  #handlingAfter = false;
 
   constructor({
     guildId,
@@ -67,9 +68,7 @@ export class GuildPlayer {
     this.#resolveAudioStream = resolveAudioStreamFn;
 
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
-      this.#handleAfter().catch(err => {
-        console.error('[GuildPlayer] handleAfter error:', err);
-      });
+      this.#advanceAfterPlayback();
     });
 
     this.#audioPlayer.on('stateChange', (oldState, newState) => {
@@ -81,6 +80,20 @@ export class GuildPlayer {
     this.#audioPlayer.on('error', err => {
       console.error('[GuildPlayer] audioPlayer error:', err);
       this.#hadError = true;
+
+      // A stream error does not reliably produce an Idle event (for example,
+      // when yt-dlp cannot read a private or deleted video). Stop explicitly
+      // so the failed track is advanced instead of leaving the queue stuck.
+      this.#audioPlayer.stop();
+
+      // Some AudioPlayer implementations do not emit Idle synchronously from
+      // stop(). Give an emitted Idle handler precedence, then advance here as
+      // a fallback once the player is confirmed idle.
+      queueMicrotask(() => {
+        if (this.#audioPlayer.state.status === AudioPlayerStatus.Idle) {
+          this.#advanceAfterPlayback();
+        }
+      });
     });
 
     this.#connection.subscribe(this.#audioPlayer);
@@ -167,6 +180,18 @@ export class GuildPlayer {
     this.#clearWatchdog();
     await this.#cleanupCurrentTempFile();
     this.#discardPrefetch();
+  }
+
+  #advanceAfterPlayback() {
+    if (this.#handlingAfter) return;
+    this.#handlingAfter = true;
+    this.#handleAfter()
+      .catch(err => {
+        console.error('[GuildPlayer] handleAfter error:', err);
+      })
+      .finally(() => {
+        this.#handlingAfter = false;
+      });
   }
 
   async #handleAfter() {
