@@ -12,6 +12,39 @@ let loaded = false
 let writeChain = Promise.resolve()
 
 const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend'])
+const PERMISSION_VALUES = new Set(['allow', 'deny'])
+const VISIBILITY_VALUES = new Set(['public', 'personal'])
+
+function normalizeCommandPermissions(value) {
+  const defaults = {}
+  if (value?.defaults && typeof value.defaults === 'object') {
+    for (const [command, permission] of Object.entries(value.defaults)) {
+      if (PERMISSION_VALUES.has(permission)) defaults[command] = permission
+    }
+  }
+  const overrides = {}
+  if (value?.overrides && typeof value.overrides === 'object') {
+    for (const [userId, commandMap] of Object.entries(value.overrides)) {
+      if (!commandMap || typeof commandMap !== 'object') continue
+      const normalized = {}
+      for (const [command, permission] of Object.entries(commandMap)) {
+        if (PERMISSION_VALUES.has(permission)) normalized[command] = permission
+      }
+      if (Object.keys(normalized).length > 0) overrides[userId] = normalized
+    }
+  }
+  return { defaults, overrides }
+}
+
+function normalizeCommandVisibility(value) {
+  const visibility = {}
+  if (value && typeof value === 'object') {
+    for (const [command, setting] of Object.entries(value)) {
+      if (VISIBILITY_VALUES.has(setting)) visibility[command] = setting
+    }
+  }
+  return visibility
+}
 
 function normalizeRecord(record) {
   return {
@@ -19,6 +52,8 @@ function normalizeRecord(record) {
     autoplayMode: AUTOPLAY_MODES.has(record?.autoplayMode) ? record.autoplayMode : 'off',
     personalize: record?.personalize === true,
     autoNotify: record?.autoNotify === true,
+    commandPermissions: normalizeCommandPermissions(record?.commandPermissions),
+    commandVisibility: normalizeCommandVisibility(record?.commandVisibility),
   }
 }
 
@@ -44,10 +79,21 @@ export function loadSettings() {
   return guildSettings
 }
 
+function defaultGuildSettings() {
+  return {
+    normalize: false,
+    autoplayMode: 'off',
+    personalize: false,
+    autoNotify: false,
+    commandPermissions: { defaults: {}, overrides: {} },
+    commandVisibility: {},
+  }
+}
+
 export function getGuildSettings(guildId) {
   ensureLoaded()
   const settings = guildSettings.get(guildId)
-  return settings ? { ...settings } : { normalize: false, autoplayMode: 'off', personalize: false, autoNotify: false }
+  return structuredClone(settings ?? defaultGuildSettings())
 }
 
 async function writeSettings() {
@@ -80,6 +126,50 @@ export function setPersonalize(guildId, enabled) {
 
 export function setAutoNotify(guildId, enabled) {
   return updateGuildSettings(guildId, { autoNotify: enabled === true })
+}
+
+export function getCommandPermissions(guildId) {
+  return getGuildSettings(guildId).commandPermissions
+}
+
+export function setDefaultCommandPermission(guildId, commandName, value) {
+  if (!PERMISSION_VALUES.has(value)) throw new Error(`Invalid command permission: ${value}`)
+  const commandPermissions = getCommandPermissions(guildId)
+  commandPermissions.defaults[commandName] = value
+  return updateGuildSettings(guildId, { commandPermissions })
+}
+
+export function setUserCommandPermission(guildId, userId, commandName, value) {
+  if (value !== null && !PERMISSION_VALUES.has(value)) throw new Error(`Invalid command permission: ${value}`)
+  const commandPermissions = getCommandPermissions(guildId)
+  const userOverrides = commandPermissions.overrides[userId] ?? {}
+  if (value === null) {
+    delete userOverrides[commandName]
+  } else {
+    userOverrides[commandName] = value
+  }
+  if (Object.keys(userOverrides).length > 0) {
+    commandPermissions.overrides[userId] = userOverrides
+  } else {
+    delete commandPermissions.overrides[userId]
+  }
+  return updateGuildSettings(guildId, { commandPermissions })
+}
+
+export function resolveCommandPermission(guildId, userId, commandName) {
+  const { defaults, overrides } = getCommandPermissions(guildId)
+  return overrides[userId]?.[commandName] ?? defaults[commandName] ?? 'allow'
+}
+
+export function getCommandVisibilitySettings(guildId) {
+  return getGuildSettings(guildId).commandVisibility
+}
+
+export function setCommandVisibility(guildId, commandName, value) {
+  if (!VISIBILITY_VALUES.has(value)) throw new Error(`Invalid command visibility: ${value}`)
+  const commandVisibility = getCommandVisibilitySettings(guildId)
+  commandVisibility[commandName] = value
+  return updateGuildSettings(guildId, { commandVisibility })
 }
 
 export function configureSettingsPathForTest(filePath) {

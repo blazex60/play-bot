@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
-import { checkSameVoiceChannel } from '../permissions.js'
+import { checkSameVoiceChannel, replyFlags } from '../permissions.js'
 import { cancelPendingRecommendations } from '../sessions.js'
 
 export default {
@@ -12,6 +12,6 @@ export default {
     sessions.delete(interaction.guildId)
     cancelPendingRecommendations(interaction.guildId)
     session.connection.destroy()
-    await interaction.reply(`👋 ${interaction.member.displayName} がボットをVCから退出させました`)
+    await interaction.reply({ content: `👋 ${interaction.member.displayName} がボットをVCから退出させました`, ...replyFlags(interaction.guildId, 'leave') })
   },
 }

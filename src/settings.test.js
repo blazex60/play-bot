@@ -12,7 +12,21 @@ import {
   setNormalize,
   setPersonalize,
   setAutoNotify,
+  setDefaultCommandPermission,
+  setUserCommandPermission,
+  resolveCommandPermission,
+  setCommandVisibility,
+  getCommandVisibilitySettings,
 } from './settings.js'
+
+const DEFAULT_RECORD = {
+  normalize: false,
+  autoplayMode: 'off',
+  personalize: false,
+  autoNotify: false,
+  commandPermissions: { defaults: {}, overrides: {} },
+  commandVisibility: {},
+}
 
 async function withTempSettings(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'music-bot-settings-test-'))
@@ -29,18 +43,18 @@ test('settings: missing file defaults normalize/autoplayMode/personalize', async
   await withTempSettings(async ({ filePath }) => {
     loadSettings()
     assert.equal(existsSync(filePath), false)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'off', personalize: false, autoNotify: false })
+    assert.deepEqual(getGuildSettings('guild-1'), DEFAULT_RECORD)
   })
 })
 
 test('settings: setNormalize persists and loadSettings restores values', async () => {
   await withTempSettings(async ({ filePath }) => {
     await setNormalize('guild-1', true)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'off', personalize: false, autoNotify: false })
+    assert.deepEqual(getGuildSettings('guild-1'), { ...DEFAULT_RECORD, normalize: true })
 
     configureSettingsPathForTest(filePath)
     loadSettings()
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'off', personalize: false, autoNotify: false })
+    assert.deepEqual(getGuildSettings('guild-1'), { ...DEFAULT_RECORD, normalize: true })
   })
 })
 
@@ -51,8 +65,8 @@ test('settings: atomic write leaves a valid JSON settings file', async () => {
 
     const raw = await readFile(filePath, 'utf8')
     assert.deepEqual(JSON.parse(raw), {
-      'guild-1': { normalize: true, autoplayMode: 'off', personalize: false, autoNotify: false },
-      'guild-2': { normalize: false, autoplayMode: 'off', personalize: false, autoNotify: false },
+      'guild-1': { ...DEFAULT_RECORD, normalize: true },
+      'guild-2': { ...DEFAULT_RECORD, normalize: false },
     })
 
     const files = await readdir(join(dir, 'data'))
@@ -73,7 +87,7 @@ test('settings: setAutoplayMode rejects invalid modes by falling back to off', a
 test('settings: setPersonalize toggles independently of other fields', async () => {
   await withTempSettings(async () => {
     await setPersonalize('guild-1', true)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'off', personalize: true, autoNotify: false })
+    assert.deepEqual(getGuildSettings('guild-1'), { ...DEFAULT_RECORD, personalize: true })
   })
 })
 
@@ -82,7 +96,7 @@ test('settings: setAutoNotify persists and defaults to off', async () => {
     assert.equal(getGuildSettings('guild-1').autoNotify, false)
 
     await setAutoNotify('guild-1', true)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'off', personalize: false, autoNotify: true })
+    assert.deepEqual(getGuildSettings('guild-1'), { ...DEFAULT_RECORD, autoNotify: true })
 
     configureSettingsPathForTest(filePath)
     loadSettings()
@@ -96,10 +110,48 @@ test('settings: setters merge instead of clobbering other fields (regression)', 
     await setPersonalize('guild-1', true)
     await setNormalize('guild-1', true)
     await setAutoNotify('guild-1', true)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: true, autoplayMode: 'auto', personalize: true, autoNotify: true })
+    assert.deepEqual(getGuildSettings('guild-1'), {
+      ...DEFAULT_RECORD,
+      normalize: true,
+      autoplayMode: 'auto',
+      personalize: true,
+      autoNotify: true,
+    })
 
     // setNormalize must not wipe autoplay fields set earlier, and vice versa.
     await setNormalize('guild-1', false)
-    assert.deepEqual(getGuildSettings('guild-1'), { normalize: false, autoplayMode: 'auto', personalize: true, autoNotify: true })
+    assert.deepEqual(getGuildSettings('guild-1'), {
+      ...DEFAULT_RECORD,
+      normalize: false,
+      autoplayMode: 'auto',
+      personalize: true,
+      autoNotify: true,
+    })
+  })
+})
+
+test('settings: setDefaultCommandPermission and setUserCommandPermission resolve with override precedence', async () => {
+  await withTempSettings(async () => {
+    assert.equal(resolveCommandPermission('guild-1', 'user-1', 'bitrate'), 'allow')
+
+    await setDefaultCommandPermission('guild-1', 'bitrate', 'deny')
+    assert.equal(resolveCommandPermission('guild-1', 'user-1', 'bitrate'), 'deny')
+
+    await setUserCommandPermission('guild-1', 'user-1', 'bitrate', 'allow')
+    assert.equal(resolveCommandPermission('guild-1', 'user-1', 'bitrate'), 'allow')
+    assert.equal(resolveCommandPermission('guild-1', 'user-2', 'bitrate'), 'deny')
+
+    // Clearing the override falls back to the guild default again.
+    await setUserCommandPermission('guild-1', 'user-1', 'bitrate', null)
+    assert.equal(resolveCommandPermission('guild-1', 'user-1', 'bitrate'), 'deny')
+  })
+})
+
+test('settings: setCommandVisibility persists per-command overrides', async () => {
+  await withTempSettings(async () => {
+    assert.deepEqual(getCommandVisibilitySettings('guild-1'), {})
+
+    await setCommandVisibility('guild-1', 'play', 'personal')
+    assert.deepEqual(getCommandVisibilitySettings('guild-1'), { play: 'personal' })
   })
 })

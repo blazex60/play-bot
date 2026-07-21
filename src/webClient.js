@@ -73,5 +73,15 @@ export function createWebClient({
         return {}
       }
     },
+    async logOperation({ guildId, discordUserId, username, source, action, detail, success }) {
+      try {
+        await request('/internal/operation-log', {
+          method: 'POST',
+          body: { guildId, discordUserId, username, source, action, detail, success },
+        })
+      } catch (err) {
+        console.error('[webClient] logOperation failed:', err.message)
+      }
+    },
   }
 }

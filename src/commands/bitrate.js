@@ -1,4 +1,5 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
+import { replyFlags } from '../permissions.js'
 
 const BITRATE_BY_TIER = { 0: 96_000, 1: 128_000, 2: 256_000, 3: 384_000 }
 
@@ -27,6 +28,10 @@ export default {
       return interaction.editReply({ content: '❌ チャンネルの編集権限がありません' })
     }
     const suffix = kbps !== null && target < kbps * 1000 ? `（Tier${tier} 上限に丸めました）` : ''
-    await interaction.editReply({ content: `✅ ビットレートを **${target / 1000}kbps** に設定しました${suffix}` })
+    // The deferred reply above is always ephemeral so error paths stay
+    // personal; the success message's visibility is configurable, so it's
+    // sent as an independent followUp after dropping the ephemeral one.
+    await interaction.deleteReply().catch(() => {})
+    await interaction.followUp({ content: `✅ ビットレートを **${target / 1000}kbps** に設定しました${suffix}`, ...replyFlags(interaction.guildId, 'bitrate') })
   },
 }

@@ -2,7 +2,16 @@ import Fastify from 'fastify';
 
 import { getOrCreateSession, cancelPendingRecommendations, bumpPlanToken } from './sessions.js';
 import { resolveWebPermission } from './webPermission.js';
-import { getGuildSettings, setAutoplayMode, setPersonalize } from './settings.js';
+import {
+  getGuildSettings,
+  setAutoplayMode,
+  setPersonalize,
+  getCommandPermissions,
+  setDefaultCommandPermission,
+  setUserCommandPermission,
+  setCommandVisibility,
+} from './settings.js';
+import { getEffectiveCommandVisibility } from './permissions.js';
 
 const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 
@@ -83,6 +92,27 @@ async function requireAllowed({ client, sessions, guildId, userId, adminRoleId, 
   return permission;
 }
 
+// Admin-only endpoints (command permission matrix, reply visibility) always
+// re-verify the caller has the guild's admin role, never the weaker
+// basic (in-VC) permission that requireAllowed accepts.
+async function requireAdmin({ client, sessions, guildId, userId, adminRoleId, reply }) {
+  const permission = await resolvePermission({ client, sessions, guildId, userId, adminRoleId });
+  if (!permission.extended) {
+    reply.code(403).send({ error: 'forbidden', permission });
+    return null;
+  }
+  return permission;
+}
+
+function requireAdminUserId(request, reply) {
+  const adminUserId = request.body?.adminUserId ?? request.query?.adminUserId;
+  if (typeof adminUserId !== 'string' || adminUserId.length === 0) {
+    reply.code(400).send({ error: 'adminUserId_required' });
+    return null;
+  }
+  return adminUserId;
+}
+
 async function enqueueTracks(session, tracks) {
   const wasEmpty = session.queue.isEmpty;
   for (const track of tracks) {
@@ -105,6 +135,7 @@ export function buildBotApi({
   token = process.env.BOT_API_TOKEN,
   adminRoleId = process.env.ADMIN_ROLE_ID,
   getOrCreateSessionFn = getOrCreateSession,
+  commandNames = [],
 } = {}) {
   if (!client) throw new Error('buildBotApi requires client');
   if (!sessions) throw new Error('buildBotApi requires sessions');
@@ -239,6 +270,83 @@ export function buildBotApi({
 
     session = await getOrCreateSessionFn({ guildId, guild, channel });
     return enqueueTracks(session, tracks);
+  });
+
+  function requireKnownCommand(command, reply) {
+    if (typeof command !== 'string' || !commandNames.includes(command)) {
+      reply.code(400).send({ error: 'unknown_command' });
+      return false;
+    }
+    return true;
+  }
+
+  app.get('/admin/:guildId/permissions', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const { defaults, overrides } = getCommandPermissions(guildId);
+    return { commands: commandNames, defaults, overrides };
+  });
+
+  app.post('/admin/:guildId/permissions/default', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const { command, value } = request.body ?? {};
+    if (!requireKnownCommand(command, reply)) return;
+    if (value !== 'allow' && value !== 'deny') {
+      reply.code(400).send({ error: 'invalid_permission_value' });
+      return;
+    }
+    await setDefaultCommandPermission(guildId, command, value);
+    return { ok: true };
+  });
+
+  app.post('/admin/:guildId/permissions/user', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const { userId, command, value } = request.body ?? {};
+    if (typeof userId !== 'string' || userId.length === 0) {
+      reply.code(400).send({ error: 'userId_required' });
+      return;
+    }
+    if (!requireKnownCommand(command, reply)) return;
+    if (value !== 'allow' && value !== 'deny' && value !== null) {
+      reply.code(400).send({ error: 'invalid_permission_value' });
+      return;
+    }
+    await setUserCommandPermission(guildId, userId, command, value);
+    return { ok: true };
+  });
+
+  app.get('/admin/:guildId/visibility', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const visibility = Object.fromEntries(
+      commandNames.map((name) => [name, getEffectiveCommandVisibility(guildId, name)])
+    );
+    return visibility;
+  });
+
+  app.post('/admin/:guildId/visibility', async (request, reply) => {
+    const adminUserId = requireAdminUserId(request, reply);
+    if (!adminUserId) return;
+    const guildId = request.params.guildId;
+    if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
+    const { command, value } = request.body ?? {};
+    if (!requireKnownCommand(command, reply)) return;
+    if (value !== 'public' && value !== 'personal') {
+      reply.code(400).send({ error: 'invalid_visibility_value' });
+      return;
+    }
+    await setCommandVisibility(guildId, command, value);
+    return { ok: true };
   });
 
   return app;

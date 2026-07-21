@@ -12,7 +12,7 @@ export const sessions = new Map()
 export const pendingStore = new PendingChoiceStore()
 export const recommendPendingStore = new PendingChoiceStore()
 
-const webClient = createWebClient()
+export const webClient = createWebClient()
 
 // /stop clears playback without destroying the session/connection, and
 // /leave deletes the session directly — neither goes through onDisconnect,

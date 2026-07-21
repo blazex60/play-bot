@@ -20,6 +20,7 @@ import { importRoutes } from './routes/import.js'
 import { importEditRoutes } from './routes/import-edit.js'
 import { playlistsRoutes } from './routes/playlists.js'
 import { internalRoutes } from './routes/internal.js'
+import { adminRoutes } from './routes/admin.js'
 
 const thisDir = dirname(fileURLToPath(import.meta.url))
 const projectRoot = resolve(thisDir, '../../..')
@@ -101,11 +102,12 @@ export async function buildWebServer({
     authenticated.addHook('preHandler', requireAuth)
     await authenticated.register(stateRoutes, { botClient })
     await authenticated.register(linksRoutes, { db: database })
-    await authenticated.register(controlRoutes, { botClient })
-    await authenticated.register(queueRoutes, { botClient })
+    await authenticated.register(controlRoutes, { botClient, db: database })
+    await authenticated.register(queueRoutes, { botClient, db: database })
     await authenticated.register(importRoutes, { db: database, botClient })
     await authenticated.register(importEditRoutes, { db: database, botClient })
     await authenticated.register(playlistsRoutes, { db: database, botClient })
+    await authenticated.register(adminRoutes, { db: database, botClient })
   })
 
   if (existsSync(webDist)) {

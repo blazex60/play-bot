@@ -1,10 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import { buildBotApi } from './botApi.js';
 import { GuildQueue, createTrack } from './queue.js';
+import { configureSettingsPathForTest } from './settings.js';
 
 const TOKEN = 'test-token';
+
+async function withTempSettings(fn) {
+  const dir = await mkdtemp(join(tmpdir(), 'music-bot-botapi-test-'));
+  configureSettingsPathForTest(join(dir, 'data', 'guild-settings.json'));
+  try {
+    await fn();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
 
 function makeTrack(title) {
   return createTrack({
@@ -79,7 +93,7 @@ function makeClient(membersById, guild = { id: 'guild-1', voiceAdapterCreator: {
   };
 }
 
-async function withApp({ sessions = new Map(), members = [makeMember()], adminRoleId = 'admin', getOrCreateSessionFn } = {}, run) {
+async function withApp({ sessions = new Map(), members = [makeMember()], adminRoleId = 'admin', getOrCreateSessionFn, commandNames } = {}, run) {
   const membersById = new Map(members.map(member => [member.id, member]));
   const app = buildBotApi({
     client: makeClient(membersById),
@@ -87,6 +101,7 @@ async function withApp({ sessions = new Map(), members = [makeMember()], adminRo
     token: TOKEN,
     adminRoleId,
     getOrCreateSessionFn,
+    commandNames,
   });
   try {
     await run(app);
@@ -192,5 +207,107 @@ test('bot API import with no session rejects users outside VC', async () => {
     });
     assert.equal(response.statusCode, 409);
     assert.deepEqual(response.json(), { error: 'user_not_in_voice' });
+  });
+});
+
+test('bot API admin endpoints reject non-admin users', async () => {
+  await withTempSettings(async () => {
+    await withApp({ members: [makeMember({ userId: 'user-1', roles: [] })], commandNames: ['skip', 'play'] }, async app => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/permissions?adminUserId=user-1',
+        headers: authHeaders(),
+      });
+      assert.equal(response.statusCode, 403);
+    });
+  });
+});
+
+test('bot API admin endpoints require adminUserId', async () => {
+  await withTempSettings(async () => {
+    await withApp({ commandNames: ['skip'] }, async app => {
+      const response = await app.inject({ method: 'GET', url: '/admin/guild-1/permissions', headers: authHeaders() });
+      assert.equal(response.statusCode, 400);
+    });
+  });
+});
+
+test('bot API admin permission endpoints read and write the command permission matrix', async () => {
+  await withTempSettings(async () => {
+    const members = [makeMember({ userId: 'admin-1', roles: ['admin'] }), makeMember({ userId: 'user-1', roles: [] })];
+    await withApp({ members, commandNames: ['skip', 'play'] }, async app => {
+      const initial = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/permissions?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.equal(initial.statusCode, 200);
+      assert.deepEqual(initial.json(), { commands: ['skip', 'play'], defaults: {}, overrides: {} });
+
+      const unknownCommand = await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/permissions/default',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'bogus', value: 'deny' },
+      });
+      assert.equal(unknownCommand.statusCode, 400);
+
+      const setDefault = await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/permissions/default',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'skip', value: 'deny' },
+      });
+      assert.equal(setDefault.statusCode, 200);
+
+      const setOverride = await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/permissions/user',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', userId: 'user-1', command: 'skip', value: 'allow' },
+      });
+      assert.equal(setOverride.statusCode, 200);
+
+      const after = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/permissions?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.deepEqual(after.json(), {
+        commands: ['skip', 'play'],
+        defaults: { skip: 'deny' },
+        overrides: { 'user-1': { skip: 'allow' } },
+      });
+    });
+  });
+});
+
+test('bot API admin visibility endpoints read effective values and write overrides', async () => {
+  await withTempSettings(async () => {
+    const members = [makeMember({ userId: 'admin-1', roles: ['admin'] })];
+    await withApp({ members, commandNames: ['skip', 'nowplaying'] }, async app => {
+      const initial = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/visibility?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.equal(initial.statusCode, 200);
+      assert.deepEqual(initial.json(), { skip: 'public', nowplaying: 'personal' });
+
+      const setVisibility = await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/visibility',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'nowplaying', value: 'public' },
+      });
+      assert.equal(setVisibility.statusCode, 200);
+
+      const after = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/visibility?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.deepEqual(after.json(), { skip: 'public', nowplaying: 'public' });
+    });
   });
 });

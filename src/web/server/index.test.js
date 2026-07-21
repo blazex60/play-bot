@@ -86,6 +86,12 @@ test('dashboard API routes are registered and require authentication (regression
     { method: 'DELETE', url: '/api/playlists/mine/1/tracks/1' },
     { method: 'POST', url: '/api/playlists/mine/1/tracks/move' },
     { method: 'POST', url: '/api/playlists/mine/1/queue' },
+    { method: 'GET', url: '/api/admin/g1/permissions' },
+    { method: 'POST', url: '/api/admin/g1/permissions/default' },
+    { method: 'POST', url: '/api/admin/g1/permissions/user' },
+    { method: 'GET', url: '/api/admin/g1/visibility' },
+    { method: 'POST', url: '/api/admin/g1/visibility' },
+    { method: 'GET', url: '/api/admin/g1/logs' },
   ]
 
   for (const route of protectedRoutes) {

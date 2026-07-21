@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { BrowserRouter, Link, Route, Routes, useLocation } from 'react-router-dom'
 
+import { Admin } from './pages/Admin.jsx'
 import { Dashboard } from './pages/Dashboard.jsx'
 import { Landing } from './pages/Landing.jsx'
 import './styles.css'
@@ -92,6 +93,7 @@ export function App() {
       <Routes>
         <Route path="/" element={<Landing />} />
         <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/admin" element={<Admin />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/login/demo" element={<DemoLoginPage />} />
         <Route path="/callback/*" element={<CallbackPage />} />

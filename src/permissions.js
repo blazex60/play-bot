@@ -1,4 +1,55 @@
 import { MessageFlags } from 'discord.js'
+import { resolveCommandPermission, getCommandVisibilitySettings } from './settings.js'
+
+// Historical hardcoded reply visibility, kept as the fallback for any guild
+// that hasn't customized a given command via the admin dashboard yet.
+const DEFAULT_VISIBILITY = {
+  play: 'public',
+  skip: 'public',
+  pause: 'public',
+  resume: 'public',
+  stop: 'public',
+  leave: 'public',
+  queue: 'public',
+  shuffle: 'personal',
+  loop: 'personal',
+  nowplaying: 'personal',
+  bitrate: 'personal',
+  normalize: 'personal',
+  autoplay: 'personal',
+}
+
+// Whether interaction.member (has adminRoleId) should bypass a command's
+// allow/deny setting entirely, so an admin can never lock themselves out.
+function hasAdminRole(interaction, adminRoleId) {
+  return Boolean(adminRoleId && interaction.member?.roles?.cache?.has?.(adminRoleId))
+}
+
+export function checkCommandAllowed(interaction, adminRoleId) {
+  if (hasAdminRole(interaction, adminRoleId)) return true
+  const permission = resolveCommandPermission(interaction.guildId, interaction.user.id, interaction.commandName)
+  if (permission === 'deny') {
+    const payload = { content: '❌ このコマンドの実行は制限されています', flags: MessageFlags.Ephemeral }
+    if (interaction.deferred || interaction.replied) {
+      interaction.followUp(payload).catch(() => {})
+    } else {
+      interaction.reply(payload).catch(() => {})
+    }
+    return false
+  }
+  return true
+}
+
+export function getEffectiveCommandVisibility(guildId, commandName) {
+  const overrides = getCommandVisibilitySettings(guildId)
+  return overrides[commandName] ?? DEFAULT_VISIBILITY[commandName] ?? 'public'
+}
+
+export function replyFlags(guildId, commandName) {
+  return getEffectiveCommandVisibility(guildId, commandName) === 'personal'
+    ? { flags: MessageFlags.Ephemeral }
+    : {}
+}
 
 export function checkSameVoiceChannel(interaction, session) {
   const targetChannelId = session

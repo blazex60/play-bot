@@ -3,7 +3,7 @@ import { createTrack } from '../queue.js'
 import { searchYoutube, resolveMetadata, isPlaylistUrl, resolveFlatPlaylist, PLAYLIST_LIMIT } from '../search.js'
 import { createSearchResultComponents } from '../views.js'
 import { getOrCreateSession, pendingStore } from '../sessions.js'
-import { checkSameVoiceChannel } from '../permissions.js'
+import { checkSameVoiceChannel, replyFlags } from '../permissions.js'
 
 function fmtDuration(seconds) {
   if (seconds == null) return '不明'
@@ -65,7 +65,7 @@ export default {
         for (const track of tracks) session.queue.add(track)
 
         const truncNote = truncated ? `\n⚠️ プレイリストが大きいため先頭 ${PLAYLIST_LIMIT} 件のみ追加しました` : ''
-        await interaction.followUp(`✅ ${interaction.member.displayName} がプレイリストから **${tracks.length}曲** をキューに追加しました${truncNote}`)
+        await interaction.followUp({ content: `✅ ${interaction.member.displayName} がプレイリストから **${tracks.length}曲** をキューに追加しました${truncNote}`, ...replyFlags(interaction.guildId, 'play') })
         if (wasEmpty) await session.player.playNext()
         return
       }
@@ -86,7 +86,7 @@ export default {
 
       const wasEmpty = session.queue.isEmpty
       session.queue.add(createTrack(info))
-      await interaction.followUp(`✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`)
+      await interaction.followUp({ content: `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, ...replyFlags(interaction.guildId, 'play') })
       if (wasEmpty) await session.player.playNext()
       return
     }
@@ -129,7 +129,7 @@ export default {
       await interaction.deleteReply().catch(() => {})
       const wasEmpty = session.queue.isEmpty
       session.queue.add(createTrack(info))
-      await interaction.followUp(`✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`)
+      await interaction.followUp({ content: `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, ...replyFlags(interaction.guildId, 'play') })
       if (wasEmpty) await session.player.playNext()
     }
 

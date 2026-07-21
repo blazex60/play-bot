@@ -122,3 +122,24 @@ test('recordPlay aborts even when the response body read hangs after headers arr
 
   await assert.doesNotReject(() => client.recordPlay({ guildId: 'g1', discordUserId: 'u1', trackTitle: 'T', trackUrl: 'https://example.com/t' }))
 })
+
+test('logOperation posts to /internal/operation-log with a bearer token', async () => {
+  const fetchImpl = fakeFetch([{ body: { ok: true } }])
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl })
+
+  await client.logOperation({ guildId: 'g1', discordUserId: 'u1', username: 'user', source: 'command', action: 'skip', detail: null, success: true })
+
+  assert.equal(fetchImpl.calls.length, 1)
+  assert.equal(new URL(fetchImpl.calls[0].url).pathname, '/internal/operation-log')
+  assert.equal(fetchImpl.calls[0].options.method, 'POST')
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].options.body), {
+    guildId: 'g1', discordUserId: 'u1', username: 'user', source: 'command', action: 'skip', detail: null, success: true,
+  })
+})
+
+test('logOperation never throws, even when the Web API is unreachable', async () => {
+  const fetchImpl = async () => { throw new Error('network down') }
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl })
+
+  await assert.doesNotReject(() => client.logOperation({ guildId: 'g1', discordUserId: 'u1', source: 'command', action: 'skip', success: true }))
+})

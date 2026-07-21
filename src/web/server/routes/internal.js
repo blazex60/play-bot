@@ -1,4 +1,4 @@
-import { nowUnix } from './route-utils.js'
+import { nowUnix, recordOperationLog } from './route-utils.js'
 
 function getBearerToken(request) {
   const header = request.headers.authorization
@@ -39,6 +39,16 @@ export async function internalRoutes(app, { db, token } = {}) {
       INSERT INTO play_history (guild_id, discord_user_id, video_id, channel, track_title, track_url, played_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(guildId, discordUserId, videoId ?? null, channel ?? null, trackTitle, trackUrl, nowUnix())
+    return reply.send({ ok: true })
+  })
+
+  app.post('/internal/operation-log', async (request, reply) => {
+    if (!db) throw new Error('db is required for internal routes')
+    const { guildId, discordUserId, username, source, action, detail, success } = request.body ?? {}
+    if (!guildId || !source || !action) {
+      return reply.code(400).send({ error: 'missing_fields' })
+    }
+    recordOperationLog(db, { guildId, discordUserId, username, source, action, detail, success: success !== false })
     return reply.send({ ok: true })
   })
 

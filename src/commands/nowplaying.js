@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, EmbedBuilder, MessageFlags } from 'discord.js'
 import { LoopMode } from '../queue.js'
+import { replyFlags } from '../permissions.js'
 
 const LOOP_LABELS = {
   [LoopMode.OFF]: 'オフ',
@@ -34,6 +35,6 @@ export default {
         { name: 'ループ', value: LOOP_LABELS[session.queue.loopMode], inline: true },
       )
     if (track.thumbnail) embed.setThumbnail(track.thumbnail)
-    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral })
+    await interaction.reply({ embeds: [embed], ...replyFlags(interaction.guildId, 'nowplaying') })
   },
 }

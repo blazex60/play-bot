@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
-import { checkSameVoiceChannel } from '../permissions.js'
+import { checkSameVoiceChannel, replyFlags } from '../permissions.js'
 
 export default {
   data: new SlashCommandBuilder().setName('shuffle').setDescription('キューをシャッフルします'),
@@ -11,6 +11,6 @@ export default {
     }
     if (!checkSameVoiceChannel(interaction, session)) return
     session.queue.shuffle()
-    await interaction.reply({ content: `🔀 ${interaction.member.displayName} がキューをシャッフルしました`, flags: MessageFlags.Ephemeral })
+    await interaction.reply({ content: `🔀 ${interaction.member.displayName} がキューをシャッフルしました`, ...replyFlags(interaction.guildId, 'shuffle') })
   },
 }

@@ -135,6 +135,71 @@ test('GET /internal/play-history/recent rejects a request missing required query
   assert.equal(response.statusCode, 400)
 })
 
+test('POST /internal/operation-log requires the bot API bearer token', async (t) => {
+  const { app } = await setup(t)
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/operation-log',
+    payload: { guildId: 'g1', source: 'command', action: 'skip' },
+  })
+  assert.equal(response.statusCode, 401)
+})
+
+test('POST /internal/operation-log upserts discord_users and inserts an operation_logs row', async (t) => {
+  const { app, db, config } = await setup(t)
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/operation-log',
+    headers: authHeaders(config),
+    payload: {
+      guildId: 'g1',
+      discordUserId: 'u1',
+      username: 'lemitsu',
+      source: 'command',
+      action: 'skip',
+      detail: null,
+      success: true,
+    },
+  })
+  assert.equal(response.statusCode, 200)
+
+  const user = db.prepare('SELECT * FROM discord_users WHERE discord_id = ?').get('u1')
+  assert.equal(user.username, 'lemitsu')
+
+  const rows = db.prepare('SELECT * FROM operation_logs WHERE discord_user_id = ?').all('u1')
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].guild_id, 'g1')
+  assert.equal(rows[0].source, 'command')
+  assert.equal(rows[0].action, 'skip')
+  assert.equal(rows[0].success, 1)
+})
+
+test('POST /internal/operation-log records a blocked command without a discord_users row when success is false', async (t) => {
+  const { app, db, config } = await setup(t)
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/operation-log',
+    headers: authHeaders(config),
+    payload: { guildId: 'g1', discordUserId: 'u2', source: 'command', action: 'skip', detail: 'blocked', success: false },
+  })
+  assert.equal(response.statusCode, 200)
+  const rows = db.prepare('SELECT * FROM operation_logs WHERE discord_user_id = ?').all('u2')
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].success, 0)
+  assert.equal(rows[0].detail, 'blocked')
+})
+
+test('POST /internal/operation-log rejects a payload missing required fields', async (t) => {
+  const { app, config } = await setup(t)
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/operation-log',
+    headers: authHeaders(config),
+    payload: { guildId: 'g1' }, // missing source/action
+  })
+  assert.equal(response.statusCode, 400)
+})
+
 test('GET /internal/play-history/recent clamps a negative limit instead of returning unlimited rows', async (t) => {
   const { app, config } = await setup(t)
   const record = (n) =>

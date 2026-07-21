@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js'
-import { checkSameVoiceChannel } from '../permissions.js'
+import { checkSameVoiceChannel, replyFlags } from '../permissions.js'
 import { bumpPlanToken, cancelPendingRecommendations } from '../sessions.js'
 
 export default {
@@ -15,6 +15,6 @@ export default {
     // see an empty queue and think it's still safe to auto-start a track.
     bumpPlanToken(interaction.guildId)
     cancelPendingRecommendations(interaction.guildId)
-    await interaction.reply(`⏹️ ${interaction.member.displayName} が再生を停止してキューをクリアしました`)
+    await interaction.reply({ content: `⏹️ ${interaction.member.displayName} が再生を停止してキューをクリアしました`, ...replyFlags(interaction.guildId, 'stop') })
   },
 }
