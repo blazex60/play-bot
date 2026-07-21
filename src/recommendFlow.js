@@ -255,12 +255,22 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
     // interaction is deferred, so this ordering doesn't change that path.
     await interaction.deferUpdate()
 
+    // Resolved once and reused below for both the permission and VC checks:
+    // a DM interaction has no interaction.member at all, and without a live
+    // member neither checkCommandAllowed's admin-role bypass nor the VC
+    // membership check below can see the picker's current state.
+    let member = interaction.member
+    if (!member) {
+      const guild = interaction.client.guilds.cache.get(entry.guildId)
+      member = guild ? await guild.members.fetch(interaction.user.id).catch(() => null) : null
+    }
+
     // A denied 'play' permission must block this pick too — otherwise an
     // admin's denial is bypassed entirely through recommendation DMs, which
     // dispatch here instead of through index.js's chat-input-command guard.
     // guildId is passed explicitly since these are DM interactions with no
     // guild context of their own (interaction.guildId is unset).
-    if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'play', entry.guildId)) {
+    if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'play', entry.guildId, member)) {
       if (!isSessionStale() && !entry.expired) {
         pendingStore.set(interaction.message.id, entry)
       }
@@ -273,7 +283,7 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
     // pick. Restore the entry if this fails so a legitimate retry (e.g.
     // after rejoining the VC) still works instead of the prompt silently
     // expiring.
-    if (!(await checkInVoiceChannel(interaction, session))) {
+    if (!(await checkInVoiceChannel(interaction, session, member))) {
       // /stop, /leave, or the VC emptying out may have cancelled this
       // guild's recommendations while we were awaiting the membership check
       // above — cancelRecommendations couldn't see this entry since it was

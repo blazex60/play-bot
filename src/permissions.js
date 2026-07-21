@@ -19,10 +19,10 @@ const DEFAULT_VISIBILITY = {
   autoplay: 'personal',
 }
 
-// Whether interaction.member (has adminRoleId) should bypass a command's
-// allow/deny setting entirely, so an admin can never lock themselves out.
-function hasAdminRole(interaction, adminRoleId) {
-  return Boolean(adminRoleId && interaction.member?.roles?.cache?.has?.(adminRoleId))
+// Whether the member (has adminRoleId) should bypass a command's allow/deny
+// setting entirely, so an admin can never lock themselves out.
+function hasAdminRole(member, adminRoleId) {
+  return Boolean(adminRoleId && member?.roles?.cache?.has?.(adminRoleId))
 }
 
 // commandName defaults to the slash command being invoked, but callers that
@@ -33,9 +33,13 @@ function hasAdminRole(interaction, adminRoleId) {
 // the permission check entirely. guildId likewise defaults to
 // interaction.guildId but must be passed explicitly for DM-originated
 // interactions (e.g. autoplay recommendation picks), which have no guild
-// context of their own.
-export function checkCommandAllowed(interaction, adminRoleId, commandName = interaction.commandName, guildId = interaction.guildId) {
-  if (hasAdminRole(interaction, adminRoleId)) return true
+// context of their own. member defaults to interaction.member for the same
+// reason — a DM interaction has none, so the admin-role bypass would
+// otherwise silently fail for every DM-originated check; callers with a DM
+// interaction must resolve the live guild member themselves (mirroring
+// checkInVoiceChannel's own guild.members.fetch fallback below) and pass it.
+export function checkCommandAllowed(interaction, adminRoleId, commandName = interaction.commandName, guildId = interaction.guildId, member = interaction.member) {
+  if (hasAdminRole(member, adminRoleId)) return true
   const permission = resolveCommandPermission(guildId, interaction.user.id, commandName)
   if (permission === 'deny') {
     const payload = { content: '❌ このコマンドの実行は制限されています', flags: MessageFlags.Ephemeral }
@@ -83,14 +87,16 @@ export function checkSameVoiceChannel(interaction, session) {
 // requirement. Recommendation prompts are now sent as DMs, so there's no
 // shared guild text channel to compare against — only VC membership matters.
 // Async because a DM-originated interaction has no interaction.member (no
-// guild context), so the member has to be fetched from the guild instead.
-export async function checkInVoiceChannel(interaction, session) {
+// guild context), so the member has to be fetched from the guild instead —
+// unless the caller already resolved one (e.g. to reuse it for a preceding
+// checkCommandAllowed call too), in which case that fetch is skipped.
+export async function checkInVoiceChannel(interaction, session, resolvedMember = interaction.member) {
   const targetChannelId = session
     ? session.connection.joinConfig.channelId
-    : interaction.member?.voice?.channelId
+    : resolvedMember?.voice?.channelId
   if (!targetChannelId) return true
 
-  let member = interaction.member
+  let member = resolvedMember
   if (!member) {
     const guild = interaction.client.guilds.cache.get(session.connection.joinConfig.guildId)
     member = guild ? await guild.members.fetch(interaction.user.id).catch(() => null) : null

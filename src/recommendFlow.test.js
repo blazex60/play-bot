@@ -183,6 +183,30 @@ test('handleRecommendChoice: a user denied the play command cannot enqueue a rec
   })
 })
 
+test('handleRecommendChoice: an admin who denied themselves play can still pick their own recommendation', async () => {
+  await withTempSettings(async () => {
+    process.env.ADMIN_ROLE_ID = 'admin-role'
+    try {
+      await setDefaultCommandPermission('g1', 'play', 'deny')
+      const pendingStore = new PendingChoiceStore()
+      pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage('msg-1'), timeoutHandle: null, expired: false })
+      const session = makeSession({ voiceChannelId: 'vc-1' })
+      const sessions = new Map([['g1', session]])
+      const interaction = makeInteraction({ customId: 'autoplay_0', messageId: 'msg-1', userId: 'u1', voiceChannelId: 'vc-1' })
+      // admin-role bypass requires the resolved member's roles — a plain
+      // guild-context interaction (not a real DM) already carries this.
+      interaction.member.roles = { cache: { has: (id) => id === 'admin-role' } }
+
+      await handleRecommendChoice(interaction, sessions, pendingStore)
+
+      assert.equal(session.queue.current?.videoId, 'v1', 'the admin-role bypass must still apply to recommendation picks')
+      assert.equal(session.player.playNextCalls.length, 1)
+    } finally {
+      delete process.env.ADMIN_ROLE_ID
+    }
+  })
+})
+
 test('handleRecommendChoice: rejects and preserves the entry if the target user left the VC', async () => {
   const pendingStore = new PendingChoiceStore()
   pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: { id: 'msg-1' }, timeoutHandle: null, expired: false })
