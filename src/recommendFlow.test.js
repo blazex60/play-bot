@@ -329,6 +329,40 @@ test('handleShowRecommendations: does not register a pick if the round is cancel
   assert.equal(interaction.deletedReply, true, 'the stale ephemeral reply should be deleted instead of left live')
 })
 
+test('handleShowRecommendations: does not register a pick if a newer round supersedes this one while reply/fetchReply are in flight (regression: retireRound does not bump the cancel generation)', async () => {
+  const recommendRounds = new Map()
+  const pendingStore = new PendingChoiceStore()
+  const sessions = new Map([['g1', makeSession()]])
+  const channel = makeChannel()
+
+  await postRecommendationPrompt({ channel, guildId: 'g1', plans: [{ userId: 'u1', candidates: [makeCandidate('v1')] }], recommendRounds, pendingStore })
+  const roundA = recommendRounds.get('g1')
+
+  let releaseReply
+  const replyGate = new Promise((resolve) => { releaseReply = resolve })
+  const interaction = makeShowInteraction({ guildId: 'g1', userId: 'u1', replyGate })
+
+  const showPromise = handleShowRecommendations(interaction, sessions, recommendRounds, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // Round A is superseded by round B while this click's reply()/fetchReply()
+  // are still in flight — e.g. someone else picked a short track from round
+  // A and playback exhausted again. This goes through postRecommendationPrompt
+  // (retireRound), not cancelRecommendations, so it never bumps the cancel
+  // generation.
+  await postRecommendationPrompt({ channel, guildId: 'g1', plans: [{ userId: 'u1', candidates: [makeCandidate('v2')] }], recommendRounds, pendingStore })
+  const roundB = recommendRounds.get('g1')
+  assert.notEqual(roundB, roundA, 'round B should now be the live round')
+
+  releaseReply()
+  await showPromise
+
+  assert.equal(pendingStore.entries().next().done, true, "no pick built from round A's stale candidates should be registered")
+  assert.equal(interaction.deletedReply, true, 'the stale ephemeral reply should be deleted instead of left live')
+
+  clearTimeout(roundB.timeoutHandle)
+})
+
 test('handleShowRecommendations: shows an ephemeral, personal choice prompt and registers it in pendingStore', async (t) => {
   const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
   const pendingStore = new PendingChoiceStore()

@@ -309,10 +309,12 @@ export async function handleShowRecommendations(interaction, sessions, recommend
     await interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral })
     const message = await interaction.fetchReply()
 
-    if (currentCancelGeneration(interaction.guildId) !== startGeneration) {
-      // The session was cancelled (/stop, /leave, VC emptied) while this
-      // reply was in flight — don't leave a fresh, pickable prompt on top
-      // of a session that was just stopped.
+    if (currentCancelGeneration(interaction.guildId) !== startGeneration || recommendRounds.get(interaction.guildId) !== round) {
+      // Either the session was cancelled (/stop, /leave, VC emptied) while
+      // this reply was in flight, or this exact round expired/was
+      // superseded by a newer one (retireRound doesn't bump the cancel
+      // generation) — either way, don't leave a fresh, pickable prompt
+      // built from a round that's no longer the live one.
       await interaction.deleteReply().catch(() => {})
       return
     }

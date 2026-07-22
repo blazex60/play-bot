@@ -184,13 +184,13 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
         if (postedCount > 0) return true
       }
 
-      // This round may have posted nothing new — e.g. the only human left in
-      // the VC already had a live DM from an earlier round and got skipped
-      // by postRecommendations' own dedup — while that earlier DM is still a
-      // perfectly valid, answerable prompt. Treat that as a handled
+      // This round may have posted nothing new — e.g. planning found no
+      // candidates this time, or posting a replacement failed — while an
+      // earlier round's shared button (or someone's personal pick prompt
+      // from it) is still live and answerable. Treat that as a handled
       // exhaustion instead of falling through to onDisconnect and cancelling
       // a prompt someone can still pick.
-      if (hasPendingForGuild(recommendPendingStore, guildId)) return true
+      if (hasPendingForGuild(recommendPendingStore, guildId) || recommendRounds.has(guildId)) return true
 
       return false
     } finally {
