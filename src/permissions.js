@@ -4,6 +4,7 @@ import { resolveCommandPermission, getCommandVisibilitySettings } from './settin
 // Historical hardcoded reply visibility, kept as the fallback for any guild
 // that hasn't customized a given command via the admin dashboard yet.
 const DEFAULT_VISIBILITY = {
+  help: 'personal',
   play: 'public',
   skip: 'public',
   pause: 'public',

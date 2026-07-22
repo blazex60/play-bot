@@ -376,6 +376,7 @@ export function Dashboard() {
           {permission?.extended ? (
             <Link className="ghost-button" to={`/admin?guildId=${encodeURIComponent(guildId)}`}>管理画面</Link>
           ) : null}
+          <Link className="ghost-button" to="/help">ヘルプ</Link>
           <button type="button" className="ghost-button" onClick={handleLogout}>Logout</button>
         </div>
       </header>

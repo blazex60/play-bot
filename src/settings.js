@@ -172,6 +172,11 @@ export function setCommandVisibility(guildId, commandName, value) {
   return updateGuildSettings(guildId, { commandVisibility })
 }
 
+/** Returns the current settings file path so tests can restore shared state. */
+export function getSettingsPathForTest() {
+  return settingsPath
+}
+
 export function configureSettingsPathForTest(filePath) {
   settingsPath = filePath
   guildSettings = new Map()
