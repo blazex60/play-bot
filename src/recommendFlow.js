@@ -159,11 +159,18 @@ export function cancelRecommendations(guildId, pendingStore, recommendRounds) {
 // ephemeral, so only its owner can see or click it, and a click on it once
 // this fires simply finds no pendingStore entry and gets the "期限切れ"
 // reply (see handleRecommendChoice), which is enough for correctness.
-function scheduleExpiry(entry, pendingStore, guildId, onTimeout) {
+// recommendRounds must also be checked before firing onTimeout: this entry
+// (and the onTimeout closure it was given) can belong to an older round that
+// a newer one has since superseded — e.g. someone picked a short track from
+// round A, playback exhausted again and round B went up, while another
+// user's still-open round-A pick keeps ticking. Without this check, that
+// stale entry's expiry would invoke round A's onTimeout and re-plan/retire
+// round B early, even though round B is still live and answerable.
+function scheduleExpiry(entry, pendingStore, guildId, recommendRounds, onTimeout) {
   entry.timeoutHandle = setTimeout(async () => {
     entry.expired = true
     pendingStore.delete(entry.message.id)
-    if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && onTimeout) {
+    if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && !recommendRounds?.get(guildId) && onTimeout) {
       try {
         await onTimeout()
       } catch (err) {
@@ -304,7 +311,7 @@ export async function handleShowRecommendations(interaction, sessions, recommend
     }
 
     const entry = { guildId: interaction.guildId, targetUserId: interaction.user.id, candidates, message, timeoutHandle: null, expired: false }
-    scheduleExpiry(entry, pendingStore, interaction.guildId, guildOnTimeoutCallbacks.get(interaction.guildId))
+    scheduleExpiry(entry, pendingStore, interaction.guildId, recommendRounds, guildOnTimeoutCallbacks.get(interaction.guildId))
     pendingStore.set(message.id, entry)
   } finally {
     releaseShow(interaction.guildId, interaction.user.id)

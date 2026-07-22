@@ -593,6 +593,53 @@ test('handleRecommendChoice: retriggers the teardown check if an in-flight pick 
   assert.equal(onTimeoutCalls, 0, "a failed pick must not tear down a guild whose shared round is still live")
 })
 
+test("handleShowRecommendations: a stale per-user pick from an old, superseded round expiring must not fire that old round's onTimeout or retire the newer live round (regression: could re-plan and retire a still-live round early)", async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const channel = makeChannel()
+  const recommendRounds = new Map()
+  const pendingStore = new PendingChoiceStore()
+  const sessions = new Map([['g1', makeSession()]])
+
+  let onTimeoutACalls = 0
+  await postRecommendationPrompt({
+    channel, guildId: 'g1', plans: [{ userId: 'u2', candidates: [makeCandidate('v1')] }], recommendRounds, pendingStore,
+    onTimeout: async () => { onTimeoutACalls += 1 },
+  })
+
+  // u2 shows their recommendations during round A's lifetime — this per-user
+  // entry's own 5-minute timer captures round A's onTimeout callback (the
+  // one live in guildOnTimeoutCallbacks at the moment it's created).
+  const showInteraction = makeShowInteraction({ guildId: 'g1', userId: 'u2' })
+  await handleShowRecommendations(showInteraction, sessions, recommendRounds, pendingStore)
+
+  // Some time later (but still within round A's own 5-minute window), a
+  // second round replaces it — e.g. someone else picked a short track from
+  // round A and playback exhausted again. Giving this its own gap in time
+  // means round B's own timer targets a different instant than u2's
+  // still-open pick from round A.
+  t.mock.timers.tick(2 * 60 * 1000)
+  let onTimeoutBCalls = 0
+  await postRecommendationPrompt({
+    channel, guildId: 'g1', plans: [{ userId: 'u2', candidates: [makeCandidate('v2')] }], recommendRounds, pendingStore,
+    onTimeout: async () => { onTimeoutBCalls += 1 },
+  })
+  const roundB = recommendRounds.get('g1')
+  assert.ok(roundB, 'round B should now be the live round')
+
+  // Advance to the instant u2's stale round-A pick expires (5 minutes after
+  // it was shown) — round B's own timer targets 5 minutes *after this*, so
+  // it must not have fired yet.
+  t.mock.timers.tick(3 * 60 * 1000)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(onTimeoutACalls, 0, "round A's stale onTimeout must not fire just because its own per-user pick expired")
+  assert.equal(onTimeoutBCalls, 0, "round B's own timer has not reached its deadline yet")
+  assert.equal(recommendRounds.get('g1'), roundB, 'round B must not be retired by an old round\'s pick expiring')
+
+  clearTimeout(roundB.timeoutHandle)
+})
+
 test('cancelRecommendations: clears per-user pending prompts and disables the shared round message', async () => {
   const pendingStore = new PendingChoiceStore()
   pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage(), timeoutHandle: setTimeout(() => {}, RECOMMEND_TIMEOUT_MS) })
