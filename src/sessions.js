@@ -4,13 +4,16 @@ import { GuildPlayer } from './player.js'
 import { PendingChoiceStore } from './views.js'
 import { createWebClient } from './webClient.js'
 import { planAutoTrack, planRecommendations, formatAutoAddNotification } from './autoplay.js'
-import { cancelRecommendations, hasPendingForGuild, postRecommendations } from './recommendFlow.js'
+import { cancelRecommendations, hasPendingForGuild, postRecommendationPrompt } from './recommendFlow.js'
 import { getGuildSettings } from './settings.js'
 
 // Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed }>
 export const sessions = new Map()
 export const pendingStore = new PendingChoiceStore()
 export const recommendPendingStore = new PendingChoiceStore()
+// Map<guildId, { guildId, candidatesByUserId, message, timeoutHandle, expired }>
+// One shared "おすすめを表示" round per guild — see recommendFlow.js.
+export const recommendRounds = new Map()
 
 export const webClient = createWebClient()
 
@@ -20,7 +23,7 @@ export const webClient = createWebClient()
 // the guild (otherwise a stale button click can still enqueue and start a
 // track after the user thought they stopped/left).
 export function cancelPendingRecommendations(guildId) {
-  cancelRecommendations(guildId, recommendPendingStore)
+  cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
 }
 
 // Invalidates any queue-exhaustion planning currently in flight for a guild.
@@ -89,7 +92,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     // closure would delete and destroy that brand new, unrelated session.
     if (s && s === session) {
       sessions.delete(guildId)
-      cancelRecommendations(guildId, recommendPendingStore)
+      cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
       if (s.connection.state.status !== VoiceConnectionStatus.Destroyed) {
         s.connection.destroy()
       }
@@ -142,49 +145,52 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
       const plans = await planRecommendations({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
       if (isStale()) return false
       if (plans && plans.length > 0) {
-        const postedCount = await postRecommendations({
-          client: guild.client,
-          guildId,
-          guildName: guild.name,
-          plans,
-          pendingStore: recommendPendingStore,
-          voiceChannel,
-          onTimeout: async () => {
-            // A manual /play may have started a track while this prompt sat
-            // unanswered — only end the session if nothing is actually
-            // playing/queued and this round is still the live one.
-            if (!queue.isEmpty || isStale()) return
-            // Nobody picked anything: keep the bot in the VC and show a
-            // fresh round (current VC membership, current preferences)
-            // instead of disconnecting. Only /leave or the VC emptying out
-            // should end the session now — see handleQueueExhausted's own
-            // lock release below, which is what makes this re-entry legal.
-            const continued = await handleQueueExhausted(lastTrack)
-            // continued === null means another overlapping timeout already
-            // claimed the lock and is handling this round itself; only a
-            // genuine `false` (a round that ran and found nothing to do)
-            // should tear the session down here.
-            if (continued === false) await onDisconnect()
-          },
-        })
+        const textChannel = session.textChannelId ? guild.channels.cache.get(session.textChannelId) : null
+        const postedCount = textChannel
+          ? await postRecommendationPrompt({
+              channel: textChannel,
+              guildId,
+              guildName: guild.name,
+              plans,
+              recommendRounds,
+              pendingStore: recommendPendingStore,
+              onTimeout: async () => {
+                // A manual /play may have started a track while this prompt sat
+                // unanswered — only end the session if nothing is actually
+                // playing/queued and this round is still the live one.
+                if (!queue.isEmpty || isStale()) return
+                // Nobody picked anything: keep the bot in the VC and show a
+                // fresh round (current VC membership, current preferences)
+                // instead of disconnecting. Only /leave or the VC emptying out
+                // should end the session now — see handleQueueExhausted's own
+                // lock release below, which is what makes this re-entry legal.
+                const continued = await handleQueueExhausted(lastTrack)
+                // continued === null means another overlapping timeout already
+                // claimed the lock and is handling this round itself; only a
+                // genuine `false` (a round that ran and found nothing to do)
+                // should tear the session down here.
+                if (continued === false) await onDisconnect()
+              },
+            })
+          : 0
         if (isStale()) {
-          // /stop (or similar) can land while sends were still in flight
-          // above: the messages already got posted with live buttons before
-          // we knew to cancel them. Undo that now rather than leaving a
+          // /stop (or similar) can land while the send was still in flight
+          // above: the message already got posted with a live button before
+          // we knew to cancel it. Undo that now rather than leaving a
           // pickable prompt that could revive playback post-stop.
-          cancelRecommendations(guildId, recommendPendingStore)
+          cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
           return false
         }
         if (postedCount > 0) return true
       }
 
-      // This round may have posted nothing new — e.g. the only human left in
-      // the VC already had a live DM from an earlier round and got skipped
-      // by postRecommendations' own dedup — while that earlier DM is still a
-      // perfectly valid, answerable prompt. Treat that as a handled
+      // This round may have posted nothing new — e.g. planning found no
+      // candidates this time, or posting a replacement failed — while an
+      // earlier round's shared button (or someone's personal pick prompt
+      // from it) is still live and answerable. Treat that as a handled
       // exhaustion instead of falling through to onDisconnect and cancelling
       // a prompt someone can still pick.
-      if (hasPendingForGuild(recommendPendingStore, guildId)) return true
+      if (hasPendingForGuild(recommendPendingStore, guildId) || recommendRounds.has(guildId)) return true
 
       return false
     } finally {
