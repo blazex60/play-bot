@@ -185,12 +185,19 @@ function scheduleExpiry(entry, pendingStore, guildId, recommendRounds, onTimeout
 // drops it from recommendRounds. Nobody having picked anything by then only
 // tears the session down if no per-user ephemeral prompt is still open and
 // no pick is in flight — mirrors scheduleExpiry's own condition.
+// disableMessage is a genuine REST call, so real time passes between
+// deleting this entry and the check below — a listener can pick an
+// already-open personal prompt from this round, exhaust the queue again,
+// and get a fresh round B posted in that window. recommendRounds.get(guildId)
+// must be re-checked afterward: if it's now populated, round B (not us)
+// owns this guild's continuation, and this stale callback must not invoke
+// its own onTimeout and re-plan/retire round B.
 function scheduleRoundExpiry(entry, recommendRounds, pendingStore, guildId, onTimeout) {
   entry.timeoutHandle = setTimeout(async () => {
     entry.expired = true
     recommendRounds.delete(guildId)
     await disableMessage(entry.message).catch(() => {})
-    if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && onTimeout) {
+    if (!hasPendingForGuild(pendingStore, guildId) && !hasInFlightPick(guildId) && !recommendRounds.get(guildId) && onTimeout) {
       try {
         await onTimeout()
       } catch (err) {

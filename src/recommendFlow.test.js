@@ -674,6 +674,60 @@ test("handleShowRecommendations: a stale per-user pick from an old, superseded r
   clearTimeout(roundB.timeoutHandle)
 })
 
+test("scheduleRoundExpiry: a round's own timeout must not fire onTimeout or retire a newer round if disableMessage is still resolving when that newer round goes up (regression: disableMessage is a real REST call, opening a race window)", async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+
+  let releaseEdit
+  const editGate = new Promise((resolve) => { releaseEdit = resolve })
+  const roundAMessage = {
+    id: 'roundA-msg',
+    components: [{ type: 1, components: [{ type: 2, style: 1, label: 'x', custom_id: 'y' }] }],
+    editCalls: [],
+    async edit(update) { await editGate; this.editCalls.push(update) },
+  }
+  const sentMessages = [roundAMessage]
+  const channel = { async send() { return sentMessages.shift() ?? makeSentMessage() } }
+
+  const recommendRounds = new Map()
+  const pendingStore = new PendingChoiceStore()
+
+  let onTimeoutACalls = 0
+  await postRecommendationPrompt({
+    channel, guildId: 'g1', plans: [{ userId: 'u1', candidates: [makeCandidate('v1')] }], recommendRounds, pendingStore,
+    onTimeout: async () => { onTimeoutACalls += 1 },
+  })
+
+  // Round A reaches its own 5-minute deadline: its timeout callback removes
+  // it from recommendRounds and starts disableMessage(roundAMessage), which
+  // is now paused awaiting editGate (simulating a slow Discord REST call).
+  t.mock.timers.tick(RECOMMEND_TIMEOUT_MS)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(recommendRounds.has('g1'), false, "round A's own callback should have already removed it from the map")
+
+  // While that's still suspended, round B goes up — e.g. someone picked a
+  // short track from round A's still-open personal prompt and playback
+  // exhausted again.
+  let onTimeoutBCalls = 0
+  await postRecommendationPrompt({
+    channel, guildId: 'g1', plans: [{ userId: 'u1', candidates: [makeCandidate('v2')] }], recommendRounds, pendingStore,
+    onTimeout: async () => { onTimeoutBCalls += 1 },
+  })
+  const roundB = recommendRounds.get('g1')
+  assert.ok(roundB, 'round B should now be live')
+
+  // Round A's suspended disableMessage now resolves, and its stale timeout
+  // callback proceeds past the await.
+  releaseEdit()
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(onTimeoutACalls, 0, "round A's stale timeout must not fire now that round B is live")
+  assert.equal(onTimeoutBCalls, 0, "round B's own timer has not reached its deadline")
+  assert.equal(recommendRounds.get('g1'), roundB, "round B must not be retired by round A's stale timeout")
+
+  clearTimeout(roundB.timeoutHandle)
+})
+
 test('handleShowRecommendations: rejects a re-show after the user already picked in this round (regression: re-clicking "show" let a single user enqueue multiple tracks per round)', async (t) => {
   const channel = makeChannel()
   const recommendRounds = new Map()
