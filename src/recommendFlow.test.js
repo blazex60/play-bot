@@ -81,8 +81,10 @@ function makeSession({ voiceChannelId = 'vc-1' } = {}) {
 }
 
 // The click on the shared "おすすめを表示" button — a plain guild-context
-// button interaction, unlike the old DM-originated prompts.
-function makeShowInteraction({ guildId, userId, member }) {
+// button interaction, unlike the old DM-originated prompts. `replyGate`, if
+// given, is awaited inside reply() before it resolves, so a test can pause a
+// click mid-flight (before pendingStore registration) to simulate a race.
+function makeShowInteraction({ guildId, userId, member, replyGate }) {
   const replies = []
   let replyMessage = null
   return {
@@ -93,11 +95,13 @@ function makeShowInteraction({ guildId, userId, member }) {
     replied: false,
     replies,
     async reply(payload) {
+      if (replyGate) await replyGate
       replies.push(payload)
       this.replied = true
       replyMessage = makeSentMessage()
     },
     async fetchReply() { return replyMessage },
+    async deleteReply() { this.deletedReply = true },
   }
 }
 
@@ -271,6 +275,55 @@ test('handleShowRecommendations: a second click while the first ephemeral prompt
   await handleShowRecommendations(second, sessions, recommendRounds, pendingStore)
 
   assert.equal(second.replies[0].content, '⚠️ 既におすすめを表示済みです。そちらから選択してください')
+})
+
+test('handleShowRecommendations: two rapid clicks by the same user must not both create a pick (regression: hasPendingForUser raced the reply/fetchReply awaits)', async () => {
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+  const pendingStore = new PendingChoiceStore()
+  const sessions = new Map([['g1', makeSession()]])
+
+  let releaseReply
+  const replyGate = new Promise((resolve) => { releaseReply = resolve })
+  const first = makeShowInteraction({ guildId: 'g1', userId: 'u1', replyGate })
+  const second = makeShowInteraction({ guildId: 'g1', userId: 'u1', replyGate })
+
+  // Both clicks start "simultaneously" and pause inside reply() — neither
+  // has registered a pendingStore entry yet when the second one starts.
+  const firstPromise = handleShowRecommendations(first, sessions, recommendRounds, pendingStore)
+  const secondPromise = handleShowRecommendations(second, sessions, recommendRounds, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  releaseReply()
+  await Promise.all([firstPromise, secondPromise])
+
+  const entries = [...pendingStore.entries()]
+  for (const [, entry] of entries) clearTimeout(entry.timeoutHandle)
+  assert.equal(entries.length, 1, 'only one of the two racing clicks should register a pick')
+  assert.equal(second.replies[0].content, '⚠️ 既におすすめを表示済みです。そちらから選択してください', "the second, reserved-out click should get the dedup reply, not a second choice prompt")
+})
+
+test('handleShowRecommendations: does not register a pick if the round is cancelled (e.g. /stop) while reply/fetchReply are in flight', async () => {
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+  const pendingStore = new PendingChoiceStore()
+  const sessions = new Map([['g1', makeSession()]])
+
+  let releaseReply
+  const replyGate = new Promise((resolve) => { releaseReply = resolve })
+  const interaction = makeShowInteraction({ guildId: 'g1', userId: 'u1', replyGate })
+
+  const showPromise = handleShowRecommendations(interaction, sessions, recommendRounds, pendingStore)
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // /stop lands while this click's reply()/fetchReply() are still in
+  // flight — cancelPendingRecommendations can't remove this not-yet-stored
+  // entry, so handleShowRecommendations must notice on its own once the
+  // awaits resolve.
+  cancelRecommendations('g1', pendingStore, recommendRounds)
+  releaseReply()
+  await showPromise
+
+  assert.equal(pendingStore.entries().next().done, true, 'no pick should be registered for a round cancelled mid-flight')
+  assert.equal(interaction.deletedReply, true, 'the stale ephemeral reply should be deleted instead of left live')
 })
 
 test('handleShowRecommendations: shows an ephemeral, personal choice prompt and registers it in pendingStore', async (t) => {

@@ -63,6 +63,25 @@ function hasInFlightPick(guildId) {
   return (guildsWithInFlightPick.get(guildId) ?? 0) > 0
 }
 
+// Reserves a (guildId, userId) pair from the synchronous instant a "show
+// recommendations" click passes its checks until the resulting ephemeral
+// message is either registered in pendingStore or discarded. Without this,
+// two rapid clicks both race past hasPendingForUser (which only sees
+// pendingStore, populated only after the reply/fetchReply awaits) and both
+// create a live pick for the same user.
+const showInFlight = new Set()
+
+function reserveShow(guildId, userId) {
+  const key = `${guildId}:${userId}`
+  if (showInFlight.has(key)) return false
+  showInFlight.add(key)
+  return true
+}
+
+function releaseShow(guildId, userId) {
+  showInFlight.delete(`${guildId}:${userId}`)
+}
+
 // The onTimeout callback most recently registered for a guild's recommend
 // round, so a pick that finishes (or fails) after the round's own prompts
 // have all already expired can still trigger it — see reconsiderTeardown.
@@ -100,13 +119,26 @@ function currentCancelGeneration(guildId) {
   return guildCancelGeneration.get(guildId) ?? 0
 }
 
-// Cancels a guild's still-open recommendation round: clears the shared
-// "show" prompt's timeout, drops it from recommendRounds and disables its
-// button, and clears every still-pending per-user ephemeral pick prompt for
-// the guild (those are left as-is rather than edited — they're ephemeral so
-// only their own owner can see them, and a stale click on one is already
-// rejected once its pendingStore entry is gone). Used when the session is
-// torn down (VC empty, /stop, watchdog) while recommendations are open.
+// Clears a round's own timer, drops it from recommendRounds, and disables
+// its shared button. A round's timer must never fire after this — since the
+// timer closes over this specific entry and unconditionally deletes
+// recommendRounds's guildId key, letting it fire later would delete
+// whatever round has since replaced this one.
+function retireRound(guildId, recommendRounds) {
+  const round = recommendRounds.get(guildId)
+  if (!round) return
+  clearTimeout(round.timeoutHandle)
+  recommendRounds.delete(guildId)
+  disableMessage(round.message).catch(() => {})
+}
+
+// Cancels a guild's still-open recommendation round: retires the shared
+// "show" prompt (see retireRound) and clears every still-pending per-user
+// ephemeral pick prompt for the guild (those are left as-is rather than
+// edited — they're ephemeral so only their own owner can see them, and a
+// stale click on one is already rejected once its pendingStore entry is
+// gone). Used when the session is torn down (VC empty, /stop, watchdog)
+// while recommendations are open.
 export function cancelRecommendations(guildId, pendingStore, recommendRounds) {
   bumpCancelGeneration(guildId)
   for (const [messageId, entry] of pendingStore.entries()) {
@@ -114,14 +146,7 @@ export function cancelRecommendations(guildId, pendingStore, recommendRounds) {
     clearTimeout(entry.timeoutHandle)
     pendingStore.delete(messageId)
   }
-  if (recommendRounds) {
-    const round = recommendRounds.get(guildId)
-    if (round) {
-      clearTimeout(round.timeoutHandle)
-      recommendRounds.delete(guildId)
-      disableMessage(round.message).catch(() => {})
-    }
-  }
+  if (recommendRounds) retireRound(guildId, recommendRounds)
 }
 
 // Arms a per-user ephemeral pick prompt's one-shot expiry timer. Unlike the
@@ -203,6 +228,12 @@ export async function postRecommendationPrompt({ channel, guildId, guildName, pl
     return 0
   }
 
+  // A previous round for this guild can still be open here (e.g. someone
+  // picked a short track from it and playback already exhausted again before
+  // its own 5-minute window elapsed) — retire it now so its timer can never
+  // fire later and delete this new round out from under it.
+  retireRound(guildId, recommendRounds)
+
   const entry = { guildId, candidatesByUserId, message, timeoutHandle: null, expired: false }
   scheduleRoundExpiry(entry, recommendRounds, pendingStore, guildId, onTimeout)
   recommendRounds.set(guildId, entry)
@@ -233,22 +264,46 @@ export async function handleShowRecommendations(interaction, sessions, recommend
   if (hasPendingForUser(pendingStore, interaction.guildId, interaction.user.id)) {
     return interaction.reply({ content: '⚠️ 既におすすめを表示済みです。そちらから選択してください', flags: MessageFlags.Ephemeral })
   }
+  // Reserve synchronously, before any await below — hasPendingForUser alone
+  // can't see a second, near-simultaneous click for the same user, since
+  // pendingStore isn't populated until after interaction.reply/fetchReply
+  // resolve further down.
+  if (!reserveShow(interaction.guildId, interaction.user.id)) {
+    return interaction.reply({ content: '⚠️ 既におすすめを表示済みです。そちらから選択してください', flags: MessageFlags.Ephemeral })
+  }
 
-  const embed = new EmbedBuilder()
-    .setTitle('🎵 次に聴きたい曲を選んでください')
-    .setDescription(candidates.map((track, i) => `${i + 1}. ${track.title}`).join('\n'))
+  try {
+    // /stop, /leave, or the VC emptying out can land while the awaits below
+    // are in flight; cancelPendingRecommendations can't clear this entry
+    // since it isn't in pendingStore yet, so check afterward instead.
+    const startGeneration = currentCancelGeneration(interaction.guildId)
 
-  const components = buildChoiceComponents(candidates, {
-    prefix: RECOMMEND_CUSTOM_ID_PREFIX,
-    getLabel: (track) => track.title,
-  })
+    const embed = new EmbedBuilder()
+      .setTitle('🎵 次に聴きたい曲を選んでください')
+      .setDescription(candidates.map((track, i) => `${i + 1}. ${track.title}`).join('\n'))
 
-  await interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral })
-  const message = await interaction.fetchReply()
+    const components = buildChoiceComponents(candidates, {
+      prefix: RECOMMEND_CUSTOM_ID_PREFIX,
+      getLabel: (track) => track.title,
+    })
 
-  const entry = { guildId: interaction.guildId, targetUserId: interaction.user.id, candidates, message, timeoutHandle: null, expired: false }
-  scheduleExpiry(entry, pendingStore, interaction.guildId, guildOnTimeoutCallbacks.get(interaction.guildId))
-  pendingStore.set(message.id, entry)
+    await interaction.reply({ embeds: [embed], components, flags: MessageFlags.Ephemeral })
+    const message = await interaction.fetchReply()
+
+    if (currentCancelGeneration(interaction.guildId) !== startGeneration) {
+      // The session was cancelled (/stop, /leave, VC emptied) while this
+      // reply was in flight — don't leave a fresh, pickable prompt on top
+      // of a session that was just stopped.
+      await interaction.deleteReply().catch(() => {})
+      return
+    }
+
+    const entry = { guildId: interaction.guildId, targetUserId: interaction.user.id, candidates, message, timeoutHandle: null, expired: false }
+    scheduleExpiry(entry, pendingStore, interaction.guildId, guildOnTimeoutCallbacks.get(interaction.guildId))
+    pendingStore.set(message.id, entry)
+  } finally {
+    releaseShow(interaction.guildId, interaction.user.id)
+  }
 }
 
 export async function handleRecommendChoice(interaction, sessions, pendingStore) {

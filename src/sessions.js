@@ -92,7 +92,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     // closure would delete and destroy that brand new, unrelated session.
     if (s && s === session) {
       sessions.delete(guildId)
-      cancelRecommendations(guildId, recommendPendingStore)
+      cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
       if (s.connection.state.status !== VoiceConnectionStatus.Destroyed) {
         s.connection.destroy()
       }
