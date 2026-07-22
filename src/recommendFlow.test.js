@@ -106,15 +106,18 @@ function makeShowInteraction({ guildId, userId, member, replyGate }) {
 }
 
 // The click on a track-choice button living inside the ephemeral message
-// handleShowRecommendations posted.
-function makePickInteraction({ customId, messageId, guildId, userId, member }) {
+// handleShowRecommendations posted. voiceChannelId defaults to 'vc-1' to
+// match makeSession's own default, so the picker is "in the VC" unless a
+// test deliberately sets it elsewhere (or passes a custom member without
+// a voice field at all).
+function makePickInteraction({ customId, messageId, guildId, userId, member, voiceChannelId = 'vc-1' }) {
   const replies = []
   return {
     customId,
     message: { id: messageId },
     guildId,
     user: { id: userId },
-    member: member ?? { roles: { cache: { has: () => false } } },
+    member: member ?? { roles: { cache: { has: () => false } }, voice: { channelId: voiceChannelId } },
     deferred: false,
     replied: false,
     replies,
@@ -385,7 +388,7 @@ test('handleRecommendChoice: an admin who denied themselves play can still pick 
       const sessions = new Map([['g1', session]])
       const interaction = makePickInteraction({
         customId: 'autoplay_0', messageId: 'msg-1', guildId: 'g1', userId: 'u1',
-        member: { roles: { cache: { has: (id) => id === 'admin-role' } } },
+        member: { roles: { cache: { has: (id) => id === 'admin-role' } }, voice: { channelId: 'vc-1' } },
       })
 
       await handleRecommendChoice(interaction, sessions, pendingStore)
@@ -396,6 +399,21 @@ test('handleRecommendChoice: an admin who denied themselves play can still pick 
       delete process.env.ADMIN_ROLE_ID
     }
   })
+})
+
+test('handleRecommendChoice: rejects a pick from a user who left the VC after their ephemeral prompt was shown (regression: the "show" snapshot alone let departed users still enqueue/start playback)', async () => {
+  const pendingStore = new PendingChoiceStore()
+  pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage(), timeoutHandle: null, expired: false })
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+  const interaction = makePickInteraction({ customId: 'autoplay_0', messageId: 'msg-1', guildId: 'g1', userId: 'u1', voiceChannelId: 'vc-2' })
+
+  await handleRecommendChoice(interaction, sessions, pendingStore)
+
+  assert.equal(session.queue.isEmpty, true, 'must not enqueue a pick from a user no longer in the VC')
+  assert.equal(session.player.playNextCalls.length, 0)
+  assert.equal(interaction.replies[0].content, '❌ ボイスチャンネルに参加してから操作してください')
+  assert.ok(pendingStore.get('msg-1'), 'entry must survive so picking again after rejoining the VC still works')
 })
 
 test('handleRecommendChoice: valid pick deletes the ephemeral prompt, posts a public confirmation, and starts playback', async () => {
@@ -557,7 +575,7 @@ test('handleRecommendChoice: retriggers the teardown check if an in-flight pick 
   const deferGate = new Promise((_resolve, reject) => { rejectDeferUpdate = reject })
   const pickInteraction = makePickInteraction({ customId: 'autoplay_0', messageId, guildId: 'g1', userId: 'u1' })
   pickInteraction.deferUpdate = async () => { await deferGate }
-  const pickPromise = handleRecommendChoice(pickInteraction, sessions, pendingStore)
+  const pickPromise = handleRecommendChoice(pickInteraction, sessions, pendingStore, recommendRounds)
   await new Promise((resolve) => setImmediate(resolve))
 
   // Nothing else is pending for g1 at this point (u2 never showed theirs),
@@ -568,6 +586,11 @@ test('handleRecommendChoice: retriggers the teardown check if an in-flight pick 
   await assert.rejects(pickPromise, deferError)
 
   assert.equal(session.queue.isEmpty, true, 'nothing should have been enqueued by the failed pick')
+  // Regression: the shared round itself is still live (its own 5-minute
+  // timer hasn't fired) and u2 never got a chance to show/pick theirs — a
+  // failed pick must not fire onTimeout early just because pendingStore and
+  // in-flight picks are both empty at this instant.
+  assert.equal(onTimeoutCalls, 0, "a failed pick must not tear down a guild whose shared round is still live")
 })
 
 test('cancelRecommendations: clears per-user pending prompts and disables the shared round message', async () => {

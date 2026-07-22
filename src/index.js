@@ -103,7 +103,7 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 
   if (interaction.isButton() && interaction.customId.startsWith(`${RECOMMEND_CUSTOM_ID_PREFIX}_`)) {
-    return handleRecommendChoice(interaction, sessions, recommendPendingStore)
+    return handleRecommendChoice(interaction, sessions, recommendPendingStore, recommendRounds)
   }
 })
 

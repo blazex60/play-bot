@@ -1,6 +1,6 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, MessageFlags } from 'discord.js'
 import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
-import { checkCommandAllowed } from './permissions.js'
+import { checkCommandAllowed, checkInVoiceChannel } from './permissions.js'
 import { createTrack } from './queue.js'
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
@@ -95,8 +95,13 @@ const guildOnTimeoutCallbacks = new Map()
 // this, nothing would ever re-check afterward and the session would stay
 // connected with an empty queue indefinitely. Safe to call unconditionally:
 // onTimeout itself no-ops once the queue is non-empty or the plan is stale.
-async function reconsiderTeardown(guildId, pendingStore) {
+// The shared round itself (recommendRounds) must also be checked, not just
+// per-user ephemeral picks — a failed pick can otherwise fire onTimeout
+// early while the round's own button is still live with minutes left and
+// other participants who haven't clicked "show" yet could still use it.
+async function reconsiderTeardown(guildId, pendingStore, recommendRounds) {
   if (hasPendingForGuild(pendingStore, guildId) || hasInFlightPick(guildId)) return
+  if (recommendRounds?.get(guildId)) return
   const onTimeout = guildOnTimeoutCallbacks.get(guildId)
   if (!onTimeout) return
   try {
@@ -306,7 +311,7 @@ export async function handleShowRecommendations(interaction, sessions, recommend
   }
 }
 
-export async function handleRecommendChoice(interaction, sessions, pendingStore) {
+export async function handleRecommendChoice(interaction, sessions, pendingStore, recommendRounds) {
   const index = parseChoiceCustomId(interaction.customId, RECOMMEND_CUSTOM_ID_PREFIX)
   if (index === null) return
 
@@ -353,6 +358,16 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
       }
       return
     }
+    // The picker may have left the bot's VC after their ephemeral prompt was
+    // shown — the "show" step only checks the planning-time snapshot, but
+    // actually enqueueing/starting playback must reflect who's in the room
+    // right now, same as every other playback-affecting command.
+    if (!(await checkInVoiceChannel(interaction, session))) {
+      if (!isSessionStale() && !entry.expired) {
+        pendingStore.set(interaction.message.id, entry)
+      }
+      return
+    }
     clearTimeout(entry.timeoutHandle)
 
     // Acknowledge the interaction, then remove the ephemeral prompt itself —
@@ -386,6 +401,6 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore)
     if (wasEmpty) await session.player.playNext()
   } finally {
     clearPickInFlight(entry.guildId)
-    await reconsiderTeardown(entry.guildId, pendingStore)
+    await reconsiderTeardown(entry.guildId, pendingStore, recommendRounds)
   }
 }
