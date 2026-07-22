@@ -4,15 +4,17 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { MessageFlags } from 'discord.js'
-import helpCommand from './help.js'
-import { configureSettingsPathForTest, setCommandVisibility } from '../settings.js'
+import helpCommand from './commands/help.js'
+import { configureSettingsPathForTest, getSettingsPathForTest, setCommandVisibility } from './settings.js'
 
 async function withTempSettings(fn) {
+  const previousSettingsPath = getSettingsPathForTest()
   const dir = await mkdtemp(join(tmpdir(), 'music-bot-help-command-test-'))
   configureSettingsPathForTest(join(dir, 'data', 'guild-settings.json'))
   try {
     await fn()
   } finally {
+    configureSettingsPathForTest(previousSettingsPath)
     await rm(dir, { recursive: true, force: true })
   }
 }

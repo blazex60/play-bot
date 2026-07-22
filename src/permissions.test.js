@@ -106,7 +106,7 @@ test('checkCommandAllowed: an explicit commandName overrides interaction.command
 test('replyFlags: falls back to hardcoded default visibility per command', async () => {
   await withTempSettings(async () => {
     assert.deepEqual(replyFlags('guild-1', 'skip'), {})
-    assert.deepEqual(replyFlags('guild-1', 'help'), {})
+    assert.deepEqual(replyFlags('guild-1', 'help'), { flags: MessageFlags.Ephemeral })
     assert.deepEqual(replyFlags('guild-1', 'nowplaying'), { flags: MessageFlags.Ephemeral })
   })
 })

@@ -24,7 +24,7 @@ const SETTINGS_COMMANDS = [
 ]
 
 const OTHER_COMMANDS = [
-  { title: '/help', copy: 'このページの内容を要約したコマンド一覧を、実行した本人にだけ見える形で表示します。' },
+  { title: '/help', copy: 'このページの内容を要約したコマンド一覧を表示します。返信の公開範囲はサーバーのコマンド表示設定に従い、個人表示に設定されている場合は実行した本人だけに表示されます。' },
 ]
 
 /** @param {{ eyebrow: string, title: string, commands: { title: string, copy: string }[] }} props */
