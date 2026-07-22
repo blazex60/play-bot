@@ -208,7 +208,7 @@ test('handleShowRecommendations: rejects a click once the round has expired', as
 })
 
 test('handleShowRecommendations: rejects a click if the session no longer exists', async () => {
-  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
   const pendingStore = new PendingChoiceStore()
   const sessions = new Map()
   const interaction = makeShowInteraction({ guildId: 'g1', userId: 'u1' })
@@ -221,7 +221,7 @@ test('handleShowRecommendations: rejects a click if the session no longer exists
 test('handleShowRecommendations: a user denied the play command cannot see their recommendations', async () => {
   await withTempSettings(async () => {
     await setDefaultCommandPermission('g1', 'play', 'deny')
-    const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+    const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
     const pendingStore = new PendingChoiceStore()
     const sessions = new Map([['g1', makeSession()]])
     const interaction = makeShowInteraction({ guildId: 'g1', userId: 'u1' })
@@ -237,7 +237,7 @@ test('handleShowRecommendations: an admin who denied themselves play can still s
     process.env.ADMIN_ROLE_ID = 'admin-role'
     try {
       await setDefaultCommandPermission('g1', 'play', 'deny')
-      const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+      const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
       const pendingStore = new PendingChoiceStore()
       const sessions = new Map([['g1', makeSession()]])
       const interaction = makeShowInteraction({ guildId: 'g1', userId: 'u1', member: { roles: { cache: { has: (id) => id === 'admin-role' } } } })
@@ -253,7 +253,7 @@ test('handleShowRecommendations: an admin who denied themselves play can still s
 })
 
 test('handleShowRecommendations: a user not present in the round snapshot gets no recommendations', async () => {
-  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
   const pendingStore = new PendingChoiceStore()
   const sessions = new Map([['g1', makeSession()]])
   const interaction = makeShowInteraction({ guildId: 'g1', userId: 'someone-who-joined-late' })
@@ -264,7 +264,7 @@ test('handleShowRecommendations: a user not present in the round snapshot gets n
 })
 
 test('handleShowRecommendations: a second click while the first ephemeral prompt is still unanswered is rejected', async (t) => {
-  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
   const pendingStore = new PendingChoiceStore()
   const sessions = new Map([['g1', makeSession()]])
 
@@ -281,7 +281,7 @@ test('handleShowRecommendations: a second click while the first ephemeral prompt
 })
 
 test('handleShowRecommendations: two rapid clicks by the same user must not both create a pick (regression: hasPendingForUser raced the reply/fetchReply awaits)', async () => {
-  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
   const pendingStore = new PendingChoiceStore()
   const sessions = new Map([['g1', makeSession()]])
 
@@ -306,7 +306,7 @@ test('handleShowRecommendations: two rapid clicks by the same user must not both
 })
 
 test('handleShowRecommendations: does not register a pick if the round is cancelled (e.g. /stop) while reply/fetchReply are in flight', async () => {
-  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
   const pendingStore = new PendingChoiceStore()
   const sessions = new Map([['g1', makeSession()]])
 
@@ -330,7 +330,7 @@ test('handleShowRecommendations: does not register a pick if the round is cancel
 })
 
 test('handleShowRecommendations: shows an ephemeral, personal choice prompt and registers it in pendingStore', async (t) => {
-  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false }]])
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map([['u1', [makeCandidate('v1')]]]), message: makeSentMessage(), timeoutHandle: null, expired: false, consumedUserIds: new Set() }]])
   const pendingStore = new PendingChoiceStore()
   const sessions = new Map([['g1', makeSession()]])
   const interaction = makeShowInteraction({ guildId: 'g1', userId: 'u1' })
@@ -640,11 +640,36 @@ test("handleShowRecommendations: a stale per-user pick from an old, superseded r
   clearTimeout(roundB.timeoutHandle)
 })
 
+test('handleShowRecommendations: rejects a re-show after the user already picked in this round (regression: re-clicking "show" let a single user enqueue multiple tracks per round)', async (t) => {
+  const channel = makeChannel()
+  const recommendRounds = new Map()
+  const pendingStore = new PendingChoiceStore()
+  const session = makeSession({ voiceChannelId: 'vc-1' })
+  const sessions = new Map([['g1', session]])
+
+  await postRecommendationPrompt({ channel, guildId: 'g1', plans: [{ userId: 'u1', candidates: [makeCandidate('v1')] }], recommendRounds, pendingStore })
+  t.after(() => clearTimeout(recommendRounds.get('g1')?.timeoutHandle))
+
+  const firstShow = makeShowInteraction({ guildId: 'g1', userId: 'u1' })
+  await handleShowRecommendations(firstShow, sessions, recommendRounds, pendingStore)
+  const [messageId] = [...pendingStore.entries()].map(([id]) => id)
+
+  const pick = makePickInteraction({ customId: 'autoplay_0', messageId, guildId: 'g1', userId: 'u1' })
+  await handleRecommendChoice(pick, sessions, pendingStore, recommendRounds)
+  assert.equal(session.queue.current?.videoId, 'v1', 'the first pick should succeed normally')
+
+  const secondShow = makeShowInteraction({ guildId: 'g1', userId: 'u1' })
+  await handleShowRecommendations(secondShow, sessions, recommendRounds, pendingStore)
+
+  assert.equal(secondShow.replies[0].content, '❌ 今回のラウンドでは既に選択済みです')
+  assert.equal(pendingStore.entries().next().done, true, 'no new pick prompt should be created after the round is already consumed')
+})
+
 test('cancelRecommendations: clears per-user pending prompts and disables the shared round message', async () => {
   const pendingStore = new PendingChoiceStore()
   pendingStore.set('msg-1', { guildId: 'g1', targetUserId: 'u1', candidates: [makeCandidate('v1')], message: makeSentMessage(), timeoutHandle: setTimeout(() => {}, RECOMMEND_TIMEOUT_MS) })
   const roundMessage = makeSentMessage()
-  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map(), message: roundMessage, timeoutHandle: setTimeout(() => {}, RECOMMEND_TIMEOUT_MS), expired: false }]])
+  const recommendRounds = new Map([['g1', { guildId: 'g1', candidatesByUserId: new Map(), message: roundMessage, timeoutHandle: setTimeout(() => {}, RECOMMEND_TIMEOUT_MS), expired: false, consumedUserIds: new Set() }]])
 
   cancelRecommendations('g1', pendingStore, recommendRounds)
 

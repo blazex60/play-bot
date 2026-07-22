@@ -246,7 +246,11 @@ export async function postRecommendationPrompt({ channel, guildId, guildName, pl
   // fire later and delete this new round out from under it.
   retireRound(guildId, recommendRounds)
 
-  const entry = { guildId, candidatesByUserId, message, timeoutHandle: null, expired: false }
+  // Tracks which userIds have already consumed their one pick for this
+  // specific round instance (see handleRecommendChoice), so re-clicking
+  // "show" after picking can't be used to enqueue multiple tracks per round
+  // — matching the old DM flow's one-prompt-per-user-per-round behavior.
+  const entry = { guildId, candidatesByUserId, message, timeoutHandle: null, expired: false, consumedUserIds: new Set() }
   scheduleRoundExpiry(entry, recommendRounds, pendingStore, guildId, onTimeout)
   recommendRounds.set(guildId, entry)
   return 1
@@ -272,6 +276,9 @@ export async function handleShowRecommendations(interaction, sessions, recommend
   const candidates = round.candidatesByUserId.get(interaction.user.id)
   if (!candidates) {
     return interaction.reply({ content: '❌ 現在あなた向けのおすすめはありません', flags: MessageFlags.Ephemeral })
+  }
+  if (round.consumedUserIds.has(interaction.user.id)) {
+    return interaction.reply({ content: '❌ 今回のラウンドでは既に選択済みです', flags: MessageFlags.Ephemeral })
   }
   if (hasPendingForUser(pendingStore, interaction.guildId, interaction.user.id)) {
     return interaction.reply({ content: '⚠️ 既におすすめを表示済みです。そちらから選択してください', flags: MessageFlags.Ephemeral })
@@ -310,7 +317,11 @@ export async function handleShowRecommendations(interaction, sessions, recommend
       return
     }
 
-    const entry = { guildId: interaction.guildId, targetUserId: interaction.user.id, candidates, message, timeoutHandle: null, expired: false }
+    // consumedRoundUserIds is captured from this specific round instance
+    // (not looked up again later) so a successful pick marks the right
+    // round as consumed even if a newer round has since replaced this one
+    // in recommendRounds.
+    const entry = { guildId: interaction.guildId, targetUserId: interaction.user.id, candidates, message, timeoutHandle: null, expired: false, consumedRoundUserIds: round.consumedUserIds }
     scheduleExpiry(entry, pendingStore, interaction.guildId, recommendRounds, guildOnTimeoutCallbacks.get(interaction.guildId))
     pendingStore.set(message.id, entry)
   } finally {
@@ -402,6 +413,11 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore,
     })
     const wasEmpty = session.queue.isEmpty
     session.queue.add(chosenTrack)
+    // Mark this user's turn as used for the round they were shown under, so
+    // re-clicking "show" (still live for other participants) can't be used
+    // to enqueue more than one track per round — matching the old DM flow's
+    // one-prompt-per-user-per-round behavior.
+    entry.consumedRoundUserIds?.add(entry.targetUserId)
     // Same confirmation format as /play's search picker, so a recommend pick
     // reads identically to a manual search pick in the channel.
     await interaction.followUp(`✅ ${chosenTrack.requestedBy} がキューに追加しました: **${chosenTrack.title}** (${fmtDuration(chosenTrack.duration)})`)
