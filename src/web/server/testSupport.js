@@ -38,7 +38,7 @@ export function createMemoryDb() {
     CREATE TABLE service_links (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       discord_user_id TEXT NOT NULL REFERENCES discord_users(discord_id),
-      service TEXT NOT NULL CHECK (service IN ('spotify','youtube')),
+      service TEXT NOT NULL CHECK (service IN ('youtube')),
       access_token_enc BLOB NOT NULL,
       refresh_token_enc BLOB,
       key_id TEXT NOT NULL,
