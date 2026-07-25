@@ -4,33 +4,44 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { PlaylistBuilder } from './PlaylistBuilder.jsx'
 
+// Overrides are keyed exactly like the old flat props object was, but split
+// into PlaylistBuilder's current { state, actions } shape based on which
+// half of the component's props each key belongs to.
 function baseProps(overrides = {}) {
-  return {
+  const state = {
     playlists: [],
     selectedPlaylist: null,
     newPlaylistName: '',
+    renameValue: '',
+    trackUrl: '',
+    trackSearchQuery: '',
+    searchResults: [],
+    canQueue: false,
+    busy: false,
+  }
+  const actions = {
     onNewPlaylistNameChange: vi.fn(),
     onCreate: vi.fn(),
     onSelect: vi.fn(),
-    renameValue: '',
     onRenameValueChange: vi.fn(),
     onRename: vi.fn(),
     onDelete: vi.fn(),
-    trackUrl: '',
     onTrackUrlChange: vi.fn(),
     onAddByUrl: vi.fn(),
-    trackSearchQuery: '',
     onTrackSearchQueryChange: vi.fn(),
     onSearchTracks: vi.fn(),
-    searchResults: [],
     onAddFromSearchResult: vi.fn(),
     onMoveTrack: vi.fn(),
     onRemoveTrack: vi.fn(),
     onQueueToGuild: vi.fn(),
-    canQueue: false,
-    busy: false,
-    ...overrides,
   }
+  const stateRecord = /** @type {Record<string, unknown>} */ (state)
+  const actionsRecord = /** @type {Record<string, unknown>} */ (actions)
+  for (const [key, value] of Object.entries(overrides)) {
+    if (key in state) stateRecord[key] = value
+    else actionsRecord[key] = value
+  }
+  return { state, actions }
 }
 
 describe('PlaylistBuilder create flow', () => {
