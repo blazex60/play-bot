@@ -1,5 +1,5 @@
 export function getSessionUser(request) {
-  const user = request.user ?? request.session?.user ?? request.auth?.user
+  const user = request.user
   const discordId = user?.discordId ?? user?.discord_id ?? user?.id
   if (!discordId) {
     const error = new Error('Authentication required')
@@ -16,10 +16,14 @@ export async function callBot(botClient, method, path, body) {
   throw new Error('botClient must expose request(method, path, body), get(path), or post(path, body)')
 }
 
+async function fetchPermission({ botClient, guildId, userId }) {
+  return typeof botClient?.permission === 'function'
+    ? botClient.permission({ guildId, userId })
+    : callBot(botClient, 'GET', `/permission?guildId=${encodeURIComponent(guildId)}&userId=${encodeURIComponent(userId)}`)
+}
+
 export async function requireBotPermission({ botClient, guildId, userId }) {
-  const permission = typeof botClient?.getPermission === 'function'
-    ? await botClient.getPermission({ guildId, userId })
-    : await callBot(botClient, 'GET', `/permission?guildId=${encodeURIComponent(guildId)}&userId=${encodeURIComponent(userId)}`)
+  const permission = await fetchPermission({ botClient, guildId, userId })
 
   if (!permission?.basic && !permission?.extended) {
     const error = new Error('Forbidden')
@@ -34,9 +38,7 @@ export async function requireBotPermission({ botClient, guildId, userId }) {
 // requires the stronger `extended` (guild admin role) permission — unlike
 // requireBotPermission above, being in the same voice channel is not enough.
 export async function requireAdminPermission({ botClient, guildId, userId }) {
-  const permission = typeof botClient?.getPermission === 'function'
-    ? await botClient.getPermission({ guildId, userId })
-    : await callBot(botClient, 'GET', `/permission?guildId=${encodeURIComponent(guildId)}&userId=${encodeURIComponent(userId)}`)
+  const permission = await fetchPermission({ botClient, guildId, userId })
 
   if (!permission?.extended) {
     const error = new Error('Forbidden')
@@ -59,6 +61,17 @@ export async function requireCommandPermission({ botClient, guildId, userId, com
     throw error
   }
   return result
+}
+
+// Shared by import.js/import-edit.js/playlists.js: all three enqueue tracks
+// to the bot the same way, preferring botClient's named convenience method
+// and falling back to the generic callBot contract when a test double
+// doesn't define one.
+export async function enqueueImportTracks(botClient, guildId, payload) {
+  if (typeof botClient?.enqueueImport === 'function') {
+    return botClient.enqueueImport(guildId, payload)
+  }
+  return callBot(botClient, 'POST', `/import/${encodeURIComponent(guildId)}/enqueue`, payload)
 }
 
 export function bindRouteError(reply, error) {
@@ -94,5 +107,58 @@ export function recordOperationLog(db, { guildId, discordUserId, username, sourc
     `).run(guildId, discordUserId ?? null, username ?? null, source, action, detail ?? null, success ? 1 : 0, nowUnix())
   } catch (error) {
     console.error('[operationLog] failed to record:', error.message)
+  }
+}
+
+// Runs the getSessionUser -> permission() -> run() -> audit-log -> reply
+// shape repeated across control/queue/admin mutation routes, so each route
+// handler only supplies the parts that actually differ between them. `guard`
+// runs first and may throw (e.g. an unknown action, or a denied permission)
+// before `run` executes; both a thrown guard/run error and a successful
+// response are logged via recordOperationLog with the same shape the
+// individual handlers previously wrote by hand. `db` may be omitted (or
+// falsy) to skip audit logging entirely, matching the read-only admin GET
+// routes that were never logged.
+export async function withAuditedBotAction(request, reply, {
+  db,
+  source,
+  action,
+  guard,
+  run,
+  buildDetail,
+  isSuccess = (body) => body?.ok !== false,
+}) {
+  const { guildId } = request.params
+  const actionName = typeof action === 'function' ? action(request) : action
+  let user
+  try {
+    user = getSessionUser(request)
+    if (guard) await guard({ request, user })
+    const responseBody = await run({ request, user })
+    if (db) {
+      recordOperationLog(db, {
+        guildId,
+        discordUserId: user.discordId,
+        username: user.username,
+        source,
+        action: actionName,
+        detail: buildDetail ? buildDetail({ request, user, responseBody }) : undefined,
+        success: isSuccess(responseBody),
+      })
+    }
+    return reply.send(responseBody)
+  } catch (error) {
+    if (db && user) {
+      recordOperationLog(db, {
+        guildId,
+        discordUserId: user.discordId,
+        username: user.username,
+        source,
+        action: actionName,
+        detail: error.message,
+        success: false,
+      })
+    }
+    return bindRouteError(reply, error)
   }
 }

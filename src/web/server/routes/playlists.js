@@ -1,7 +1,7 @@
 import { createTrack } from '../../../queue.js'
 import { resolveMetadata as defaultResolveMetadata, searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
-import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
+import { bindRouteError, enqueueImportTracks, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 function parseId(value) {
   const id = Number.parseInt(value, 10)
@@ -194,13 +194,6 @@ async function resolveTrackInput(body, { user, resolveMetadataFn }) {
   throw error
 }
 
-async function enqueuePlaylistTracks(botClient, guildId, payload) {
-  if (typeof botClient?.enqueueImport === 'function') {
-    return botClient.enqueueImport(guildId, payload)
-  }
-  return callBot(botClient, 'POST', `/import/${encodeURIComponent(guildId)}/enqueue`, payload)
-}
-
 export async function playlistsRoutes(app, {
   db,
   botClient,
@@ -357,7 +350,7 @@ export async function playlistsRoutes(app, {
       // on the bot side self-services session creation from the requester's own
       // current voice channel (see botApi.js), so requiring permission here would
       // wrongly 403 a user who is simply starting playback for the first time.
-      const state = await callBot(botClient, 'GET', `/state/${encodeURIComponent(guildId)}`)
+      const state = await botClient.state(guildId)
       if (state?.active) {
         await requireBotPermission({ botClient, guildId, userId: user.discordId })
       }
@@ -378,7 +371,7 @@ export async function playlistsRoutes(app, {
         channel: row.channel,
       }))
 
-      const botResponse = await enqueuePlaylistTracks(botClient, guildId, {
+      const botResponse = await enqueueImportTracks(botClient, guildId, {
         userId: user.discordId,
         tracks,
       }).catch((error) => {

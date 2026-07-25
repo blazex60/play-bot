@@ -3,7 +3,6 @@ import {
   createDecipheriv,
   createHash,
   randomBytes,
-  timingSafeEqual,
 } from 'node:crypto'
 
 const ALGORITHM = 'aes-256-gcm'
@@ -71,10 +70,4 @@ export function decrypt(blob) {
   } catch (err) {
     return null
   }
-}
-
-export function isCurrentKeyId(keyId) {
-  const current = Buffer.from(getKeyId())
-  const stored = Buffer.from(String(keyId ?? ''))
-  return current.length === stored.length && timingSafeEqual(current, stored)
 }

@@ -1,15 +1,7 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 
 export function randomToken(bytes = 32) {
   return randomBytes(bytes).toString('base64url')
-}
-
-export function createCodeVerifier() {
-  return randomToken(32)
-}
-
-export function createCodeChallenge(verifier) {
-  return createHash('sha256').update(verifier).digest('base64url')
 }
 
 export function nowMs() {
@@ -69,10 +61,6 @@ export async function fetchJson(fetchImpl, url, options) {
     throw error
   }
   return body
-}
-
-export function basicAuthHeader(clientId, clientSecret) {
-  return `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`
 }
 
 export function appendParams(baseUrl, params) {

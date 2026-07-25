@@ -1,4 +1,4 @@
-import { bindRouteError, callBot, getSessionUser, requireAdminPermission, recordOperationLog } from './route-utils.js'
+import { bindRouteError, callBot, getSessionUser, requireAdminPermission, withAuditedBotAction } from './route-utils.js'
 
 const DEFAULT_LOG_LIMIT = 50
 const MAX_LOG_LIMIT = 200
@@ -29,73 +29,38 @@ export async function adminRoutes(app, { db, botClient } = {}) {
     }
   })
 
-  app.post('/api/admin/:guildId/permissions/default', async (request, reply) => {
-    const { guildId } = request.params
-    let user
-    try {
-      user = getSessionUser(request)
-      await requireAdminPermission({ botClient, guildId, userId: user.discordId })
+  app.post('/api/admin/:guildId/permissions/default', (request, reply) => withAuditedBotAction(request, reply, {
+    db,
+    source: 'admin',
+    action: 'set_default_permission',
+    guard: ({ request, user }) => requireAdminPermission({ botClient, guildId: request.params.guildId, userId: user.discordId }),
+    run: async ({ request, user }) => {
+      const { guildId } = request.params
       const { command, value } = request.body ?? {}
       const result = await callBot(botClient, 'POST', `/admin/${encodeURIComponent(guildId)}/permissions/default`, { adminUserId: user.discordId, command, value })
-      recordOperationLog(db, {
-        guildId,
-        discordUserId: user.discordId,
-        username: user.username,
-        source: 'admin',
-        action: 'set_default_permission',
-        detail: JSON.stringify({ command, value }),
-        success: true,
-      })
-      return reply.send(result ?? { ok: true })
-    } catch (error) {
-      if (user) {
-        recordOperationLog(db, {
-          guildId,
-          discordUserId: user.discordId,
-          username: user.username,
-          source: 'admin',
-          action: 'set_default_permission',
-          detail: error.message,
-          success: false,
-        })
-      }
-      return bindRouteError(reply, error)
-    }
-  })
+      return result ?? { ok: true }
+    },
+    buildDetail: ({ request }) => JSON.stringify({ command: request.body?.command, value: request.body?.value }),
+    // Setting a permission is a synchronous DB write on the bot side with no
+    // partial-failure outcome, unlike control/queue actions — always log it
+    // as a success once it didn't throw.
+    isSuccess: () => true,
+  }))
 
-  app.post('/api/admin/:guildId/permissions/user', async (request, reply) => {
-    const { guildId } = request.params
-    let user
-    try {
-      user = getSessionUser(request)
-      await requireAdminPermission({ botClient, guildId, userId: user.discordId })
+  app.post('/api/admin/:guildId/permissions/user', (request, reply) => withAuditedBotAction(request, reply, {
+    db,
+    source: 'admin',
+    action: 'set_user_permission',
+    guard: ({ request, user }) => requireAdminPermission({ botClient, guildId: request.params.guildId, userId: user.discordId }),
+    run: async ({ request, user }) => {
+      const { guildId } = request.params
       const { userId, command, value } = request.body ?? {}
       const result = await callBot(botClient, 'POST', `/admin/${encodeURIComponent(guildId)}/permissions/user`, { adminUserId: user.discordId, userId, command, value })
-      recordOperationLog(db, {
-        guildId,
-        discordUserId: user.discordId,
-        username: user.username,
-        source: 'admin',
-        action: 'set_user_permission',
-        detail: JSON.stringify({ userId, command, value }),
-        success: true,
-      })
-      return reply.send(result ?? { ok: true })
-    } catch (error) {
-      if (user) {
-        recordOperationLog(db, {
-          guildId,
-          discordUserId: user.discordId,
-          username: user.username,
-          source: 'admin',
-          action: 'set_user_permission',
-          detail: error.message,
-          success: false,
-        })
-      }
-      return bindRouteError(reply, error)
-    }
-  })
+      return result ?? { ok: true }
+    },
+    buildDetail: ({ request }) => JSON.stringify({ userId: request.body?.userId, command: request.body?.command, value: request.body?.value }),
+    isSuccess: () => true,
+  }))
 
   app.get('/api/admin/:guildId/visibility', async (request, reply) => {
     try {
@@ -109,39 +74,20 @@ export async function adminRoutes(app, { db, botClient } = {}) {
     }
   })
 
-  app.post('/api/admin/:guildId/visibility', async (request, reply) => {
-    const { guildId } = request.params
-    let user
-    try {
-      user = getSessionUser(request)
-      await requireAdminPermission({ botClient, guildId, userId: user.discordId })
+  app.post('/api/admin/:guildId/visibility', (request, reply) => withAuditedBotAction(request, reply, {
+    db,
+    source: 'admin',
+    action: 'set_command_visibility',
+    guard: ({ request, user }) => requireAdminPermission({ botClient, guildId: request.params.guildId, userId: user.discordId }),
+    run: async ({ request, user }) => {
+      const { guildId } = request.params
       const { command, value } = request.body ?? {}
       const result = await callBot(botClient, 'POST', `/admin/${encodeURIComponent(guildId)}/visibility`, { adminUserId: user.discordId, command, value })
-      recordOperationLog(db, {
-        guildId,
-        discordUserId: user.discordId,
-        username: user.username,
-        source: 'admin',
-        action: 'set_command_visibility',
-        detail: JSON.stringify({ command, value }),
-        success: true,
-      })
-      return reply.send(result ?? { ok: true })
-    } catch (error) {
-      if (user) {
-        recordOperationLog(db, {
-          guildId,
-          discordUserId: user.discordId,
-          username: user.username,
-          source: 'admin',
-          action: 'set_command_visibility',
-          detail: error.message,
-          success: false,
-        })
-      }
-      return bindRouteError(reply, error)
-    }
-  })
+      return result ?? { ok: true }
+    },
+    buildDetail: ({ request }) => JSON.stringify({ command: request.body?.command, value: request.body?.value }),
+    isSuccess: () => true,
+  }))
 
   app.get('/api/admin/:guildId/logs', async (request, reply) => {
     try {

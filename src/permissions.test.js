@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { MessageFlags } from 'discord.js'
 import { configureSettingsPathForTest, setDefaultCommandPermission, setUserCommandPermission, setCommandVisibility } from './settings.js'
-import { checkCommandAllowed, replyFlags, getEffectiveCommandVisibility, sendVisibleFollowUp } from './permissions.js'
+import { checkCommandAllowed, replyFlags, getEffectiveCommandVisibility, sendVisibleFollowUp, requireSessionInSameVoice } from './permissions.js'
 
 async function withTempSettings(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'music-bot-permissions-test-'))
@@ -53,6 +53,73 @@ function fakeDeferredInteraction(ephemeral) {
     deleteReply: async (messageId) => { calls.deleteReply.push(messageId) },
   }
 }
+
+function fakeVoiceInteraction({ guildId = 'guild-1', channelId = 'voice-1', inSameTextChannel = true } = {}) {
+  const calls = { reply: [] }
+  return {
+    guildId,
+    channelId: inSameTextChannel ? channelId : 'other-text-channel',
+    member: { displayName: 'Tester', voice: { channelId } },
+    deferred: false,
+    replied: false,
+    reply: async (payload) => { calls.reply.push(payload); return payload },
+    followUp: async (payload) => { calls.reply.push(payload); return payload },
+    calls,
+  }
+}
+
+function fakeSession(channelId = 'voice-1', extra = {}) {
+  return { connection: { joinConfig: { channelId } }, ...extra }
+}
+
+test('requireSessionInSameVoice: no session replies emptyMessage and returns false', async () => {
+  const sessions = new Map()
+  const interaction = fakeVoiceInteraction()
+  const result = await requireSessionInSameVoice(interaction, sessions, { emptyMessage: '❌ 再生中の曲がありません' })
+  assert.equal(result, false)
+  assert.equal(interaction.calls.reply.length, 1)
+  assert.equal(interaction.calls.reply[0].content, '❌ 再生中の曲がありません')
+  assert.equal(interaction.calls.reply[0].flags, MessageFlags.Ephemeral)
+})
+
+test('requireSessionInSameVoice: isEmpty predicate treats a present-but-empty session as absent', async () => {
+  const sessions = new Map([['guild-1', fakeSession('voice-1', { queue: { isEmpty: true } })]])
+  const interaction = fakeVoiceInteraction()
+  const result = await requireSessionInSameVoice(interaction, sessions, {
+    emptyMessage: '❌ キューが空です',
+    isEmpty: (s) => s.queue.isEmpty,
+  })
+  assert.equal(result, false)
+  assert.equal(interaction.calls.reply[0].content, '❌ キューが空です')
+})
+
+test('requireSessionInSameVoice: rejects when caller is not in the same voice/text channel as the session', async () => {
+  const sessions = new Map([['guild-1', fakeSession('voice-1')]])
+  const interaction = fakeVoiceInteraction({ channelId: 'other-voice-channel' })
+  const result = await requireSessionInSameVoice(interaction, sessions, { emptyMessage: '❌ 再生中の曲がありません' })
+  assert.equal(result, false)
+})
+
+test('requireSessionInSameVoice: returns the session when present and in the same voice channel', async () => {
+  const session = fakeSession('voice-1')
+  const sessions = new Map([['guild-1', session]])
+  const interaction = fakeVoiceInteraction()
+  const result = await requireSessionInSameVoice(interaction, sessions, { emptyMessage: '❌ 再生中の曲がありません' })
+  assert.equal(result, session)
+  assert.equal(interaction.calls.reply.length, 0)
+})
+
+test('requireSessionInSameVoice: skipVoiceCheck returns the session without checking VC membership', async () => {
+  const session = fakeSession('voice-1')
+  const sessions = new Map([['guild-1', session]])
+  const interaction = fakeVoiceInteraction({ channelId: 'a-completely-different-channel' })
+  const result = await requireSessionInSameVoice(interaction, sessions, {
+    emptyMessage: '❌ 再生中の曲がありません',
+    skipVoiceCheck: true,
+  })
+  assert.equal(result, session)
+  assert.equal(interaction.calls.reply.length, 0)
+})
 
 test('checkCommandAllowed: allows by default', async () => {
   await withTempSettings(async () => {
