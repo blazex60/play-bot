@@ -86,8 +86,11 @@ test('dashboard drives playback, queue, import, and match review flows', async (
 
   await expect(page.getByRole('heading', { name: 'Music Dashboard' })).toBeVisible()
   await expect(page.getByText('Lo-fi Study')).toBeVisible()
-  await expect(page.getByRole('button', { name: /Spotify/ })).toBeDisabled()
-  await expect(page.getByRole('button', { name: /Apple Music/ })).toBeDisabled()
+  // Playlist import is YouTube-only (Spotify/Apple Music were fully removed);
+  // this also guards against a service tab for either silently reappearing.
+  await expect(page.getByRole('tab', { name: 'YouTube' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Spotify/ })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /Apple Music/ })).toHaveCount(0)
 
   await page.getByRole('button', { name: 'Pause' }).click()
   await expect(page.getByRole('status')).toHaveText('操作を送信しました')
