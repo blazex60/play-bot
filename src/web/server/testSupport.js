@@ -1,6 +1,15 @@
 import Database from 'better-sqlite3'
 import { createWebConfig } from './config.js'
 
+// NOTE: this schema is hand-maintained in parallel with
+// src/db/migrations/*.sql, not generated from it — buildWebServer() does run
+// the real migrations against this same in-memory db afterward (see
+// index.test.js), but every migration's CREATE TABLE is IF NOT EXISTS, so a
+// table already defined here is never touched by a later migration unless
+// that migration explicitly rebuilds it (e.g. a CHECK-constraint change via
+// CREATE TABLE ... _new / DROP / RENAME). When adding a migration that adds a
+// column, index, or table, mirror it here too, or a test against this memory
+// db can silently pass against a stale shape.
 export function createMemoryDb() {
   const db = new Database(':memory:')
   db.pragma('foreign_keys = ON')
