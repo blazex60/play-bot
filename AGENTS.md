@@ -4,7 +4,7 @@
 
 ## Purpose
 
-Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で音声を処理し、Fastify + React の Web ダッシュボードから再生操作と Spotify/YouTube プレイリスト取り込みを行える。LLM・外部 AI API は一切使用しない。`legal/` は同じリポジトリで管理する Cloudflare Pages 向けの独立した静的法務ページ（利用規約・プライバシーポリシー）。
+Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で音声を処理し、Fastify + React の Web ダッシュボードから再生操作と YouTube プレイリスト取り込みを行える(Spotify/Apple Music は削除済み — 詳細は `CLAUDE.md` の「Web UI scope」参照)。LLM・外部 AI API は一切使用しない。`legal/` は同じリポジトリで管理する Cloudflare Pages 向けの独立した静的法務ページ（利用規約・プライバシーポリシー）。
 
 ## Key Files
 

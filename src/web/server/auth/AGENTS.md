@@ -5,13 +5,13 @@
 
 ## Purpose
 
-Discord / YouTube の OAuth 2.0 authorize + callback route と、それらが共有する state/PKCE/token ヘルパー。
+Discord / YouTube の OAuth 2.0 authorize + callback route と、それらが共有する state/token ヘルパー。
 
 ## Key Files
 
 | File | Description |
 |------|--------------|
-| `oauth.js` | 共通ヘルパー: `randomToken`, PKCE (`createCodeVerifier`/`createCodeChallenge`), `insertOauthState`/`consumeOauthState`, `fetchJson`, `basicAuthHeader`, `tokenExpiresAt` |
+| `oauth.js` | 共通ヘルパー: `randomToken`, `insertOauthState`/`consumeOauthState`, `fetchJson`, `tokenExpiresAt`, `createUserSession`。両 provider とも client secret はリクエストボディ（`client_secret` フォームフィールド）で送信し、Basic 認証ヘッダーは使わない |
 | `discord.js` | `registerDiscordAuthRoutes` — ログイン用 OAuth（`identify` scope）。成功後に `web_sessions` cookie を発行する。`redirectAfterFromRequest` でオープンリダイレクトを防止 |
 | `youtube.js` | `registerYoutubeAuthRoutes` — `youtube.readonly` scope の OAuth。Google の Testing 公開ステータスのため 100 ユーザー上限・7日で認可失効の制約がある（詳細はルート `CLAUDE.md`） |
 
