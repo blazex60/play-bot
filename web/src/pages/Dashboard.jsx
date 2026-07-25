@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { api, ApiError } from '../api/client.js'
+import { api } from '../api/client.js'
 import '../dashboard.css'
 import { AutoplayPanel } from '../components/AutoplayPanel.jsx'
 import { MatchReview } from '../components/MatchReview.jsx'
@@ -10,11 +10,8 @@ import { PlaylistBuilder } from '../components/PlaylistBuilder.jsx'
 import { PlaylistPanel } from '../components/PlaylistPanel.jsx'
 import { QueueList } from '../components/QueueList.jsx'
 import { TransportControls } from '../components/TransportControls.jsx'
-
-function initialGuildId() {
-  const params = new URLSearchParams(window.location.search)
-  return params.get('guildId') ?? window.localStorage.getItem('musicbot:guildId') ?? ''
-}
+import { useGuildId } from '../hooks/useGuildId.js'
+import { usePageActions } from '../hooks/usePageActions.js'
 
 /** @param {unknown} payload @returns {import('../api/client.js').ServiceLink[]} */
 function normalizeLinks(payload) {
@@ -36,7 +33,7 @@ function normalizeState(payload) {
 }
 
 export function Dashboard() {
-  const [guildId, setGuildId] = useState(initialGuildId)
+  const [guildId, setGuildId] = useGuildId()
   const [user, setUser] = useState(/** @type {import('../api/client.js').User | null} */ (null))
   const [permission, setPermission] = useState(/** @type {{ extended?: boolean } | null} */ (null))
   const [state, setState] = useState(/** @type {import('../api/client.js').PlaybackState} */ ({ active: false, upcoming: [] }))
@@ -47,8 +44,6 @@ export function Dashboard() {
   const [importJob, setImportJob] = useState(/** @type {import('../api/client.js').ImportJob | null} */ (null))
   const [reviewTracks, setReviewTracks] = useState(/** @type {import('../api/client.js').ImportTrack[]} */ ([]))
   const [searchQuery, setSearchQuery] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [message, setMessage] = useState('')
   const [savedPlaylists, setSavedPlaylists] = useState(/** @type {import('../api/client.js').SavedPlaylist[]} */ ([]))
   const [selectedSavedPlaylist, setSelectedSavedPlaylist] = useState(
     /** @type {import('../api/client.js').SavedPlaylist | null} */ (null)
@@ -60,18 +55,11 @@ export function Dashboard() {
   const [trackSearchResults, setTrackSearchResults] = useState(
     /** @type {import('../api/client.js').SavedPlaylistTrack[]} */ ([])
   )
+  const { busy, message, runAction: runActionBase, showError } = usePageActions()
 
   const queue = useMemo(() => state.upcoming ?? state.queue ?? [], [state])
   const autoplayMode = state.autoplayMode ?? 'off'
   const personalize = state.personalize ?? false
-
-  const showError = useCallback((/** @type {unknown} */ error) => {
-    if (error instanceof ApiError && error.status === 401) {
-      window.location.assign('/login')
-      return
-    }
-    setMessage(error instanceof Error ? error.message : '操作に失敗しました')
-  }, [])
 
   const refreshState = useCallback(async () => {
     if (!guildId) return
@@ -105,7 +93,6 @@ export function Dashboard() {
 
   useEffect(() => {
     if (!guildId) return undefined
-    window.localStorage.setItem('musicbot:guildId', guildId)
     refreshState()
     const timer = window.setInterval(refreshState, 5_000)
     return () => window.clearInterval(timer)
@@ -121,17 +108,10 @@ export function Dashboard() {
 
   /** @param {() => Promise<void>} work @param {string} successMessage */
   async function runAction(work, successMessage) {
-    setBusy(true)
-    setMessage('')
-    try {
+    await runActionBase(async () => {
       await work()
-      setMessage(successMessage)
       await refreshState()
-    } catch (error) {
-      showError(error)
-    } finally {
-      setBusy(false)
-    }
+    }, successMessage)
   }
 
   /** @param {string} value */
@@ -421,7 +401,7 @@ export function Dashboard() {
           job={importJob}
           tracks={reviewTracks}
           searchQuery={searchQuery}
-          busy={busy}
+          busy={busy || !guildId}
           onQueryChange={setSearchQuery}
           onSearch={searchReplacement}
           onReplace={replaceTrack}
