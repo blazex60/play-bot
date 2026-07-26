@@ -32,6 +32,19 @@ export function useSavedPlaylists({ guildId, runAction }) {
     }
   }, [])
 
+  // The mutation functions below call this (not refresh() directly) after
+  // their own mutation already succeeded — a resync failure here must not
+  // make runAction report the whole action as failed, since that would hide
+  // a real success behind an error message and risk the user retrying a
+  // create/rename/delete that already went through.
+  async function refreshAfterMutation() {
+    try {
+      await refresh()
+    } catch (error) {
+      console.error('[useSavedPlaylists] refresh after mutation failed:', error)
+    }
+  }
+
   /** @param {unknown} tracks */
   function updateSelectedTracks(tracks) {
     if (!Array.isArray(tracks)) return
@@ -44,7 +57,7 @@ export function useSavedPlaylists({ guildId, runAction }) {
     await runAction(async () => {
       await api.createSavedPlaylist(name)
       setNewPlaylistName('')
-      await refresh()
+      await refreshAfterMutation()
     }, 'プレイリストを作成しました')
   }
 
@@ -65,7 +78,7 @@ export function useSavedPlaylists({ guildId, runAction }) {
     await runAction(async () => {
       await api.renameSavedPlaylist(selectedPlaylist.id, name)
       setSelectedPlaylist((current) => (current ? { ...current, name } : current))
-      await refresh()
+      await refreshAfterMutation()
     }, 'プレイリスト名を変更しました')
   }
 
@@ -75,7 +88,7 @@ export function useSavedPlaylists({ guildId, runAction }) {
     await runAction(async () => {
       await api.deleteSavedPlaylist(selectedPlaylist.id)
       setSelectedPlaylist(null)
-      await refresh()
+      await refreshAfterMutation()
     }, 'プレイリストを削除しました')
   }
 
@@ -87,7 +100,7 @@ export function useSavedPlaylists({ guildId, runAction }) {
       const payload = await api.addSavedPlaylistTrack(selectedPlaylist.id, { url })
       updateSelectedTracks(/** @type {{ tracks?: unknown }} */ (payload)?.tracks)
       setTrackUrl('')
-      await refresh()
+      await refreshAfterMutation()
     }, '曲を追加しました')
   }
 
@@ -110,7 +123,7 @@ export function useSavedPlaylists({ guildId, runAction }) {
     await runAction(async () => {
       const payload = await api.addSavedPlaylistTrack(selectedPlaylist.id, { track })
       updateSelectedTracks(/** @type {{ tracks?: unknown }} */ (payload)?.tracks)
-      await refresh()
+      await refreshAfterMutation()
     }, '曲を追加しました')
   }
 
@@ -120,7 +133,7 @@ export function useSavedPlaylists({ guildId, runAction }) {
     await runAction(async () => {
       const payload = await api.removeSavedPlaylistTrack(selectedPlaylist.id, trackId)
       updateSelectedTracks(/** @type {{ tracks?: unknown }} */ (payload)?.tracks)
-      await refresh()
+      await refreshAfterMutation()
     }, '曲を削除しました')
   }
 
