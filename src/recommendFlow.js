@@ -2,18 +2,11 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, MessageFlag
 import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
 import { checkCommandAllowed, checkInVoiceChannel } from './permissions.js'
 import { createTrack } from './queue.js'
+import { fmtDuration } from './format.js'
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
 export const RECOMMEND_SHOW_CUSTOM_ID = 'recommend-show'
 export const RECOMMEND_TIMEOUT_MS = 5 * 60 * 1000
-
-export function fmtDuration(seconds) {
-  if (seconds == null) return '不明'
-  const h = Math.floor(seconds / 3600)
-  const m = Math.floor((seconds % 3600) / 60)
-  const s = seconds % 60
-  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`
-}
 
 async function disableMessage(message) {
   const disabledRows = message.components.map((row) => {

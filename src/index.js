@@ -25,7 +25,7 @@ const client = new Client({
 // Load commands
 const commands = new Collection()
 const commandsPath = join(__dirname, 'commands')
-for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js'))) {
+for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js') && !f.endsWith('.test.js'))) {
   const mod = await import(join(commandsPath, file))
   commands.set(mod.default.data.name, mod.default)
 }

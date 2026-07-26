@@ -11,7 +11,11 @@
 
 | File | Description |
 |------|--------------|
-| `001_init.sql` | 初期スキーマ: `discord_users`, `web_sessions`, `service_links`（YouTube 連携トークン。CHECK 制約は過去の名残で `spotify` も許可しているが、バックエンド削除によりコードから書き込まれることはない）, `oauth_states`, `import_jobs`, `import_tracks` |
+| `001_init.sql` | 初期スキーマ: `discord_users`, `web_sessions`, `service_links`（外部サービス連携トークン）, `oauth_states`, `import_jobs`, `import_tracks` |
+| `002_play_history.sql` | `play_history`(ギルド/ユーザーごとの再生履歴。autoplay のパーソナライズ機能が参照する) |
+| `003_user_playlists.sql` | `user_playlists`, `user_playlist_tracks`(ダッシュボードの「My Playlists」保存済みプレイリスト機能) |
+| `004_operation_logs.sql` | `operation_logs`(ダッシュボード操作・Bot コマンドの監査ログ。`(guild_id, id DESC)` でインデックス) |
+| `005_remove_spotify_service_check.sql` | `service_links.service` の CHECK 制約から過去の名残だった `spotify` を除去し `youtube` のみ許可するよう縮小。`001_init.sql` は変更禁止のため、テーブル再作成(`_new` 作成 → コピー → DROP → RENAME)方式で適用 |
 
 ## For AI Agents
 

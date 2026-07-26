@@ -1,7 +1,7 @@
 import { getGuildSettings } from './settings.js'
 import { resolveRelated } from './search.js'
 import { createTrack } from './queue.js'
-import { fmtDuration } from './recommendFlow.js'
+import { fmtDuration } from './format.js'
 
 export const HALF_LIFE_DAYS = 14
 export const STABLE_MIN_WEIGHT = 3.0

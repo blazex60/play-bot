@@ -87,6 +87,23 @@ export async function sendVisibleFollowUp(interaction, content, targetFlags) {
   return interaction.followUp({ content, ...targetFlags })
 }
 
+// Shared guard for the common "fetch this guild's session, bail out with an
+// ephemeral reply if there isn't one (or isEmpty(session) says it doesn't
+// count), then require same-VC/-text-channel" shape repeated across most VC
+// commands (pause/resume/skip/stop/loop/leave/shuffle). Returns the session
+// on success, or `false` after already having replied. skipVoiceCheck lets
+// callers that don't gate on VC membership (e.g. /nowplaying) reuse just the
+// session-presence half.
+export async function requireSessionInSameVoice(interaction, sessions, { emptyMessage, isEmpty = () => false, skipVoiceCheck = false } = {}) {
+  const session = sessions.get(interaction.guildId)
+  if (!session || isEmpty(session)) {
+    await interaction.reply({ content: emptyMessage, flags: MessageFlags.Ephemeral })
+    return false
+  }
+  if (!skipVoiceCheck && !checkSameVoiceChannel(interaction, session)) return false
+  return session
+}
+
 export function checkSameVoiceChannel(interaction, session) {
   const targetChannelId = session
     ? session.connection.joinConfig.channelId

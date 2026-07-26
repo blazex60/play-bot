@@ -4,13 +4,20 @@ import { searchYoutube, resolveMetadata, isPlaylistUrl, resolveFlatPlaylist, PLA
 import { createSearchResultComponents } from '../views.js'
 import { getOrCreateSession, pendingStore, webClient } from '../sessions.js'
 import { checkSameVoiceChannel, checkCommandAllowed, replyFlags, sendVisibleFollowUp } from '../permissions.js'
+import { fmtDuration } from '../format.js'
 
-function fmtDuration(seconds) {
-  if (seconds == null) return '不明'
-  const h = Math.floor(seconds / 3600)
-  const m = Math.floor((seconds % 3600) / 60)
-  const s = seconds % 60
-  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`
+// Shared by all three enqueue paths below (direct-URL playlist, direct-URL
+// single track, keyword-search onSelect): adds tracks to the queue, lets the
+// caller announce it (replyFn runs between the add and playNext so the
+// "added to queue" confirmation is always sent before playback start is
+// awaited, matching every call site's original ordering), then starts
+// playback if the queue was empty beforehand.
+export async function enqueueAndAnnounce(session, tracks, replyFn) {
+  const wasEmpty = session.queue.isEmpty
+  for (const track of tracks) session.queue.add(track)
+  await replyFn()
+  if (wasEmpty) await session.player.playNext()
+  return wasEmpty
 }
 
 export default {
@@ -71,15 +78,13 @@ export default {
           return false
         }
 
-        const wasEmpty = session.queue.isEmpty
-        for (const track of tracks) session.queue.add(track)
-
-        const truncNote = truncated ? `\n⚠️ プレイリストが大きいため先頭 ${PLAYLIST_LIMIT} 件のみ追加しました` : ''
-        // Drop the deferred "thinking" placeholder before the real result —
-        // otherwise it's left dangling forever since nothing ever edits it.
-        await interaction.deleteReply().catch(() => {})
-        await interaction.followUp({ content: `✅ ${interaction.member.displayName} がプレイリストから **${tracks.length}曲** をキューに追加しました${truncNote}`, ...playVisibility })
-        if (wasEmpty) await session.player.playNext()
+        await enqueueAndAnnounce(session, tracks, async () => {
+          const truncNote = truncated ? `\n⚠️ プレイリストが大きいため先頭 ${PLAYLIST_LIMIT} 件のみ追加しました` : ''
+          // Drop the deferred "thinking" placeholder before the real result —
+          // otherwise it's left dangling forever since nothing ever edits it.
+          await interaction.deleteReply().catch(() => {})
+          await interaction.followUp({ content: `✅ ${interaction.member.displayName} がプレイリストから **${tracks.length}曲** をキューに追加しました${truncNote}`, ...playVisibility })
+        })
         return
       }
 
@@ -101,11 +106,10 @@ export default {
         return false
       }
 
-      const wasEmpty = session.queue.isEmpty
-      session.queue.add(createTrack(info))
-      await interaction.deleteReply().catch(() => {})
-      await interaction.followUp({ content: `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, ...playVisibility })
-      if (wasEmpty) await session.player.playNext()
+      await enqueueAndAnnounce(session, [createTrack(info)], async () => {
+        await interaction.deleteReply().catch(() => {})
+        await interaction.followUp({ content: `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, ...playVisibility })
+      })
       return
     }
 
@@ -190,15 +194,14 @@ export default {
         logSelect(false, err.message)
         return
       }
-      await interaction.deleteReply().catch(() => {})
-      const wasEmpty = session.queue.isEmpty
-      session.queue.add(createTrack(info))
-      // A plain followUp here would silently stay ephemeral regardless of
-      // the 'play' visibility setting — this is the *first* followUp sent
-      // on this interaction, and Discord ignores its flags in that case
-      // (see sendVisibleFollowUp's doc comment).
-      await sendVisibleFollowUp(interaction, `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, replyFlags(interaction.guildId, 'play'))
-      if (wasEmpty) await session.player.playNext()
+      await enqueueAndAnnounce(session, [createTrack(info)], async () => {
+        await interaction.deleteReply().catch(() => {})
+        // A plain followUp here would silently stay ephemeral regardless of
+        // the 'play' visibility setting — this is the *first* followUp sent
+        // on this interaction, and Discord ignores its flags in that case
+        // (see sendVisibleFollowUp's doc comment).
+        await sendVisibleFollowUp(interaction, `✅ ${interaction.member.displayName} がキューに追加しました: **${info.title}** (${fmtDuration(info.duration)})`, replyFlags(interaction.guildId, 'play'))
+      })
       logSelect(true)
     }
 

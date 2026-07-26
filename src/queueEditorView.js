@@ -5,23 +5,9 @@ import {
   ButtonStyle,
   StringSelectMenuBuilder,
 } from 'discord.js'
-import { LoopMode } from './queue.js'
+import { fmtDuration, LOOP_LABELS } from './format.js'
 
 const PAGE_SIZE = 10
-
-const LOOP_LABELS = {
-  [LoopMode.OFF]: 'オフ',
-  [LoopMode.TRACK]: '1曲リピート',
-  [LoopMode.QUEUE]: 'キューリピート',
-}
-
-function fmtDuration(seconds) {
-  if (seconds == null) return '不明'
-  const h = Math.floor(seconds / 3600)
-  const m = Math.floor((seconds % 3600) / 60)
-  const s = seconds % 60
-  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`
-}
 
 export function buildQueueEditorPayload(queue, { page = 0, selectedIndex = null } = {}) {
   const current = queue.current

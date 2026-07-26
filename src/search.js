@@ -5,6 +5,10 @@ export class YtdlpError extends Error {}
 
 const YTDLP_JS_RUNTIME_ARGS = ['--js-runtimes', 'node'];
 
+function buildYtdlpArgs(...args) {
+  return [...YTDLP_JS_RUNTIME_ARGS, ...args];
+}
+
 function spawnAsync(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
@@ -12,6 +16,7 @@ function spawnAsync(cmd, args) {
     let stderr = '';
     proc.stdout.on('data', d => { stdout += d; });
     proc.stderr.on('data', d => { stderr += d; });
+    proc.on('error', reject);
     proc.on('close', code => {
       if (code !== 0) reject(new YtdlpError(stderr.trim() || `yt-dlp exited with ${code}`));
       else resolve(stdout.trim());
@@ -20,12 +25,7 @@ function spawnAsync(cmd, args) {
 }
 
 export async function searchYoutube(query) {
-  const output = await spawnAsync('yt-dlp', [
-    ...YTDLP_JS_RUNTIME_ARGS,
-    '--dump-json',
-    '--flat-playlist',
-    `ytsearch5:${query}`,
-  ]);
+  const output = await spawnAsync('yt-dlp', buildYtdlpArgs('--dump-json', '--flat-playlist', `ytsearch5:${query}`));
   return parseJsonLines(output, 'youtube search results');
 }
 
@@ -74,17 +74,15 @@ function toWatchUrl(entry) {
   return raw ?? null;
 }
 
-export async function resolveFlatPlaylist(url, { requestedBy, requestedById = null, limit = PLAYLIST_LIMIT } = {}) {
-  const output = await spawnAsync('yt-dlp', [
-    ...YTDLP_JS_RUNTIME_ARGS,
-    '--dump-json',
-    '--flat-playlist',
-    '--playlist-end', String(limit + 1),
-    url,
-  ]);
-  const entries = parseJsonLines(output, 'playlist entries');
-  const truncated = entries.length > limit;
-  const tracks = entries.slice(0, limit).map(entry => createTrack({
+// Shared mapping for --flat-playlist entries (resolveFlatPlaylist,
+// resolveRelated), whose fields are less normalized than full --dump-json
+// metadata and so need toWatchUrl/pickThumbnail's extra fallbacks. Not used
+// by resolveMetadata: full metadata reliably has webpage_url/thumbnail
+// already, and its top-level `url` field is the resolved media stream URL,
+// not a watch-page URL — running it through toWatchUrl would pick that up
+// by mistake.
+export function mapEntryToTrack(entry, { requestedBy, requestedById = null } = {}) {
+  return createTrack({
     title: entry.title ?? 'Unknown',
     webpageUrl: toWatchUrl(entry),
     duration: entry.duration ?? null,
@@ -93,17 +91,24 @@ export async function resolveFlatPlaylist(url, { requestedBy, requestedById = nu
     thumbnail: pickThumbnail(entry),
     videoId: entry.id ?? null,
     channel: entry.channel ?? entry.uploader ?? null,
-  }));
+  });
+}
+
+export async function resolveFlatPlaylist(url, { requestedBy, requestedById = null, limit = PLAYLIST_LIMIT } = {}) {
+  const output = await spawnAsync('yt-dlp', buildYtdlpArgs(
+    '--dump-json',
+    '--flat-playlist',
+    '--playlist-end', String(limit + 1),
+    url,
+  ));
+  const entries = parseJsonLines(output, 'playlist entries');
+  const truncated = entries.length > limit;
+  const tracks = entries.slice(0, limit).map(entry => mapEntryToTrack(entry, { requestedBy, requestedById }));
   return { tracks, truncated };
 }
 
 export async function resolveMetadata(url, { requestedBy, requestedById = null }) {
-  const output = await spawnAsync('yt-dlp', [
-    ...YTDLP_JS_RUNTIME_ARGS,
-    '--dump-json',
-    '--no-playlist',
-    url,
-  ]);
+  const output = await spawnAsync('yt-dlp', buildYtdlpArgs('--dump-json', '--no-playlist', url));
   const info = parseFirstJsonLine(output, 'video metadata');
   return createTrack({
     title: info.title ?? 'Unknown',
@@ -118,36 +123,23 @@ export async function resolveMetadata(url, { requestedBy, requestedById = null }
 }
 
 export async function resolveRelated(videoId, { limit = 10 } = {}) {
-  const output = await spawnAsync('yt-dlp', [
-    ...YTDLP_JS_RUNTIME_ARGS,
+  const output = await spawnAsync('yt-dlp', buildYtdlpArgs(
     '--dump-json',
     '--flat-playlist',
     '--playlist-end', String(limit + 1),
     `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`,
-  ]);
+  ));
   const entries = parseJsonLines(output, 'related videos');
-  return entries.slice(0, limit).map(entry => createTrack({
-    title: entry.title ?? 'Unknown',
-    webpageUrl: toWatchUrl(entry),
-    duration: entry.duration ?? null,
-    requestedBy: '🔀 自動再生',
-    requestedById: null,
-    thumbnail: pickThumbnail(entry),
-    videoId: entry.id ?? null,
-    channel: entry.channel ?? entry.uploader ?? null,
-  }));
+  return entries.slice(0, limit).map(entry => mapEntryToTrack(entry, { requestedBy: '🔀 自動再生', requestedById: null }));
 }
 
 export function resolveAudioStream(url) {
-  const proc = spawn('yt-dlp', [
-    ...YTDLP_JS_RUNTIME_ARGS,
-    '-f', 'bestaudio/best',
-    '--no-playlist',
-    '-o', '-',
-    url,
-  ]);
+  const proc = spawn('yt-dlp', buildYtdlpArgs('-f', 'bestaudio/best', '--no-playlist', '-o', '-', url));
   let stderrBuf = '';
   proc.stderr.on('data', d => { stderrBuf += d; });
+  proc.on('error', err => {
+    proc.stdout.destroy(err);
+  });
   proc.on('close', code => {
     if (code !== 0) {
       proc.stdout.destroy(new YtdlpError(stderrBuf.trim() || `yt-dlp exited ${code}`));

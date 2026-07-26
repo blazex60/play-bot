@@ -37,6 +37,10 @@ Bot process は SQLite を開かない。ライブ状態は Bot process の `ses
 | `/shuffle` | キューをシャッフル | VC 内のユーザーのみ |
 | `/loop` | ループモード切り替え（オフ -> 1曲 -> キュー -> オフ） | VC 内のユーザーのみ |
 | `/nowplaying` | 現在再生中の曲を表示 | 全員 |
+| `/bitrate [kbps]` | VC のビットレートを設定（省略時は Boost tier 上限） | 全員 |
+| `/normalize <enabled>` | Guild 単位の音量ノーマライズ on/off | 全員 |
+| `/autoplay mode/personalize/notify` | キュー枯渇時の自動再生モード・パーソナライズ・通知設定 | 全員 |
+| `/help` | コマンド一覧を表示 | 全員 |
 
 ## セットアップ
 
@@ -80,8 +84,12 @@ docker compose up --build
 
 ## Web UI
 
-- `/` dashboard: now playing、pause/resume/skip/stop、volume、queue reorder/remove、playlist import、post-import match review
+- `/`: public landing page
+- `/dashboard`: now playing、pause/resume/skip/stop、autoplay/personalize、queue reorder/remove、YouTube playlist import、post-import match review、「My Playlists」保存済みプレイリスト管理
+- `/admin`: guild 管理者向け(コマンド許可/拒否マトリクス、表示設定、操作ログ)。`extended` 権限が必要
+- `/help`: コマンド一覧の詳細ヘルプ（公開ページ）
 - `/login`: Discord OAuth login entry
+- `/login/demo`: Google OAuth 審査担当者向けのパスワード保護デモログイン（`DEMO_LOGIN_ENABLED` 有効時のみ）
 - `/callback/*`: OAuth callback completion screen for browser-side fallbacks
 
 ## セキュリティ境界

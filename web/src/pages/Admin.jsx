@@ -1,21 +1,18 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { api, ApiError } from '../api/client.js'
+import { api } from '../api/client.js'
 import '../dashboard.css'
 import { PermissionMatrix } from '../components/PermissionMatrix.jsx'
 import { VisibilityPanel } from '../components/VisibilityPanel.jsx'
 import { OperationLogTable } from '../components/OperationLogTable.jsx'
+import { useGuildId } from '../hooks/useGuildId.js'
+import { usePageActions } from '../hooks/usePageActions.js'
 
 const LOG_PAGE_SIZE = 50
 
-function initialGuildId() {
-  const params = new URLSearchParams(window.location.search)
-  return params.get('guildId') ?? window.localStorage.getItem('musicbot:guildId') ?? ''
-}
-
 export function Admin() {
-  const [guildId] = useState(initialGuildId)
+  const [guildId] = useGuildId()
   const [permission, setPermission] = useState(/** @type {{ extended?: boolean } | null} */ (null))
   const [permissions, setPermissions] = useState(
     /** @type {import('../api/client.js').AdminPermissions} */ ({ commands: [], defaults: {}, overrides: {}, knownUsers: [] })
@@ -23,16 +20,7 @@ export function Admin() {
   const [visibility, setVisibility] = useState(/** @type {import('../api/client.js').AdminVisibility} */ ({}))
   const [logs, setLogs] = useState(/** @type {import('../api/client.js').OperationLogEntry[]} */ ([]))
   const [hasMoreLogs, setHasMoreLogs] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [message, setMessage] = useState('')
-
-  const showError = useCallback((/** @type {unknown} */ error) => {
-    if (error instanceof ApiError && error.status === 401) {
-      window.location.assign('/login')
-      return
-    }
-    setMessage(error instanceof Error ? error.message : '操作に失敗しました')
-  }, [])
+  const { busy, setBusy, message, runAction, showError } = usePageActions()
 
   const loadLogs = useCallback(async (/** @type {number | undefined} */ before = undefined) => {
     const payload = await api.adminLogs(guildId, before ? { limit: LOG_PAGE_SIZE, before } : { limit: LOG_PAGE_SIZE })
@@ -67,24 +55,15 @@ export function Admin() {
 
   /** @param {string} command @param {'allow'|'deny'} value */
   async function setDefaultPermission(command, value) {
-    setBusy(true)
-    setMessage('')
-    try {
+    await runAction(async () => {
       await api.setDefaultCommandPermission(guildId, command, value)
       setPermissions((current) => ({ ...current, defaults: { ...current.defaults, [command]: value } }))
-      setMessage('デフォルト権限を更新しました')
-    } catch (error) {
-      showError(error)
-    } finally {
-      setBusy(false)
-    }
+    }, 'デフォルト権限を更新しました')
   }
 
   /** @param {string} userId @param {string} command @param {'allow'|'deny'|null} value */
   async function setUserOverride(userId, command, value) {
-    setBusy(true)
-    setMessage('')
-    try {
+    await runAction(async () => {
       await api.setUserCommandPermission(guildId, userId, command, value)
       setPermissions((current) => {
         const userOverrides = { ...(current.overrides[userId] ?? {}) }
@@ -101,27 +80,15 @@ export function Admin() {
         }
         return { ...current, overrides }
       })
-      setMessage('ユーザー権限を更新しました')
-    } catch (error) {
-      showError(error)
-    } finally {
-      setBusy(false)
-    }
+    }, 'ユーザー権限を更新しました')
   }
 
   /** @param {string} command @param {'public'|'personal'} value */
   async function setVisibilityValue(command, value) {
-    setBusy(true)
-    setMessage('')
-    try {
+    await runAction(async () => {
       await api.setCommandVisibility(guildId, command, value)
       setVisibility((current) => ({ ...current, [command]: value }))
-      setMessage('表示設定を更新しました')
-    } catch (error) {
-      showError(error)
-    } finally {
-      setBusy(false)
-    }
+    }, '表示設定を更新しました')
   }
 
   if (!guildId) {

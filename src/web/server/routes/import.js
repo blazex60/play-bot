@@ -1,6 +1,6 @@
 import { resolveImportTracks, toImportTrackRow } from '../matching.js'
 import { listYoutubePlaylistTracks } from '../services/youtube.js'
-import { bindRouteError, callBot, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
+import { bindRouteError, enqueueImportTracks, getSessionUser, nowUnix, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 function insertImportJob(db, { userId, guildId, service, playlistId, playlistName, totalCount }) {
   const result = db.prepare(`
@@ -51,13 +51,6 @@ async function listPlaylistTracks({ service, userId, playlistId, services }) {
   throw error
 }
 
-async function enqueueImport(botClient, guildId, payload) {
-  if (typeof botClient?.enqueueImport === 'function') {
-    return botClient.enqueueImport(guildId, payload)
-  }
-  return callBot(botClient, 'POST', `/import/${encodeURIComponent(guildId)}/enqueue`, payload)
-}
-
 export async function importRoutes(app, { db, botClient, services } = {}) {
   app.post('/api/import/:guildId', async (request, reply) => {
     let jobId = null
@@ -101,7 +94,7 @@ export async function importRoutes(app, { db, botClient, services } = {}) {
         if (result.track) matchedTracks.push(result.track)
       })
 
-      const botResponse = await enqueueImport(botClient, guildId, {
+      const botResponse = await enqueueImportTracks(botClient, guildId, {
         userId: user.discordId,
         jobId,
         tracks: matchedTracks,
@@ -113,8 +106,8 @@ export async function importRoutes(app, { db, botClient, services } = {}) {
         throw error
       })
 
-      const matchedCount = botResponse?.matchedCount ?? botResponse?.matched_count ?? matchedTracks.length
-      const failedCount = botResponse?.failedCount ?? botResponse?.failed_count ?? (providerTracks.length - matchedCount)
+      const matchedCount = botResponse?.matchedCount ?? matchedTracks.length
+      const failedCount = botResponse?.failedCount ?? (providerTracks.length - matchedCount)
       const status = failedCount > 0 ? 'partial' : 'completed'
       completeImportJob(db, jobId, { matchedCount, failedCount, status })
 

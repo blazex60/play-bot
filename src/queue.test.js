@@ -113,6 +113,15 @@ test('moveUpcoming: 任意の位置への移動', () => {
   )
 })
 
+test('moveUpcoming: upcomingの最後尾同士(先頭↔末尾)の入れ替え', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
+  assert.equal(queue.moveUpcoming(0, 2), true)
+  assert.deepEqual(
+    queue.upcoming().map((t) => t.title),
+    ['B', 'C', 'A']
+  )
+})
+
 test('moveUpcoming: 先頭への移動(toIndex=0)後next()で正しい曲が再生される', () => {
   const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
   assert.equal(queue.moveUpcoming(2, 0), true)

@@ -29,6 +29,7 @@ better-sqlite3 を使った永続化層。**Web process (`src/web/server/`) 専�
 - スキーマを変更する場合は `migrations/` に新しい番号付き `.sql` ファイルを追加する。既存マイグレーションは編集しない（適用済み環境との整合性が壊れる）
 - `MUSICBOT_TOKEN_ENC_KEY` を失うと保存済みトークンは復号不可能になる。鍵のデフォルト値やフォールバックは絶対に実装しない
 - `crypto.js` の暗号化パラメータ（`aes-256-gcm`, IV 12 bytes, tag 16 bytes）は互換性のため変更しない
+- **既知の負債**: `src/web/server/testSupport.js` の `createMemoryDb()` はこのディレクトリの実マイグレーションとは別にスキーマを手動で複製している(各マイグレーションの `CREATE TABLE` は `IF NOT EXISTS` のため、ここで既に定義済みのテーブルは後から実行される移行では変更されない)。カラム/インデックス追加を伴うマイグレーションを足す際は `testSupport.js` 側も手動で同期すること
 
 ### Testing Requirements
 - `crypto.test.js`, `tokenStore.test.js` が `node:test` で用意されている。`tokenStore.test.js` は `configureDatabasePathForTest` で一時 SQLite ファイルを使う

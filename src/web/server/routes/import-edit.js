@@ -1,6 +1,6 @@
 import { resolveYoutubeTrack, toImportTrackRow } from '../matching.js'
 import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
-import { bindRouteError, callBot, getSessionUser, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
+import { bindRouteError, enqueueImportTracks, getSessionUser, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 function getImportTrack(db, trackId) {
   return db.prepare(`
@@ -17,13 +17,6 @@ function updateImportTrack(db, trackId, row, status = 'replaced') {
     SET matched_url = ?, matched_title = ?, match_status = ?
     WHERE id = ?
   `).run(row.matched_url, row.matched_title, status, trackId)
-}
-
-async function enqueueReplacement(botClient, guildId, payload) {
-  if (typeof botClient?.enqueueImport === 'function') {
-    return botClient.enqueueImport(guildId, payload)
-  }
-  return callBot(botClient, 'POST', `/import/${encodeURIComponent(guildId)}/enqueue`, payload)
 }
 
 export async function importEditRoutes(app, { db, botClient, searchYoutube } = {}) {
@@ -79,7 +72,7 @@ export async function importEditRoutes(app, { db, botClient, searchYoutube } = {
 
       const row = toImportTrackRow(result, existing.position)
       updateImportTrack(db, existing.id, row)
-      await enqueueReplacement(botClient, existing.guild_id, {
+      await enqueueImportTracks(botClient, existing.guild_id, {
         userId: user.discordId,
         jobId: existing.job_id,
         tracks: [result.track],

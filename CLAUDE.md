@@ -62,15 +62,19 @@ Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用
 
 ### Web routes
 
-- `/` dashboard
+- `/` public landing page
+- `/dashboard` メインダッシュボード(single-screen)
+- `/admin` guild admin 専用画面(`extended` 権限が必要)
+- `/help` コマンド一覧の詳細ヘルプ(公開ページ)
 - `/login` Discord OAuth entry
+- `/login/demo` Google 審査担当者向けのパスワード保護デモログイン(`DEMO_LOGIN_ENABLED` 有効時のみ)
 - `/callback/*` OAuth callback fallback screen
 - `/api/*` authenticated dashboard data/control routes
 - `/auth/discord`, `/auth/youtube` OAuth routes
 
 ### Web UI scope
 
-Dashboard は single-screen 構成。Now playing、transport controls、queue reorder/remove、YouTube playlist browser、import panel、post-import match review を表示する。プレイリスト連携は YouTube のみサポートする。Spotify（2026年2月の仕様変更で Development Mode アプリの認可ユーザー数上限が 5 人に縮小されたため）と Apple Music は OAuth ルート・DB 上のトークン・import パイプラインを含めて削除済み。
+`/dashboard` は single-screen 構成。Now playing、transport controls、autoplay/personalize パネル、queue reorder/remove、YouTube playlist browser、import panel、post-import match review、「My Playlists」保存済みプレイリストの作成・編集・キュー投入を1画面に表示する。`/admin` は権限マトリクス(コマンドごとの許可/拒否)・表示設定(public/personal)・操作ログ一覧を guild 管理者向けに表示する。プレイリスト連携は YouTube のみサポートする。Spotify（2026年2月の仕様変更で Development Mode アプリの認可ユーザー数上限が 5 人に縮小されたため）と Apple Music は OAuth ルート・DB 上のトークン・import パイプラインを含めて削除済み。
 
 **YouTube の OAuth スコープ**: `https://www.googleapis.com/auth/youtube.readonly`（`src/web/server/config.js`）。自分の非公開プレイリストの一覧・中身の読み取りのみに必要な最小権限で、書き込み系スコープは不要。ただし Google の「Testing」公開ステータスのままだと（1）テストユーザー数が最大100人、（2）各ユーザーの認可が7日で失効し再連携が必要、という制約がある。ユーザー数や運用期間次第では Google の App Verification（本番公開のための審査）が必要になる場合がある。
 
