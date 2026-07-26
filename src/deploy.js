@@ -19,7 +19,7 @@ const commandHashPath = process.env.MUSIC_BOT_COMMAND_HASH_FILE ?? join(__dirnam
 const skipIfUnchanged = process.argv.includes('--if-changed')
 
 const commands = []
-for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js')).sort()) {
+for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js') && !f.endsWith('.test.js')).sort()) {
   const mod = await import(join(commandsPath, file))
   commands.push(mod.default.data.toJSON())
 }

@@ -16,7 +16,7 @@ Bot 本体のソース。Discord client のエントリーポイント、VC セ�
 | `queueExhaustion.js` | キュー枯渇時の自動再生/おすすめモード継続ロジック（`createQueueExhaustionHandler`）。`sessions.js` を import しない一方向依存を保つため `getSession` サンクを受け取る |
 | `player.js` | `GuildPlayer`。AudioPlayer のラップ、ストール検出ウォッチドッグ、`#hadError` フラグによるトラックスキップ制御 |
 | `queue.js` | `GuildQueue`。トラック配列と `LoopMode`（OFF/TRACK/QUEUE）を管理 |
-| `search.js` | yt-dlp を `child_process.spawn` で呼び出し、検索・メタデータ取得・ストリーム URL 解決を行う |
+| `search.js` | yt-dlp を `child_process.spawn` で呼び出し、検索・メタデータ取得を行う。`resolveAudioStream()` は yt-dlp の stdout をそのまま返す（URL を解決して FFmpeg に渡す方式ではない。詳細はルート `CLAUDE.md`） |
 | `format.js` | 表示用の共有ヘルパー（`fmtDuration`, `LOOP_LABELS`）。`commands/` と `queueEditorView.js`/`recommendFlow.js` が共有する |
 | `normalize.js` | FFmpeg loudnorm によるトラック単位の音量ノーマライズ（`/normalize` コマンド用） |
 | `views.js` | 検索結果ボタン UI（`ActionRowBuilder`）と `SearchPendingStore` |

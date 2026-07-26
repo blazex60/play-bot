@@ -21,6 +21,13 @@ CREATE TABLE service_links_new (
   UNIQUE (discord_user_id, service)
 );
 
+-- A database that was ever live before the Spotify removal can still hold a
+-- 'spotify' row here; the backend has had no code path that reads/refreshes
+-- it since removal, so it's already dead data. Purge it first — copying it
+-- unfiltered into service_links_new would violate the narrowed CHECK above
+-- and abort this migration on exactly the databases it's meant to clean up.
+DELETE FROM service_links WHERE service <> 'youtube';
+
 INSERT INTO service_links_new
   SELECT id, discord_user_id, service, access_token_enc, refresh_token_enc,
          key_id, scope, token_expires_at, status, created_at, updated_at
