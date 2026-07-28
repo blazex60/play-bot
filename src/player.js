@@ -30,6 +30,7 @@ export class GuildPlayer {
   #handleQueueExhausted;
   #queueExhaustedTimeoutMs;
   #recordPlayFn;
+  #onTrackStart;
   #audioPlayer;
   #forceSkip = false;
   #hadError = false;
@@ -55,6 +56,7 @@ export class GuildPlayer {
     handleQueueExhausted = null,
     queueExhaustedTimeoutMs = QUEUE_EXHAUSTED_TIMEOUT,
     recordPlayFn = null,
+    onTrackStart = null,
     audioPlayer = createAudioPlayer(),
     createAudioResourceFn = createAudioResource,
     resolveAudioStreamFn = resolveAudioStream,
@@ -66,6 +68,7 @@ export class GuildPlayer {
     this.#handleQueueExhausted = handleQueueExhausted;
     this.#queueExhaustedTimeoutMs = queueExhaustedTimeoutMs;
     this.#recordPlayFn = recordPlayFn;
+    this.#onTrackStart = onTrackStart;
     this.#audioPlayer = audioPlayer;
     this.#createAudioResource = createAudioResourceFn;
     this.#resolveAudioStream = resolveAudioStreamFn;
@@ -147,6 +150,7 @@ export class GuildPlayer {
     this.#audioPlayer.play(resource);
     this.#prefetchUpcoming();
     this.#recordPlay(track);
+    this.#onTrackStart?.(track.videoId);
   }
 
   #recordPlay(track) {

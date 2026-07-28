@@ -33,7 +33,7 @@ function makeAudioPlayer() {
   }
 }
 
-function makePlayer({ audioPlayer = makeAudioPlayer(), handleQueueExhausted, onDisconnect = async () => {}, trackDuration = 60, recordPlayFn, track } = {}) {
+function makePlayer({ audioPlayer = makeAudioPlayer(), handleQueueExhausted, onDisconnect = async () => {}, trackDuration = 60, recordPlayFn, onTrackStart, track } = {}) {
   const queue = new GuildQueue()
   queue.add(track ?? createTrack({
     title: 'Track A',
@@ -48,6 +48,7 @@ function makePlayer({ audioPlayer = makeAudioPlayer(), handleQueueExhausted, onD
     audioPlayer,
     handleQueueExhausted,
     recordPlayFn,
+    onTrackStart,
     connection: {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer)
@@ -279,6 +280,43 @@ test('GuildPlayer: playNext does not record autoplay-selected tracks (no request
   await player.playNext()
 
   assert.equal(calls.length, 0)
+
+  await player.stop()
+})
+
+test('GuildPlayer: playNext calls onTrackStart with the track videoId', async () => {
+  const calls = []
+  const track = createTrack({
+    title: 'Track A',
+    webpageUrl: 'https://example.com/a',
+    duration: 60,
+    requestedById: 'discord-123',
+    videoId: 'vid-1',
+  })
+  const { player } = makePlayer({ onTrackStart: (videoId) => calls.push(videoId), track })
+
+  await player.playNext()
+
+  assert.deepEqual(calls, ['vid-1'])
+
+  await player.stop()
+})
+
+test('GuildPlayer: playNext calls onTrackStart even for autoplay tracks with no requester id', async () => {
+  const calls = []
+  const track = createTrack({
+    title: 'Autoplay Track',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+    requestedBy: '🔀 自動再生',
+    requestedById: null,
+    videoId: 'vid-2',
+  })
+  const { player } = makePlayer({ onTrackStart: (videoId) => calls.push(videoId), track })
+
+  await player.playNext()
+
+  assert.deepEqual(calls, ['vid-2'])
 
   await player.stop()
 })

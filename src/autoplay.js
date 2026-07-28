@@ -101,7 +101,7 @@ function findMajorityConsensusVideoId(stableVectors) {
   return bestCount > stableVectors.length / 2 ? bestVideoId : null
 }
 
-export async function planAutoTrack({ guildId, channel, lastTrack, webClient, now, resolveRelatedFn = resolveRelated } = {}) {
+export async function planAutoTrack({ guildId, channel, lastTrack, webClient, now, resolveRelatedFn = resolveRelated, recentVideoIds = [] } = {}) {
   const settings = getGuildSettings(guildId)
   if (settings.autoplayMode !== 'auto') return null
   if (!lastTrack?.videoId) return null
@@ -133,24 +133,31 @@ export async function planAutoTrack({ guildId, channel, lastTrack, webClient, no
   let usedSeedVideoId = null
   let candidates = null
   if (consensusVideoId && consensusVideoId !== lastTrack.videoId) {
-    candidates = await tryResolveRelated(resolveRelatedFn, consensusVideoId, 10)
+    candidates = await tryResolveRelated(resolveRelatedFn, consensusVideoId, 20)
     if (candidates) usedSeedVideoId = consensusVideoId
   }
   if (!candidates) {
-    candidates = await tryResolveRelated(resolveRelatedFn, lastTrack.videoId, 10)
+    candidates = await tryResolveRelated(resolveRelatedFn, lastTrack.videoId, 20)
     if (candidates) usedSeedVideoId = lastTrack.videoId
   }
   if (!candidates) return null
 
-  const excludeVideoIds = new Set([lastTrack.videoId, usedSeedVideoId].filter(Boolean))
-  const filtered = candidates.filter((candidate) => !candidate.videoId || !excludeVideoIds.has(candidate.videoId))
+  const baseExclude = new Set([lastTrack.videoId, usedSeedVideoId].filter(Boolean))
+  const strictExclude = new Set([...baseExclude, ...recentVideoIds])
+  let filtered = candidates.filter((candidate) => !candidate.videoId || !strictExclude.has(candidate.videoId))
+  if (filtered.length === 0) {
+    // Exhausting candidates against the last-100 history would stall or
+    // disconnect autoplay, so fall back to excluding only the just-played
+    // track and seed when the recent-history exclusion leaves nothing.
+    filtered = candidates.filter((candidate) => !candidate.videoId || !baseExclude.has(candidate.videoId))
+  }
   if (filtered.length === 0) return null
 
   const [chosen] = rankByChannelAffinity(filtered, groupChannelWeights)
   return toAutoplayTrack(chosen)
 }
 
-export async function planRecommendations({ guildId, channel, lastTrack, webClient, now, resolveRelatedFn = resolveRelated } = {}) {
+export async function planRecommendations({ guildId, channel, lastTrack, webClient, now, resolveRelatedFn = resolveRelated, recentVideoIds = [] } = {}) {
   const settings = getGuildSettings(guildId)
   if (settings.autoplayMode !== 'recommend') return []
 
@@ -170,7 +177,7 @@ export async function planRecommendations({ guildId, channel, lastTrack, webClie
   const candidatesBySeed = new Map()
   async function getCandidatesForSeed(seedVideoId) {
     if (!candidatesBySeed.has(seedVideoId)) {
-      candidatesBySeed.set(seedVideoId, await tryResolveRelated(resolveRelatedFn, seedVideoId, 6))
+      candidatesBySeed.set(seedVideoId, await tryResolveRelated(resolveRelatedFn, seedVideoId, 12))
     }
     return candidatesBySeed.get(seedVideoId)
   }
@@ -185,8 +192,14 @@ export async function planRecommendations({ guildId, channel, lastTrack, webClie
     const candidates = await getCandidatesForSeed(seedVideoId)
     if (!candidates) continue
 
-    const excludeForUser = new Set([...excludeVideoIds, seedVideoId])
-    const filtered = candidates.filter((candidate) => !candidate.videoId || !excludeForUser.has(candidate.videoId))
+    const baseExcludeForUser = new Set([...excludeVideoIds, seedVideoId])
+    const strictExcludeForUser = new Set([...baseExcludeForUser, ...recentVideoIds])
+    let filtered = candidates.filter((candidate) => !candidate.videoId || !strictExcludeForUser.has(candidate.videoId))
+    if (filtered.length === 0) {
+      // Same fallback as planAutoTrack: don't let the recent-history
+      // exclusion starve a user's recommendations down to zero candidates.
+      filtered = candidates.filter((candidate) => !candidate.videoId || !baseExcludeForUser.has(candidate.videoId))
+    }
     if (filtered.length === 0) continue
 
     const ranked = rankByChannelAffinity(filtered, vector.channelWeights)
