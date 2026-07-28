@@ -17,6 +17,9 @@ import {
   resolveCommandPermission,
   setCommandVisibility,
   getCommandVisibilitySettings,
+  getAdminRoleId,
+  setAdminRoleId,
+  resolveAdminRoleId,
 } from './settings.js'
 
 const DEFAULT_RECORD = {
@@ -26,6 +29,7 @@ const DEFAULT_RECORD = {
   autoNotify: false,
   commandPermissions: { defaults: {}, overrides: {} },
   commandVisibility: {},
+  adminRoleId: null,
 }
 
 async function withTempSettings(fn) {
@@ -164,5 +168,40 @@ test('settings: setCommandVisibility persists per-command overrides', async () =
     configureSettingsPathForTest(filePath)
     loadSettings()
     assert.deepEqual(getCommandVisibilitySettings('guild-1'), { play: 'personal' })
+  })
+})
+
+test('settings: resolveAdminRoleId prefers guild override over fallback', async () => {
+  await withTempSettings(async ({ filePath }) => {
+    assert.equal(getAdminRoleId('guild-1'), null)
+    assert.equal(resolveAdminRoleId('guild-1', 'env-role'), 'env-role')
+
+    await setAdminRoleId('guild-1', 'guild-role')
+    assert.equal(getAdminRoleId('guild-1'), 'guild-role')
+    assert.equal(resolveAdminRoleId('guild-1', 'env-role'), 'guild-role')
+    // A guild override must not leak into other guilds.
+    assert.equal(resolveAdminRoleId('guild-2', 'env-role'), 'env-role')
+
+    // Round-trip through disk to exercise normalizeRecord's adminRoleId handling.
+    configureSettingsPathForTest(filePath)
+    loadSettings()
+    assert.equal(resolveAdminRoleId('guild-1', 'env-role'), 'guild-role')
+  })
+})
+
+test('settings: setAdminRoleId(null) clears the override, falling back again', async () => {
+  await withTempSettings(async () => {
+    await setAdminRoleId('guild-1', 'guild-role')
+    assert.equal(resolveAdminRoleId('guild-1', 'env-role'), 'guild-role')
+
+    await setAdminRoleId('guild-1', null)
+    assert.equal(getAdminRoleId('guild-1'), null)
+    assert.equal(resolveAdminRoleId('guild-1', 'env-role'), 'env-role')
+  })
+})
+
+test('settings: resolveAdminRoleId with no fallback and no override is null', async () => {
+  await withTempSettings(async () => {
+    assert.equal(resolveAdminRoleId('guild-1', undefined), null)
   })
 })

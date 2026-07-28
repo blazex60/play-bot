@@ -5,6 +5,7 @@ import { createSearchResultComponents } from '../views.js'
 import { getOrCreateSession, pendingStore, webClient } from '../sessions.js'
 import { checkSameVoiceChannel, checkCommandAllowed, replyFlags, sendVisibleFollowUp } from '../permissions.js'
 import { fmtDuration } from '../format.js'
+import { resolveAdminRoleId } from '../settings.js'
 
 // Shared by all three enqueue paths below (direct-URL playlist, direct-URL
 // single track, keyword-search onSelect): adds tracks to the queue, lets the
@@ -152,7 +153,7 @@ export default {
       // before the user clicks a result, so re-check 'play' permission here
       // too — the initial checkCommandAllowed in index.js only guarded the
       // slash command dispatch, not this later button click.
-      if (!checkCommandAllowed(buttonInteraction, process.env.ADMIN_ROLE_ID, 'play')) {
+      if (!checkCommandAllowed(buttonInteraction, resolveAdminRoleId(buttonInteraction.guildId), 'play')) {
         logSelect(false, 'blocked')
         return
       }

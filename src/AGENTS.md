@@ -22,7 +22,7 @@ Bot 本体のソース。Discord client のエントリーポイント、VC セ�
 | `views.js` | 検索結果ボタン UI（`ActionRowBuilder`）と `SearchPendingStore` |
 | `queueEditorView.js` / `queueEditorInteractions.js` | キュー編集用の Embed/コンポーネント生成と、そのボタン・モーダル interaction ハンドラ |
 | `permissions.js` | スラッシュコマンド用の VC 同席チェック（`checkSameVoiceChannel`, `requireSessionInSameVoice`） |
-| `webPermission.js` | Web ダッシュボードからの操作権限判定（`resolveWebPermission`）。VC 同席 or `ADMIN_ROLE_ID` |
+| `webPermission.js` | Web ダッシュボードからの操作権限判定（`resolveWebPermission`）。VC 同席 or 実効管理者ロール（`/adminrole` でのギルド別設定 or `ADMIN_ROLE_ID` 環境変数のフォールバック） |
 | `settings.js` | Guild 単位の設定（normalize on/off、autoplay mode 等）を JSON ファイル（`data/guild-settings.json`）に永続化 |
 | `botApi.js` | Web process から呼ばれる loopback-only 内部 Fastify API。`BOT_API_TOKEN` bearer 必須 |
 | `deploy.js` | スラッシュコマンド定義を Discord API に登録するスクリプト（`node src/deploy.js`） |

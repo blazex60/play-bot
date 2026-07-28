@@ -2,6 +2,7 @@ import { MessageFlags, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRow
 import { buildQueueEditorPayload } from './queueEditorView.js'
 import { checkSameVoiceChannel, checkCommandAllowed } from './permissions.js'
 import { webClient } from './sessions.js'
+import { resolveAdminRoleId } from './settings.js'
 
 // Queue-editor moves/removes mutate the same queue /queue itself does, so
 // they're audited under the 'queue' action too — otherwise these edits would
@@ -47,7 +48,7 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
   // includes qedit_close: when /queue is public, the panel is visible to
   // (and clickable by) anyone in the channel, not just its original poster,
   // so a denied user must not be able to dismiss someone else's panel either.
-  if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'queue')) return
+  if (!checkCommandAllowed(interaction, resolveAdminRoleId(interaction.guildId), 'queue')) return
 
   if (interaction.isButton() && action === 'qedit_close') {
     if (!checkSameVoiceChannel(interaction, session)) return

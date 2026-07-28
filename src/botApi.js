@@ -11,6 +11,7 @@ import {
   setUserCommandPermission,
   setCommandVisibility,
   resolveCommandPermission,
+  resolveAdminRoleId,
 } from './settings.js';
 import { getEffectiveCommandVisibility } from './permissions.js';
 
@@ -58,11 +59,12 @@ async function fetchMember(client, guildId, userId) {
 }
 
 async function resolvePermission({ client, sessions, guildId, userId, adminRoleId }) {
+  const effectiveAdminRoleId = resolveAdminRoleId(guildId, adminRoleId);
   const { member } = await fetchMember(client, guildId, userId);
   return resolveWebPermission({
     member,
     session: sessions.get(guildId),
-    adminRoleId,
+    adminRoleId: effectiveAdminRoleId,
   });
 }
 
@@ -75,10 +77,11 @@ async function resolvePermission({ client, sessions, guildId, userId, adminRoleI
 // remembers to check. member can be passed in to reuse an already-fetched
 // one instead of triggering a second REST lookup for the same user.
 async function resolveCommandAllowed({ client, guildId, userId, command, adminRoleId, member }) {
+  const effectiveAdminRoleId = resolveAdminRoleId(guildId, adminRoleId);
   if (!member) {
     ({ member } = await fetchMember(client, guildId, userId));
   }
-  if (adminRoleId && member.roles.cache.has(adminRoleId)) return true;
+  if (effectiveAdminRoleId && member.roles.cache.has(effectiveAdminRoleId)) return true;
   return resolveCommandPermission(guildId, userId, command) !== 'deny';
 }
 

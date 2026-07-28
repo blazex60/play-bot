@@ -5,7 +5,7 @@
 
 ## Purpose
 
-14 個のスラッシュコマンド実装。各ファイルは `export default { data: SlashCommandBuilder, execute(interaction, sessions) }` の形で 1 コマンドを定義する。`src/index.js` がこのディレクトリを `readdirSync` で走査してロードし、`src/deploy.js` が `data` を Discord API に登録する。両方とも `*.test.js` を除外して `.js` ファイルのみ走査するため、`play.test.js` のようなテストファイルを追加しても起動/デプロイには影響しない。
+15 個のスラッシュコマンド実装。各ファイルは `export default { data: SlashCommandBuilder, execute(interaction, sessions) }` の形で 1 コマンドを定義する。`src/index.js` がこのディレクトリを `readdirSync` で走査してロードし、`src/deploy.js` が `data` を Discord API に登録する。両方とも `*.test.js` を除外して `.js` ファイルのみ走査するため、`play.test.js` のようなテストファイルを追加しても起動/デプロイには影響しない。
 
 ## Key Files
 
@@ -22,6 +22,7 @@
 | `normalize.js` | Guild 単位の音量ノーマライズ on/off を `settings.js` に保存 |
 | `autoplay.js` | `/autoplay mode/personalize/notify` — キュー枯渇時の自動再生モード・パーソナライズ・通知設定を `settings.js` に保存 |
 | `help.js` | `/help` — コマンド一覧の embed 表示。Web ダッシュボードの `/help` ページへのリンクを含む |
+| `adminrole.js` | `/adminrole set/clear/show` — 管理画面(Web dashboard)へのアクセスを許可するロールをギルドごとに設定。実行には Discord の Administrator 権限が必要 |
 
 ## For AI Agents
 
@@ -46,6 +47,6 @@
 - `../sessions.js`（`getOrCreateSession`, `pendingStore`）
 - `../search.js`（`searchYoutube`, `resolveMetadata`, プレイリスト解決）
 - `../views.js`, `../queueEditorView.js`
-- `../settings.js`（`normalize.js`, `autoplay.js` コマンド）
+- `../settings.js`（`normalize.js`, `autoplay.js`, `adminrole.js` コマンド）
 
 <!-- MANUAL: -->
