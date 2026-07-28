@@ -11,8 +11,25 @@ import {
   hasAutoplayContinuationBeenUsed,
 } from './queueExhaustion.js'
 
-// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed }>
+// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed, recentPlayedVideoIds }>
 export const sessions = new Map()
+
+// How many recently-played videoIds a live VC session remembers, so autoplay
+// can avoid re-picking them. Resets to empty whenever a new session object is
+// created (VC rejoin) rather than persisting across sessions — see
+// getOrCreateSession below.
+export const MAX_SESSION_HISTORY = 100
+
+// Exported (rather than inlined in getOrCreateSession's onTrackStart closure)
+// so it's unit-testable without going through the real joinVoiceChannel flow.
+export function recordPlayedVideoId(session, videoId) {
+  if (!session || !videoId) return
+  session.recentPlayedVideoIds.push(videoId)
+  if (session.recentPlayedVideoIds.length > MAX_SESSION_HISTORY) {
+    session.recentPlayedVideoIds.shift()
+  }
+}
+
 export const pendingStore = new PendingChoiceStore()
 export const recommendPendingStore = new PendingChoiceStore()
 // Map<guildId, { guildId, candidatesByUserId, message, timeoutHandle, expired }>
@@ -99,6 +116,12 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     recommendRounds,
   })
 
+  // Like onDisconnect above, this closes over the `session` binding (not a
+  // snapshot) so it can read session.recentPlayedVideoIds once playback
+  // actually starts, even though GuildPlayer is constructed before `session`
+  // is assigned below.
+  const onTrackStart = (videoId) => recordPlayedVideoId(session, videoId)
+
   const player = new GuildPlayer({
     guildId,
     connection,
@@ -106,13 +129,14 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     onDisconnect,
     handleQueueExhausted,
     recordPlayFn: webClient.recordPlay,
+    onTrackStart,
   })
   // A voice channel's own built-in chat can receive messages too, so a
   // session created without an interaction text channel (e.g. an import
   // that starts playback with no /play command in the picture) still gets
   // somewhere to post recommend-mode choices instead of recommend mode
   // silently falling through to a disconnect at the next queue exhaustion.
-  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0, autoplayContinuationUsed: false }
+  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0, autoplayContinuationUsed: false, recentPlayedVideoIds: [] }
   sessions.set(guildId, session)
   return session
 }

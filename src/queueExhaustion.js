@@ -65,7 +65,7 @@ export function createQueueExhaustionHandler({
       const voiceChannel = guild.channels.cache.get(connection.joinConfig.channelId)
       if (!voiceChannel) return false
 
-      const autoTrack = await planAutoTrack({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
+      const autoTrack = await planAutoTrack({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient, recentVideoIds: session.recentPlayedVideoIds })
       if (isStale()) return false
       if (autoTrack) {
         // A manual /play may have already re-filled and started the queue
@@ -85,7 +85,7 @@ export function createQueueExhaustionHandler({
         return true
       }
 
-      const plans = await planRecommendations({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient })
+      const plans = await planRecommendations({ guildId, guild, channel: voiceChannel, queue, lastTrack, webClient, recentVideoIds: session.recentPlayedVideoIds })
       if (isStale()) return false
       if (plans && plans.length > 0) {
         const textChannel = session.textChannelId ? guild.channels.cache.get(session.textChannelId) : null

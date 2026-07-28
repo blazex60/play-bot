@@ -224,6 +224,43 @@ test('planAutoTrack: resolveRelated failure returns null', async () => {
   })
 })
 
+test('planAutoTrack: candidates in recentVideoIds are excluded', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'auto')
+    await setPersonalize('g1', false)
+    const resolveRelatedFn = async () => [makeCandidate('recent-1'), makeCandidate('fresh-1')]
+    const result = await planAutoTrack({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      recentVideoIds: ['recent-1'],
+    })
+    assert.equal(result.videoId, 'fresh-1')
+  })
+})
+
+test('planAutoTrack: falls back to picking from recent history when exclusion leaves no candidates', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'auto')
+    await setPersonalize('g1', false)
+    const resolveRelatedFn = async () => [makeCandidate('recent-1'), makeCandidate('recent-2')]
+    const result = await planAutoTrack({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      recentVideoIds: ['recent-1', 'recent-2'],
+    })
+    assert.ok(result, 'should fall back to a candidate instead of returning null')
+    assert.ok(['recent-1', 'recent-2'].includes(result.videoId))
+  })
+})
+
 test('planAutoTrack: no lastTrack.videoId returns null', async () => {
   await withTempSettings(async () => {
     await setAutoplayMode('g1', 'auto')
@@ -293,6 +330,44 @@ test('planRecommendations: skips users with no resolvable candidates', async () 
       now: NOW,
     })
     assert.deepEqual(plans, [])
+  })
+})
+
+test('planRecommendations: candidates in recentVideoIds are excluded', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'recommend')
+    await setPersonalize('g1', false)
+    const resolveRelatedFn = async () => [makeCandidate('recent-1'), makeCandidate('fresh-1')]
+    const plans = await planRecommendations({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      recentVideoIds: ['recent-1'],
+    })
+    assert.equal(plans.length, 1)
+    assert.deepEqual(plans[0].candidates.map((c) => c.videoId), ['fresh-1'])
+  })
+})
+
+test('planRecommendations: falls back to picking from recent history when exclusion leaves no candidates', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'recommend')
+    await setPersonalize('g1', false)
+    const resolveRelatedFn = async () => [makeCandidate('recent-1'), makeCandidate('recent-2')]
+    const plans = await planRecommendations({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      recentVideoIds: ['recent-1', 'recent-2'],
+    })
+    assert.equal(plans.length, 1, 'should fall back instead of skipping the user entirely')
+    assert.ok(['recent-1', 'recent-2'].includes(plans[0].candidates[0].videoId))
   })
 })
 
