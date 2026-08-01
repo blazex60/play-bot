@@ -73,7 +73,7 @@ test('landing route is public and links to the dashboard login flow', async ({ p
 
   await page.goto('/')
 
-  await expect(page.getByRole('heading', { name: /Discord の音楽 Bot/ })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /Play-bot は Discord VC 用の音楽 Bot/ })).toBeVisible()
   await expect(page.getByRole('link', { name: 'Discord でログイン' })).toHaveAttribute('href', '/auth/discord?redirect=/dashboard')
   await expect(page.getByRole('link', { name: 'Dashboard' })).toHaveAttribute('href', '/dashboard')
   expect(apiRequests).toEqual([])
