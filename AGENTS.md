@@ -63,3 +63,27 @@ npm run check          # 上記一式 + build:web
 - Playwright / vitest / node:test — テスト
 
 <!-- MANUAL: Any manually added notes below this line are preserved on regeneration -->
+
+## Cursor Cloud specific instructions
+
+Standard commands live in `README.md` and `package.json` scripts. The notes below are non-obvious startup/run caveats for this environment (the update script already ran `npm install`, installed `yt-dlp`, and installed the Playwright Chromium browser).
+
+### Env loading differs per process
+- The **bot** process (`src/index.js`, `src/deploy.js`) loads `.env` itself via `dotenv/config`, so `npm start` / `node src/index.js` pick it up automatically.
+- The **web** process (`src/web/server/index.js`) does **not** import dotenv (in Docker it relies on compose `env_file`). Run it locally with Node's flag: `node --env-file=.env src/web/server/index.js`.
+- Create a local `.env` from `.env.example`. `MUSICBOT_TOKEN_ENC_KEY` must be a base64 32-byte key (`openssl rand -base64 32`); `WEB_SESSION_SECRET` / `BOT_API_TOKEN` any long random value.
+
+### `build:web` does not produce `web/dist`
+- `npm run build:web` is only a build-**validation** smoke test: it builds into a temp dir and deletes it (prints `P0_VITE_BUILD_OK`). It does **not** create `web/dist`.
+- To actually populate `web/dist` so `music-web` can serve the SPA, run: `node node_modules/vite/bin/vite.js build --config web/vite.config.js --outDir dist`. The `music-web` server only registers static routes if `web/dist` exists at startup, so build it before (or restart after) generating it.
+- For iterative UI dev, the Vite dev server on port 5173 is what the Playwright e2e config launches.
+
+### Running the stack without real Discord credentials
+- The full bot requires a real `DISCORD_TOKEN` secret. Without it, `node src/index.js` loads all settings/commands then exits with `TokenInvalid` at Discord login — expected.
+- The bot's loopback API (`127.0.0.1:${BOT_API_PORT}`) only starts after the Discord client is `ready`. So when the bot isn't connected, the dashboard's live-state routes (which proxy to that API) return no live data, but auth/session/import/DB routes still work.
+- To reach the dashboard without Discord OAuth, set `DEMO_LOGIN_ENABLED=true` + `DEMO_LOGIN_PASSWORD` in `.env` and POST the password to `/auth/demo/login` (the `/login/demo` page does this). This issues a `google-review-demo` session and lands on `/dashboard`.
+- `yt-dlp` (used by `src/search.js` via bare `spawn('yt-dlp', ...)`) must be on `PATH`; the update script symlinks it into `/usr/local/bin`.
+
+### Test suite notes
+- `npm run test:server` takes several minutes (some tests spawn `yt-dlp` / do real work) — it is not hung.
+- `npm run test:e2e`: the `landing route is public` spec currently fails on a stale copy assertion (the landing `<h1>` reads `Play-bot は Discord VC 用の音楽 Bot です。` while the test expects a heading matching `/Discord の音楽 Bot/`). This is a pre-existing test/code mismatch unrelated to environment setup; the other 5 browser specs pass.
