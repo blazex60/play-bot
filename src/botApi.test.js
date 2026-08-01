@@ -331,6 +331,47 @@ test('bot API admin permission endpoints read and write the command permission m
   });
 });
 
+test('bot API admin endpoints exclude matrix-exempt commands like adminrole', async () => {
+  await withTempSettings(async () => {
+    const members = [makeMember({ userId: 'admin-1', roles: ['admin'] })];
+    await withApp({ members, commandNames: ['skip', 'adminrole', 'play'] }, async app => {
+      const permissions = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/permissions?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.equal(permissions.statusCode, 200);
+      assert.deepEqual(permissions.json().commands, ['skip', 'play']);
+
+      const denyAdminrole = await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/permissions/default',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'adminrole', value: 'deny' },
+      });
+      assert.equal(denyAdminrole.statusCode, 400);
+      assert.deepEqual(denyAdminrole.json(), { error: 'unknown_command' });
+
+      const visibility = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/visibility?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.equal(visibility.statusCode, 200);
+      assert.deepEqual(visibility.json(), { skip: 'public', play: 'public' });
+
+      const setAdminroleVisibility = await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/visibility',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'adminrole', value: 'public' },
+      });
+      assert.equal(setAdminroleVisibility.statusCode, 400);
+      assert.deepEqual(setAdminroleVisibility.json(), { error: 'unknown_command' });
+    });
+  });
+});
+
 test('bot API admin visibility endpoints read effective values and write overrides', async () => {
   await withTempSettings(async () => {
     const members = [makeMember({ userId: 'admin-1', roles: ['admin'] })];

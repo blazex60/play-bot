@@ -22,7 +22,7 @@
 | `normalize.js` | Guild 単位の音量ノーマライズ on/off を `settings.js` に保存 |
 | `autoplay.js` | `/autoplay mode/personalize/notify` — キュー枯渇時の自動再生モード・パーソナライズ・通知設定を `settings.js` に保存 |
 | `help.js` | `/help` — コマンド一覧の embed 表示。Web ダッシュボードの `/help` ページへのリンクを含む |
-| `adminrole.js` | `/adminrole set/clear/show` — 管理画面(Web dashboard)へのアクセスを許可するロールをギルドごとに設定。実行には Discord の Administrator 権限が必要 |
+| `adminrole.js` | `/adminrole set/clear/show` — 管理画面(Web dashboard)へのアクセスを許可するロールをギルドごとに設定。実行には Discord の Administrator 権限が必要。許可マトリクス/表示設定の対象外（`MATRIX_EXCLUDED_COMMANDS`） |
 
 ## For AI Agents
 

@@ -20,7 +20,10 @@ export default {
       sub.setName('show').setDescription('現在の管理者ロール設定を表示します')
     ),
 
-  async execute(interaction) {
+  // Always ephemeral: this command is excluded from the reply-visibility
+  // matrix (see MATRIX_EXCLUDED_COMMANDS) because exposing admin-role
+  // changes publicly would leak privileged configuration.
+  async execute(interaction, sessions) {
     if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
       await interaction.reply({ content: '❌ このコマンドは管理者権限が必要です', flags: MessageFlags.Ephemeral })
       return false

@@ -21,7 +21,7 @@ Bot 本体のソース。Discord client のエントリーポイント、VC セ�
 | `normalize.js` | FFmpeg loudnorm によるトラック単位の音量ノーマライズ（`/normalize` コマンド用） |
 | `views.js` | 検索結果ボタン UI（`ActionRowBuilder`）と `SearchPendingStore` |
 | `queueEditorView.js` / `queueEditorInteractions.js` | キュー編集用の Embed/コンポーネント生成と、そのボタン・モーダル interaction ハンドラ |
-| `permissions.js` | スラッシュコマンド用の VC 同席チェック（`checkSameVoiceChannel`, `requireSessionInSameVoice`） |
+| `permissions.js` | スラッシュコマンド用の VC 同席チェック（`checkSameVoiceChannel`, `requireSessionInSameVoice`）とコマンド許可マトリクス（`checkCommandAllowed`）。`/adminrole` は `MATRIX_EXCLUDED_COMMANDS` でマトリクス対象外 |
 | `webPermission.js` | Web ダッシュボードからの操作権限判定（`resolveWebPermission`）。VC 同席 or 実効管理者ロール（`/adminrole` でのギルド別設定 or `ADMIN_ROLE_ID` 環境変数のフォールバック） |
 | `settings.js` | Guild 単位の設定（normalize on/off、autoplay mode 等）を JSON ファイル（`data/guild-settings.json`）に永続化 |
 | `botApi.js` | Web process から呼ばれる loopback-only 内部 Fastify API。`BOT_API_TOKEN` bearer 必須 |
@@ -31,7 +31,7 @@ Bot 本体のソース。Discord client のエントリーポイント、VC セ�
 
 | Directory | Purpose |
 |-----------|---------|
-| `commands/` | 14 個のスラッシュコマンド実装（`export default { data, execute }`）（see `commands/AGENTS.md`） |
+| `commands/` | 15 個のスラッシュコマンド実装（`export default { data, execute }`）（see `commands/AGENTS.md`） |
 | `db/` | better-sqlite3 layer。Web process 専用（Bot process からは import されない）（see `db/AGENTS.md`） |
 | `web/` | Fastify Web server と（ビルド成果物経由で配信される）React dashboard の server 側（see `web/AGENTS.md`） |
 

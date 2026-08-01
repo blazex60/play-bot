@@ -13,7 +13,7 @@ import {
   resolveCommandPermission,
   resolveAdminRoleId,
 } from './settings.js';
-import { getEffectiveCommandVisibility } from './permissions.js';
+import { getEffectiveCommandVisibility, isMatrixManagedCommand } from './permissions.js';
 
 const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 
@@ -166,6 +166,10 @@ export function buildBotApi({
 } = {}) {
   if (!client) throw new Error('buildBotApi requires client');
   if (!sessions) throw new Error('buildBotApi requires sessions');
+
+  // Drop privileged setup commands (e.g. adminrole) so they never appear in
+  // the permission/visibility admin UI and cannot be denied via the matrix.
+  const managedCommandNames = commandNames.filter(isMatrixManagedCommand);
 
   const app = Fastify({ logger: false });
 
@@ -320,7 +324,7 @@ export function buildBotApi({
   });
 
   function requireKnownCommand(command, reply) {
-    if (typeof command !== 'string' || !commandNames.includes(command)) {
+    if (typeof command !== 'string' || !managedCommandNames.includes(command)) {
       reply.code(400).send({ error: 'unknown_command' });
       return false;
     }
@@ -333,7 +337,7 @@ export function buildBotApi({
     const guildId = request.params.guildId;
     if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
     const { defaults, overrides } = getCommandPermissions(guildId);
-    return { commands: commandNames, defaults, overrides };
+    return { commands: managedCommandNames, defaults, overrides };
   });
 
   app.post('/admin/:guildId/permissions/default', async (request, reply) => {
@@ -376,7 +380,7 @@ export function buildBotApi({
     const guildId = request.params.guildId;
     if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
     const visibility = Object.fromEntries(
-      commandNames.map((name) => [name, getEffectiveCommandVisibility(guildId, name)])
+      managedCommandNames.map((name) => [name, getEffectiveCommandVisibility(guildId, name)])
     );
     return visibility;
   });

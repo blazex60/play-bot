@@ -36,7 +36,7 @@ function createInteraction({ isAdmin = true, subcommand = 'show', role = null } 
 test('adminrole: rejects a non-administrator and returns false', async () => {
   const interaction = createInteraction({ isAdmin: false })
 
-  const result = await adminRoleCommand.execute(interaction)
+  const result = await adminRoleCommand.execute(interaction, new Map())
 
   assert.equal(result, false)
   assert.equal(interaction.replies.length, 1)
@@ -49,7 +49,7 @@ test('adminrole set: stores the role id for the guild and confirms', async () =>
     const role = { id: 'role-123' }
     const interaction = createInteraction({ subcommand: 'set', role })
 
-    await adminRoleCommand.execute(interaction)
+    await adminRoleCommand.execute(interaction, new Map())
 
     assert.equal(getAdminRoleId('guild-1'), 'role-123')
     assert.match(interaction.replies[0].content, /<@&role-123>/)
@@ -60,10 +60,10 @@ test('adminrole set: stores the role id for the guild and confirms', async () =>
 test('adminrole clear: removes the guild override', async () => {
   await withTempSettings(async () => {
     const setInteraction = createInteraction({ subcommand: 'set', role: { id: 'role-123' } })
-    await adminRoleCommand.execute(setInteraction)
+    await adminRoleCommand.execute(setInteraction, new Map())
 
     const clearInteraction = createInteraction({ subcommand: 'clear' })
-    await adminRoleCommand.execute(clearInteraction)
+    await adminRoleCommand.execute(clearInteraction, new Map())
 
     assert.equal(getAdminRoleId('guild-1'), null)
     assert.match(clearInteraction.replies[0].content, /解除しました/)
@@ -73,10 +73,10 @@ test('adminrole clear: removes the guild override', async () => {
 test('adminrole show: reflects the guild override when set', async () => {
   await withTempSettings(async () => {
     const setInteraction = createInteraction({ subcommand: 'set', role: { id: 'role-123' } })
-    await adminRoleCommand.execute(setInteraction)
+    await adminRoleCommand.execute(setInteraction, new Map())
 
     const showInteraction = createInteraction({ subcommand: 'show' })
-    await adminRoleCommand.execute(showInteraction)
+    await adminRoleCommand.execute(showInteraction, new Map())
 
     assert.match(showInteraction.replies[0].content, /<@&role-123>/)
     assert.match(showInteraction.replies[0].content, /このサーバー専用設定/)
@@ -85,15 +85,17 @@ test('adminrole show: reflects the guild override when set', async () => {
 
 test('adminrole show: reflects the env fallback when no guild override exists', async () => {
   await withTempSettings(async () => {
+    const previousEnv = process.env.ADMIN_ROLE_ID
     process.env.ADMIN_ROLE_ID = 'env-role'
     try {
       const showInteraction = createInteraction({ subcommand: 'show' })
-      await adminRoleCommand.execute(showInteraction)
+      await adminRoleCommand.execute(showInteraction, new Map())
 
       assert.match(showInteraction.replies[0].content, /<@&env-role>/)
       assert.match(showInteraction.replies[0].content, /環境変数のデフォルト/)
     } finally {
-      delete process.env.ADMIN_ROLE_ID
+      if (previousEnv === undefined) delete process.env.ADMIN_ROLE_ID
+      else process.env.ADMIN_ROLE_ID = previousEnv
     }
   })
 })
@@ -104,7 +106,7 @@ test('adminrole show: reports unset when neither guild override nor env fallback
     delete process.env.ADMIN_ROLE_ID
     try {
       const showInteraction = createInteraction({ subcommand: 'show' })
-      await adminRoleCommand.execute(showInteraction)
+      await adminRoleCommand.execute(showInteraction, new Map())
 
       assert.match(showInteraction.replies[0].content, /未設定/)
     } finally {

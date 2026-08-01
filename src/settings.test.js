@@ -202,6 +202,14 @@ test('settings: setAdminRoleId(null) clears the override, falling back again', a
 
 test('settings: resolveAdminRoleId with no fallback and no override is null', async () => {
   await withTempSettings(async () => {
-    assert.equal(resolveAdminRoleId('guild-1', undefined), null)
+    const previousEnv = process.env.ADMIN_ROLE_ID
+    delete process.env.ADMIN_ROLE_ID
+    try {
+      assert.equal(resolveAdminRoleId('guild-1'), null)
+      assert.equal(resolveAdminRoleId('guild-1', undefined), null)
+    } finally {
+      if (previousEnv === undefined) delete process.env.ADMIN_ROLE_ID
+      else process.env.ADMIN_ROLE_ID = previousEnv
+    }
   })
 })

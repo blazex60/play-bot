@@ -18,6 +18,7 @@ const SETTINGS_COMMANDS = [
   ['bitrate', 'VCのビットレートを設定します（省略時はサーバー最大値）'],
   ['normalize', '曲ごとの音量ノーマライズ設定を切り替えます'],
   ['autoplay', 'キューが空になった時の自動再生を設定します'],
+  ['adminrole', 'Web管理画面の権限ロールをこのサーバー専用に設定します（要 Administrator）'],
 ]
 
 function formatCommandList(commands) {
