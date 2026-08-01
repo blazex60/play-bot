@@ -8,7 +8,7 @@ import { sessions, pendingStore, recommendPendingStore, recommendRounds, cancelP
 import { parseSearchCustomId } from './views.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
 import { handleRecommendChoice, handleShowRecommendations, RECOMMEND_CUSTOM_ID_PREFIX, RECOMMEND_SHOW_CUSTOM_ID } from './recommendFlow.js'
-import { loadSettings } from './settings.js'
+import { loadSettings, resolveAdminRoleId } from './settings.js'
 import { cleanupStaleTempDir } from './normalize.js'
 import { startBotApi } from './botApi.js'
 import { checkCommandAllowed } from './permissions.js'
@@ -53,7 +53,7 @@ client.on(Events.InteractionCreate, async interaction => {
       detail,
     })
 
-    if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID)) {
+    if (!checkCommandAllowed(interaction, resolveAdminRoleId(interaction.guildId))) {
       logOperation(false, 'blocked')
       return
     }

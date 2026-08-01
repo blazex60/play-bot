@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 
 import { buildBotApi } from './botApi.js';
 import { GuildQueue, createTrack } from './queue.js';
-import { configureSettingsPathForTest, setDefaultCommandPermission } from './settings.js';
+import { configureSettingsPathForTest, setDefaultCommandPermission, setUserCommandPermission } from './settings.js';
 
 const TOKEN = 'test-token';
 
@@ -326,6 +326,75 @@ test('bot API admin permission endpoints read and write the command permission m
         commands: ['skip', 'play'],
         defaults: { skip: 'deny' },
         overrides: { 'user-1': { skip: 'allow' } },
+      });
+    });
+  });
+});
+
+test('bot API admin endpoints exclude matrix-exempt commands like adminrole', async () => {
+  await withTempSettings(async () => {
+    const members = [makeMember({ userId: 'admin-1', roles: ['admin'] })];
+    await withApp({ members, commandNames: ['skip', 'adminrole', 'play'] }, async app => {
+      const permissions = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/permissions?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.equal(permissions.statusCode, 200);
+      assert.deepEqual(permissions.json().commands, ['skip', 'play']);
+
+      const denyAdminrole = await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/permissions/default',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'adminrole', value: 'deny' },
+      });
+      assert.equal(denyAdminrole.statusCode, 400);
+      assert.deepEqual(denyAdminrole.json(), { error: 'unknown_command' });
+
+      const visibility = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/visibility?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.equal(visibility.statusCode, 200);
+      assert.deepEqual(visibility.json(), { skip: 'public', play: 'public' });
+
+      const setAdminroleVisibility = await app.inject({
+        method: 'POST',
+        url: '/admin/guild-1/visibility',
+        headers: authHeaders(),
+        payload: { adminUserId: 'admin-1', command: 'adminrole', value: 'public' },
+      });
+      assert.equal(setAdminroleVisibility.statusCode, 400);
+      assert.deepEqual(setAdminroleVisibility.json(), { error: 'unknown_command' });
+    });
+  });
+});
+
+test('bot API permissions GET strips legacy adminrole entries from defaults and overrides', async () => {
+  await withTempSettings(async () => {
+    // Simulate guild-settings.json written before adminrole was matrix-excluded:
+    // settings setters accept any command name, so a stale deny can still exist on disk.
+    await setDefaultCommandPermission('guild-1', 'skip', 'deny');
+    await setDefaultCommandPermission('guild-1', 'adminrole', 'deny');
+    await setUserCommandPermission('guild-1', 'user-1', 'play', 'allow');
+    await setUserCommandPermission('guild-1', 'user-1', 'adminrole', 'deny');
+    // A user whose only override was adminrole should disappear entirely.
+    await setUserCommandPermission('guild-1', 'user-2', 'adminrole', 'allow');
+
+    const members = [makeMember({ userId: 'admin-1', roles: ['admin'] })];
+    await withApp({ members, commandNames: ['skip', 'adminrole', 'play'] }, async app => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/admin/guild-1/permissions?adminUserId=admin-1',
+        headers: authHeaders(),
+      });
+      assert.equal(response.statusCode, 200);
+      assert.deepEqual(response.json(), {
+        commands: ['skip', 'play'],
+        defaults: { skip: 'deny' },
+        overrides: { 'user-1': { play: 'allow' } },
       });
     });
   });

@@ -96,7 +96,7 @@ docker compose up --build
 
 - `DISCORD_TOKEN`, OAuth client secrets, `WEB_SESSION_SECRET`, `BOT_API_TOKEN`, `MUSICBOT_TOKEN_ENC_KEY` は `.env` のみ
 - Bot API は loopback + bearer token 前提で、Cloudflare Tunnel には出さない
-- Web permissions は Bot API が Discord live voice state と `ADMIN_ROLE_ID` で判定する
+- Web permissions は Bot API が Discord live voice state と実効管理者ロール（ギルド別 `/adminrole` 設定、未設定時は `ADMIN_ROLE_ID`）で判定する
 - 外部 AI API は使用しない
 
 ## Cloudflare Pages 法務ページ

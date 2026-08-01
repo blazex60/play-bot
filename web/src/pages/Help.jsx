@@ -21,6 +21,7 @@ const SETTINGS_COMMANDS = [
   { title: '/autoplay mode <value>', copy: 'キューが空になったときの自動再生モードを設定します。オフ / 自動（関連動画から自動追加）/ おすすめ（DM でおすすめを提示し選んで追加）の3種類です。' },
   { title: '/autoplay personalize <value>', copy: '自動再生のパーソナライズ機能を on/off します。有効にすると、これまでの再生履歴を考慮した候補が選ばれやすくなります。' },
   { title: '/autoplay notify <value>', copy: '自動再生で曲がキューに追加された際に通知を送るかどうかを切り替えます。' },
+  { title: '/adminrole set|clear|show', copy: 'Web 管理画面（/admin）へのアクセスを許可するロールを、このサーバー専用に設定・確認・解除します。Discord の Administrator 権限を持つユーザーだけが実行できます。未設定時は環境変数 ADMIN_ROLE_ID のデフォルトにフォールバックします。' },
 ]
 
 const OTHER_COMMANDS = [

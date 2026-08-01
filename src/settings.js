@@ -46,6 +46,10 @@ function normalizeCommandVisibility(value) {
   return visibility
 }
 
+function normalizeAdminRoleId(value) {
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
 function normalizeRecord(record) {
   return {
     normalize: record?.normalize === true,
@@ -54,6 +58,7 @@ function normalizeRecord(record) {
     autoNotify: record?.autoNotify === true,
     commandPermissions: normalizeCommandPermissions(record?.commandPermissions),
     commandVisibility: normalizeCommandVisibility(record?.commandVisibility),
+    adminRoleId: normalizeAdminRoleId(record?.adminRoleId),
   }
 }
 
@@ -87,6 +92,7 @@ function defaultGuildSettings() {
     autoNotify: false,
     commandPermissions: { defaults: {}, overrides: {} },
     commandVisibility: {},
+    adminRoleId: null,
   }
 }
 
@@ -170,6 +176,25 @@ export function setCommandVisibility(guildId, commandName, value) {
   const commandVisibility = getCommandVisibilitySettings(guildId)
   commandVisibility[commandName] = value
   return updateGuildSettings(guildId, { commandVisibility })
+}
+
+export function getAdminRoleId(guildId) {
+  return getGuildSettings(guildId).adminRoleId
+}
+
+export function setAdminRoleId(guildId, roleId) {
+  return updateGuildSettings(guildId, { adminRoleId: normalizeAdminRoleId(roleId) })
+}
+
+// Resolves the role ID that grants the web dashboard's admin dashboard and
+// the slash-command admin bypass: a per-guild override set via /adminrole
+// takes priority, falling back to `fallback` (normally process.env.ADMIN_ROLE_ID)
+// so single-guild deployments keep working via .env alone. `fallback` is an
+// explicit parameter (not read from process.env internally) so callers that
+// already resolved their own default (e.g. botApi.js's buildBotApi option)
+// can inject it, keeping this function pure and easy to test.
+export function resolveAdminRoleId(guildId, fallback = process.env.ADMIN_ROLE_ID) {
+  return getAdminRoleId(guildId) ?? normalizeAdminRoleId(fallback)
 }
 
 /** Returns the current settings file path so tests can restore shared state. */

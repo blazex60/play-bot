@@ -160,6 +160,15 @@ test('checkCommandAllowed: admin role bypasses a deny setting', async () => {
   })
 })
 
+test('checkCommandAllowed: matrix-excluded commands ignore deny settings', async () => {
+  await withTempSettings(async () => {
+    await setDefaultCommandPermission('guild-1', 'adminrole', 'deny')
+    const interaction = fakeInteraction({ commandName: 'adminrole' })
+    assert.equal(checkCommandAllowed(interaction, undefined), true)
+    assert.equal(interaction.calls.reply.length, 0)
+  })
+})
+
 test('checkCommandAllowed: an explicit commandName overrides interaction.commandName (component interactions have none)', async () => {
   await withTempSettings(async () => {
     await setDefaultCommandPermission('guild-1', 'queue', 'deny')

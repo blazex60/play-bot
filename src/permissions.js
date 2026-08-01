@@ -20,6 +20,17 @@ const DEFAULT_VISIBILITY = {
   autoplay: 'personal',
 }
 
+// Commands that manage the admin-role gate itself must not appear in the
+// allow/deny or public/personal matrices — otherwise the delegated web-admin
+// role could deny `/adminrole` and lock Discord Administrators out of
+// changing or revoking that role. These commands enforce their own auth
+// (Discord Administrator) and always reply ephemerally.
+export const MATRIX_EXCLUDED_COMMANDS = new Set(['adminrole'])
+
+export function isMatrixManagedCommand(commandName) {
+  return Boolean(commandName) && !MATRIX_EXCLUDED_COMMANDS.has(commandName)
+}
+
 // Whether the member (has adminRoleId) should bypass a command's allow/deny
 // setting entirely, so an admin can never lock themselves out.
 function hasAdminRole(member, adminRoleId) {
@@ -40,6 +51,10 @@ function hasAdminRole(member, adminRoleId) {
 // interaction must resolve the live guild member themselves (mirroring
 // checkInVoiceChannel's own guild.members.fetch fallback below) and pass it.
 export function checkCommandAllowed(interaction, adminRoleId, commandName = interaction.commandName, guildId = interaction.guildId, member = interaction.member) {
+  // Privileged setup commands skip the matrix entirely; their handlers do
+  // their own Discord-Administrator check so a denied matrix entry can never
+  // strand server owners without a way to reconfigure the admin role.
+  if (MATRIX_EXCLUDED_COMMANDS.has(commandName)) return true
   if (hasAdminRole(member, adminRoleId)) return true
   const permission = resolveCommandPermission(guildId, interaction.user.id, commandName)
   if (permission === 'deny') {

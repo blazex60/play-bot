@@ -11,13 +11,34 @@ import {
   setUserCommandPermission,
   setCommandVisibility,
   resolveCommandPermission,
+  resolveAdminRoleId,
 } from './settings.js';
-import { getEffectiveCommandVisibility } from './permissions.js';
+import { getEffectiveCommandVisibility, isMatrixManagedCommand } from './permissions.js';
 
 const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 
 const DEFAULT_BOT_API_PORT = 8787;
 const LOOPBACK_HOST = '127.0.0.1';
+
+// Strip matrix-excluded commands (e.g. adminrole) from persisted permission
+// maps before handing them to the admin UI. New writes are already rejected by
+// requireKnownCommand, but older guild-settings.json rows can still contain
+// those keys — leaving them in the response would re-surface them in the panel
+// even though commands[] no longer lists them.
+function filterManagedCommandPermissions({ defaults, overrides }) {
+  const filteredDefaults = Object.fromEntries(
+    Object.entries(defaults).filter(([name]) => isMatrixManagedCommand(name))
+  );
+  const filteredOverrides = {};
+  for (const [userId, commandMap] of Object.entries(overrides)) {
+    if (!commandMap || typeof commandMap !== 'object') continue;
+    const filtered = Object.fromEntries(
+      Object.entries(commandMap).filter(([name]) => isMatrixManagedCommand(name))
+    );
+    if (Object.keys(filtered).length > 0) filteredOverrides[userId] = filtered;
+  }
+  return { defaults: filteredDefaults, overrides: filteredOverrides };
+}
 
 function parsePort(value) {
   const port = Number.parseInt(value ?? String(DEFAULT_BOT_API_PORT), 10);
@@ -58,11 +79,12 @@ async function fetchMember(client, guildId, userId) {
 }
 
 async function resolvePermission({ client, sessions, guildId, userId, adminRoleId }) {
+  const effectiveAdminRoleId = resolveAdminRoleId(guildId, adminRoleId);
   const { member } = await fetchMember(client, guildId, userId);
   return resolveWebPermission({
     member,
     session: sessions.get(guildId),
-    adminRoleId,
+    adminRoleId: effectiveAdminRoleId,
   });
 }
 
@@ -75,10 +97,11 @@ async function resolvePermission({ client, sessions, guildId, userId, adminRoleI
 // remembers to check. member can be passed in to reuse an already-fetched
 // one instead of triggering a second REST lookup for the same user.
 async function resolveCommandAllowed({ client, guildId, userId, command, adminRoleId, member }) {
+  const effectiveAdminRoleId = resolveAdminRoleId(guildId, adminRoleId);
   if (!member) {
     ({ member } = await fetchMember(client, guildId, userId));
   }
-  if (adminRoleId && member.roles.cache.has(adminRoleId)) return true;
+  if (effectiveAdminRoleId && member.roles.cache.has(effectiveAdminRoleId)) return true;
   return resolveCommandPermission(guildId, userId, command) !== 'deny';
 }
 
@@ -163,6 +186,10 @@ export function buildBotApi({
 } = {}) {
   if (!client) throw new Error('buildBotApi requires client');
   if (!sessions) throw new Error('buildBotApi requires sessions');
+
+  // Drop privileged setup commands (e.g. adminrole) so they never appear in
+  // the permission/visibility admin UI and cannot be denied via the matrix.
+  const managedCommandNames = commandNames.filter(isMatrixManagedCommand);
 
   const app = Fastify({ logger: false });
 
@@ -317,7 +344,7 @@ export function buildBotApi({
   });
 
   function requireKnownCommand(command, reply) {
-    if (typeof command !== 'string' || !commandNames.includes(command)) {
+    if (typeof command !== 'string' || !managedCommandNames.includes(command)) {
       reply.code(400).send({ error: 'unknown_command' });
       return false;
     }
@@ -329,8 +356,8 @@ export function buildBotApi({
     if (!adminUserId) return;
     const guildId = request.params.guildId;
     if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
-    const { defaults, overrides } = getCommandPermissions(guildId);
-    return { commands: commandNames, defaults, overrides };
+    const { defaults, overrides } = filterManagedCommandPermissions(getCommandPermissions(guildId));
+    return { commands: managedCommandNames, defaults, overrides };
   });
 
   app.post('/admin/:guildId/permissions/default', async (request, reply) => {
@@ -373,7 +400,7 @@ export function buildBotApi({
     const guildId = request.params.guildId;
     if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
     const visibility = Object.fromEntries(
-      commandNames.map((name) => [name, getEffectiveCommandVisibility(guildId, name)])
+      managedCommandNames.map((name) => [name, getEffectiveCommandVisibility(guildId, name)])
     );
     return visibility;
   });

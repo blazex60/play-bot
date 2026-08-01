@@ -40,9 +40,12 @@ test('help: normalizes the detailed-help URL and uses the configured visibility'
 
       assert.equal(interaction.replies.length, 1)
       assert.equal(interaction.replies[0].flags, MessageFlags.Ephemeral)
-      const detailField = interaction.replies[0].embeds[0].data.fields.find((field) => field.name === '詳細なヘルプ')
+      const fields = interaction.replies[0].embeds[0].data.fields
+      const detailField = fields.find((field) => field.name === '詳細なヘルプ')
       assert.match(detailField.value, /https:\/\/example\.com\/help/)
       assert.doesNotMatch(detailField.value, /example\.com\/\/help/)
+      const settingsField = fields.find((field) => field.name === '設定')
+      assert.match(settingsField.value, /`\/adminrole`/)
     } finally {
       if (previousBaseUrl === undefined) {
         delete process.env.PUBLIC_BASE_URL

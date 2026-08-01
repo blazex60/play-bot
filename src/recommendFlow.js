@@ -3,6 +3,7 @@ import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
 import { checkCommandAllowed, checkInVoiceChannel } from './permissions.js'
 import { createTrack } from './queue.js'
 import { fmtDuration } from './format.js'
+import { resolveAdminRoleId } from './settings.js'
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
 export const RECOMMEND_SHOW_CUSTOM_ID = 'recommend-show'
@@ -269,7 +270,7 @@ export async function handleShowRecommendations(interaction, sessions, recommend
   if (!sessions.get(interaction.guildId)) {
     return interaction.reply({ content: '❌ セッションが終了しています', flags: MessageFlags.Ephemeral })
   }
-  if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'play', interaction.guildId, interaction.member)) {
+  if (!checkCommandAllowed(interaction, resolveAdminRoleId(interaction.guildId), 'play', interaction.guildId, interaction.member)) {
     return
   }
 
@@ -372,7 +373,7 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore,
     // admin's denial is bypassed entirely through recommendation picks,
     // which dispatch here instead of through index.js's chat-input-command
     // guard.
-    if (!checkCommandAllowed(interaction, process.env.ADMIN_ROLE_ID, 'play', entry.guildId, interaction.member)) {
+    if (!checkCommandAllowed(interaction, resolveAdminRoleId(entry.guildId), 'play', entry.guildId, interaction.member)) {
       if (!isSessionStale() && !entry.expired) {
         pendingStore.set(interaction.message.id, entry)
       }
