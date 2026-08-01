@@ -20,6 +20,26 @@ const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 const DEFAULT_BOT_API_PORT = 8787;
 const LOOPBACK_HOST = '127.0.0.1';
 
+// Strip matrix-excluded commands (e.g. adminrole) from persisted permission
+// maps before handing them to the admin UI. New writes are already rejected by
+// requireKnownCommand, but older guild-settings.json rows can still contain
+// those keys — leaving them in the response would re-surface them in the panel
+// even though commands[] no longer lists them.
+function filterManagedCommandPermissions({ defaults, overrides }) {
+  const filteredDefaults = Object.fromEntries(
+    Object.entries(defaults).filter(([name]) => isMatrixManagedCommand(name))
+  );
+  const filteredOverrides = {};
+  for (const [userId, commandMap] of Object.entries(overrides)) {
+    if (!commandMap || typeof commandMap !== 'object') continue;
+    const filtered = Object.fromEntries(
+      Object.entries(commandMap).filter(([name]) => isMatrixManagedCommand(name))
+    );
+    if (Object.keys(filtered).length > 0) filteredOverrides[userId] = filtered;
+  }
+  return { defaults: filteredDefaults, overrides: filteredOverrides };
+}
+
 function parsePort(value) {
   const port = Number.parseInt(value ?? String(DEFAULT_BOT_API_PORT), 10);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -336,7 +356,7 @@ export function buildBotApi({
     if (!adminUserId) return;
     const guildId = request.params.guildId;
     if (!(await requireAdmin({ client, sessions, guildId, userId: adminUserId, adminRoleId, reply }))) return;
-    const { defaults, overrides } = getCommandPermissions(guildId);
+    const { defaults, overrides } = filterManagedCommandPermissions(getCommandPermissions(guildId));
     return { commands: managedCommandNames, defaults, overrides };
   });
 
