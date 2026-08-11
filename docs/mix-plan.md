@@ -104,25 +104,11 @@ Web process 側（`src/web/server/services/gemini.js`）一択。`webClient.js` 
 
 ## 7. フェーズ
 
-### Phase 0 — 等価性の物差し ✅ 進行中
+### Phase 0 — 等価性の物差し ✅ 完了
 
-- Idle 非依存の受け入れテストを `src/player.acceptance.test.js` に切り出し
-- `MIXER_ENABLED`（デフォルト false）を `.env.example` に追加
-- 成果物: 新旧どちらの実装でも通るべきテスト一覧（本ファイル + テストファイル）
+### Phase 1 — PCM ミキサー基盤（クロスフェード0秒） ✅ 完了
 
-#### 受け入れテスト一覧（`src/player.acceptance.test.js`）
-
-| カテゴリ | 内容 |
-|---|---|
-| 再生ポリシー | `isShortTrack` / `shouldReconnectRetry` の単体検証 |
-| エラー時 advance | 再生不能曲の自動スキップ、`forceAdvance` による TRACK ループ脱出 |
-| ハンドオフ競合 | ハンドオフ中のエラーが1回だけ advance される |
-| キュー枯渇 | `handleQueueExhausted` true/false/throw の3パターン |
-| ループ | QUEUE ループで先頭に戻る |
-| 短尺曲 | 5秒未満の曲は再接続リトライしない |
-| 記録 | `recordPlay` / `onTrackStart` の有無と失敗耐性 |
-
-### Phase 1 — PCM ミキサー基盤（クロスフェード0秒）
+`MIXER_ENABLED=true` で有効化。実装: `pcmSource.js` / `mixStream.js` / `fade.js`（スタブ）、`GuildPlayer` mixer 駆動、`trackend` ハンドオフ、8秒 underrun ガード。
 
 ### Phase 2 — クロスフェード
 
