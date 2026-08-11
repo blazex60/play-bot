@@ -13,6 +13,9 @@ import {
   prefetchTrack,
 } from './normalize.js';
 import { shouldReconnectRetry } from './player/playbackPolicy.js';
+import { isMixerEnabled } from './audio/config.js';
+import { MixStream } from './audio/mixStream.js';
+import { createStreamSource, createFileSource } from './audio/pcmSource.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
@@ -47,6 +50,11 @@ export class GuildPlayer {
   #handlingAfterPlayback = 0;
   #pendingAfter = false;
   #playbackCount = 0;
+  #mixerEnabled;
+  #mixStream = null;
+  #mixerResource = null;
+  #mixerStarted = false;
+  #createPcmSourceFn;
 
   constructor({
     guildId,
@@ -60,6 +68,8 @@ export class GuildPlayer {
     audioPlayer = createAudioPlayer(),
     createAudioResourceFn = createAudioResource,
     resolveAudioStreamFn = resolveAudioStream,
+    createPcmSourceFn = null,
+    mixerEnabled = isMixerEnabled(),
   }) {
     this.#guildId = guildId;
     this.#connection = connection;
@@ -72,10 +82,33 @@ export class GuildPlayer {
     this.#audioPlayer = audioPlayer;
     this.#createAudioResource = createAudioResourceFn;
     this.#resolveAudioStream = resolveAudioStreamFn;
+    this.#mixerEnabled = mixerEnabled;
+    this.#createPcmSourceFn = createPcmSourceFn;
 
-    this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
-      this.#advanceAfterPlayback();
-    });
+    if (this.#mixerEnabled) {
+      this.#mixStream = new MixStream();
+      this.#mixerResource = this.#createAudioResource(this.#mixStream, {
+        inputType: StreamType.Raw,
+      });
+      this.#mixStream.on('trackend', () => {
+        this.#advanceAfterPlayback();
+      });
+      this.#mixStream.on('sourceerror', (err) => {
+        console.error('[GuildPlayer] mix source error:', err.message);
+        this.#hadError = true;
+        this.#mixStream.dropCurrent();
+      });
+      this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
+        console.warn('[GuildPlayer] unexpected Idle in mixer mode, recovering');
+        if (this.#mixerResource && this.#mixerStarted) {
+          this.#audioPlayer.play(this.#mixerResource);
+        }
+      });
+    } else {
+      this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
+        this.#advanceAfterPlayback();
+      });
+    }
 
     this.#audioPlayer.on('stateChange', (oldState, newState) => {
       if (newState.status === AudioPlayerStatus.Playing) {
@@ -87,6 +120,11 @@ export class GuildPlayer {
       console.error('[GuildPlayer] audioPlayer error:', err);
       this.#hadError = true;
       const failedTrack = this.#queue.current;
+
+      if (this.#mixerEnabled) {
+        this.#mixStream?.dropCurrent();
+        return;
+      }
 
       // A stream error does not reliably produce an Idle event (for example,
       // when yt-dlp cannot read a private or deleted video). Stop explicitly
@@ -113,6 +151,11 @@ export class GuildPlayer {
     const track = this.#queue.current;
     if (!track) {
       await this.#onDisconnect();
+      return;
+    }
+
+    if (this.#mixerEnabled) {
+      await this.#playNextMixer(track);
       return;
     }
 
@@ -153,6 +196,58 @@ export class GuildPlayer {
     this.#onTrackStart?.(track.videoId);
   }
 
+  async #playNextMixer(track) {
+    let source;
+    try {
+      source = await this.#createPcmSource(track);
+    } catch (err) {
+      console.warn(`[GuildPlayer] pcm source failed for ${track.title}:`, err.message);
+      this.#hadError = true;
+      this.#advanceAfterPlayback();
+      return;
+    }
+
+    if (this.#queue.current !== track) {
+      source.destroy();
+      if (!this.#queue.current) await this.#onDisconnect();
+      return;
+    }
+    if (this.#forceSkip) {
+      source.destroy();
+      this.#forceSkip = false;
+      const nextTrack = this.#queue.next({ forceAdvance: true });
+      if (nextTrack === null) {
+        await this.#onDisconnect();
+      } else {
+        await this.playNext();
+      }
+      return;
+    }
+
+    this.#playbackStart = Date.now();
+    this.#lastActiveAt = Date.now();
+    this.#resetWatchdog();
+    this.#playbackCount += 1;
+
+    if (!this.#mixerStarted) {
+      this.#audioPlayer.play(this.#mixerResource);
+      this.#mixerStarted = true;
+    }
+
+    this.#mixStream.setCurrent(source);
+    this.#prefetchUpcoming();
+    this.#recordPlay(track);
+    this.#onTrackStart?.(track.videoId);
+  }
+
+  get mixStream() {
+    return this.#mixStream;
+  }
+
+  get positionSec() {
+    return this.#mixStream?.positionSec ?? 0;
+  }
+
   #recordPlay(track) {
     if (!this.#recordPlayFn || !track.requestedById) return;
     this.#recordPlayFn({
@@ -182,16 +277,26 @@ export class GuildPlayer {
 
   async skip() {
     this.#forceSkip = true;
+    if (this.#mixerEnabled) {
+      this.#mixStream?.dropCurrent();
+      return;
+    }
     this.#audioPlayer.stop();
   }
 
   async stop() {
     this.#queue.clear();
-    this.#audioPlayer.stop();
-    this.#currentResource = null;
     this.#clearWatchdog();
     await this.#cleanupCurrentTempFile();
     this.#discardPrefetch();
+    if (this.#mixerEnabled) {
+      this.#mixStream?.endMixer();
+      this.#mixerStarted = false;
+      this.#audioPlayer.stop();
+      return;
+    }
+    this.#audioPlayer.stop();
+    this.#currentResource = null;
   }
 
   #advanceAfterPlayback() {
@@ -282,6 +387,32 @@ export class GuildPlayer {
       return false;
     } finally {
       clearTimeout(timeoutHandle);
+    }
+  }
+
+  async #createPcmSource(track) {
+    if (this.#createPcmSourceFn) {
+      return this.#createPcmSourceFn(track);
+    }
+
+    this.#currentTempFile = null;
+
+    if (!getGuildSettings(this.#guildId).normalize || !isNormalizeDurationAllowed(track)) {
+      this.#discardPrefetch();
+      return createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
+    }
+
+    try {
+      const prefetched = await this.#getPrefetchedOrFetch(track);
+      console.info(
+        `[normalize] applying: ${track.title} ` +
+        `(${prefetched.measured.measured_I} LUFS -> -16 LUFS)`
+      );
+      this.#currentTempFile = prefetched.filePath;
+      return createFileSource(prefetched.filePath, { measured: prefetched.measured });
+    } catch (err) {
+      console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err.message);
+      return createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
     }
   }
 
@@ -385,6 +516,19 @@ export class GuildPlayer {
 
   #resetWatchdog() {
     this.#clearWatchdog();
+    if (this.#mixerEnabled) {
+      this.#watchdogTimer = setInterval(() => {
+        const source = this.#mixStream?.currentSource;
+        if (!source) return;
+        if (Date.now() - source.lastDataAt > WATCHDOG_STALL_THRESHOLD) {
+          console.warn('[GuildPlayer] watchdog: mixer stall detected');
+          this.#hadError = true;
+          this.#mixStream.dropCurrent();
+        }
+      }, WATCHDOG_INTERVAL);
+      return;
+    }
+
     let lastPlaybackDuration = 0;
     this.#watchdogTimer = setInterval(() => {
       const state = this.#audioPlayer.state;

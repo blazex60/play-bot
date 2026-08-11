@@ -5,6 +5,8 @@ import { LoopMode, createTrack } from './queue.js';
 import { isShortTrack, shouldReconnectRetry } from './player/playbackPolicy.js';
 import { triggerTrackEnd } from './player/playbackDrive.js';
 import { makeAudioPlayer, makePlayer, nextTurn } from './player/test-helpers.js';
+import { FRAME_BYTES } from './audio/fade.js';
+import { PcmSource } from './audio/pcmSource.js';
 
 test('playbackPolicy: isShortTrack is true when duration is under 5 seconds', () => {
   assert.equal(isShortTrack({ duration: 4 }), true);
@@ -277,6 +279,46 @@ test('acceptance: rejecting recordPlayFn does not break playback', async () => {
   await player.playNext();
   await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(audioPlayer.state.status, AudioPlayerStatus.Playing);
+
+  await player.stop();
+});
+
+test('acceptance (mixer): gapless playback advances through trackend', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let createCount = 0;
+  const { player, audioPlayer, queue } = makePlayer({
+    mixerEnabled: true,
+    trackDuration: 3,
+    createPcmSourceFn: async () => {
+      createCount += 1;
+      return PcmSource.fromBuffers([frame]);
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3 }));
+
+  await player.playNext();
+  assert.equal(audioPlayer.state.status, AudioPlayerStatus.Playing);
+  triggerTrackEnd({ mixStream: player.mixStream });
+  await nextTurn();
+  assert.equal(queue.current.title, 'Track B');
+  assert.equal(createCount, 2);
+
+  await player.stop();
+});
+
+test('acceptance (mixer): skip advances to the next track', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const { player, queue } = makePlayer({
+    mixerEnabled: true,
+    trackDuration: 60,
+    createPcmSourceFn: async () => PcmSource.fromBuffers([frame, frame, frame]),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60 }));
+
+  await player.playNext();
+  await player.skip();
+  await nextTurn();
+  assert.equal(queue.current.title, 'Track B');
 
   await player.stop();
 });

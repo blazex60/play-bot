@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { AudioPlayerStatus, StreamType } from '@discordjs/voice';
 import { GuildPlayer } from '../player.js';
 import { GuildQueue, createTrack } from '../queue.js';
+import { PcmSource } from '../audio/pcmSource.js';
+import { FRAME_BYTES } from '../audio/fade.js';
 
 export function nextTurn() {
   return new Promise(resolve => setImmediate(resolve));
@@ -40,6 +42,9 @@ export function makePlayer({
   recordPlayFn,
   onTrackStart,
   track,
+  mixerEnabled = false,
+  createPcmSourceFn = null,
+  framesPerTrack = 2,
 } = {}) {
   const queue = new GuildQueue();
   queue.add(track ?? createTrack({
@@ -49,6 +54,11 @@ export function makePlayer({
   }));
 
   const resources = [];
+  const silentFrame = Buffer.alloc(FRAME_BYTES);
+  const resolvedCreatePcmSourceFn = createPcmSourceFn ?? (async () => {
+    return PcmSource.fromBuffers(Array.from({ length: framesPerTrack }, () => silentFrame));
+  });
+
   const player = new GuildPlayer({
     guildId: 'guild-1',
     queue,
@@ -56,6 +66,8 @@ export function makePlayer({
     handleQueueExhausted,
     recordPlayFn,
     onTrackStart,
+    mixerEnabled,
+    createPcmSourceFn: mixerEnabled ? resolvedCreatePcmSourceFn : null,
     connection: {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer);
