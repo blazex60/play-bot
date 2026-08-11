@@ -1,18 +1,25 @@
 # MIX プレイリスト機能 実装プラン
 
 対象リポジトリ: `blazex60/play-bot`
+配置先: `docs/mix-plan.md`
+実装環境: Claude Code / Cursor
+
+---
+
+## 0. この文書の使い方
+
+各 Phase の「完了条件」は、コーディングエージェントに渡す際の受け入れ基準として使う。
+未決事項（12章）に残っている項目は、**推測で埋めずに必ず確認すること**。
 
 ---
 
 ## 1. 目的
 
-以下の3機能を追加する。
-
 | 機能 | 内容 |
 |---|---|
-| 自然なクロスフェード | 曲の性質に応じて重畳長を変えながら曲間を繋ぐ |
-| 曲順の最適化 | キュー内の曲順を Gemini で並べ替える |
-| リクエストに応じた自動プレイリスト作成 | ユーザーのリクエスト文からプレイリストを生成する |
+| 自然なクロスフェード | DJ 的な「つなぎ目を感じない」接続を目指す |
+| 曲順の最適化 | BPM・キー・エネルギーの隣接コストを最小化する経路探索 |
+| 自動プレイリスト作成 | ユーザーのリクエスト文からプレイリストを生成する |
 
 ---
 
@@ -20,22 +27,15 @@
 
 | 論点 | 決定 |
 |---|---|
-| クロスフェードの実現方式 | 連続 PCM ミキサーへの再設計（ffmpeg `acrossfade` による簡易実装は不採用） |
+| クロスフェードの実現方式 | 連続 PCM ミキサーへの再設計（ffmpeg `acrossfade` は不採用） |
 | ミキサーの適用範囲 | 全再生経路をミキサーに統一する。移行期間中のみ `MIXER_ENABLED` フラグで旧経路を残す |
 | 「LLM・外部 AI API 不使用」の設計方針 | 撤回する。Gemini を採用する |
 | 既存 `autoplay.js` との関係 | 置き換えず、MIX は別機能として併存させる |
-| normalize との関係 | MIX（クロスフェード）時は normalize を強制 ON にする |
+| normalize との関係 | MIX 時は normalize を強制 ON にする |
 | クロスフェード長 | 固定値ではなく、曲末の解析結果から曲ごとに自動決定する |
-
-### 未決だった項目のデフォルト
-
-| 項目 | 採用値 |
-|---|---|
-| スラッシュコマンド | `/mix order`（曲順最適化）、`/mix create`（自動生成） |
-| Gemini モデル | `gemini-2.5-pro`（`.env` の `GEMINI_MODEL` で上書き可）。キー未設定時は機能を無効化して再生を止めない |
-| 曲末解析キャッシュ | migration `006` で新テーブル `track_analysis`（`video_id` PK） |
-| 連続 underrun 許容 | 初期値 **8 秒**（定数化して実測後に調整） |
-| RMS 包絡取得 | Phase 2 着手時に loudnorm 同一パス検証。不可なら **2 パス**（loudnorm + `astats`/`silencedetect`）に落とす |
+| つなぎの目標水準 | ベーススワップ・フレーズ整列/位相合わせ・テンポ合わせ・ハーモニックミキシングまで狙う |
+| 主な対象ジャンル | **J-POP / ボーカル中心** |
+| 曲順最適化の主体 | BPM/キーの経路探索が主。Gemini は補助（雰囲気・選曲の妥当性） |
 
 ---
 
@@ -43,88 +43,262 @@
 
 現在の `GuildPlayer` は「1曲 = 1 AudioResource」で、`AudioPlayerStatus.Idle` を受けてから次曲の resource を組み立てる（`src/player.js` の `#handleAfter`）。`@discordjs/voice` の AudioPlayer は同時に1つの resource しか再生できないため、**前の曲の終端と次の曲の先頭が重なる区間を作れない**。
 
-したがってクロスフェードには、
-
-- セッション中ずっと生きる単一の `Readable` を `StreamType.Raw` で1度だけ resource 化し、
-- その中に自前のミキサーが PCM フレームを書き込み、
-- 曲送りを Idle イベントではなくミキサーが駆動する
-
-という構造が必要になる。
+したがって、セッション中ずっと生きる単一の `Readable` を `StreamType.Raw` で1度だけ resource 化し、その中に自前のミキサーが PCM フレームを書き込み、曲送りを Idle ではなくミキサーが駆動する構造が必要になる。
 
 ### コスト面の前提
 
-「ミキサーを挟むと ffmpeg が1本増える」は**成立しない**。現行の非 normalize 経路は `StreamType.Arbitrary` のため、`@discordjs/voice` が内部で prism-media 経由の ffmpeg トランスコーダを起動している。自前で ffmpeg → s16le に変換すれば `StreamType.Raw` になり、voice 側の内部トランスコードが不要になる。プロセス本数は変わらず、CPU コストはほぼ中立。
+「ミキサーを挟むと ffmpeg が1本増える」は**成立しない**。現行の非 normalize 経路は `StreamType.Arbitrary` のため、`@discordjs/voice` が内部で prism-media 経由の ffmpeg トランスコーダを起動している。自前で s16le に変換すれば `StreamType.Raw` になり、voice 側の内部トランスコードが不要になる。プロセス本数は変わらず、CPU コストはほぼ中立。
 
-JS 側のサンプル加算も、1曲だけ流れている間は加算せずバッファをそのまま push する最適化が可能。実コストが乗るのはクロスフェード中のみ。
+JS 側のサンプル加算も、1曲だけ流れている間は加算せずバッファをそのまま push する最適化が可能。実コストが乗るのは重畳区間のみ。
 
 ---
 
 ## 4. 目標アーキテクチャ
 
-### 4.1 新規モジュール
+### 4.1 モジュール一覧
 
-| モジュール | 役割 |
-|---|---|
-| `src/audio/pcmSource.js` | 1曲 = 1 PCM ソース。ffmpeg を s16le/48000/2ch で吐かせる |
-| `src/audio/mixStream.js` | `Readable` 派生。20ms = 3840 バイトのフレームを生成し、`current` と `incoming` を加算して push |
-| `src/audio/fade.js` | フェードカーブとゲイン計算。純粋関数 |
-| `src/audio/trackAnalysis.js` | 曲末の形状解析と推奨クロスフェード長の算出（Phase 2） |
-| `src/web/server/services/gemini.js` | Gemini API クライアント（Phase 3） |
+| モジュール | 役割 | Phase |
+|---|---|---|
+| `src/audio/pcmSource.js` | 1曲 = 1 PCM ソース。`read(bytes)` / `available` / `ended` / `lastDataAt` / `destroy()` | 1 ✅ |
+| `src/audio/mixStream.js` | `Readable` 派生。20ms フレームを生成し `current` と `incoming` を加算 | 1 ✅（重畳は Phase 2） |
+| `src/audio/fade.js` | フェードカーブとゲイン計算。純粋関数 | 1(stub) ✅ / 2 |
+| `src/audio/eq.js` | biquad（highpass / lowshelf）。ベーススワップ用 | 2 |
+| `src/audio/trackAnalysis.js` | ボーカル区間・拍グリッド・キー・曲末形状の解析 | 1.5 / 2 |
+| `src/audio/transition.js` | 2曲の解析結果から重畳区間と各種パラメータを決定 | 2 |
+| `src/mix/ordering.js` | BPM/キー/エネルギーによる曲順の経路探索 | 3 |
+| `src/web/server/services/gemini.js` | Gemini API クライアント | 3 |
 
-### 4.2 GuildPlayer の変更
+### 4.2 PcmSource
+
+- `createFileSource(filePath, { measured })` — DL 済みファイルに loudnorm を適用して s16le/48000/2ch を出力
+- `createStreamSource(track)` — yt-dlp stdout → ffmpeg stdin → 同
+
+内部で 1〜2 秒分を先読みバッファし、ffmpeg stdout に backpressure をかける。
+
+### 4.3 MixStream
+
+`_read()` がバックプレッシャーの起点になる。AudioPlayer が 20ms ごとにフレームを引くため、ミキサー側に独自のタイマーは不要。
+
+- `FRAME_BYTES = 3840`（20ms / 48000Hz / 2ch / s16）
+- `_read()` で `current` から1フレーム取り出して push。取れなければ pending にし、ソースの `data` で再開
+- emit: `trackend` / `underrun` / `sourceerror`
+- 曲ごとの再生位置（consumed bytes ÷ 192000）を保持
+
+### 4.4 GuildPlayer の変更
 
 - コンストラクタで MixStream を1回だけ resource 化して `play()`。以降 AudioPlayer は Playing 固定
 - `playNext()` → `#loadSource(track)`（normalize prefetch → PcmSource 生成 → `mix.setCurrent()`）
 - `trackend` イベントが従来の `#handleAfter` を駆動
 - `skip()` は `mix.dropCurrent()`
-- `AudioPlayerStatus.Idle` が発火したら**異常**として扱う
+- `AudioPlayerStatus.Idle` が発火したら**異常**として扱う。ログ出力の上、resource を再生成して復旧
 
-### 4.3 必須ガード
+### 4.5 Idle が来なくなることで壊れる箇所
 
-underrun 時に無音フレームを push する設計のため、連続 underrun が **8 秒**続いたら強制的にエラー扱いにする。
+| 箇所 | 影響と対応 |
+|---|---|
+| watchdog | `playbackDuration` はセッション累計で単調増加し続け、現行のストール検知が永久に発火しない。`source.lastDataAt` と連続 underrun 時間で判定する |
+| `/nowplaying` の経過時間 | 同上。MixStream の曲ごと再生位置を使う |
+| 曲送り | `trackend` 駆動に変更 |
+| `RECONNECT_GRACE`（5秒未満の再試行） | ソース生成失敗の検知に置き換える |
+| `#forceSkip` / `#handlingAfter` / `#pendingAfter` | Idle の非同期性に起因する競合処理。mixer 駆動では大幅に整理できる |
+| `stop()` / `#onDisconnect` | MixStream を end するか無音を流し続けるかを決める。VC 切断条件も見直す |
+| `#tryHandleQueueExhausted` | クロスフェードには次曲が終了前に確定している必要があるため、呼び出しを前倒しする |
+| `player.test.js` | Idle 前提のテストはほぼ書き直し |
 
----
+### 4.6 必須ガード
 
-## 5. 自然なクロスフェードの要件
-
-1. 曲末の実際の音楽終端を取る（`silencedetect` + RMS 包絡）
-2. ラウドネスを揃える（normalize 強制 ON）
-3. クリップ対策（重畳区間に -3dB マージン or ソフトリミッタ）
-4. 形状別フェード長: 単調減衰 1–2s / ぶつ切り 4–6s / 無音・拍手は音楽終端前倒し。上限は曲長 10%
-
----
-
-## 6. Gemini の配置
-
-Web process 側（`src/web/server/services/gemini.js`）一択。`webClient.js` 経由で `optimizeOrder` / `generatePlaylist`。
-
-防御: タイムアウト・リトライ・レート制限、失敗時は `null`、zod 検証、曲順は入力の順列であることを検証。
+underrun 時に無音フレームを push する設計のため、**無音のまま永久に再生し続ける状態**が作れてしまう。連続 underrun が一定秒数続いたら強制的にエラー扱いにすること。これを忘れると「Bot は接続しているのに無音」という最もデバッグしづらい障害になる。
 
 ---
 
-## 7. フェーズ
+## 5. J-POP における「自然なつなぎ」の要件
 
-### Phase 0 — 等価性の物差し ✅ 完了
+### 5.1 支配的な問題はビートではなく歌
 
-### Phase 1 — PCM ミキサー基盤（クロスフェード0秒） ✅ 完了
+2つのキックが 20ms ずれても「なんとなく変」程度だが、**2人の歌が同時に鳴ると誰でも即座に破綻と分かる**。DJ がボーカル曲を繋ぐときに実際にやっているのは、ビートマッチよりも「歌のない区間で繋ぐ」ことである。
 
-`MIXER_ENABLED=true` で有効化。実装: `pcmSource.js` / `mixStream.js` / `fade.js`（スタブ）、`GuildPlayer` mixer 駆動、`trackend` ハンドオフ、8秒 underrun ガード。
+したがって J-POP では、**ボーカル区間の検出が拍検出より優先される**。
 
-### Phase 2 — クロスフェード
+### 5.2 J-POP 固有の制約
 
-### Phase 3 — Gemini 導入 + 曲順最適化（着手前に Phase 5 法務）
+- **アウトロが短い、または無い。** ぶつ切りで終わる曲、ラスサビ直後に終わる曲が多く、重ねられる窓が 2〜4小節しか取れないことが珍しくない。32小節かけて溶かす EDM 的なミックスは物理的に不可能
+- **転調する。** 特にラスサビの半音上げは定番。曲全体を単一キーとして扱う Camelot 判定は信頼できない。`{ headKey, tailKey }` の2つを保持し、前曲の `tailKey` と次曲の `headKey` を突き合わせる
+
+### 5.3 成果物の期待値
+
+**「32小節かけて溶ける DJ ミックス」ではなく、「間奏や無歌唱部で 2〜4小節、低域を渡しながら拍を揃えて重ねる」**という形になる。J-POP でそれ以上をやると不自然になるため、これが正解。
+
+### 5.4 優先順位（ジャンルに合わせて改訂済み）
+
+| 優先 | 項目 | 内容 |
+|---|---|---|
+| A | **ボーカル区間の検出** | 繋ぎ位置を決める主要制約。新規・最優先 |
+| B | **ベーススワップ** | 重畳区間で出ていく曲に highpass（〜120Hz）、入る曲に lowshelf。低コスト高効果 |
+| C | **フレーズ整列・位相合わせ** | A で見つけた窓の中で小節境界とキックを揃える。現代 J-POP は DAW 制作で BPM が安定しており拍検出精度は高い。危険なのはバラード・ライブ音源・生演奏 |
+| D | **テンポ合わせ** | **優先度低。** 重畳が 2〜4小節なら数%のテンポ差は顕在化しない。長く重ねられる曲に限った贅沢機能。事前レンダリングするためリアルタイム負荷はゼロ |
+| E | **ハーモニック判定** | 曲全体ではなく重畳区間のキーを推定（`headKey` / `tailKey`） |
+
+### 5.5 共通の音響処理
+
+- **クリップ対策** — -16 LUFS の2本を加算すると瞬間的に +6dB 近く跳ねる。loudnorm の `TP=-1.5` では足りないため、重畳区間に -3dB マージンを入れるか、ミックス後にソフトリミッタを噛ませる
+- **フェードカーブ** — equal-power（`cos`/`sin`）を無相関素材に、linear を同一曲ループに使い分ける
+
+---
+
+## 6. 曲末解析による重畳長の決定
+
+prefetch 時に末尾の RMS 包絡を 100ms 刻みで取得し、形状で分類する。
+
+| 終端の形状 | 重畳長 |
+|---|---|
+| 単調減衰（フェードアウト済み） | 1〜2 秒 |
+| 急に切れる（ぶつ切り） | 4〜6 秒 |
+| 無音・拍手が続く | 音楽終端まで前倒しして重ねる |
+
+上限は曲長の 10% 程度でクランプ。ただし 5.1 により、**ボーカル区間と衝突する場合はボーカル側の制約を優先する**。
+
+---
+
+## 7. normalize 強制 ON の帰結
+
+- `MAX_NORMALIZE_DURATION_SEC = 1800` があるため、**30分超の曲はクロスフェード対象外**。仕様として `/help` とドキュメントに明記する
+- 現行の prefetch は「次の1曲だけ」。解析が重くなるぶん前倒しが必要で、キューが1曲しかない場面では間に合わない。**間に合わない場合は単純フェード、さらに間に合わなければギャップレス接続へ、と二段階でフォールバックする**
+
+---
+
+## 8. 曲順最適化と Gemini
+
+「Bot process は SQLite を開かない」という既存の境界に従い、Gemini クライアントは **Web process 側（`src/web/server/services/gemini.js`）**に置く。Bot は既に `webClient.js` 経由で履歴を取得しているため、同じ経路に追加する。
+
+### 役割分担
+
+解析で BPM・キー・エネルギーが取れるため、**技術的な曲順はアルゴリズムが決める**。
+
+- `src/mix/ordering.js` — 隣接コスト（BPM 差、`tailKey`→`headKey` の Camelot 距離、エネルギー段差）を最小化する経路探索
+- Gemini — 雰囲気・文脈・選曲の妥当性の評価、およびリクエスト文からの曲名生成
+
+なお、**BPM の近い曲を隣に置けばテンポ合わせ（D）は不要になる**。曲順最適化と繋ぎは同じ問題の裏表である。
+
+### Gemini 呼び出しの必須の防御
+
+- タイムアウト・リトライ・レート制限を実装し、**失敗時は必ず `null` を返して再生を止めない**
+- 出力は zod（既存依存）でスキーマ検証する
+- 曲順に関しては、**結果が入力の順列であることを検証**し、違反したら元順序にフォールバックする。LLM は曲を落としたり重複させたりする
+
+---
+
+## 9. フェーズ
+
+### Phase 0 — 等価性の物差しを作る ✅ 完了（PR #19）
+
+- Idle 非依存の受け入れテストを `src/player.acceptance.test.js` に切り出し
+- `MIXER_ENABLED`（デフォルト false）を `.env.example` に追加
+- `playbackPolicy.js` / `playbackDrive.js`（`triggerTrackEnd`）を追加
+
+### Phase 1 — PCM ミキサー基盤（クロスフェード0秒） ✅ 完了（PR #19）
+
+ギャップレス接続のみ。`MIXER_ENABLED=true` で有効化。
+
+- `pcmSource.js` / `mixStream.js` / `fade.js`（スタブ）
+- `player.js` の mixer 駆動パス（`trackend`、Idle 異常復旧、mixer watchdog）
+- 連続 underrun ガード（実装値 8s — 12章の実測確認待ち）
+
+**完了条件**: Phase 0 のテスト全通過。実機で 10曲連続再生、skip 連打、stop → 再生、両ループモード、再生失敗曲を含むキューが正常。CPU 使用率が旧経路と同等。
+
+> 注: ユニット/受け入れテストは通過済み。実機 A/B（10曲連続・CPU 比較）は本番投入時の確認項目として残る。
+
+### Phase 1.5 — 解析スパイク（新規・Phase 2 の前提） ✅ 完了（初回）
+
+公開 CC 音源 + 合成コントロールで計測。詳細は [`docs/mix-analysis-spike.md`](mix-analysis-spike.md)。
+
+**採用（暫定）**: BPM=`aubiotrack`、キー=`essentia.js`、loudnorm+silence+tail=ffmpeg 1-pass。  
+**不採用**: センター成分のみのボーカル検出。Demucs は保留。  
+**残作業**: 実 J-POP での再キャリブレーション、PitchMelodia 評価、Docker への aubio/essentia 追加。
+
+### Phase 2 — クロスフェード本実装
+
+Phase 1.5 の結論に従って実装する。優先順位は 5.4 の A → B → C → E → D。
+
+- `trackAnalysis.js` — ボーカル区間 / 拍グリッド / `headKey` `tailKey` / 曲末形状 / エネルギーを返す
+- `eq.js` — ベーススワップ用 biquad
+- `fade.js` — カーブ・-3dB マージン・ソフトリミッタ
+- `transition.js` — 2曲の解析結果から重畳区間・重畳長・フェードカーブ・EQ カーブを決定
+- `mixStream.js` — 重畳区間の実装。`current.remainingSec <= overlapSec` で next のプリロールを開始
+- `player.js` — prefetch とキュー枯渇ハンドオフを前倒し。7章の二段階フォールバック
+- 解析結果を `videoId` キーでキャッシュ。Bot process は DB を開けないため migration 006 + `webClient` 経由
+
+**完了条件**: フェードアウト曲・ぶつ切り曲・アウトロの無い曲・ライブ音源の4パターンで手動 A/B が許容範囲。低信頼度曲が確実に単純フェードへ落ちる。
+
+### Phase 3 — 曲順最適化 + Gemini 導入
+
+**着手前に Phase 5 の法務部分を済ませること。** データを送り始めてからポリシーを直すのは順序が逆になる。
+
+- `src/mix/ordering.js` — 経路探索（8章）
+- `gemini.js` — API クライアント（8章）
+- `webClient.js` に `optimizeOrder`、`botApi.js` に並べ替えエンドポイント
+- スラッシュコマンドと Web UI のキューパネルにボタン
+- `.env.example` に `GEMINI_API_KEY`
 
 ### Phase 4 — リクエストからの自動プレイリスト生成
 
+- リクエスト文 → Gemini が曲名リストを生成 → `search.js` で YouTube 解決 → ヒットしない曲は静かに除外 → 要求数に足りなければ再問い合わせ → `ordering.js` で並べ替え → `user_playlists` に保存
+- Web UI の My Playlists からも生成できるようにする
+- `autoplay.js` には触らない（併存）
+
 ### Phase 5 — ドキュメントと法務
+
+- `CLAUDE.md` / `AGENTS.md` / `README.md` の「LLM・外部 AI API は一切使用しない」を削除し、Gemini の利用範囲・送信データ・失敗時挙動の記述に置き換える
+- `legal/privacy.html` に Gemini への送信内容（曲名・チャンネル名・リクエスト文）を追記する。Google API 由来データを含むため、Google の Limited Use 要件との整合を確認すること
+- 音声アーキテクチャの節を Idle 駆動 → mixer 駆動に全面書き換え
+- Phase 1 の安定確認後、`MIXER_ENABLED` フラグと旧経路を削除
 
 ---
 
-## 8. 依存関係
+## 10. 依存関係
 
 ```
-Phase 0 → Phase 1 ─┬→ Phase 2
-                   └→ Phase 5(法務) → Phase 3 → Phase 4
+Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
+                   │                          ├→ Phase 3 → Phase 4
+                   └→ Phase 5(法務) ──────────┘
 ```
 
-Phase 1 完了後に本番投入を1回挟む。
+- Phase 1 と Phase 1.5 の間に本番投入を1回挟む
+- Phase 1.5 と「法務」は並行できる
+- Phase 3 は Phase 2 の解析結果（BPM/キー）に依存する
+
+---
+
+## 11. 制約と限界（合意済み）
+
+- **拍検出は曲を選ぶ。** 4つ打ちの安定した曲では高精度だが、ライブ音源・アコースティック・ルバートのあるバラード・テンポの揺れる曲では外す。倍テンポ / 半テンポ誤検出も起きる
+- したがって**全曲を DJ ミックスにはできない**。信頼度が低い曲は単純フェードへ落ちる
+- 30分超の曲はクロスフェード対象外（normalize 不可のため）
+- 重畳長は J-POP では 2〜4小節程度が上限になることが多い
+
+---
+
+## 12. 未決事項
+
+| 項目 | 状態 |
+|---|---|
+| ボーカル検出の採用手法 | **センター成分は不採用。** PitchMelodia 系を次評価、Demucs は保留（spike 済み） |
+| 拍/BPM 検出ライブラリ（aubio / essentia.js） | **aubiotrack 第一**、essentia はキー同梱時にクロスチェック |
+| ffmpeg 解析パスを何回にするか | loudnorm+silence+tail は **1-pass**。BPM/キーは別 |
+| 検出信頼度の閾値 | 暫定: key strength&lt;0.55、BPM 半/倍不一致 → 単純フェード。実 J-POP で再調整 |
+| 音源分離採用時の Docker 構成変更 | 現時点では不採用のため見送り |
+| スラッシュコマンド名 | `/mix order` / `/mix create` を仮置き |
+| 使用する Gemini のモデル名 | 未定（`.env.example` に `gemini-2.5-pro` を仮記載済み。確定前に確認） |
+| 解析キャッシュのスキーマ（新テーブル / 既存拡張） | 未定 |
+| 連続 underrun の許容秒数 | 実装仮値 8s。実測して決める |
+
+---
+
+## 13. 実装進捗メモ（エージェント追記）
+
+| Phase | 状態 | 備考 |
+|---|---|---|
+| 0 | ✅ | PR #19 / `src/player.acceptance.test.js` |
+| 1 | ✅ | PR #19 / `MIXER_ENABLED` で切替。重畳なし |
+| 1.5 | ✅ 初回完了 | `docs/mix-analysis-spike.md`。実 J-POP 再計測は残 |
+| 2–4 | 未着手 | 依存は 10章の通り |
+| 5 法務 | ✅ 文面更新済み | privacy / CLAUDE / AGENTS / README。PR #20 にも分離 |
