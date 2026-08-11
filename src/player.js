@@ -236,7 +236,11 @@ export class GuildPlayer {
       this.#mixerStarted = true;
     }
 
-    this.#mixStream.setCurrent(source);
+    // Pre-failed sources emit sourceerror (which advances) and return false —
+    // skip recordPlay/onTrackStart just like the createPcmSource throw path.
+    if (!this.#mixStream.setCurrent(source)) {
+      return;
+    }
     this.#prefetchUpcoming();
     this.#recordPlay(track);
     this.#onTrackStart?.(track.videoId);

@@ -27,7 +27,7 @@ export class MixStream extends Readable {
   setCurrent(source) {
     if (this.#destroyed) {
       source.destroy();
-      return;
+      return false;
     }
 
     if (this.#current) {
@@ -37,13 +37,14 @@ export class MixStream extends Readable {
 
     // Source may have failed before any error listener was attached.
     // Surface it as sourceerror instead of installing a dead current.
+    // Return false so callers skip play side effects (recordPlay, onTrackStart).
     if (source.error) {
       source.destroy();
       this.#current = null;
       this.#betweenTracks = true;
       this.#underrunSince = null;
       this.emit('sourceerror', source.error);
-      return;
+      return false;
     }
 
     this.#current = source;
@@ -59,6 +60,7 @@ export class MixStream extends Readable {
     });
 
     this.#scheduleRead();
+    return true;
   }
 
   dropCurrent() {
