@@ -3,7 +3,7 @@
 ## 概要
 
 Discord VC で YouTube 音楽をストリーミング再生する Bot。
-discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で構成。LLM・外部 AI API は使用しない。
+discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で構成。MIX 機能向けに Gemini API（Web process）を利用する。
 
 ---
 
@@ -116,11 +116,15 @@ resolveAudioStream(url)  →  yt-dlp stdout  →  createAudioResource(stream)
 - **selfDeaf はネイティブ対応** — `joinVoiceChannel({ selfDeaf: true })` を使用
 - **AudioPlayerStatus.Idle イベント** — 曲終了後の次曲再生はこのイベントで駆動
 - **循環インポート防止** — `sessions.js` が共有状態を管理。`index.js` と `play.js` の双方向依存を排除
-- **LLM 不使用** — 外部 AI API は一切使わない
+
+## Gemini / MIX
+
+MIX プレイリスト機能（曲順最適化の補助・リクエスト文からの自動プレイリスト生成）では Google Gemini API を使う。クライアントは **Web process 専用**（`src/web/server/services/gemini.js`）。Bot process から直接呼ばない。送信するのは曲タイトル・チャンネル名・duration・ユーザーのリクエスト文に限定し、音声ファイルや OAuth トークンは送らない。Gemini 失敗時も再生は止めず、当該機能のみ縮退する。API キーは `.env` の `GEMINI_API_KEY`（モデルは `GEMINI_MODEL`）。運用前提は **課金設定済み（Paid）の Google Cloud プロジェクト**（無料枠では Google がプロンプト/応答を製品改善に利用し得るため。詳細は `legal/privacy.html`）。ミキサー移行の詳細は `docs/mix-plan.md` を参照（移行期間の `MIXER_ENABLED` は Phase 1 安定後に撤去予定。現時点では削除しない）。
 
 ## シークレット管理
 
 - `DISCORD_TOKEN` / `CLIENT_ID` は必ず `.env` に書く
 - Web UI では `DISCORD_CLIENT_SECRET`, `GOOGLE_CLIENT_SECRET`, `WEB_SESSION_SECRET`, `BOT_API_TOKEN`, `MUSICBOT_TOKEN_ENC_KEY` も `.env` のみ
+- MIX / Gemini 向けに `GEMINI_API_KEY`（および任意の `GEMINI_MODEL`）も `.env` のみ
 - OAuth redirect URI は `PUBLIC_BASE_URL` から導出する。Discord だけ `DISCORD_OAUTH_REDIRECT` で明示 override 可能
 - ソースコードにシークレットを書かない
