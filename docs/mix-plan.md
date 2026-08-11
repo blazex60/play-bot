@@ -84,13 +84,15 @@ JS 側のサンプル加算も、1曲だけ流れている間は加算せずバ�
 - emit: `trackend` / `underrun` / `sourceerror`
 - 曲ごとの再生位置（consumed bytes ÷ 192000）を保持
 
-### 4.4 GuildPlayer の変更
+### 4.4 GuildPlayer の変更（実装済みライフサイクル）
 
-- コンストラクタで MixStream を1回だけ resource 化して `play()`。以降 AudioPlayer は Playing 固定
-- `playNext()` → `#loadSource(track)`（normalize prefetch → PcmSource 生成 → `mix.setCurrent()`）
-- `trackend` イベントが従来の `#handleAfter` を駆動
+`MIXER_ENABLED=true` 時の実際の流れ:
+
+- コンストラクタで `MixStream` と `#mixerResource`（`StreamType.Raw`）を作るが、この時点では `play()` しない
+- `playNext()` → `#playNextMixer()` → `#createPcmSource()` → `mix.setCurrent(source)`。初回だけ `#audioPlayer.play(#mixerResource)` で遅延開始し、以降は Playing 固定を目指す
+- `trackend` → `#advanceAfterPlayback()` → `#handleAfter()` が曲送りを駆動
 - `skip()` は `mix.dropCurrent()`
-- `AudioPlayerStatus.Idle` が発火したら**異常**として扱う。ログ出力の上、resource を再生成して復旧
+- `AudioPlayerStatus.Idle` は異常として扱い、既存の `#mixerResource` を再度 `play()` して復旧する（resource の再生成はしない）
 
 ### 4.5 Idle が来なくなることで壊れる箇所
 

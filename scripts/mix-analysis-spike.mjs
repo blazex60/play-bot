@@ -10,9 +10,10 @@ import { mkdir, writeFile, access, readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const OUT_DIR = path.join(ROOT, 'tmp', 'mix-spike')
 const RESULTS_JSON = path.join(OUT_DIR, 'results.json')
+const GENERATED_REPORT = path.join(OUT_DIR, 'report.generated.md')
 
 // Public CC / royalty-free samples (direct HTTP — YouTube is bot-blocked in this env).
 // Audio stays in tmp/mix-spike and is NOT committed.
@@ -229,7 +230,8 @@ async function analyzeTailEnvelope(filePath) {
     '-hide_banner', '-nostats',
     '-ss', String(start),
     '-i', filePath,
-    '-af', 'astats=metadata=1:reset=0.1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+    '-af',
+    'silencedetect=noise=-40dB:d=0.3,astats=metadata=1:reset=0.1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
     '-f', 'null', '-',
   ], { timeoutMs: 120_000 })
   const elapsedMs = Date.now() - t0
@@ -334,23 +336,15 @@ async function tryAubioBpm(filePath) {
 }
 
 async function analyzeKeyChromagram(filePath) {
-  // Lightweight chroma-ish proxy: energy per pitch-class via bandpass banks is heavy.
-  // For spike, use ffmpeg showcqt / chromagram dump if available; else mark unavailable.
-  const t0 = Date.now()
-  const { stderr, code } = await spawnCapture('ffmpeg', [
-    '-hide_banner', '-nostats',
-    '-t', '45',
-    '-i', filePath,
-    '-af', 'afireqsrc=preset=flat,astats=metadata=1:reset=1',
-    '-f', 'null', '-',
-  ], { timeoutMs: 60_000 })
+  // This runner does not invoke essentia.js. Key/BPM cross-checks with essentia
+  // were measured separately and recorded manually in docs/mix-analysis-spike.md.
+  void filePath
   return {
-    method: 'key-placeholder',
-    ok: code === 0,
-    elapsedMs: Date.now() - t0,
+    method: 'not-run-in-runner',
+    ok: false,
+    elapsedMs: 0,
     available: false,
-    note: 'Dedicated key detection not in ffmpeg alone; essentia.js or aubio pitch deferred to follow-up install.',
-    stderrTail: stderr.slice(-120),
+    note: 'Key analysis is not part of this runner; see docs/mix-analysis-spike.md (manual essentia session).',
   }
 }
 
@@ -407,16 +401,11 @@ function renderMarkdown(results) {
     lines.push('')
   }
 
-  lines.push('## Provisional conclusions')
+  lines.push('## Notes')
   lines.push('')
-  lines.push('Fill after reviewing numbers:')
-  lines.push('')
-  lines.push('- [ ] Center-channel vocal detection: adopt / reject / needs essentia')
-  lines.push('- [ ] BPM library: aubio / essentia.js / defer')
-  lines.push('- [ ] ffmpeg combined pass: 1-pass OK / needs 2-pass')
-  lines.push('- [ ] Confidence thresholds: TBD')
-  lines.push('')
-  lines.push('Raw JSON: `tmp/mix-spike/results.json`')
+  lines.push('- This generated report covers runner-owned checks only (center vocal, tail RMS, combined ffmpeg, aubiotrack).')
+  lines.push('- Essentia BPM/key numbers live in the committed `docs/mix-analysis-spike.md` and are not produced here.')
+  lines.push('- Raw JSON: `tmp/mix-spike/results.json`')
   lines.push('')
   return lines.join('\n')
 }
@@ -432,10 +421,10 @@ async function main() {
   }
   await writeFile(RESULTS_JSON, JSON.stringify(results, null, 2))
   const md = renderMarkdown(results)
-  const mdPath = path.join(ROOT, 'docs', 'mix-analysis-spike.md')
-  await writeFile(mdPath, md)
+  // Never overwrite the validated committed report under docs/.
+  await writeFile(GENERATED_REPORT, md)
   console.log(md)
-  console.error(`[spike] wrote ${mdPath}`)
+  console.error(`[spike] wrote ${GENERATED_REPORT}`)
 }
 
 main().catch((err) => {

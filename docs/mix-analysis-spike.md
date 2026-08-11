@@ -1,8 +1,9 @@
 # MIX Phase 1.5 — Analysis Spike Results
 
-Generated: 2026-08-11T23:35:00Z  
-Runner: `node scripts/mix-analysis-spike.mjs`  
-Artifacts: `tmp/mix-spike/`（gitignore、音声はリポジトリに含めない）
+Validated findings committed: 2026-08-11  
+Runner-owned checks: `node scripts/mix-analysis-spike.mjs`（center vocal / tail RMS / combined ffmpeg / aubiotrack）  
+Essentia BPM・キー: 別途の one-off Node セッション（`essentia.js` を `--no-save` で導入して計測。runner には含めない）  
+Artifacts: `tmp/mix-spike/`（gitignore。runner 再実行は `tmp/mix-spike/report.generated.md` と `results.json` のみ更新し、本ファイルは上書きしない）
 
 ## 環境制約
 
@@ -44,7 +45,7 @@ Artifacts: `tmp/mix-spike/`（gitignore、音声はリポジトリに含めな�
 
 ### B. BPM（aubiotrack vs essentia.js）
 
-| id | aubiotrack BPM | essentia RhythmExtractor2013 | PercivalBpmEstimator | 所要 |
+| id | aubiotrack BPM（runner） | essentia RhythmExtractor2013（manual） | PercivalBpmEstimator（manual） | 所要 |
 |---|---:|---:|---:|---|
 | vocal-indie-1 | 147.5 | 146.4 (conf 0.10) | **80.1**（半テンポ疑い） | aubio ~0.3s / essentia ~5.5s / 60s |
 | instrumental-carefree | 97.1 | 96.0 (conf 3.65) | 96.1 | 同上 |
@@ -53,13 +54,15 @@ Artifacts: `tmp/mix-spike/`（gitignore、音声はリポジトリに含めな�
 **結論（B）: BPM は `aubiotrack` を第一候補、キーも要る解析パスでは `essentia.js` を併用。**  
 半テンポ/倍テンポは RhythmExtractor と Percival の不一致で検出し、信頼度を落とす。
 
-### C. キー（essentia KeyExtractor）
+### C. キー（essentia KeyExtractor・manual）
 
 | id | key | scale | strength |
 |---|---|---|---:|
 | vocal-indie-1 | C | major | 0.58 |
 | instrumental-carefree | F | major | 0.93 |
 | instrumental-wallpaper | G | major | 0.98 |
+
+> essentia の表は runner 出力ではない。再現時は別セッションで KeyExtractor / RhythmExtractor2013 を呼ぶこと。
 
 **結論（C）: `essentia.js` KeyExtractor を採用方針とする。**  
 `headKey` / `tailKey` は曲頭・曲末の窓を別々にかけて推定。strength < 0.55 程度は低信頼としてハーモニック判定をスキップ（閾値は Phase 2 で再調整）。
@@ -105,5 +108,8 @@ Artifacts: `tmp/mix-spike/`（gitignore、音声はリポジトリに含めな�
 ```bash
 # optional: sudo apt-get install -y aubio-tools
 node scripts/mix-analysis-spike.mjs
-# → docs/mix-analysis-spike.md と tmp/mix-spike/results.json
+# → tmp/mix-spike/results.json
+# → tmp/mix-spike/report.generated.md  （docs/mix-analysis-spike.md は上書きしない）
 ```
+
+検証済みの結論・essentia 表は本ファイル（committed）を正とする。runner の生成物で置き換えないこと。

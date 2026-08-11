@@ -49,7 +49,7 @@ cp .env.example .env
 npm install
 ```
 
-`.env` には Discord Bot token と application client ID に加え、Web UI 用の OAuth / session / internal API secret を設定する。MIX 機能を使う場合は `GEMINI_API_KEY`（任意で `GEMINI_MODEL`）を設定する。音声ミキサー移行中は `MIXER_ENABLED` で旧経路との切替が可能（詳細は `docs/mix-plan.md`）。
+`.env` には Discord Bot token と application client ID に加え、Web UI 用の OAuth / session / internal API secret を設定する。MIX 機能を使う場合は `GEMINI_API_KEY`（任意で `GEMINI_MODEL`）を設定する。音声ミキサー移行中は `MIXER_ENABLED=true` のときだけ新ミキサー経路が有効になり、それ以外の値（未設定・`false` など）では従来の再生経路のままになる（詳細は `docs/mix-plan.md`）。
 
 Provider console に登録する redirect URI:
 
