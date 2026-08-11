@@ -217,19 +217,18 @@ prefetch 時に末尾の RMS 包絡を 100ms 刻みで取得し、形状で分�
 **不採用**: センター成分のみのボーカル検出。Demucs は保留。  
 **残作業**: 実 J-POP での再キャリブレーション、PitchMelodia 評価、Docker への aubio/essentia 追加。
 
-### Phase 2 — クロスフェード本実装
+### Phase 2 — クロスフェード本実装 ✅ 進行中（PR 分離）
 
-Phase 1.5 の結論に従って実装する。優先順位は 5.4 の A → B → C → E → D。
+Phase 1.5 の結論に従って実装中。優先順位は 5.4 の A → B → C → E → D。
 
-- `trackAnalysis.js` — ボーカル区間 / 拍グリッド / `headKey` `tailKey` / 曲末形状 / エネルギーを返す
-- `eq.js` — ベーススワップ用 biquad
-- `fade.js` — カーブ・-3dB マージン・ソフトリミッタ
-- `transition.js` — 2曲の解析結果から重畳区間・重畳長・フェードカーブ・EQ カーブを決定
-- `mixStream.js` — 重畳区間の実装。`current.remainingSec <= overlapSec` で next のプリロールを開始
-- `player.js` — prefetch とキュー枯渇ハンドオフを前倒し。7章の二段階フォールバック
-- 解析結果を `videoId` キーでキャッシュ。Bot process は DB を開けないため migration 006 + `webClient` 経由
-
-**完了条件**: フェードアウト曲・ぶつ切り曲・アウトロの無い曲・ライブ音源の4パターンで手動 A/B が許容範囲。低信頼度曲が確実に単純フェードへ落ちる。
+実装済み（本ブランチ）:
+- `fade.js` — equal-power/linear、`-3dB` マージン、ソフトリミッタ
+- `eq.js` — ベーススワップ用 biquad（highpass / lowshelf）
+- `trackAnalysis.js` — 曲末形状 + aubiotrack BPM（キーはキャッシュ列のみ・essentia は次）
+- `transition.js` — 二段階フォールバック（crossfade / simple-fade / gapless）とボーカル弱時の ≤2s クランプ
+- `mixStream.js` — `startCrossfade` による重畳
+- `player.js` — クロスフェード arm、normalize 強制、解析キャッシュ接続
+- migration `006_track_analysis.sql` + `/internal/track-analysis/:videoId`
 
 ### Phase 3 — 曲順最適化 + Gemini 導入
 
@@ -302,5 +301,6 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 0 | ✅ | PR #19 / `src/player.acceptance.test.js` |
 | 1 | ✅ | PR #19 / `MIXER_ENABLED` で切替。重畳なし |
 | 1.5 | ✅ 初回完了 | `docs/mix-analysis-spike.md`。実 J-POP 再計測は残 |
-| 2–4 | 未着手 | 依存は 10章の通り |
-| 5 法務 | ✅ 文面更新済み | privacy / CLAUDE / AGENTS / README。PR #20 にも分離 |
+| 2 | 🚧 進行中 | `cursor/mix-crossfade-phase2-78b7`。重畳・解析キャッシュ・二段階フォールバック。キー(essentia)/テンポ合わせは残 |
+| 3–4 | 未着手 | 依存は 10章の通り |
+| 5 法務 | ✅ 文面更新済み | privacy / CLAUDE / AGENTS / README。PR #19/#20 |

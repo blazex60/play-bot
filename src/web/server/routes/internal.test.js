@@ -233,3 +233,40 @@ test('GET /internal/play-history/recent clamps a negative limit instead of retur
   assert.equal(response.statusCode, 200)
   assert.equal(response.json().u1.length, 200, 'a negative limit should fall back to the default cap, not become unlimited')
 })
+
+test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async (t) => {
+  const { app, config } = await setup(t)
+  const analysis = {
+    version: 1,
+    durationSec: 180,
+    tailShape: 'fade-out',
+    bpm: 128,
+    confidence: 0.7,
+    recommendedOverlapSec: 2,
+    vocalConfidence: 0.2,
+  }
+
+  const missing = await app.inject({
+    method: 'GET',
+    url: '/internal/track-analysis/vid-mix-1',
+    headers: authHeaders(config),
+  })
+  assert.equal(missing.statusCode, 404)
+
+  const put = await app.inject({
+    method: 'PUT',
+    url: '/internal/track-analysis/vid-mix-1',
+    headers: authHeaders(config),
+    payload: { analysis },
+  })
+  assert.equal(put.statusCode, 200)
+
+  const get = await app.inject({
+    method: 'GET',
+    url: '/internal/track-analysis/vid-mix-1',
+    headers: authHeaders(config),
+  })
+  assert.equal(get.statusCode, 200)
+  assert.equal(get.json().analysis.bpm, 128)
+  assert.equal(get.json().analysis.tailShape, 'fade-out')
+})

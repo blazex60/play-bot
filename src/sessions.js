@@ -130,6 +130,8 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     handleQueueExhausted,
     recordPlayFn: webClient.recordPlay,
     onTrackStart,
+    getTrackAnalysisFn: (videoId) => webClient.getTrackAnalysis(videoId),
+    putTrackAnalysisFn: (videoId, analysis) => webClient.putTrackAnalysis(videoId, analysis),
   })
   // A voice channel's own built-in chat can receive messages too, so a
   // session created without an interaction text channel (e.g. an import

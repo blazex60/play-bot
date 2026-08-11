@@ -16,8 +16,11 @@ import { shouldReconnectRetry } from './player/playbackPolicy.js';
 import { isMixerEnabled } from './audio/config.js';
 import { MixStream } from './audio/mixStream.js';
 import { createStreamSource, createFileSource } from './audio/pcmSource.js';
+import { analyzeTrackFile } from './audio/trackAnalysis.js';
+import { planTransition } from './audio/transition.js';
 
 const WATCHDOG_INTERVAL = 10_000;
+const CROSSFADE_ARM_INTERVAL_MS = 200;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
 
@@ -55,6 +58,13 @@ export class GuildPlayer {
   #mixerResource = null;
   #mixerStarted = false;
   #createPcmSourceFn;
+  #incomingTempFile = null;
+  #analysisCache = new Map();
+  #crossfadeArmTimer = null;
+  #crossfadeStarted = false;
+  #getTrackAnalysisFn;
+  #putTrackAnalysisFn;
+  #analyzeTrackFileFn;
 
   constructor({
     guildId,
@@ -70,6 +80,9 @@ export class GuildPlayer {
     resolveAudioStreamFn = resolveAudioStream,
     createPcmSourceFn = null,
     mixerEnabled = isMixerEnabled(),
+    getTrackAnalysisFn = null,
+    putTrackAnalysisFn = null,
+    analyzeTrackFileFn = analyzeTrackFile,
   }) {
     this.#guildId = guildId;
     this.#connection = connection;
@@ -84,13 +97,20 @@ export class GuildPlayer {
     this.#resolveAudioStream = resolveAudioStreamFn;
     this.#mixerEnabled = mixerEnabled;
     this.#createPcmSourceFn = createPcmSourceFn;
+    this.#getTrackAnalysisFn = getTrackAnalysisFn;
+    this.#putTrackAnalysisFn = putTrackAnalysisFn;
+    this.#analyzeTrackFileFn = analyzeTrackFileFn;
 
     if (this.#mixerEnabled) {
       this.#mixStream = new MixStream();
       this.#mixerResource = this.#createAudioResource(this.#mixStream, {
         inputType: StreamType.Raw,
       });
-      this.#mixStream.on('trackend', () => {
+      this.#mixStream.on('trackend', (info) => {
+        if (info?.promoted) {
+          this.#onCrossfadePromoted();
+          return;
+        }
         this.#advanceAfterPlayback();
       });
       this.#mixStream.on('sourceerror', (err) => {
@@ -238,12 +258,41 @@ export class GuildPlayer {
 
     // Pre-failed sources emit sourceerror (which advances) and return false —
     // skip recordPlay/onTrackStart just like the createPcmSource throw path.
-    if (!this.#mixStream.setCurrent(source)) {
+    if (!this.#mixStream.setCurrent(source, { durationSec: track.duration ?? null })) {
       return;
     }
+    this.#crossfadeStarted = false;
+    this.#startCrossfadeArm();
     this.#prefetchUpcoming();
     this.#recordPlay(track);
     this.#onTrackStart?.(track.videoId);
+  }
+
+  async #onCrossfadePromoted() {
+    this.#forceSkip = false;
+    this.#hadError = false;
+    this.#clearCrossfadeArm();
+    await this.#cleanupCurrentTempFile();
+    if (this.#incomingTempFile) {
+      this.#currentTempFile = this.#incomingTempFile;
+      this.#incomingTempFile = null;
+    }
+
+    const nextTrack = this.#queue.next({ forceAdvance: false });
+    if (!nextTrack) {
+      await this.#onDisconnect();
+      return;
+    }
+
+    this.#playbackStart = Date.now();
+    this.#lastActiveAt = Date.now();
+    this.#playbackCount += 1;
+    this.#crossfadeStarted = false;
+    this.#mixStream?.setDurationSec(nextTrack.duration ?? null);
+    this.#startCrossfadeArm();
+    this.#prefetchUpcoming();
+    this.#recordPlay(nextTrack);
+    this.#onTrackStart?.(nextTrack.videoId);
   }
 
   get mixStream() {
@@ -293,7 +342,9 @@ export class GuildPlayer {
   async stop() {
     this.#queue.clear();
     this.#clearWatchdog();
+    this.#clearCrossfadeArm();
     await this.#cleanupCurrentTempFile();
+    await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
     if (this.#mixerEnabled) {
       this.#mixStream?.endMixer();
@@ -338,7 +389,9 @@ export class GuildPlayer {
 
   async #handleAfter() {
     this.#currentResource = null;
+    this.#clearCrossfadeArm();
     await this.#cleanupCurrentTempFile();
+    await this.#cleanupIncomingTempFile();
 
     if (this.#forceSkip) {
       this.#forceSkip = false;
@@ -396,15 +449,19 @@ export class GuildPlayer {
     }
   }
 
-  async #createPcmSource(track) {
+  async #createPcmSource(track, { forIncoming = false } = {}) {
     if (this.#createPcmSourceFn) {
-      return this.#createPcmSourceFn(track);
+      return this.#createPcmSourceFn(track, { forIncoming });
     }
 
-    this.#currentTempFile = null;
+    if (!forIncoming) {
+      this.#currentTempFile = null;
+    }
 
-    if (!getGuildSettings(this.#guildId).normalize || !isNormalizeDurationAllowed(track)) {
-      this.#discardPrefetch();
+    // MIX path forces normalize when duration allows (crossfade quality).
+    const normalizeOn = this.#mixerEnabled || getGuildSettings(this.#guildId).normalize;
+    if (!normalizeOn || !isNormalizeDurationAllowed(track)) {
+      if (!forIncoming) this.#discardPrefetch();
       return createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
     }
 
@@ -414,11 +471,118 @@ export class GuildPlayer {
         `[normalize] applying: ${track.title} ` +
         `(${prefetched.measured.measured_I} LUFS -> -16 LUFS)`
       );
-      this.#currentTempFile = prefetched.filePath;
+      if (forIncoming) {
+        this.#incomingTempFile = prefetched.filePath;
+      } else {
+        this.#currentTempFile = prefetched.filePath;
+      }
+      this.#scheduleAnalysis(track, prefetched.filePath);
       return createFileSource(prefetched.filePath, { measured: prefetched.measured });
     } catch (err) {
       console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err.message);
       return createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
+    }
+  }
+
+  #scheduleAnalysis(track, filePath) {
+    if (!track?.videoId || !filePath) return;
+    queueMicrotask(() => {
+      this.#resolveAnalysis(track, filePath).catch((err) => {
+        console.warn('[GuildPlayer] analysis failed:', err.message);
+      });
+    });
+  }
+
+  async #resolveAnalysis(track, filePath = null) {
+    if (!track) return null;
+    if (track.videoId && this.#analysisCache.has(track.videoId)) {
+      return this.#analysisCache.get(track.videoId);
+    }
+    if (track.videoId && this.#getTrackAnalysisFn) {
+      const cached = await this.#getTrackAnalysisFn(track.videoId);
+      if (cached) {
+        this.#analysisCache.set(track.videoId, cached);
+        return cached;
+      }
+    }
+    if (!filePath || !this.#analyzeTrackFileFn) return null;
+    const analysis = await this.#analyzeTrackFileFn(filePath, {
+      videoId: track.videoId,
+      durationSec: track.duration,
+    });
+    if (track.videoId) {
+      this.#analysisCache.set(track.videoId, analysis);
+      this.#putTrackAnalysisFn?.(track.videoId, analysis);
+    }
+    return analysis;
+  }
+
+  #startCrossfadeArm() {
+    this.#clearCrossfadeArm();
+    if (!this.#mixerEnabled) return;
+    this.#crossfadeArmTimer = setInterval(() => {
+      this.#maybeStartCrossfade().catch((err) => {
+        console.error('[GuildPlayer] crossfade arm error:', err.message);
+      });
+    }, CROSSFADE_ARM_INTERVAL_MS);
+  }
+
+  #clearCrossfadeArm() {
+    if (this.#crossfadeArmTimer != null) {
+      clearInterval(this.#crossfadeArmTimer);
+      this.#crossfadeArmTimer = null;
+    }
+  }
+
+  async #maybeStartCrossfade() {
+    if (!this.#mixerEnabled || this.#crossfadeStarted || this.#mixStream?.isCrossfading) return;
+    if (this.#forceSkip || this.#handlingAfter) return;
+    if (this.#audioPlayer.state.status !== AudioPlayerStatus.Playing) return;
+
+    const remaining = this.#mixStream?.remainingSec;
+    if (remaining == null) return;
+
+    const current = this.#queue.current;
+    const [next] = this.#queue.upcoming();
+    if (!next) return;
+
+    const outAnalysis = await this.#resolveAnalysis(current);
+    const inAnalysis = await this.#resolveAnalysis(next);
+    const plan = planTransition(outAnalysis, inAnalysis);
+    if (plan.mode === 'gapless' || !(plan.fadeSec > 0)) return;
+    if (remaining > plan.fadeSec + 0.2) return;
+
+    this.#crossfadeStarted = true;
+    let source;
+    try {
+      source = await this.#createPcmSource(next, { forIncoming: true });
+    } catch (err) {
+      console.warn('[GuildPlayer] incoming pcm source failed:', err.message);
+      this.#crossfadeStarted = false;
+      await this.#cleanupIncomingTempFile();
+      return;
+    }
+
+    if (this.#queue.current !== current || this.#forceSkip) {
+      source.destroy();
+      await this.#cleanupIncomingTempFile();
+      this.#crossfadeStarted = false;
+      return;
+    }
+
+    const started = this.#mixStream.startCrossfade(source, plan);
+    if (!started) {
+      source.destroy();
+      await this.#cleanupIncomingTempFile();
+      this.#crossfadeStarted = false;
+    }
+  }
+
+  async #cleanupIncomingTempFile() {
+    const filePath = this.#incomingTempFile;
+    this.#incomingTempFile = null;
+    if (filePath) {
+      await cleanupTempFile(filePath);
     }
   }
 
@@ -468,7 +632,8 @@ export class GuildPlayer {
   }
 
   #prefetchUpcoming() {
-    if (!getGuildSettings(this.#guildId).normalize) {
+    // Mixer path always prefers normalize prefetch so crossfade can use files.
+    if (!this.#mixerEnabled && !getGuildSettings(this.#guildId).normalize) {
       this.#discardPrefetch();
       return;
     }
