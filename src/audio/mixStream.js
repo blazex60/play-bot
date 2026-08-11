@@ -35,6 +35,17 @@ export class MixStream extends Readable {
       this.#current.destroy();
     }
 
+    // Source may have failed before any error listener was attached.
+    // Surface it as sourceerror instead of installing a dead current.
+    if (source.error) {
+      source.destroy();
+      this.#current = null;
+      this.#betweenTracks = true;
+      this.#underrunSince = null;
+      this.emit('sourceerror', source.error);
+      return;
+    }
+
     this.#current = source;
     this.#consumedBytes = 0;
     this.#underrunSince = null;
@@ -56,6 +67,8 @@ export class MixStream extends Readable {
       this.#current.destroy();
       this.#current = null;
     }
+    // Match #finishCurrent: stop silence/underrun while the next source loads.
+    this.#betweenTracks = true;
     this.#underrunSince = null;
     this.emit('trackend');
   }

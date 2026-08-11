@@ -79,7 +79,11 @@ export class PcmSource extends EventEmitter {
     if (this.#destroyed) return;
     this.#error = err;
     this.#ended = true;
-    this.emit('error', err);
+    // Avoid crashing the process when the consumer has not attached yet
+    // (e.g. the gap between createStreamSource and MixStream.setCurrent).
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', err);
+    }
     this.emit('end');
     this.destroy();
   }

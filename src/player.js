@@ -209,11 +209,13 @@ export class GuildPlayer {
 
     if (this.#queue.current !== track) {
       source.destroy();
+      await this.#cleanupCurrentTempFile();
       if (!this.#queue.current) await this.#onDisconnect();
       return;
     }
     if (this.#forceSkip) {
       source.destroy();
+      await this.#cleanupCurrentTempFile();
       this.#forceSkip = false;
       const nextTrack = this.#queue.next({ forceAdvance: true });
       if (nextTrack === null) {
@@ -518,6 +520,9 @@ export class GuildPlayer {
     this.#clearWatchdog();
     if (this.#mixerEnabled) {
       this.#watchdogTimer = setInterval(() => {
+        // Pause/unpause stops Discord from pulling frames, which freezes
+        // lastDataAt as the PCM buffer fills — same guard as the legacy path.
+        if (this.#audioPlayer.state.status !== AudioPlayerStatus.Playing) return;
         const source = this.#mixStream?.currentSource;
         if (!source) return;
         if (Date.now() - source.lastDataAt > WATCHDOG_STALL_THRESHOLD) {
