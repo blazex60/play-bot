@@ -12,8 +12,8 @@ import {
   isNormalizeDurationAllowed,
   prefetchTrack,
 } from './normalize.js';
+import { shouldReconnectRetry } from './player/playbackPolicy.js';
 
-const RECONNECT_GRACE = 5000;
 const WATCHDOG_INTERVAL = 10_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
@@ -238,9 +238,8 @@ export class GuildPlayer {
 
     const elapsed = Date.now() - this.#playbackStart;
     const track = this.#queue.current;
-    const isShortTrack = track?.duration != null && track.duration < 5;
 
-    if (elapsed < RECONNECT_GRACE && !isShortTrack && !this.#hadError) {
+    if (shouldReconnectRetry({ elapsedMs: elapsed, track, hadError: this.#hadError })) {
       await sleep(2000);
       await this.playNext();
       return;
