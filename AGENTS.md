@@ -1,10 +1,10 @@
-<!-- Generated: 2026-07-15 | Updated: 2026-07-15 -->
+<!-- Generated: 2026-07-15 | Updated: 2026-08-11 -->
 
 # music-bot
 
 ## Purpose
 
-Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で音声を処理し、Fastify + React の Web ダッシュボードから再生操作と YouTube プレイリスト取り込みを行える(Spotify/Apple Music は削除済み — 詳細は `CLAUDE.md` の「Web UI scope」参照)。LLM・外部 AI API は一切使用しない。`legal/` は同じリポジトリで管理する Cloudflare Pages 向けの独立した静的法務ページ（利用規約・プライバシーポリシー）。
+Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で音声を処理し、Fastify + React の Web ダッシュボードから再生操作と YouTube プレイリスト取り込みを行える(Spotify/Apple Music は削除済み — 詳細は `CLAUDE.md` の「Web UI scope」参照)。MIX 機能では Google Gemini API を Web process（`src/web/server/services/gemini.js`）から利用する（曲順補助・リクエスト文からのプレイリスト生成。失敗時も再生は継続）。詳細は `docs/mix-plan.md` と `CLAUDE.md` の「Gemini / MIX」。`legal/` は同じリポジトリで管理する Cloudflare Pages 向けの独立した静的法務ページ（利用規約・プライバシーポリシー）。
 
 ## Key Files
 
@@ -33,9 +33,10 @@ Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.
 
 ### Working In This Directory
 - 音声・OAuth・Web アーキテクチャの制約は `CLAUDE.md` に集約されている。実装前に必ず読むこと（`network_mode: host` 必須、`@discordjs/voice` バージョン制約、yt-dlp stdout パイプ方式、ウォッチドッグのロジックなど）
+- MIX / Gemini の範囲と失敗時挙動は `CLAUDE.md` の「Gemini / MIX」および `docs/mix-plan.md` を参照。Gemini は Web process のみ。再生経路を Gemini 失敗で止めないこと
 - Bot process（`src/index.js` 系）は SQLite を一切開かない。DB は Web process（`src/web/server/`）専用。この境界を壊さないこと
 - Bot API（`src/botApi.js`）は loopback (`127.0.0.1:${BOT_API_PORT}`) 限定で bearer token 必須。Cloudflare Tunnel には絶対に出さない
-- シークレットは全て `.env` のみ。ソースコードに書かない
+- シークレットは全て `.env` のみ（`GEMINI_API_KEY` 含む）。ソースコードに書かない
 - `legal/` はこのリポジトリの npm/Node プロジェクトとは無関係の独立した静的サイトで、別の Cloudflare Pages project としてデプロイされる
 
 ### Testing Requirements
@@ -57,6 +58,7 @@ npm run check          # 上記一式 + build:web
 ### External
 - discord.js v14 / @discordjs/voice — Discord Bot・VC 接続
 - yt-dlp（外部バイナリ、npm 依存ではない） / FFmpeg — 音声取得・トランスコード
+- Google Gemini API — MIX の曲順補助・リクエスト文からのプレイリスト生成（Web process のみ）
 - Fastify + better-sqlite3 — Web server と永続化
 - React 19 + Vite + react-router-dom — Web ダッシュボード
 - zod — QA manifest のスキーマ検証
