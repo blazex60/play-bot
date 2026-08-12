@@ -44,3 +44,28 @@ test('isValidPermutation rejects duplicates and out-of-range indices', () => {
 test('transitionCost stays finite without analysis', () => {
   assert.ok(Number.isFinite(transitionCost(null, null)));
 });
+
+test('transitionCost ignores key distance when harmonic confidence is low', () => {
+  const from = { bpm: 120, tailKey: '8B', harmonicConfidence: 0.2 };
+  const toCompatible = { bpm: 120, headKey: '8B', harmonicConfidence: 0.2 };
+  const toDistant = { bpm: 120, headKey: '2A', harmonicConfidence: 0.2 };
+  assert.equal(
+    transitionCost(from, toCompatible),
+    transitionCost(from, toDistant),
+    'low-confidence keys must not change cost',
+  );
+
+  const fromOk = { ...from, harmonicConfidence: 0.8 };
+  const toOkClose = { ...toCompatible, harmonicConfidence: 0.8 };
+  const toOkFar = { ...toDistant, harmonicConfidence: 0.8 };
+  assert.ok(transitionCost(fromOk, toOkClose) < transitionCost(fromOk, toOkFar));
+});
+
+test('optimizeTrackOrder caps work to maxTracks and preserves the tail', () => {
+  const n = 45;
+  const tracks = Array.from({ length: n }, (_, i) => ({ title: `T${i}` }));
+  const analyses = tracks.map((_, i) => ({ bpm: 100 + (i % 7), harmonicConfidence: 0.8 }));
+  const order = optimizeTrackOrder({ tracks, analyses, maxTracks: 12, maxExact: 5 });
+  assert.equal(isValidPermutation(order, n), true);
+  assert.deepEqual(order.slice(12), Array.from({ length: n - 12 }, (_, i) => i + 12));
+});

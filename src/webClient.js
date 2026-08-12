@@ -107,12 +107,12 @@ export function createWebClient({
         return false
       }
     },
-    async optimizeOrder({ anchorVideoId = null, tracks } = {}) {
+    async optimizeOrder({ guildId = null, anchorVideoId = null, tracks } = {}) {
       try {
         if (!Array.isArray(tracks) || tracks.length === 0) return null
         const payload = await request('/internal/optimize-order', {
           method: 'POST',
-          body: { anchorVideoId, tracks },
+          body: { guildId, anchorVideoId, tracks },
         })
         if (!payload?.order || !Array.isArray(payload.order)) return null
         return payload

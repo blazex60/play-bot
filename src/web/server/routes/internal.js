@@ -3,6 +3,16 @@ import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js
 import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
 import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
+import {
+  REFINE_TIMEOUT_MS,
+  createRefineRateLimiter,
+} from '../services/gemini.js'
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
 
 // Mirrors the operation_logs CHECK(source IN (...)) constraint. recordOperationLog
 // only console.errors on an insert failure (never rethrows), so without this
@@ -34,6 +44,7 @@ export async function internalRoutes(app, {
   db,
   token,
   gemini = null,
+  refineLimiter = createRefineRateLimiter(),
   searchYoutube = defaultSearchYoutube,
 } = {}) {
   app.addHook('onRequest', async (request, reply) => {
@@ -176,7 +187,7 @@ export async function internalRoutes(app, {
 
   app.post('/internal/optimize-order', async (request, reply) => {
     if (!db) throw new Error('db is required for internal routes')
-    const { anchorVideoId = null, tracks } = request.body ?? {}
+    const { guildId = null, anchorVideoId = null, tracks } = request.body ?? {}
     if (!Array.isArray(tracks) || tracks.length === 0) {
       return reply.code(400).send({ error: 'missing_fields' })
     }
@@ -190,15 +201,27 @@ export async function internalRoutes(app, {
     let order = optimizeTrackOrder({ anchorAnalysis, tracks, analyses })
     let source = 'algorithm'
 
+    // Gemini refine is optional and must stay under the bot's ~5s webClient abort.
+    // Rate-limit paid calls; on limit/timeout/failure keep the algorithm order.
     if (gemini && tracks.length >= 2) {
-      const enriched = tracks.map((track, idx) => ({ ...track, analysis: analyses[idx] }))
-      const refined = await gemini.refineOrder({
-        tracks: enriched,
-        algorithmOrder: order,
-      })
-      if (refined && isValidPermutation(refined, tracks.length)) {
-        order = refined
-        source = 'gemini'
+      const limitKey = guildId || 'global'
+      if (refineLimiter.tryBegin(limitKey)) {
+        try {
+          const refined = await Promise.race([
+            gemini.refineOrder({
+              tracks,
+              algorithmOrder: order,
+              timeoutMs: REFINE_TIMEOUT_MS,
+            }),
+            delay(REFINE_TIMEOUT_MS).then(() => null),
+          ])
+          if (refined && isValidPermutation(refined, tracks.length)) {
+            order = refined
+            source = 'gemini'
+          }
+        } finally {
+          refineLimiter.end(limitKey)
+        }
       }
     }
 

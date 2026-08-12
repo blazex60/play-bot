@@ -50,6 +50,7 @@ export async function buildWebServer({
   fetchImpl = globalThis.fetch,
   logger = true,
   startCleanup = true,
+  gemini = undefined,
 } = {}) {
   const app = Fastify({
     logger,
@@ -90,11 +91,13 @@ export async function buildWebServer({
 
   // Bot -> Web internal channel (play history), token-guarded, independent
   // of the browser cookie-session requireAuth hook used below.
-  const geminiClient = createGeminiClient({
-    apiKey: config.gemini?.apiKey,
-    model: config.gemini?.model,
-    fetchImpl,
-  })
+  const geminiClient = gemini === undefined
+    ? createGeminiClient({
+      apiKey: config.gemini?.apiKey,
+      model: config.gemini?.model,
+      fetchImpl,
+    })
+    : gemini
 
   await app.register(internalRoutes, {
     db: database,
