@@ -595,15 +595,20 @@ export class GuildPlayer {
           cleanupTempFile(prefetched.filePath).catch((err) => {
             console.error('[GuildPlayer] abandoned incoming temp cleanup error:', err);
           });
-        } else {
-          this.#incomingTempFile = prefetched.filePath;
+          // Do not schedule analysis or open a FileSource on a temp we are
+          // deleting — callers treat rejection as a cancelled/failed prep.
+          const cancelErr = new Error('incoming prep cancelled');
+          cancelErr.code = 'INCOMING_PREP_CANCELLED';
+          throw cancelErr;
         }
+        this.#incomingTempFile = prefetched.filePath;
       } else {
         this.#currentTempFile = prefetched.filePath;
       }
       this.#scheduleAnalysis(track, prefetched.filePath);
       return createFileSource(prefetched.filePath, { measured: prefetched.measured });
     } catch (err) {
+      if (err?.code === 'INCOMING_PREP_CANCELLED') throw err;
       console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err.message);
       return createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
     }
