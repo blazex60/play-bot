@@ -59,6 +59,35 @@ test('MixStream dropCurrent emits trackend immediately', async () => {
   assert.equal(ended, true);
 });
 
+test('MixStream pushes silence between tracks so the player is not starved', async () => {
+  const mix = new MixStream();
+  const source = PcmSource.fromBuffers([silence(FRAME_BYTES)]);
+  mix.setCurrent(source);
+
+  // Use paused reads (like @discordjs/voice) — flowing 'data' mode would
+  // spin forever on continuous between-track silence.
+  const first = await new Promise((resolve) => {
+    const tryRead = () => {
+      const chunk = mix.read(FRAME_BYTES);
+      if (chunk) return resolve(chunk);
+      setImmediate(tryRead);
+    };
+    tryRead();
+  });
+  assert.equal(first.length, FRAME_BYTES);
+
+  await new Promise(resolve => setImmediate(resolve));
+
+  let silenceFrames = 0;
+  for (let i = 0; i < 20 && silenceFrames < 3; i++) {
+    const chunk = mix.read(FRAME_BYTES);
+    if (chunk) silenceFrames += 1;
+    else await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.ok(silenceFrames >= 3, 'expected silence frames during between-tracks handoff');
+  mix.endMixer();
+});
+
 test('MixStream reports playback position in seconds', async () => {
   const mix = new MixStream();
   const source = PcmSource.fromBuffers([silence(FRAME_BYTES * 5)]);

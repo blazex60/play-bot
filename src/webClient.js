@@ -83,5 +83,29 @@ export function createWebClient({
         console.error('[webClient] logOperation failed:', err.message)
       }
     },
+    async getTrackAnalysis(videoId) {
+      try {
+        if (!videoId) return null
+        const payload = await request(`/internal/track-analysis/${encodeURIComponent(videoId)}`)
+        return payload?.analysis ?? null
+      } catch (err) {
+        if (err?.status === 404) return null
+        console.error('[webClient] getTrackAnalysis failed:', err.message)
+        return null
+      }
+    },
+    async putTrackAnalysis(videoId, analysis) {
+      try {
+        if (!videoId || !analysis) return false
+        await request(`/internal/track-analysis/${encodeURIComponent(videoId)}`, {
+          method: 'PUT',
+          body: { analysis },
+        })
+        return true
+      } catch (err) {
+        console.error('[webClient] putTrackAnalysis failed:', err.message)
+        return false
+      }
+    },
   }
 }

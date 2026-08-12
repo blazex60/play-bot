@@ -5,11 +5,58 @@ export const FRAME_MS = 20;
 export const FRAME_BYTES = SAMPLE_RATE * (FRAME_MS / 1000) * CHANNELS * BYTES_PER_SAMPLE;
 export const BYTES_PER_SECOND = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE;
 
+/** Crossfade overlap headroom to reduce clipping when summing two -16 LUFS streams. */
+export const OVERLAP_GAIN = 10 ** (-3 / 20);
+
 /**
- * Phase 2 stub: returns unity gain for gapless playback.
+ * @param {{ positionSec: number, fadeSec?: number, curve?: 'linear'|'equal-power', role?: 'out'|'in' }} args
+ * @returns {number} gain 0..1
  */
-export function gainForPosition({ positionSec, fadeSec = 0, curve = 'linear' }) {
-  void curve;
-  if (fadeSec <= 0 || positionSec >= fadeSec) return 1;
-  return 1;
+export function gainForPosition({ positionSec, fadeSec = 0, curve = 'equal-power', role = 'out' }) {
+  if (!(fadeSec > 0)) return 1;
+  const t = Math.min(1, Math.max(0, positionSec / fadeSec));
+  if (curve === 'linear') {
+    return role === 'out' ? 1 - t : t;
+  }
+  // equal-power
+  const angle = (t * Math.PI) / 2;
+  return role === 'out' ? Math.cos(angle) : Math.sin(angle);
+}
+
+/** Soft-clip samples in-place on an Int16 interleaved stereo frame. */
+export function softLimitFrame(frame, ceiling = 0.95) {
+  const view = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2);
+  const max = 32767 * ceiling;
+  for (let i = 0; i < view.length; i++) {
+    const x = view[i] / 32768;
+    // cubic soft clip
+    const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
+    const scaled = y * 32768;
+    view[i] = scaled > max ? max : scaled < -max ? -max : scaled;
+  }
+  return frame;
+}
+
+/**
+ * Mix two s16le frames with gains. Applies OVERLAP_GAIN, soft-limits in float
+ * domain, then clamps to int16 (soft-limit must run before hard clip).
+ * @returns {Buffer}
+ */
+export function mixFrames(outFrame, inFrame, outGain, inGain) {
+  const out = Buffer.allocUnsafe(FRAME_BYTES);
+  const a = new Int16Array(outFrame.buffer, outFrame.byteOffset, FRAME_BYTES / 2);
+  const b = new Int16Array(inFrame.buffer, inFrame.byteOffset, FRAME_BYTES / 2);
+  const dest = new Int16Array(out.buffer, out.byteOffset, FRAME_BYTES / 2);
+  const gOut = outGain * OVERLAP_GAIN;
+  const gIn = inGain * OVERLAP_GAIN;
+  const ceiling = 0.95;
+  const max = 32767 * ceiling;
+  for (let i = 0; i < dest.length; i++) {
+    const x = (a[i] * gOut + b[i] * gIn) / 32768;
+    // cubic soft clip (same transfer as softLimitFrame)
+    const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
+    const scaled = y * 32768;
+    dest[i] = scaled > max ? max : scaled < -max ? -max : scaled;
+  }
+  return out;
 }

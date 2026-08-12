@@ -233,3 +233,63 @@ test('GET /internal/play-history/recent clamps a negative limit instead of retur
   assert.equal(response.statusCode, 200)
   assert.equal(response.json().u1.length, 200, 'a negative limit should fall back to the default cap, not become unlimited')
 })
+
+test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async (t) => {
+  const { app, config } = await setup(t)
+  const analysis = {
+    version: 1,
+    durationSec: 180,
+    tailShape: 'fade-out',
+    bpm: 128,
+    confidence: 0.7,
+    recommendedOverlapSec: 2,
+    vocalConfidence: 0.2,
+  }
+
+  const missing = await app.inject({
+    method: 'GET',
+    url: '/internal/track-analysis/vid-mix-1',
+    headers: authHeaders(config),
+  })
+  assert.equal(missing.statusCode, 404)
+
+  const put = await app.inject({
+    method: 'PUT',
+    url: '/internal/track-analysis/vid-mix-1',
+    headers: authHeaders(config),
+    payload: { analysis },
+  })
+  assert.equal(put.statusCode, 200)
+
+  const get = await app.inject({
+    method: 'GET',
+    url: '/internal/track-analysis/vid-mix-1',
+    headers: authHeaders(config),
+  })
+  assert.equal(get.statusCode, 200)
+  assert.equal(get.json().analysis.bpm, 128)
+  assert.equal(get.json().analysis.tailShape, 'fade-out')
+})
+
+test('PUT /internal/track-analysis normalizes analyzedAt milliseconds to seconds', async (t) => {
+  const { app, config, db } = await setup(t)
+  const ms = Date.UTC(2026, 0, 15, 12, 0, 0)
+
+  const put = await app.inject({
+    method: 'PUT',
+    url: '/internal/track-analysis/vid-ms',
+    headers: authHeaders(config),
+    payload: {
+      analysis: {
+        version: 1,
+        durationSec: 90,
+        confidence: 0.5,
+        analyzedAt: ms,
+      },
+    },
+  })
+  assert.equal(put.statusCode, 200)
+
+  const row = db.prepare('SELECT analyzed_at AS analyzedAt FROM track_analysis WHERE video_id = ?').get('vid-ms')
+  assert.equal(row.analyzedAt, Math.floor(ms / 1000))
+})

@@ -82,4 +82,73 @@ export async function internalRoutes(app, { db, token } = {}) {
     }
     return reply.send(result)
   })
+
+  app.get('/internal/track-analysis/:videoId', async (request, reply) => {
+    if (!db) throw new Error('db is required for internal routes')
+    const { videoId } = request.params ?? {}
+    if (!videoId) return reply.code(400).send({ error: 'missing_fields' })
+    const row = db.prepare(`
+      SELECT payload_json AS payloadJson, version, analyzed_at AS analyzedAt
+      FROM track_analysis WHERE video_id = ?
+    `).get(videoId)
+    if (!row) return reply.code(404).send({ error: 'not_found' })
+    return reply.send({
+      version: row.version,
+      analyzedAt: row.analyzedAt,
+      analysis: JSON.parse(row.payloadJson),
+    })
+  })
+
+  app.put('/internal/track-analysis/:videoId', async (request, reply) => {
+    if (!db) throw new Error('db is required for internal routes')
+    const { videoId } = request.params ?? {}
+    const analysis = request.body?.analysis
+    if (!videoId || !analysis || typeof analysis !== 'object') {
+      return reply.code(400).send({ error: 'missing_fields' })
+    }
+    const now = nowUnix()
+    // analyzeTrackFile may send ms (legacy) or seconds; store Unix seconds only.
+    const analyzedAtSec = Number.isFinite(analysis.analyzedAt)
+      ? Math.floor(analysis.analyzedAt > 1e11 ? analysis.analyzedAt / 1000 : analysis.analyzedAt)
+      : now
+    db.prepare(`
+      INSERT INTO track_analysis (
+        video_id, version, duration_sec, tail_shape, last_rms, bpm, bpm_confidence,
+        head_key, tail_key, harmonic_confidence, vocal_confidence,
+        recommended_overlap_sec, confidence, payload_json, analyzed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(video_id) DO UPDATE SET
+        version = excluded.version,
+        duration_sec = excluded.duration_sec,
+        tail_shape = excluded.tail_shape,
+        last_rms = excluded.last_rms,
+        bpm = excluded.bpm,
+        bpm_confidence = excluded.bpm_confidence,
+        head_key = excluded.head_key,
+        tail_key = excluded.tail_key,
+        harmonic_confidence = excluded.harmonic_confidence,
+        vocal_confidence = excluded.vocal_confidence,
+        recommended_overlap_sec = excluded.recommended_overlap_sec,
+        confidence = excluded.confidence,
+        payload_json = excluded.payload_json,
+        analyzed_at = excluded.analyzed_at
+    `).run(
+      videoId,
+      analysis.version ?? 1,
+      analysis.durationSec ?? null,
+      analysis.tailShape ?? null,
+      analysis.lastRms ?? null,
+      analysis.bpm ?? null,
+      analysis.bpmConfidence ?? null,
+      analysis.headKey ?? null,
+      analysis.tailKey ?? null,
+      analysis.harmonicConfidence ?? null,
+      analysis.vocalConfidence ?? null,
+      analysis.recommendedOverlapSec ?? null,
+      analysis.confidence ?? null,
+      JSON.stringify(analysis),
+      analyzedAtSec,
+    )
+    return reply.send({ ok: true })
+  })
 }
