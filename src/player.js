@@ -572,7 +572,6 @@ export class GuildPlayer {
   async #handleAfter() {
     this.#currentResource = null;
     this.#clearCrossfadeArm();
-    this.#clearPreparedIncoming();
     await this.#cleanupCurrentTempFile();
 
     const upcomingBeforeAdvance = this.#queue.loopMode === LoopMode.TRACK
@@ -581,6 +580,7 @@ export class GuildPlayer {
     const preserveIncoming = upcomingBeforeAdvance
       && this.#preparedIncoming?.track === upcomingBeforeAdvance;
     if (!preserveIncoming) {
+      this.#clearPreparedIncoming();
       await this.#cleanupIncomingTempFile();
     }
 
