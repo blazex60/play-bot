@@ -18,6 +18,7 @@ import { MixStream } from './audio/mixStream.js';
 import { createStreamSource, createFileSource } from './audio/pcmSource.js';
 import { analyzeTrackFile } from './audio/trackAnalysis.js';
 import { planTransition } from './audio/transition.js';
+import { LoopMode } from './queue.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
@@ -330,16 +331,13 @@ export class GuildPlayer {
     this.#forceSkip = false;
     this.#hadError = false;
     this.#clearCrossfadeArm();
-    await this.#cleanupCurrentTempFile();
-    if (this.#incomingTempFile) {
-      this.#currentTempFile = this.#incomingTempFile;
-      this.#incomingTempFile = null;
-    }
 
     const target = this.#crossfadeTargetTrack;
     this.#crossfadeTargetTrack = null;
 
-    // Avoid double-advance when a gapless trackend already moved the queue.
+    // Sync queue immediately — MixStream already switched audible audio.
+    // Awaiting temp cleanup first would leave skip/error seeing the outgoing
+    // track as current and double-advance into the promoted song.
     if (target) {
       if (this.#queue.current !== target) {
         const advanced = this.#queue.next({ forceAdvance: true });
@@ -351,8 +349,13 @@ export class GuildPlayer {
       this.#queue.next({ forceAdvance: false });
     }
 
+    const outgoingTemp = this.#currentTempFile;
+    this.#currentTempFile = this.#incomingTempFile;
+    this.#incomingTempFile = null;
+
     const nextTrack = this.#queue.current;
     if (!nextTrack) {
+      if (outgoingTemp) await cleanupTempFile(outgoingTemp);
       await this.#onDisconnect();
       return;
     }
@@ -367,6 +370,10 @@ export class GuildPlayer {
     this.#prefetchUpcoming();
     this.#recordPlay(nextTrack);
     this.#onTrackStart?.(nextTrack.videoId);
+
+    if (outgoingTemp) {
+      await cleanupTempFile(outgoingTemp);
+    }
   }
 
   get mixStream() {
@@ -617,7 +624,11 @@ export class GuildPlayer {
     if (remaining == null) return;
 
     const current = this.#queue.current;
-    const [next] = this.#queue.upcoming();
+    if (!current) return;
+    // TRACK loop must re-arm the same track; upcoming()[0] would advance on promote.
+    const next = this.#queue.loopMode === LoopMode.TRACK
+      ? current
+      : this.#queue.upcoming()[0];
     if (!next) return;
 
     const outAnalysis = await this.#resolveAnalysis(current);

@@ -115,8 +115,9 @@ export class MixStream extends Readable {
       return false;
     }
     if (source.error) {
+      // Incoming arming failure is recoverable — keep the outgoing track.
       source.destroy();
-      this.emit('sourceerror', source.error);
+      this.emit('incomingerror', source.error);
       return false;
     }
 
@@ -137,7 +138,8 @@ export class MixStream extends Readable {
     source.on('data', () => this.#scheduleRead());
     source.on('end', () => this.#scheduleRead());
     source.on('error', (err) => {
-      this.emit('sourceerror', err);
+      // Cancel overlap only; do not emit sourceerror (that aborts outgoing).
+      this.emit('incomingerror', err);
       this.#clearIncoming();
     });
 
@@ -277,9 +279,14 @@ export class MixStream extends Readable {
       return inFrame ?? (this.#current ? this.#readExact(this.#current, FRAME_BYTES) : SILENCE_FRAME);
     }
     if (!inFrame) {
-      // Wait for incoming data without advancing underrun on outgoing alone.
       if (this.#incoming?.ended) {
         this.#clearIncoming();
+        return outFrame;
+      }
+      // Incoming not ready yet — keep playing/consuming outgoing outro
+      // instead of inserting underrun silence that freezes the current track.
+      if (outFrame) {
+        this.#consumedBytes += FRAME_BYTES;
         return outFrame;
       }
       return null;
