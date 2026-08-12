@@ -33,7 +33,7 @@ Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.
 
 ### Working In This Directory
 - 音声・OAuth・Web アーキテクチャの制約は `CLAUDE.md` に集約されている。実装前に必ず読むこと（`network_mode: host` 必須、`@discordjs/voice` バージョン制約、yt-dlp stdout パイプ方式、ウォッチドッグのロジックなど）
-- MIX / Gemini の範囲と失敗時挙動は `CLAUDE.md` の「Gemini / MIX」および `docs/mix-plan.md` を参照。Gemini は Web process のみ。再生経路を Gemini 失敗で止めないこと
+- MIX / Gemini の範囲と失敗時挙動は `CLAUDE.md` の「Gemini / MIX」および `docs/mix-plan.md` を参照。Gemini は Web process のみ。再生経路を Gemini 失敗で止めないこと。運用は課金設定済み（Paid）Google Cloud プロジェクト前提（`legal/privacy.html`）
 - Bot process（`src/index.js` 系）は SQLite を一切開かない。DB は Web process（`src/web/server/`）専用。この境界を壊さないこと
 - Bot API（`src/botApi.js`）は loopback (`127.0.0.1:${BOT_API_PORT}`) 限定で bearer token 必須。Cloudflare Tunnel には絶対に出さない
 - シークレットは全て `.env` のみ（`GEMINI_API_KEY` 含む）。ソースコードに書かない

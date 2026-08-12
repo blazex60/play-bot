@@ -119,7 +119,7 @@ resolveAudioStream(url)  →  yt-dlp stdout  →  createAudioResource(stream)
 
 ## Gemini / MIX
 
-MIX プレイリスト機能（曲順最適化の補助・リクエスト文からの自動プレイリスト生成）では Google Gemini API を使う。クライアントは **Web process 専用**（`src/web/server/services/gemini.js`）。Bot process から直接呼ばない。送信するのは曲タイトル・チャンネル名・duration・ユーザーのリクエスト文に限定し、音声ファイルや OAuth トークンは送らない。Gemini 失敗時も再生は止めず、当該機能のみ縮退する。API キーは `.env` の `GEMINI_API_KEY`（モデルは `GEMINI_MODEL`）。ミキサー移行の詳細は `docs/mix-plan.md` を参照（移行期間の `MIXER_ENABLED` は Phase 1 安定後に撤去予定。現時点では削除しない）。
+MIX プレイリスト機能（曲順最適化の補助・リクエスト文からの自動プレイリスト生成）では Google Gemini API を使う。クライアントは **Web process 専用**（`src/web/server/services/gemini.js`）。Bot process から直接呼ばない。送信するのは曲タイトル・チャンネル名・duration・ユーザーのリクエスト文に限定し、音声ファイルや OAuth トークンは送らない。Gemini 失敗時も再生は止めず、当該機能のみ縮退する。API キーは `.env` の `GEMINI_API_KEY`（モデルは `GEMINI_MODEL`）。運用前提は **課金設定済み（Paid）の Google Cloud プロジェクト**（無料枠では Google がプロンプト/応答を製品改善に利用し得るため。詳細は `legal/privacy.html`）。ミキサー移行の詳細は `docs/mix-plan.md` を参照（移行期間の `MIXER_ENABLED` は Phase 1 安定後に撤去予定。現時点では削除しない）。
 
 ## シークレット管理
 
