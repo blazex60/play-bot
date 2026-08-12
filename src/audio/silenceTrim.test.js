@@ -29,11 +29,12 @@ test('buildSilenceTrimFilter includes leading and trailing trim', () => {
   const filter = buildSilenceTrimFilter({ thresholdDb: -45, keepSec: 0.03 });
   assert.match(filter, /silenceremove=/);
   assert.match(filter, /start_periods=1/);
-  assert.match(filter, /stop_periods=-1/);
+  assert.match(filter, /stop_periods=1/);
+  assert.doesNotMatch(filter, /stop_periods=-/);
   assert.match(filter, /-45dB/);
   assert.match(filter, /start_silence=0\.03/);
   assert.equal(SILENCE_TRIM_THRESHOLD_DB, -50);
-  assert.match(SILENCE_TRIM_FILTER, /stop_periods=-1/);
+  assert.match(SILENCE_TRIM_FILTER, /stop_periods=1/);
 });
 
 test('trimSilence removes leading and trailing padding from a synthetic file', async () => {

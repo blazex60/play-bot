@@ -99,8 +99,9 @@ export class MixStream extends Readable {
     source.on('data', () => this.#scheduleRead());
     source.on('end', () => this.#scheduleRead());
     source.on('error', (err) => {
+      // Consumer (GuildPlayer) dropCurrent/advances; do not finishCurrent here —
+      // that would race snaphandoff against the error handoff.
       this.emit('sourceerror', err);
-      this.#finishCurrent();
     });
 
     this.#scheduleRead();
@@ -390,7 +391,6 @@ export class MixStream extends Readable {
     next.on('end', () => this.#scheduleRead());
     next.on('error', (err) => {
       this.emit('sourceerror', err);
-      this.#finishCurrent();
     });
   }
 
@@ -441,10 +441,11 @@ export class MixStream extends Readable {
     source.on('end', () => this.#scheduleRead());
     source.on('error', (err) => {
       this.emit('sourceerror', err);
-      this.#finishCurrent();
     });
 
-    this.#scheduleRead();
+    // Do not #scheduleRead here: natural-end snap runs inside #readFrame while
+    // #pendingRead is still true; scheduling would re-enter #tryPushFrame and
+    // double-push. The caller reads the first adopted frame instead (like promote).
     return true;
   }
 

@@ -334,7 +334,9 @@ export class GuildPlayer {
   }
 
   async #onSnapHandoff(adopt) {
-    if (this.#crossfadeStarted || this.#mixStream?.isCrossfading) return;
+    // Error path already dropCurrent → #handleAfter; adopting here would
+    // advance the queue twice and skip/replace the snapped-in track.
+    if (this.#handlingAfter || this.#crossfadeStarted || this.#mixStream?.isCrossfading) return;
     const current = this.#queue.current;
     if (!current) return;
     const next = this.#queue.loopMode === LoopMode.TRACK
@@ -718,7 +720,8 @@ export class GuildPlayer {
     if (!filePath || !this.#analyzeTrackFileFn) return null;
     const analysis = await this.#analyzeTrackFileFn(filePath, {
       videoId: track.videoId,
-      durationSec: track.duration,
+      // Prefer probed post-trim duration so tail analysis seeks within EOF.
+      durationSec: this.#resolvePlaybackDurationSec(track) ?? track.duration,
     });
     if (track.videoId) {
       this.#analysisCache.set(track.videoId, analysis);
