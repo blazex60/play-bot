@@ -18,6 +18,8 @@ export function useSavedPlaylists({ guildId, runAction }) {
   const [renameValue, setRenameValue] = useState('')
   const [trackUrl, setTrackUrl] = useState('')
   const [trackSearchQuery, setTrackSearchQuery] = useState('')
+  const [generatePrompt, setGeneratePrompt] = useState('')
+  const [generateCount, setGenerateCount] = useState(10)
   const [searchResults, setSearchResults] = useState(
     /** @type {import('../api/client.js').SavedPlaylistTrack[]} */ ([])
   )
@@ -146,6 +148,26 @@ export function useSavedPlaylists({ guildId, runAction }) {
     }, 'プレイリストを並べ替えました')
   }
 
+  async function generateFromPrompt() {
+    const prompt = generatePrompt.trim()
+    if (!prompt) return
+    await runAction(async () => {
+      const payload = await api.generateSavedPlaylist({
+        prompt,
+        count: generateCount,
+      })
+      const playlist = typeof payload === 'object' && payload !== null && 'playlist' in payload
+        ? payload.playlist
+        : payload
+      if (playlist && typeof playlist === 'object' && 'id' in playlist) {
+        setSelectedPlaylist(/** @type {import('../api/client.js').SavedPlaylist} */ (playlist))
+        setRenameValue(playlist.name ?? '')
+        setGeneratePrompt('')
+      }
+      await refreshAfterMutation()
+    }, 'Gemini でプレイリストを生成しました')
+  }
+
   async function queueToGuild() {
     if (!selectedPlaylist || !guildId) return
     await runAction(async () => {
@@ -161,6 +183,8 @@ export function useSavedPlaylists({ guildId, runAction }) {
       renameValue,
       trackUrl,
       trackSearchQuery,
+      generatePrompt,
+      generateCount,
       searchResults,
       canQueue: Boolean(guildId),
     },
@@ -176,6 +200,9 @@ export function useSavedPlaylists({ guildId, runAction }) {
       onAddByUrl: addByUrl,
       onTrackSearchQueryChange: setTrackSearchQuery,
       onSearchTracks: searchTracks,
+      onGeneratePromptChange: setGeneratePrompt,
+      onGenerateCountChange: setGenerateCount,
+      onGenerateFromPrompt: generateFromPrompt,
       onAddFromSearchResult: addFromSearchResult,
       onMoveTrack: moveTrack,
       onRemoveTrack: removeTrack,

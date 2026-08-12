@@ -1,5 +1,8 @@
 import { nowUnix, recordOperationLog } from './route-utils.js'
 import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js'
+import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
+import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
+import { resolveYoutubeTrack } from '../matching.js'
 
 // Mirrors the operation_logs CHECK(source IN (...)) constraint. recordOperationLog
 // only console.errors on an insert failure (never rethrows), so without this
@@ -27,7 +30,12 @@ function upsertDiscordUser(db, { discordId, username }) {
 // Web -> Bot direction (src/botApi.js). Guarded by the same BOT_API_TOKEN
 // shared secret rather than the cookie-session requireAuth middleware, since
 // the caller here is the bot process, not a browser.
-export async function internalRoutes(app, { db, token, gemini = null } = {}) {
+export async function internalRoutes(app, {
+  db,
+  token,
+  gemini = null,
+  searchYoutube = defaultSearchYoutube,
+} = {}) {
   app.addHook('onRequest', async (request, reply) => {
     if (!token || getBearerToken(request) !== token) {
       return reply.code(401).send({ error: 'unauthorized' })
@@ -195,5 +203,41 @@ export async function internalRoutes(app, { db, token, gemini = null } = {}) {
     }
 
     return reply.send({ order, source })
+  })
+
+  app.post('/internal/generate-playlist', async (request, reply) => {
+    if (!db) throw new Error('db is required for internal routes')
+    if (!gemini?.generateTrackList) {
+      return reply.code(503).send({ error: 'gemini_unavailable' })
+    }
+
+    const {
+      discordUserId,
+      username,
+      prompt,
+      targetCount,
+      name = null,
+    } = request.body ?? {}
+
+    if (!discordUserId || !username || !prompt) {
+      return reply.code(400).send({ error: 'missing_fields' })
+    }
+
+    upsertDiscordUser(db, { discordId: discordUserId, username })
+
+    const playlist = await createGeneratedUserPlaylist({
+      db,
+      gemini,
+      userId: discordUserId,
+      username,
+      prompt,
+      targetCount,
+      name,
+      searchYoutubeFn: searchYoutube,
+      resolveYoutubeTrackFn: resolveYoutubeTrack,
+      loadAnalysisFn: async (videoId) => loadAnalysis(videoId),
+    })
+
+    return reply.send({ playlist })
   })
 }

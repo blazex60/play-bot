@@ -4,6 +4,14 @@ const OrderSchema = z.object({
   order: z.array(z.number().int().nonnegative()),
 });
 
+const TrackListSchema = z.object({
+  playlistName: z.string().min(1).max(80).optional(),
+  tracks: z.array(z.object({
+    title: z.string().min(1).max(200),
+    artist: z.string().max(200).optional(),
+  })).min(1),
+});
+
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MODEL = 'gemini-2.5-pro';
 
@@ -29,6 +37,21 @@ function buildPrompt(tracks, algorithmOrder) {
   ].join('\n');
 }
 
+function buildGeneratePrompt(prompt, targetCount, excludeTitles = []) {
+  const excludeBlock = excludeTitles.length
+    ? `\nDo NOT suggest these titles again:\n${excludeTitles.map((t) => `- ${t}`).join('\n')}`
+    : '';
+  return [
+    'You suggest vocal tracks (mainly J-POP / anime songs) for a DJ-style playlist.',
+    `Return ONLY JSON: {"playlistName":"short name","tracks":[{"title":"song title","artist":"optional"}]}`,
+    `Suggest about ${targetCount} distinct tracks matching the user request.`,
+    'Use real, searchable song titles. Do not include URLs or track numbers.',
+    excludeBlock,
+    '',
+    `User request: ${prompt}`,
+  ].join('\n');
+}
+
 /**
  * @param {{
  *   apiKey: string,
@@ -46,6 +69,9 @@ export function createGeminiClient({
   if (!apiKey) {
     return {
       async refineOrder() {
+        return null;
+      },
+      async generateTrackList() {
         return null;
       },
     };
@@ -102,7 +128,27 @@ export function createGeminiClient({
         return null;
       }
     },
+
+    /**
+     * Generate track title suggestions from a user prompt.
+     * @param {{ prompt: string, targetCount?: number, excludeTitles?: string[] }} args
+     */
+    async generateTrackList({ prompt, targetCount = 10, excludeTitles = [] }) {
+      try {
+        const parsed = TrackListSchema.safeParse(
+          await generateJson(buildGeneratePrompt(prompt, targetCount, excludeTitles)),
+        );
+        if (!parsed.success) return null;
+        return {
+          playlistName: parsed.data.playlistName,
+          tracks: parsed.data.tracks.slice(0, Math.max(1, targetCount)),
+        };
+      } catch (err) {
+        console.error('[gemini] generateTrackList failed:', err.message);
+        return null;
+      }
+    },
   };
 }
 
-export { OrderSchema };
+export { OrderSchema, TrackListSchema };

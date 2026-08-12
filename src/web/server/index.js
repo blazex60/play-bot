@@ -90,14 +90,16 @@ export async function buildWebServer({
 
   // Bot -> Web internal channel (play history), token-guarded, independent
   // of the browser cookie-session requireAuth hook used below.
+  const geminiClient = createGeminiClient({
+    apiKey: config.gemini?.apiKey,
+    model: config.gemini?.model,
+    fetchImpl,
+  })
+
   await app.register(internalRoutes, {
     db: database,
     token: config.botApi.token,
-    gemini: createGeminiClient({
-      apiKey: config.gemini?.apiKey,
-      model: config.gemini?.model,
-      fetchImpl,
-    }),
+    gemini: geminiClient,
   })
 
   registerDiscordAuthRoutes(app, { db: database, config, fetchImpl })
@@ -115,7 +117,7 @@ export async function buildWebServer({
     await authenticated.register(queueRoutes, { botClient, db: database })
     await authenticated.register(importRoutes, { db: database, botClient })
     await authenticated.register(importEditRoutes, { db: database, botClient })
-    await authenticated.register(playlistsRoutes, { db: database, botClient })
+    await authenticated.register(playlistsRoutes, { db: database, botClient, gemini: geminiClient })
     await authenticated.register(adminRoutes, { db: database, botClient })
   })
 

@@ -1,0 +1,85 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  buildSearchQuery,
+  clampTargetCount,
+  defaultPlaylistName,
+  generatePlaylistFromPrompt,
+  resolveGeneratedTracks,
+} from './playlistGenerate.js';
+
+test('buildSearchQuery combines title and artist', () => {
+  assert.equal(buildSearchQuery({ title: '夜に駆ける', artist: 'YOASOBI' }), '夜に駆ける YOASOBI');
+  assert.equal(buildSearchQuery({ title: '  Solo  ' }), 'Solo');
+  assert.equal(buildSearchQuery({ title: '' }), null);
+});
+
+test('clampTargetCount bounds 3..25', () => {
+  assert.equal(clampTargetCount(1), 3);
+  assert.equal(clampTargetCount(10), 10);
+  assert.equal(clampTargetCount(99), 25);
+});
+
+test('defaultPlaylistName truncates long prompts', () => {
+  const long = 'あ'.repeat(60);
+  assert.equal(defaultPlaylistName(long).length, 48);
+});
+
+test('resolveGeneratedTracks skips misses and dedupes videoId', async () => {
+  const tracks = await resolveGeneratedTracks({
+    suggestions: [
+      { title: 'A' },
+      { title: 'B' },
+      { title: 'A-dup' },
+    ],
+    searchYoutubeFn: async (query) => [{ id: query === 'A' ? 'vid-a' : 'vid-b', title: query }],
+    resolveYoutubeTrackFn: (entry) => ({
+      status: 'matched',
+      track: { title: entry.title, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
+    }),
+    requestedBy: 'tester',
+  });
+  assert.equal(tracks.length, 2);
+  assert.deepEqual(tracks.map((t) => t.videoId), ['vid-a', 'vid-b']);
+});
+
+test('generatePlaylistFromPrompt retries when too few tracks resolve', async () => {
+  let calls = 0;
+  const result = await generatePlaylistFromPrompt({
+    prompt: '夏っぽいJ-POP',
+    targetCount: 4,
+    gemini: {
+      async generateTrackList({ excludeTitles }) {
+        calls += 1;
+        if (excludeTitles.length === 0) {
+          return {
+            playlistName: 'Summer MIX',
+            tracks: [
+              { title: 'miss-1' },
+              { title: 'miss-2' },
+              { title: 'hit' },
+            ],
+          };
+        }
+        return {
+          tracks: [
+            { title: 'hit' },
+            { title: 'hit-2' },
+          ],
+        };
+      },
+    },
+    searchYoutubeFn: async (query) => (query.startsWith('hit') ? [{ id: query }] : []),
+    resolveYoutubeTrackFn: (entry) => ({
+      status: 'matched',
+      track: { title: entry.id, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
+    }),
+    optimizeTrackOrderFn: ({ tracks }) => tracks.map((_, i) => i),
+    requestedBy: 'tester',
+  });
+
+  assert.equal(calls, 2);
+  assert.ok(result);
+  assert.equal(result.playlistName, 'Summer MIX');
+  assert.equal(result.tracks.length, 2);
+});

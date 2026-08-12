@@ -121,5 +121,24 @@ export function createWebClient({
         return null
       }
     },
+    async generatePlaylist({
+      discordUserId,
+      username,
+      prompt,
+      targetCount = 10,
+      name = null,
+    } = {}) {
+      try {
+        if (!discordUserId || !username || !prompt) return null
+        const payload = await request('/internal/generate-playlist', {
+          method: 'POST',
+          body: { discordUserId, username, prompt, targetCount, name },
+        })
+        return payload?.playlist ?? null
+      } catch (err) {
+        console.error('[webClient] generatePlaylist failed:', err.message)
+        return null
+      }
+    },
   }
 }

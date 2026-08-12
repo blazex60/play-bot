@@ -232,18 +232,18 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 
 残作業（Phase 2 後追い）: essentia キー runtime、テンポ合わせ(D)、Docker aubio/essentia
 
-### Phase 3 — 曲順最適化 + Gemini 導入 🚧 進行中
+### Phase 3 — 曲順最適化 + Gemini 導入 ✅ 完了（PR #22）
 
 - `src/mix/ordering.js` + `camelot.js` — BPM/キー隣接コストの経路探索
 - `src/web/server/services/gemini.js` — 任意の Gemini 補助（失敗時は algorithm のみ）
 - `/internal/optimize-order` + `webClient.optimizeOrder`
 - `/mix order` + Web ダッシュボード「MIX 並べ替え」
 
-### Phase 4 — リクエストからの自動プレイリスト生成
+### Phase 4 — リクエストからの自動プレイリスト生成 🚧 進行中
 
-- リクエスト文 → Gemini が曲名リストを生成 → `search.js` で YouTube 解決 → ヒットしない曲は静かに除外 → 要求数に足りなければ再問い合わせ → `ordering.js` で並べ替え → `user_playlists` に保存
-- Web UI の My Playlists からも生成できるようにする
-- `autoplay.js` には触らない（併存）
+- `src/mix/playlistGenerate.js` — Gemini 曲名提案 → YouTube 解決 → `ordering.js` で並べ替え
+- `/internal/generate-playlist` + `POST /api/playlists/mine/generate`
+- `/mix create` + Web「Gemini で生成」
 
 ### Phase 5 — ドキュメントと法務
 
@@ -301,6 +301,6 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 1 | ✅ | PR #19 / `MIXER_ENABLED` で切替。重畳なし |
 | 1.5 | ✅ 初回完了 | `docs/mix-analysis-spike.md`。実 J-POP 再計測は残 |
 | 2 | ✅ | PR #21 merged。重畳・解析キャッシュ・二段階フォールバック |
-| 3 | 🚧 進行中 | `cursor/mix-order-phase3-78b7`。ordering + Gemini + `/mix order` |
-| 4 | 未着手 | 依存は 10章の通り |
+| 3 | ✅ | PR #22。ordering + Gemini refine + `/mix order` |
+| 4 | 🚧 進行中 | `cursor/mix-create-phase4-78b7`。`/mix create` + Web 生成 |
 | 5 法務 | ✅ 文面更新済み | privacy / CLAUDE / AGENTS / README。PR #19/#20 |
