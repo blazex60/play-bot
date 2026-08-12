@@ -274,6 +274,17 @@ export class GuildPlayer {
       this.#hadError = true;
       this.#mixStream.dropCurrent();
     });
+    this.#mixStream.on('incomingerror', (err) => {
+      // Mid-fade incoming failure: MixStream already cleared overlap and kept
+      // outgoing. Reset arm state so #maybeStartCrossfade can retry, and drop
+      // any normalize temp created for the failed incoming leg.
+      console.warn('[GuildPlayer] mix incoming error:', err.message);
+      this.#crossfadeStarted = false;
+      this.#crossfadeTargetTrack = null;
+      this.#cleanupIncomingTempFile().catch((cleanupErr) => {
+        console.warn('[GuildPlayer] incoming temp cleanup failed:', cleanupErr.message);
+      });
+    });
   }
 
   /**

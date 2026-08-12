@@ -343,10 +343,20 @@ export class MixStream extends Readable {
       return;
     }
 
+    // Drop startCrossfade's incomingerror handler and rebind as current source
+    // so later decode failures go through sourceerror / #hadError recovery.
+    next.removeAllListeners();
     this.#current = next;
     this.#consumedBytes = 0;
     this.#durationSec = null;
     this.#betweenTracks = false;
+
+    next.on('data', () => this.#scheduleRead());
+    next.on('end', () => this.#scheduleRead());
+    next.on('error', (err) => {
+      this.emit('sourceerror', err);
+      this.#finishCurrent();
+    });
   }
 
   #clearIncoming() {
