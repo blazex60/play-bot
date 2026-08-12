@@ -1,5 +1,6 @@
 import { SlashCommandBuilder, MessageFlags } from 'discord.js';
 import { requireSessionInSameVoice, replyFlags } from '../permissions.js';
+import { trackIdentity } from '../queue.js';
 import { webClient } from '../sessions.js';
 
 export default {
@@ -33,8 +34,10 @@ export default {
 
     await interaction.deferReply(replyFlags(interaction.guildId, 'mix'));
 
+    const snapshotIds = upcoming.map(trackIdentity);
     const current = session.queue.current;
     const result = await webClient.optimizeOrder({
+      guildId: interaction.guildId,
       anchorVideoId: current?.videoId ?? null,
       tracks: upcoming.map((track) => ({
         videoId: track.videoId,
@@ -49,12 +52,14 @@ export default {
       return false;
     }
 
-    const ok = session.queue.reorderUpcoming(result.order);
+    const ok = session.queue.reorderUpcomingIfUnchanged(result.order, snapshotIds);
     if (!ok) {
-      await interaction.editReply({ content: '❌ 並べ替え結果をキューに適用できませんでした' });
+      await interaction.editReply({ content: '❌ 最適化中にキューが変更されたため並べ替えを中止しました' });
       return false;
     }
 
+    // Subcommand-specific audit row; return null so the dispatcher does not
+    // also insert a generic `mix` success (see src/index.js deferred-outcome).
     await webClient.logOperation({
       guildId: interaction.guildId,
       discordUserId: interaction.user.id,
@@ -69,6 +74,6 @@ export default {
     await interaction.editReply({
       content: `🎚️ ${interaction.member.displayName} が upcoming ${upcoming.length} 曲を MIX 向けに並べ替えました${label}`,
     });
-    return true;
+    return null;
   },
 };

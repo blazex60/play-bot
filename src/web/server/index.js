@@ -50,6 +50,7 @@ export async function buildWebServer({
   fetchImpl = globalThis.fetch,
   logger = true,
   startCleanup = true,
+  gemini = undefined,
 } = {}) {
   const app = Fastify({
     logger,
@@ -93,11 +94,13 @@ export async function buildWebServer({
   await app.register(internalRoutes, {
     db: database,
     token: config.botApi.token,
-    gemini: createGeminiClient({
-      apiKey: config.gemini?.apiKey,
-      model: config.gemini?.model,
-      fetchImpl,
-    }),
+    gemini: gemini === undefined
+      ? createGeminiClient({
+        apiKey: config.gemini?.apiKey,
+        model: config.gemini?.model,
+        fetchImpl,
+      })
+      : gemini,
   })
 
   registerDiscordAuthRoutes(app, { db: database, config, fetchImpl })

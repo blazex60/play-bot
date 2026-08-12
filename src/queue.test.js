@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { GuildQueue, createTrack } from './queue.js'
+import { GuildQueue, createTrack, trackIdentity } from './queue.js'
 
 test('createTrack: videoId/channel/requestedById default to null when omitted', () => {
   const track = createTrack({ title: 'A', webpageUrl: 'https://example.com/a', duration: 60, requestedBy: 'user' })
@@ -144,4 +144,19 @@ test('reorderUpcoming: rejects invalid permutations', () => {
   const queue = makeQueueWithUpcoming(['current', 'A', 'B'])
   assert.equal(queue.reorderUpcoming([0, 0]), false)
   assert.equal(queue.reorderUpcoming([0]), false)
+})
+
+test('reorderUpcomingIfUnchanged: rejects when snapshot no longer matches', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
+  const snapshot = queue.upcoming().map(trackIdentity)
+  queue.moveUpcoming(0, 2)
+  assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot), false)
+  assert.deepEqual(queue.upcoming().map((t) => t.title), ['B', 'C', 'A'])
+})
+
+test('reorderUpcomingIfUnchanged: applies when snapshot still matches', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
+  const snapshot = queue.upcoming().map(trackIdentity)
+  assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot), true)
+  assert.deepEqual(queue.upcoming().map((t) => t.title), ['C', 'A', 'B'])
 })

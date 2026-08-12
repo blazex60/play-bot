@@ -4,6 +4,8 @@ const DEFAULT_BPM_WEIGHT = 1;
 const DEFAULT_KEY_WEIGHT = 1.2;
 const DEFAULT_ENERGY_WEIGHT = 0.3;
 const MISSING_ANALYSIS_PENALTY = 0.35;
+/** Cap greedy/exact work so large imported playlists cannot O(n²)-block the event loop. */
+export const MAX_OPTIMIZE_TRACKS = 40;
 
 /**
  * @param {number | null | undefined} bpm
@@ -99,11 +101,13 @@ export function isValidPermutation(order, length) {
 
 /**
  * Held-Karp TSP for small upcoming queues; greedy fallback for larger ones.
+ * Queues longer than `maxTracks` only optimize a prefix; the rest keep original order.
  * @param {{
  *   anchorAnalysis?: object | null,
  *   tracks: object[],
  *   analyses?: (object | null)[],
  *   maxExact?: number,
+ *   maxTracks?: number,
  * }} args
  * @returns {number[]} permutation of track indices (0..n-1)
  */
@@ -112,9 +116,22 @@ export function optimizeTrackOrder({
   tracks,
   analyses = [],
   maxExact = 10,
+  maxTracks = MAX_OPTIMIZE_TRACKS,
 }) {
   const n = tracks.length;
   if (n <= 1) return [...Array(n).keys()];
+
+  if (n > maxTracks) {
+    const headOrder = optimizeTrackOrder({
+      anchorAnalysis,
+      tracks: tracks.slice(0, maxTracks),
+      analyses: analyses.slice(0, maxTracks),
+      maxExact,
+      maxTracks,
+    });
+    const tail = Array.from({ length: n - maxTracks }, (_, i) => i + maxTracks);
+    return [...headOrder, ...tail];
+  }
 
   const analysisAt = (idx) => analyses[idx] ?? null;
 

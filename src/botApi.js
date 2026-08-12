@@ -14,6 +14,7 @@ import {
   resolveAdminRoleId,
 } from './settings.js';
 import { getEffectiveCommandVisibility, isMatrixManagedCommand } from './permissions.js';
+import { trackIdentity } from './queue.js';
 
 const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 
@@ -309,8 +310,10 @@ export function buildBotApi({
       if (upcoming.length < 2) {
         return { ok: false, reason: 'too_few_tracks', state: serializeSession(session) };
       }
+      const snapshotIds = upcoming.map(trackIdentity);
       const current = session.queue.current;
       const result = await webClient.optimizeOrder({
+        guildId,
         anchorVideoId: current?.videoId ?? null,
         tracks: upcoming.map((track) => ({
           videoId: track.videoId,
@@ -322,8 +325,13 @@ export function buildBotApi({
       if (!result?.order) {
         return { ok: false, reason: 'optimize_failed', state: serializeSession(session) };
       }
-      const ok = session.queue.reorderUpcoming(result.order);
-      return { ok, source: result.source ?? 'algorithm', state: serializeSession(session) };
+      const ok = session.queue.reorderUpcomingIfUnchanged(result.order, snapshotIds);
+      return {
+        ok,
+        reason: ok ? undefined : 'queue_changed',
+        source: result.source ?? 'algorithm',
+        state: serializeSession(session),
+      };
     }
     reply.code(404).send({ error: 'unknown_action' });
   });
