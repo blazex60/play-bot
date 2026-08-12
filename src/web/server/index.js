@@ -20,6 +20,7 @@ import { importRoutes } from './routes/import.js'
 import { importEditRoutes } from './routes/import-edit.js'
 import { playlistsRoutes } from './routes/playlists.js'
 import { internalRoutes } from './routes/internal.js'
+import { createGeminiClient } from './services/gemini.js'
 import { adminRoutes } from './routes/admin.js'
 
 const thisDir = dirname(fileURLToPath(import.meta.url))
@@ -49,6 +50,7 @@ export async function buildWebServer({
   fetchImpl = globalThis.fetch,
   logger = true,
   startCleanup = true,
+  gemini = undefined,
 } = {}) {
   const app = Fastify({
     logger,
@@ -89,7 +91,17 @@ export async function buildWebServer({
 
   // Bot -> Web internal channel (play history), token-guarded, independent
   // of the browser cookie-session requireAuth hook used below.
-  await app.register(internalRoutes, { db: database, token: config.botApi.token })
+  await app.register(internalRoutes, {
+    db: database,
+    token: config.botApi.token,
+    gemini: gemini === undefined
+      ? createGeminiClient({
+        apiKey: config.gemini?.apiKey,
+        model: config.gemini?.model,
+        fetchImpl,
+      })
+      : gemini,
+  })
 
   registerDiscordAuthRoutes(app, { db: database, config, fetchImpl })
   registerDemoAuthRoutes(app, { db: database, config })

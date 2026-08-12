@@ -66,6 +66,10 @@ export function createWebConfig(env = process.env) {
       discordId: 'google-review-demo',
       username: 'Google Reviewer',
     },
+    gemini: {
+      apiKey: env.GEMINI_API_KEY ?? null,
+      model: env.GEMINI_MODEL ?? 'gemini-2.5-pro',
+    },
   }
 }
 

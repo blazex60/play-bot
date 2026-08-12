@@ -271,6 +271,106 @@ test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async 
   assert.equal(get.json().analysis.tailShape, 'fade-out')
 })
 
+test('POST /internal/optimize-order returns a valid permutation', async (t) => {
+  const { app, config } = await setup(t)
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/optimize-order',
+    headers: authHeaders(config),
+    payload: {
+      anchorVideoId: 'anchor',
+      tracks: [
+        { videoId: 'a', title: 'Fast', duration: 180 },
+        { videoId: 'b', title: 'Faster', duration: 180 },
+        { videoId: 'c', title: 'Slow', duration: 180 },
+      ],
+    },
+  })
+  assert.equal(response.statusCode, 200)
+  const body = response.json()
+  assert.equal(body.order.length, 3)
+  assert.deepEqual([...body.order].sort(), [0, 1, 2])
+  assert.equal(body.source, 'algorithm')
+})
+
+test('POST /internal/optimize-order keeps algorithm order when Gemini refine is slow', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const hangingGemini = {
+    refineOrder: () => new Promise(() => {}),
+  }
+  const app = await buildWebServer({
+    config,
+    db,
+    gemini: hangingGemini,
+    fetchImpl: async () => { throw new Error('unexpected fetch') },
+    logger: false,
+    startCleanup: false,
+  })
+  t.after(() => app.close())
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/optimize-order',
+    headers: authHeaders(config),
+    payload: {
+      guildId: 'g-slow',
+      tracks: [
+        { videoId: 'a', title: 'A', duration: 120 },
+        { videoId: 'b', title: 'B', duration: 120 },
+      ],
+    },
+  })
+  assert.equal(response.statusCode, 200)
+  const body = response.json()
+  assert.equal(body.source, 'algorithm')
+  assert.deepEqual([...body.order].sort(), [0, 1])
+})
+
+test('POST /internal/optimize-order skips Gemini when rate-limited', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  let refineCalls = 0
+  const gemini = {
+    async refineOrder() {
+      refineCalls += 1
+      return [1, 0]
+    },
+  }
+  const { createRefineRateLimiter } = await import('../services/gemini.js')
+  const refineLimiter = createRefineRateLimiter({ cooldownMs: 60_000 })
+  assert.equal(refineLimiter.tryBegin('g-limited'), true)
+
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+  const dedicated = Fastify({ logger: false })
+  await dedicated.register(internalRoutes, {
+    db,
+    token: config.botApi.token,
+    gemini,
+    refineLimiter,
+  })
+  t.after(() => dedicated.close())
+
+  const response = await dedicated.inject({
+    method: 'POST',
+    url: '/internal/optimize-order',
+    headers: authHeaders(config),
+    payload: {
+      guildId: 'g-limited',
+      tracks: [
+        { videoId: 'a', title: 'A', duration: 120 },
+        { videoId: 'b', title: 'B', duration: 120 },
+      ],
+    },
+  })
+  assert.equal(response.statusCode, 200)
+  assert.equal(response.json().source, 'algorithm')
+  assert.equal(refineCalls, 0)
+})
+
 test('PUT /internal/track-analysis normalizes analyzedAt milliseconds to seconds', async (t) => {
   const { app, config, db } = await setup(t)
   const ms = Date.UTC(2026, 0, 15, 12, 0, 0)

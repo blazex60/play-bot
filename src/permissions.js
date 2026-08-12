@@ -18,6 +18,7 @@ const DEFAULT_VISIBILITY = {
   bitrate: 'personal',
   normalize: 'personal',
   autoplay: 'personal',
+  mix: 'personal',
 }
 
 // Commands that manage the admin-role gate itself must not appear in the

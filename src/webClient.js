@@ -107,5 +107,19 @@ export function createWebClient({
         return false
       }
     },
+    async optimizeOrder({ guildId = null, anchorVideoId = null, tracks } = {}) {
+      try {
+        if (!Array.isArray(tracks) || tracks.length === 0) return null
+        const payload = await request('/internal/optimize-order', {
+          method: 'POST',
+          body: { guildId, anchorVideoId, tracks },
+        })
+        if (!payload?.order || !Array.isArray(payload.order)) return null
+        return payload
+      } catch (err) {
+        console.error('[webClient] optimizeOrder failed:', err.message)
+        return null
+      }
+    },
   }
 }

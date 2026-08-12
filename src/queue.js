@@ -4,6 +4,27 @@ export function createTrack({ title, webpageUrl, duration, requestedBy, requeste
   return { title, webpageUrl, duration, requestedBy, requestedById, thumbnail, videoId, channel };
 }
 
+/** Stable identity for snapshot checks during async optimize. */
+export function trackIdentity(track) {
+  if (track?.videoId) return `vid:${track.videoId}`;
+  if (track?.webpageUrl) return `url:${track.webpageUrl}`;
+  return `title:${track?.title ?? ''}`;
+}
+
+/**
+ * @param {object[]} tracks
+ * @param {string[]} snapshotIds from trackIdentity at optimize start
+ * @returns {boolean}
+ */
+export function sameTrackSnapshot(tracks, snapshotIds) {
+  if (!Array.isArray(tracks) || !Array.isArray(snapshotIds)) return false;
+  if (tracks.length !== snapshotIds.length) return false;
+  for (let i = 0; i < tracks.length; i += 1) {
+    if (trackIdentity(tracks[i]) !== snapshotIds[i]) return false;
+  }
+  return true;
+}
+
 export class GuildQueue {
   #tracks = [];
   #currentIndex = 0;
@@ -87,6 +108,40 @@ export class GuildQueue {
     const [track] = this.#tracks.splice(absFrom, 1);
     this.#tracks.splice(absTo, 0, track);
     return true;
+  }
+
+  /**
+   * Reorder upcoming tracks by a full permutation of upcoming indices.
+   * @param {number[]} order upcoming-relative indices 0..upcoming().length-1
+   * @returns {boolean}
+   */
+  reorderUpcoming(order) {
+    const upcoming = this.upcoming();
+    const len = upcoming.length;
+    if (len === 0) return false;
+    if (len === 1 && order.length === 1 && order[0] === 0) return true;
+    if (!Array.isArray(order) || order.length !== len) return false;
+    const seen = new Set();
+    for (const idx of order) {
+      if (!Number.isInteger(idx) || idx < 0 || idx >= len || seen.has(idx)) return false;
+      seen.add(idx);
+    }
+    const reordered = order.map((idx) => upcoming[idx]);
+    for (let i = 0; i < len; i += 1) {
+      this.#tracks[this.#currentIndex + 1 + i] = reordered[i];
+    }
+    return true;
+  }
+
+  /**
+   * Apply an optimize permutation only if upcoming still matches the pre-request snapshot.
+   * @param {number[]} order
+   * @param {string[]} snapshotIds
+   * @returns {boolean}
+   */
+  reorderUpcomingIfUnchanged(order, snapshotIds) {
+    if (!sameTrackSnapshot(this.upcoming(), snapshotIds)) return false;
+    return this.reorderUpcoming(order);
   }
 
 }
