@@ -284,6 +284,33 @@ test('MixStream holds incoming frame when outgoing underruns mid-crossfade', asy
   mix.endMixer();
 });
 
+test('MixStream snaphandoff adopts prepared next without betweenTracks silence', async () => {
+  const mix = new MixStream();
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(7000);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 3 }, () => Buffer.from(frame)));
+  const incoming = PcmSource.fromBuffers(Array.from({ length: 4 }, () => Buffer.from(frame)));
+
+  let trackEndCount = 0;
+  let adopted = false;
+  mix.on('trackend', () => { trackEndCount += 1; });
+  mix.on('snaphandoff', ({ adopt }) => {
+    adopted = adopt(incoming, { durationSec: 2 });
+  });
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 60 }), true);
+  for (let i = 0; i < 8 && !adopted; i += 1) {
+    const chunk = await readFramePaused(mix);
+    if (!adopted) assert.ok(chunk, `expected audio frame before handoff (i=${i})`);
+  }
+
+  assert.equal(adopted, true);
+  assert.equal(trackEndCount, 0);
+  assert.equal(mix.currentSource, incoming);
+  mix.pause();
+  mix.endMixer();
+});
+
 test('MixStream promoted source errors emit sourceerror', async () => {
   const mix = new MixStream();
   const frame = Buffer.alloc(FRAME_BYTES);

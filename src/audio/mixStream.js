@@ -274,8 +274,15 @@ export class MixStream extends Readable {
 
     const frame = this.#readExact(this.#current, FRAME_BYTES);
     if (!frame) {
-      if (this.#current.ended) {
+      if (this.#current?.ended) {
         this.#finishCurrent();
+        if (this.#current && !this.#current.ended) {
+          const adopted = this.#readExact(this.#current, FRAME_BYTES);
+          if (adopted) {
+            this.#consumedBytes += FRAME_BYTES;
+            return adopted;
+          }
+        }
       }
       return null;
     }
@@ -401,15 +408,67 @@ export class MixStream extends Readable {
     this.#heldInFrame = null;
   }
 
+  /**
+   * Replace the outgoing source without entering betweenTracks silence.
+   * Used when the next track was prefetched but crossfade did not arm in time.
+   * @param {object} source
+   * @param {{ durationSec?: number|null }} [options]
+   * @returns {boolean}
+   */
+  adoptCurrent(source, { durationSec = null } = {}) {
+    if (this.#destroyed || !source) {
+      source?.destroy?.();
+      return false;
+    }
+    if (source.error) {
+      source.destroy();
+      return false;
+    }
+
+    if (this.#current) {
+      this.#current.removeAllListeners();
+      this.#current.destroy();
+    }
+    this.#clearIncoming();
+
+    this.#current = source;
+    this.#consumedBytes = 0;
+    this.#durationSec = durationSec;
+    this.#underrunSince = null;
+    this.#betweenTracks = false;
+
+    source.on('data', () => this.#scheduleRead());
+    source.on('end', () => this.#scheduleRead());
+    source.on('error', (err) => {
+      this.emit('sourceerror', err);
+      this.#finishCurrent();
+    });
+
+    this.#scheduleRead();
+    return true;
+  }
+
   #finishCurrent() {
-    const source = this.#current;
-    this.#current = null;
-    source?.removeAllListeners();
-    source?.destroy();
+    const outgoing = this.#current;
     if (this.#incoming) {
       this.#promoteIncoming();
       return;
     }
+
+    let adopted = false;
+    this.emit('snaphandoff', {
+      adopt: (source, opts = {}) => {
+        adopted = this.adoptCurrent(source, opts);
+        return adopted;
+      },
+    });
+    if (adopted) {
+      return;
+    }
+
+    this.#current = null;
+    outgoing?.removeAllListeners();
+    outgoing?.destroy();
     this.#betweenTracks = true;
     this.#underrunSince = null;
     this.emit('trackend');

@@ -397,3 +397,62 @@ test('acceptance (mixer): crossfade arms without cached analysis using fallback 
   assert.equal(player.mixStream.isCrossfading, true);
   await player.stop();
 });
+
+test('acceptance (mixer): snap handoff when metadata outlasts actual PCM', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let createCount = 0;
+  const { player, queue } = makePlayer({
+    mixerEnabled: true,
+    trackDuration: 60,
+    createPcmSourceFn: async () => {
+      createCount += 1;
+      return PcmSource.fromBuffers([frame, frame]);
+    },
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  for (let i = 0; i < 20; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+    await nextTurn();
+    if (queue.current.title === 'Track B') break;
+  }
+
+  assert.equal(queue.current.title, 'Track B');
+  assert.equal(createCount, 2, 'handoff must reuse prepared incoming, not redownload');
+  await player.stop();
+});
+
+test('acceptance (mixer): trackend handoff reuses prepared incoming', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let createCount = 0;
+  const { player, queue } = makePlayer({
+    mixerEnabled: true,
+    trackDuration: 3,
+    createPcmSourceFn: async () => {
+      createCount += 1;
+      return PcmSource.fromBuffers([frame, frame, frame]);
+    },
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 3,
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  triggerTrackEnd({ mixStream: player.mixStream });
+  await nextTurn();
+
+  assert.equal(queue.current.title, 'Track B');
+  assert.equal(createCount, 2);
+  await player.stop();
+});
