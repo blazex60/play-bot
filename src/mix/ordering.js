@@ -59,14 +59,17 @@ export function transitionCost(fromAnalysis, toAnalysis, weights = {}) {
 
   const harmonicOk = (fromAnalysis?.harmonicConfidence ?? 0) >= 0.55
     && (toAnalysis?.harmonicConfidence ?? 0) >= 0.55;
-  const keyDist = harmonicOk
-    ? camelotDistance(fromAnalysis?.tailKey ?? fromAnalysis?.headKey, toAnalysis?.headKey)
-    : camelotDistance(fromAnalysis?.tailKey ?? fromAnalysis?.headKey, toAnalysis?.headKey);
-  if (keyDist != null) {
-    cost += keyWeight * Math.min(2, keyDist / 2);
-    parts += 1;
-  } else {
-    cost += MISSING_ANALYSIS_PENALTY * keyWeight;
+  if (harmonicOk) {
+    const keyDist = camelotDistance(
+      fromAnalysis?.tailKey ?? fromAnalysis?.headKey,
+      toAnalysis?.headKey,
+    );
+    if (keyDist != null) {
+      cost += keyWeight * Math.min(2, keyDist / 2);
+      parts += 1;
+    } else {
+      cost += MISSING_ANALYSIS_PENALTY * keyWeight;
+    }
   }
 
   const fromEnergy = fromAnalysis?.lastRms;
