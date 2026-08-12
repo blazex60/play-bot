@@ -63,6 +63,7 @@ export class GuildPlayer {
   #analysisCache = new Map();
   #crossfadeArmTimer = null;
   #crossfadeStarted = false;
+  #crossfadeArming = false;
   #crossfadeTargetTrack = null;
   #getTrackAnalysisFn;
   #putTrackAnalysisFn;
@@ -627,54 +628,60 @@ export class GuildPlayer {
   }
 
   async #maybeStartCrossfade() {
-    if (!this.#mixerEnabled || this.#crossfadeStarted || this.#mixStream?.isCrossfading) return;
+    if (!this.#mixerEnabled || this.#crossfadeArming || this.#crossfadeStarted) return;
+    if (this.#mixStream?.isCrossfading) return;
     if (this.#forceSkip || this.#handlingAfter) return;
     if (this.#audioPlayer.state.status !== AudioPlayerStatus.Playing) return;
 
-    const remaining = this.#mixStream?.remainingSec;
-    if (remaining == null) return;
-
-    const current = this.#queue.current;
-    if (!current) return;
-    // TRACK loop must re-arm the same track; upcoming()[0] would advance on promote.
-    const next = this.#queue.loopMode === LoopMode.TRACK
-      ? current
-      : this.#queue.upcoming()[0];
-    if (!next) return;
-
-    const outAnalysis = await this.#resolveAnalysis(current);
-    const inAnalysis = await this.#resolveAnalysis(next);
-    const plan = planTransition(outAnalysis, inAnalysis);
-    if (plan.mode === 'gapless' || !(plan.fadeSec > 0)) return;
-    if (remaining > plan.fadeSec + 0.2) return;
-
-    this.#crossfadeStarted = true;
-    this.#crossfadeTargetTrack = next;
-    let source;
+    this.#crossfadeArming = true;
     try {
-      source = await this.#createPcmSource(next, { forIncoming: true });
-    } catch (err) {
-      console.warn('[GuildPlayer] incoming pcm source failed:', err.message);
-      this.#crossfadeStarted = false;
-      this.#crossfadeTargetTrack = null;
-      await this.#cleanupIncomingTempFile();
-      return;
-    }
+      const remaining = this.#mixStream?.remainingSec;
+      if (remaining == null) return;
 
-    if (this.#queue.current !== current || this.#forceSkip) {
-      source.destroy();
-      await this.#cleanupIncomingTempFile();
-      this.#crossfadeStarted = false;
-      this.#crossfadeTargetTrack = null;
-      return;
-    }
+      const current = this.#queue.current;
+      if (!current) return;
+      // TRACK loop must re-arm the same track; upcoming()[0] would advance on promote.
+      const next = this.#queue.loopMode === LoopMode.TRACK
+        ? current
+        : this.#queue.upcoming()[0];
+      if (!next) return;
 
-    const started = this.#mixStream.startCrossfade(source, plan);
-    if (!started) {
-      source.destroy();
-      await this.#cleanupIncomingTempFile();
-      this.#crossfadeStarted = false;
-      this.#crossfadeTargetTrack = null;
+      const outAnalysis = await this.#resolveAnalysis(current);
+      const inAnalysis = await this.#resolveAnalysis(next);
+      const plan = planTransition(outAnalysis, inAnalysis);
+      if (plan.mode === 'gapless' || !(plan.fadeSec > 0)) return;
+      if (remaining > plan.fadeSec + 0.2) return;
+
+      this.#crossfadeStarted = true;
+      this.#crossfadeTargetTrack = next;
+      let source;
+      try {
+        source = await this.#createPcmSource(next, { forIncoming: true });
+      } catch (err) {
+        console.warn('[GuildPlayer] incoming pcm source failed:', err.message);
+        this.#crossfadeStarted = false;
+        this.#crossfadeTargetTrack = null;
+        await this.#cleanupIncomingTempFile();
+        return;
+      }
+
+      if (this.#queue.current !== current || this.#forceSkip) {
+        source.destroy();
+        await this.#cleanupIncomingTempFile();
+        this.#crossfadeStarted = false;
+        this.#crossfadeTargetTrack = null;
+        return;
+      }
+
+      const started = this.#mixStream.startCrossfade(source, plan);
+      if (!started) {
+        source.destroy();
+        await this.#cleanupIncomingTempFile();
+        this.#crossfadeStarted = false;
+        this.#crossfadeTargetTrack = null;
+      }
+    } finally {
+      this.#crossfadeArming = false;
     }
   }
 
@@ -787,22 +794,9 @@ export class GuildPlayer {
 
   #resetWatchdog() {
     this.#clearWatchdog();
-    if (this.#mixerEnabled) {
-      this.#watchdogTimer = setInterval(() => {
-        // Pause/unpause stops Discord from pulling frames, which freezes
-        // lastDataAt as the PCM buffer fills — same guard as the legacy path.
-        if (this.#audioPlayer.state.status !== AudioPlayerStatus.Playing) return;
-        const source = this.#mixStream?.currentSource;
-        if (!source) return;
-        if (Date.now() - source.lastDataAt > WATCHDOG_STALL_THRESHOLD) {
-          console.warn('[GuildPlayer] watchdog: mixer stall detected');
-          this.#hadError = true;
-          this.#mixStream.dropCurrent();
-        }
-      }, WATCHDOG_INTERVAL);
-      return;
-    }
-
+    // Both mixer and legacy paths measure Discord playbackDuration progress.
+    // Producer lastDataAt freezes on pause while PCM still buffers, and also
+    // misses stalls where frames are produced but Discord stops advancing.
     let lastPlaybackDuration = 0;
     this.#watchdogTimer = setInterval(() => {
       const state = this.#audioPlayer.state;
@@ -812,9 +806,16 @@ export class GuildPlayer {
       if (duration > lastPlaybackDuration) {
         lastPlaybackDuration = duration;
         this.#lastActiveAt = Date.now();
-      } else if (Date.now() - this.#lastActiveAt > WATCHDOG_STALL_THRESHOLD) {
-        console.warn('[GuildPlayer] watchdog: stall detected, stopping player');
-        this.#hadError = true;
+        return;
+      }
+
+      if (Date.now() - this.#lastActiveAt <= WATCHDOG_STALL_THRESHOLD) return;
+
+      console.warn('[GuildPlayer] watchdog: stall detected');
+      this.#hadError = true;
+      if (this.#mixerEnabled) {
+        this.#mixStream?.dropCurrent();
+      } else {
         this.#audioPlayer.stop();
       }
     }, WATCHDOG_INTERVAL);

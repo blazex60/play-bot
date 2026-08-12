@@ -27,6 +27,11 @@ export class MixStream extends Readable {
   #fadeElapsedSec = 0;
   #outEq = null;
   #inEq = null;
+  /** @type {WeakMap<object, Buffer>} partial PCM kept across underruns per source */
+  #pendingExact = new WeakMap();
+  /** Held partner frame when only one side of a crossfade frame is ready */
+  #heldOutFrame = null;
+  #heldInFrame = null;
 
   constructor() {
     super();
@@ -88,6 +93,8 @@ export class MixStream extends Readable {
     this.#fadeElapsedSec = 0;
     this.#outEq = null;
     this.#inEq = null;
+    this.#heldOutFrame = null;
+    this.#heldInFrame = null;
 
     source.on('data', () => this.#scheduleRead());
     source.on('end', () => this.#scheduleRead());
@@ -227,12 +234,15 @@ export class MixStream extends Readable {
     this.#current = null;
     this.#incoming = null;
     this.#crossfade = null;
+    this.#heldOutFrame = null;
+    this.#heldInFrame = null;
     callback(err);
   }
 
   #readExact(source, bytes) {
     if (!source) return null;
-    let frame = Buffer.alloc(0);
+    let frame = this.#pendingExact.get(source) ?? Buffer.alloc(0);
+    this.#pendingExact.delete(source);
     while (frame.length < bytes) {
       const chunk = source.read(bytes - frame.length);
       if (!chunk || chunk.length === 0) {
@@ -241,6 +251,10 @@ export class MixStream extends Readable {
             return Buffer.concat([frame, Buffer.alloc(bytes - frame.length)]);
           }
           return null;
+        }
+        // Underrun: keep already-consumed PCM for the next attempt.
+        if (frame.length > 0) {
+          this.#pendingExact.set(source, frame);
         }
         return null;
       }
@@ -270,8 +284,10 @@ export class MixStream extends Readable {
   }
 
   #readCrossfadeFrame() {
-    const outFrame = this.#readExact(this.#current, FRAME_BYTES);
-    const inFrame = this.#readExact(this.#incoming, FRAME_BYTES);
+    const outFrame = this.#heldOutFrame ?? this.#readExact(this.#current, FRAME_BYTES);
+    this.#heldOutFrame = null;
+    const inFrame = this.#heldInFrame ?? this.#readExact(this.#incoming, FRAME_BYTES);
+    this.#heldInFrame = null;
 
     if (!outFrame && this.#current?.ended) {
       // Promote incoming to current mid-fade if outgoing ends first.
@@ -291,7 +307,11 @@ export class MixStream extends Readable {
       }
       return null;
     }
-    if (!outFrame) return null;
+    if (!outFrame) {
+      // Outgoing underrun with a ready incoming frame — hold it for the next tick.
+      this.#heldInFrame = inFrame;
+      return null;
+    }
 
     let processedOut = Buffer.from(outFrame);
     let processedIn = Buffer.from(inFrame);
@@ -332,6 +352,8 @@ export class MixStream extends Readable {
     this.#outEq = null;
     this.#inEq = null;
     this.#fadeElapsedSec = 0;
+    this.#heldOutFrame = null;
+    this.#heldInFrame = null;
 
     // Emit trackend for the outgoing track; GuildPlayer advances queue metadata
     // without calling setCurrent again when already crossfading.
@@ -369,6 +391,8 @@ export class MixStream extends Readable {
     this.#outEq = null;
     this.#inEq = null;
     this.#fadeElapsedSec = 0;
+    this.#heldOutFrame = null;
+    this.#heldInFrame = null;
   }
 
   #finishCurrent() {

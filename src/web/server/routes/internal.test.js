@@ -270,3 +270,26 @@ test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async 
   assert.equal(get.json().analysis.bpm, 128)
   assert.equal(get.json().analysis.tailShape, 'fade-out')
 })
+
+test('PUT /internal/track-analysis normalizes analyzedAt milliseconds to seconds', async (t) => {
+  const { app, config, db } = await setup(t)
+  const ms = Date.UTC(2026, 0, 15, 12, 0, 0)
+
+  const put = await app.inject({
+    method: 'PUT',
+    url: '/internal/track-analysis/vid-ms',
+    headers: authHeaders(config),
+    payload: {
+      analysis: {
+        version: 1,
+        durationSec: 90,
+        confidence: 0.5,
+        analyzedAt: ms,
+      },
+    },
+  })
+  assert.equal(put.statusCode, 200)
+
+  const row = db.prepare('SELECT analyzed_at AS analyzedAt FROM track_analysis WHERE video_id = ?').get('vid-ms')
+  assert.equal(row.analyzedAt, Math.floor(ms / 1000))
+})

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { unlink } from 'node:fs/promises';
 import { BYTES_PER_SECOND } from './fade.js';
 
 export const ANALYSIS_VERSION = 1;
@@ -71,29 +72,36 @@ async function analyzeBpm(filePath) {
     return { available: false, bpm: null, confidence: 0 };
   }
   const wavPath = `${filePath}.analysis.wav`;
-  await spawnCapture('ffmpeg', [
-    '-y', '-hide_banner', '-loglevel', 'error',
-    '-t', '60', '-i', filePath,
-    '-ac', '1', '-ar', '44100', wavPath,
-  ]);
-  const { stdout, code } = await spawnCapture('aubiotrack', ['-i', wavPath]);
-  const beats = stdout.trim().split('\n').map(Number).filter((n) => Number.isFinite(n));
-  let bpm = null;
-  if (beats.length >= 4) {
-    const intervals = [];
-    for (let i = 1; i < beats.length; i++) intervals.push(beats[i] - beats[i - 1]);
-    intervals.sort((a, b) => a - b);
-    const median = intervals[Math.floor(intervals.length / 2)];
-    if (median > 0) bpm = Number((60 / median).toFixed(2));
+  try {
+    const conv = await spawnCapture('ffmpeg', [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-t', '60', '-i', filePath,
+      '-ac', '1', '-ar', '44100', wavPath,
+    ]);
+    if (conv.code !== 0) {
+      return { available: true, ok: false, bpm: null, beatCount: 0, confidence: 0 };
+    }
+    const { stdout, code } = await spawnCapture('aubiotrack', ['-i', wavPath]);
+    const beats = stdout.trim().split('\n').map(Number).filter((n) => Number.isFinite(n));
+    let bpm = null;
+    if (beats.length >= 4) {
+      const intervals = [];
+      for (let i = 1; i < beats.length; i++) intervals.push(beats[i] - beats[i - 1]);
+      intervals.sort((a, b) => a - b);
+      const median = intervals[Math.floor(intervals.length / 2)];
+      if (median > 0) bpm = Number((60 / median).toFixed(2));
+    }
+    return {
+      available: true,
+      ok: code === 0 && bpm != null,
+      bpm,
+      beatCount: beats.length,
+      // Without Percival cross-check in this path, treat as medium confidence.
+      confidence: bpm != null ? 0.6 : 0,
+    };
+  } finally {
+    await unlink(wavPath).catch(() => {});
   }
-  return {
-    available: true,
-    ok: code === 0 && bpm != null,
-    bpm,
-    beatCount: beats.length,
-    // Without Percival cross-check in this path, treat as medium confidence.
-    confidence: bpm != null ? 0.6 : 0,
-  };
 }
 
 /**
@@ -136,6 +144,9 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
     ]);
     duration = Number(stdout.trim());
   }
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error('unable to determine track duration for analysis');
+  }
 
   const [tail, bpm] = await Promise.all([
     analyzeTailShape(filePath, duration),
@@ -169,7 +180,8 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
     vocalConfidence,
     recommendedOverlapSec: overlapSec,
     confidence,
-    analyzedAt: Date.now(),
+    // Unix seconds — matches track_analysis.analyzed_at / nowUnix().
+    analyzedAt: Math.floor(Date.now() / 1000),
   };
 }
 

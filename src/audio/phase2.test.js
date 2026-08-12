@@ -182,3 +182,114 @@ test('MixStream incoming error clears overlap without sourceerror', async () => 
   assert.ok(await readFramePaused(mix), 'outgoing track must keep playing after incoming failure');
   mix.endMixer();
 });
+
+test('MixStream preserves partial PCM across underruns', async () => {
+  const mix = new MixStream();
+  const half = Math.floor(FRAME_BYTES / 2);
+  const firstHalf = Buffer.alloc(half, 1);
+  const secondHalf = Buffer.alloc(FRAME_BYTES - half, 2);
+
+  const source = new EventEmitter();
+  source.ended = false;
+  source.error = null;
+  const queue = [firstHalf];
+  source.read = (n) => {
+    if (queue.length === 0) return null;
+    const chunk = queue.shift();
+    return chunk.subarray(0, Math.min(n, chunk.length));
+  };
+  source.destroy = () => {
+    source.removeAllListeners();
+    source.ended = true;
+  };
+
+  assert.equal(mix.setCurrent(source, { durationSec: 1 }), true);
+  // First pull underruns after consuming firstHalf — MixStream emits silence.
+  const underrunFrame = await readFramePaused(mix);
+  assert.ok(underrunFrame);
+  assert.ok([...underrunFrame].every((b) => b === 0));
+
+  queue.push(secondHalf);
+  source.emit('data');
+  const frame = await readFramePaused(mix);
+  assert.ok(frame);
+  assert.equal(frame.length, FRAME_BYTES);
+  assert.equal(frame[0], 1, 'stashed partial bytes must survive the underrun');
+  assert.equal(frame[half], 2);
+  mix.endMixer();
+});
+
+test('MixStream holds incoming frame when outgoing underruns mid-crossfade', async () => {
+  const mix = new MixStream();
+
+  const outgoing = new EventEmitter();
+  outgoing.ended = false;
+  outgoing.error = null;
+  let allowOutgoing = true;
+  outgoing.read = (n) => {
+    if (!allowOutgoing) return null;
+    return Buffer.alloc(Math.min(n, FRAME_BYTES), 4);
+  };
+  outgoing.destroy = () => {
+    outgoing.removeAllListeners();
+    outgoing.ended = true;
+  };
+
+  const incoming = new EventEmitter();
+  incoming.ended = false;
+  incoming.error = null;
+  let inReads = 0;
+  incoming.read = (n) => {
+    inReads += 1;
+    return Buffer.alloc(Math.min(n, FRAME_BYTES), 5);
+  };
+  incoming.destroy = () => {
+    incoming.removeAllListeners();
+    incoming.ended = true;
+  };
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  assert.ok(await readFramePaused(mix));
+
+  assert.equal(mix.startCrossfade(incoming, { fadeSec: 0.2, curve: 'equal-power' }), true);
+  allowOutgoing = false;
+  inReads = 0;
+
+  // Outgoing underruns; incoming frame must be held, not dropped.
+  const underrunFrame = await readFramePaused(mix);
+  assert.ok(underrunFrame);
+  assert.equal(inReads, 1);
+
+  allowOutgoing = true;
+  outgoing.emit('data');
+  const mixed = await readFramePaused(mix);
+  assert.ok(mixed);
+  assert.equal(inReads, 1, 'held incoming frame must not be re-read');
+  mix.endMixer();
+});
+
+test('MixStream promoted source errors emit sourceerror', async () => {
+  const mix = new MixStream();
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(2000);
+  // Short outgoing so promote happens quickly.
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 2 }, () => Buffer.from(frame)));
+  const incoming = PcmSource.fromBuffers(Array.from({ length: 8 }, () => Buffer.from(frame)));
+
+  let sourceError = false;
+  mix.on('sourceerror', () => { sourceError = true; });
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, { fadeSec: 0.04, curve: 'equal-power' }), true);
+
+  for (let i = 0; i < 8; i++) {
+    await readFramePaused(mix);
+    if (!mix.isCrossfading) break;
+  }
+
+  incoming.emit('error', new Error('promoted decode failed'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sourceError, true);
+  mix.endMixer();
+});

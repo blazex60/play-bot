@@ -107,6 +107,10 @@ export async function internalRoutes(app, { db, token } = {}) {
       return reply.code(400).send({ error: 'missing_fields' })
     }
     const now = nowUnix()
+    // analyzeTrackFile may send ms (legacy) or seconds; store Unix seconds only.
+    const analyzedAtSec = Number.isFinite(analysis.analyzedAt)
+      ? Math.floor(analysis.analyzedAt > 1e11 ? analysis.analyzedAt / 1000 : analysis.analyzedAt)
+      : now
     db.prepare(`
       INSERT INTO track_analysis (
         video_id, version, duration_sec, tail_shape, last_rms, bpm, bpm_confidence,
@@ -143,7 +147,7 @@ export async function internalRoutes(app, { db, token } = {}) {
       analysis.recommendedOverlapSec ?? null,
       analysis.confidence ?? null,
       JSON.stringify(analysis),
-      analysis.analyzedAt ?? now,
+      analyzedAtSec,
     )
     return reply.send({ ok: true })
   })

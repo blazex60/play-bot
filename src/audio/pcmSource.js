@@ -144,9 +144,18 @@ export class PcmSource extends EventEmitter {
     input.on('error', (err) => source.#fail(err));
     proc.stdin.on('error', () => {});
     proc.on('error', (err) => source.#fail(err));
+    // Drain stderr so a noisy decode cannot fill the pipe and stall ffmpeg.
+    let stderrTail = '';
+    proc.stderr.on('data', (d) => {
+      stderrTail = (stderrTail + d).slice(-2000);
+    });
+    proc.stderr.on('error', () => {});
     proc.on('close', (code) => {
       if (code !== 0 && !source.ended && !source.#destroyed) {
-        source.#fail(new Error(`ffmpeg exited with ${code}`));
+        const detail = stderrTail.trim();
+        source.#fail(new Error(
+          detail ? `ffmpeg exited with ${code}: ${detail}` : `ffmpeg exited with ${code}`,
+        ));
       }
     });
 
@@ -175,9 +184,17 @@ export class PcmSource extends EventEmitter {
 
     source.#proc = proc;
     proc.on('error', (err) => source.#fail(err));
+    let stderrTail = '';
+    proc.stderr.on('data', (d) => {
+      stderrTail = (stderrTail + d).slice(-2000);
+    });
+    proc.stderr.on('error', () => {});
     proc.on('close', (code) => {
       if (code !== 0 && !source.ended && !source.#destroyed) {
-        source.#fail(new Error(`ffmpeg exited with ${code}`));
+        const detail = stderrTail.trim();
+        source.#fail(new Error(
+          detail ? `ffmpeg exited with ${code}: ${detail}` : `ffmpeg exited with ${code}`,
+        ));
       }
     });
     source.#attachStdout(proc.stdout);
