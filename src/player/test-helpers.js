@@ -44,6 +44,8 @@ export function makePlayer({
   track,
   mixerEnabled = false,
   createPcmSourceFn = null,
+  getTrackAnalysisFn = null,
+  analyzeTrackFileFn = null,
   framesPerTrack = 2,
 } = {}) {
   const queue = new GuildQueue();
@@ -68,6 +70,8 @@ export function makePlayer({
     onTrackStart,
     mixerEnabled,
     createPcmSourceFn: mixerEnabled ? resolvedCreatePcmSourceFn : null,
+    getTrackAnalysisFn,
+    analyzeTrackFileFn,
     connection: {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer);
