@@ -745,7 +745,10 @@ export class GuildPlayer {
       return;
     }
 
-    const [track] = this.#queue.upcoming();
+    // TRACK loop re-arms the current track; upcoming() is empty in that mode.
+    const track = this.#queue.loopMode === LoopMode.TRACK
+      ? this.#queue.current
+      : this.#queue.upcoming()[0];
     if (!track || !isNormalizeDurationAllowed(track)) {
       this.#discardPrefetch();
       return;

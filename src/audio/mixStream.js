@@ -296,6 +296,9 @@ export class MixStream extends Readable {
     }
     if (!inFrame) {
       if (this.#incoming?.ended) {
+        // Same recovery path as decode failure: clear overlap and let
+        // GuildPlayer reset arm flags so another incoming can be tried.
+        this.emit('incomingerror', new Error('incoming ended during crossfade'));
         this.#clearIncoming();
         return outFrame;
       }
@@ -343,6 +346,9 @@ export class MixStream extends Readable {
 
   #promoteIncoming() {
     const next = this.#incoming;
+    // Incoming already played fadeElapsedSec of PCM during overlap; keep that
+    // offset so remainingSec matches real audio left after setDurationSec.
+    const promotedConsumedBytes = Math.round(this.#fadeElapsedSec * BYTES_PER_SECOND);
     if (this.#current) {
       this.#current.removeAllListeners();
       this.#current.destroy();
@@ -369,7 +375,7 @@ export class MixStream extends Readable {
     // so later decode failures go through sourceerror / #hadError recovery.
     next.removeAllListeners();
     this.#current = next;
-    this.#consumedBytes = 0;
+    this.#consumedBytes = promotedConsumedBytes;
     this.#durationSec = null;
     this.#betweenTracks = false;
 

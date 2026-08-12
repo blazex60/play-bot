@@ -38,7 +38,8 @@ export function softLimitFrame(frame, ceiling = 0.95) {
 }
 
 /**
- * Mix two s16le frames with gains. Applies OVERLAP_GAIN then soft-limit.
+ * Mix two s16le frames with gains. Applies OVERLAP_GAIN, soft-limits in float
+ * domain, then clamps to int16 (soft-limit must run before hard clip).
  * @returns {Buffer}
  */
 export function mixFrames(outFrame, inFrame, outGain, inGain) {
@@ -48,10 +49,14 @@ export function mixFrames(outFrame, inFrame, outGain, inGain) {
   const dest = new Int16Array(out.buffer, out.byteOffset, FRAME_BYTES / 2);
   const gOut = outGain * OVERLAP_GAIN;
   const gIn = inGain * OVERLAP_GAIN;
+  const ceiling = 0.95;
+  const max = 32767 * ceiling;
   for (let i = 0; i < dest.length; i++) {
-    const sample = a[i] * gOut + b[i] * gIn;
-    dest[i] = sample > 32767 ? 32767 : sample < -32768 ? -32768 : sample;
+    const x = (a[i] * gOut + b[i] * gIn) / 32768;
+    // cubic soft clip (same transfer as softLimitFrame)
+    const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
+    const scaled = y * 32768;
+    dest[i] = scaled > max ? max : scaled < -max ? -max : scaled;
   }
-  softLimitFrame(out);
   return out;
 }
