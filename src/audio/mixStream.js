@@ -457,12 +457,20 @@ export class MixStream extends Readable {
     }
 
     let adopted = false;
+    let adoptWindowOpen = true;
+    // Listeners must call adopt() synchronously during this emit. Async adopt
+    // after emit returns races trackend / queue advance and is rejected.
     this.emit('snaphandoff', {
       adopt: (source, opts = {}) => {
+        if (!adoptWindowOpen) {
+          source?.destroy?.();
+          return false;
+        }
         adopted = this.adoptCurrent(source, opts);
         return adopted;
       },
     });
+    adoptWindowOpen = false;
     if (adopted) {
       return;
     }

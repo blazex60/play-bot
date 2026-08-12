@@ -336,7 +336,12 @@ export class GuildPlayer {
   async #onSnapHandoff(adopt) {
     // Error path already dropCurrent → #handleAfter; adopting here would
     // advance the queue twice and skip/replace the snapped-in track.
-    if (this.#handlingAfter || this.#crossfadeStarted || this.#mixStream?.isCrossfading) return;
+    if (
+      this.#hadError
+      || this.#handlingAfter
+      || this.#crossfadeStarted
+      || this.#mixStream?.isCrossfading
+    ) return;
     const current = this.#queue.current;
     if (!current) return;
     const next = this.#queue.loopMode === LoopMode.TRACK

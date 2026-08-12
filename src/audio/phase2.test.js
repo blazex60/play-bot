@@ -311,6 +311,34 @@ test('MixStream snaphandoff adopts prepared next without betweenTracks silence',
   mix.endMixer();
 });
 
+test('MixStream rejects late asynchronous snaphandoff adopt', async () => {
+  const mix = new MixStream();
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(5000);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 2 }, () => Buffer.from(frame)));
+  const lateIncoming = PcmSource.fromBuffers(Array.from({ length: 3 }, () => Buffer.from(frame)));
+
+  let adoptFn = null;
+  let trackEndCount = 0;
+  mix.on('trackend', () => { trackEndCount += 1; });
+  mix.on('snaphandoff', ({ adopt }) => {
+    adoptFn = adopt;
+    // Intentionally do not adopt synchronously.
+  });
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 60 }), true);
+  for (let i = 0; i < 6 && !adoptFn; i += 1) {
+    await readFramePaused(mix);
+  }
+  assert.ok(adoptFn, 'expected snaphandoff to capture adopt');
+  assert.equal(trackEndCount, 1);
+
+  const late = adoptFn(lateIncoming, { durationSec: 2 });
+  assert.equal(late, false);
+  assert.notEqual(mix.currentSource, lateIncoming);
+  mix.endMixer();
+});
+
 test('MixStream promoted source errors emit sourceerror', async () => {
   const mix = new MixStream();
   const frame = Buffer.alloc(FRAME_BYTES);

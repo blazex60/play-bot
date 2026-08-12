@@ -12,21 +12,23 @@ export const SILENCE_TRIM_THRESHOLD_DB = -50;
 export const SILENCE_TRIM_KEEP_SEC = 0.02;
 
 /**
- * ffmpeg silenceremove filter: trim leading + trailing quiet sections.
- * stop_periods must be positive (1): negative values restart and strip
- * mid-track silence (ffmpeg docs), which we do not want for padding trim.
+ * ffmpeg filter chain: trim leading + trailing quiet sections only.
+ *
+ * Uses areverse + start_periods (never stop_periods). Even positive
+ * stop_periods still drops mid-track silence in silenceremove's stream
+ * mode, which would crush intentional pauses / bridges.
  */
 export function buildSilenceTrimFilter({
   thresholdDb = SILENCE_TRIM_THRESHOLD_DB,
   keepSec = SILENCE_TRIM_KEEP_SEC,
 } = {}) {
   const thr = `${thresholdDb}dB`;
-  return [
+  const lead = [
     'silenceremove=',
     `start_periods=1:start_duration=0:start_threshold=${thr}:start_silence=${keepSec}:`,
-    `stop_periods=1:stop_duration=0:stop_threshold=${thr}:stop_silence=${keepSec}:`,
     'detection=peak',
   ].join('');
+  return `areverse,${lead},areverse,${lead}`;
 }
 
 export const SILENCE_TRIM_FILTER = buildSilenceTrimFilter();

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { rm, mkdir, rename, access, copyFile } from 'node:fs/promises'
+import { rm, mkdir, rename, access } from 'node:fs/promises'
 import { createAudioResource, StreamType } from '@discordjs/voice'
 import os from 'node:os'
 import path from 'node:path'
@@ -110,12 +110,16 @@ export async function trimSilence(filePath, {
   const backupPath = `${filePath}.pre-silence-trim`
   try {
     const beforeSec = await probeDurationFn(filePath).catch(() => null)
-    await copyFile(filePath, backupPath)
+    if (beforeSec == null) {
+      throw new NormalizeError('source duration unknown; skipping silence trim')
+    }
+    // Move instead of copy: same rollback guarantee without duplicating the file.
+    await rename(filePath, backupPath)
     await spawnFn('ffmpeg', [
       '-hide_banner',
       '-loglevel', 'error',
       '-y',
-      '-i', filePath,
+      '-i', backupPath,
       '-af', filter,
       // Re-encode: filters cannot stream-copy. Opus keeps temp size reasonable.
       '-c:a', 'libopus',
@@ -131,7 +135,7 @@ export async function trimSilence(filePath, {
       )
     }
     // Guard against wiping nearly the whole track (e.g. very quiet masters).
-    if (beforeSec != null && afterSec < beforeSec * 0.2) {
+    if (afterSec < beforeSec * 0.2) {
       throw new NormalizeError(
         `silence trim too aggressive (${beforeSec.toFixed(1)}s -> ${afterSec.toFixed(1)}s)`,
       )
