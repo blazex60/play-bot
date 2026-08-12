@@ -47,13 +47,29 @@ test('recommendOverlapSec clamps abrupt tails longer than fade-outs', () => {
   assert.equal(recommendOverlapSec('abrupt', 20), 2); // 10% of 20s
 });
 
-test('planTransition falls back to gapless on low confidence', () => {
+test('planTransition falls back to gapless only on very low confidence', () => {
   const plan = planTransition(
-    { confidence: 0.2, recommendedOverlapSec: 4, durationSec: 180, vocalConfidence: 0.2 },
-    { confidence: 0.2 },
+    { confidence: 0.15, recommendedOverlapSec: 4, durationSec: 180, vocalConfidence: 0.2 },
+    { confidence: 0.15 },
   );
   assert.equal(plan.mode, 'gapless');
   assert.equal(plan.fadeSec, 0);
+});
+
+test('planTransition uses simple-fade when outgoing analysis is missing', () => {
+  const plan = planTransition(null, { confidence: 0.7, bpm: 120 });
+  assert.equal(plan.mode, 'simple-fade');
+  assert.ok(plan.fadeSec > 0);
+  assert.equal(plan.reason, 'missing-outgoing-analysis');
+});
+
+test('planTransition uses simple-fade for medium confidence', () => {
+  const plan = planTransition(
+    { confidence: 0.4, recommendedOverlapSec: 4, durationSec: 180, vocalConfidence: 0.2 },
+    { confidence: 0.4, bpm: 120 },
+  );
+  assert.equal(plan.mode, 'simple-fade');
+  assert.ok(plan.fadeSec > 0);
 });
 
 test('planTransition uses simple-fade when incoming analysis is missing', () => {

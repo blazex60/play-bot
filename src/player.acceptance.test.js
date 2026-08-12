@@ -367,3 +367,33 @@ test('acceptance (mixer): slow handoff keeps queue on track 2 after mixer stream
 
   await player.stop();
 });
+
+test('acceptance (mixer): crossfade arms without cached analysis using fallback plan', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let crossfadeStarted = false;
+  const { player, queue } = makePlayer({
+    mixerEnabled: true,
+    trackDuration: 3,
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 3,
+    videoId: 'vid-b',
+  }));
+
+  player.mixStream.on('crossfadestart', () => { crossfadeStarted = true; });
+
+  await player.playNext();
+  for (let i = 0; i < 135; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 450));
+
+  assert.equal(crossfadeStarted, true, 'expected fallback simple-fade/crossfade to start');
+  assert.equal(player.mixStream.isCrossfading, true);
+  await player.stop();
+});

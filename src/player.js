@@ -22,8 +22,19 @@ import { LoopMode } from './queue.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
+/** Start downloading/decoding the next track this many seconds before overlap. */
+const CROSSFADE_PREP_LEAD_SEC = 15;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
+
+function fallbackAnalysis(track) {
+  return {
+    confidence: 0.45,
+    recommendedOverlapSec: 1.5,
+    durationSec: track?.duration ?? null,
+    vocalConfidence: 0.2,
+  };
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -65,6 +76,8 @@ export class GuildPlayer {
   #crossfadeStarted = false;
   #crossfadeArming = false;
   #crossfadeTargetTrack = null;
+  /** @type {{ track: object, promise: Promise<object> } | null} */
+  #preparedIncoming = null;
   #getTrackAnalysisFn;
   #putTrackAnalysisFn;
   #analyzeTrackFileFn;
@@ -247,9 +260,14 @@ export class GuildPlayer {
 
     // Pre-failed sources emit sourceerror (which advances) and return false —
     // skip recordPlay/onTrackStart just like the createPcmSource throw path.
-    if (!this.#mixStream.setCurrent(source, { durationSec: track.duration ?? null })) {
+    let durationSec = track.duration ?? null;
+    if (durationSec == null && track.videoId && this.#analysisCache.has(track.videoId)) {
+      durationSec = this.#analysisCache.get(track.videoId)?.durationSec ?? null;
+    }
+    if (!this.#mixStream.setCurrent(source, { durationSec })) {
       return;
     }
+    this.#clearPreparedIncoming();
     this.#crossfadeStarted = false;
     this.#crossfadeTargetTrack = null;
     this.#startCrossfadeArm();
@@ -436,6 +454,7 @@ export class GuildPlayer {
     this.#queue.clear();
     this.#clearWatchdog();
     this.#clearCrossfadeArm();
+    this.#clearPreparedIncoming();
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
@@ -595,6 +614,7 @@ export class GuildPlayer {
       const cached = await this.#getTrackAnalysisFn(track.videoId);
       if (cached) {
         this.#analysisCache.set(track.videoId, cached);
+        this.#maybeApplyAnalysisDuration(track, cached);
         return cached;
       }
     }
@@ -607,7 +627,42 @@ export class GuildPlayer {
       this.#analysisCache.set(track.videoId, analysis);
       this.#putTrackAnalysisFn?.(track.videoId, analysis);
     }
+    this.#maybeApplyAnalysisDuration(track, analysis);
     return analysis;
+  }
+
+  #maybeApplyAnalysisDuration(track, analysis) {
+    if (!this.#mixerEnabled || !analysis?.durationSec) return;
+    if (this.#queue.current !== track) return;
+    if (this.#mixStream?.remainingSec == null) {
+      this.#mixStream.setDurationSec(analysis.durationSec);
+    }
+  }
+
+  #clearPreparedIncoming() {
+    if (!this.#preparedIncoming) return;
+    this.#preparedIncoming.promise.then((source) => {
+      source?.destroy?.();
+    }).catch(() => {});
+    this.#preparedIncoming = null;
+  }
+
+  #ensureIncomingPrep(next, current) {
+    if (this.#preparedIncoming?.track === next) return;
+    this.#clearPreparedIncoming();
+    this.#preparedIncoming = {
+      track: next,
+      promise: this.#createPcmSource(next, { forIncoming: true }),
+    };
+  }
+
+  async #takePreparedIncoming(next) {
+    if (this.#preparedIncoming?.track === next) {
+      const pending = this.#preparedIncoming;
+      this.#preparedIncoming = null;
+      return pending.promise;
+    }
+    return this.#createPcmSource(next, { forIncoming: true });
   }
 
   #startCrossfadeArm() {
@@ -646,21 +701,23 @@ export class GuildPlayer {
         : this.#queue.upcoming()[0];
       if (!next) return;
 
-      const outAnalysis = await this.#resolveAnalysis(current);
-      const inAnalysis = await this.#resolveAnalysis(next);
+      const outAnalysis = (await this.#resolveAnalysis(current)) ?? fallbackAnalysis(current);
+      const inAnalysis = (await this.#resolveAnalysis(next)) ?? fallbackAnalysis(next);
       const plan = planTransition(outAnalysis, inAnalysis);
       if (plan.mode === 'gapless' || !(plan.fadeSec > 0)) return;
-      if (remaining > plan.fadeSec + 0.2) return;
 
-      this.#crossfadeStarted = true;
-      this.#crossfadeTargetTrack = next;
+      const fadeWindow = plan.fadeSec + 0.35;
+      const prepWindow = plan.fadeSec + CROSSFADE_PREP_LEAD_SEC;
+      if (remaining <= prepWindow) {
+        this.#ensureIncomingPrep(next, current);
+      }
+      if (remaining > fadeWindow) return;
+
       let source;
       try {
-        source = await this.#createPcmSource(next, { forIncoming: true });
+        source = await this.#takePreparedIncoming(next);
       } catch (err) {
         console.warn('[GuildPlayer] incoming pcm source failed:', err.message);
-        this.#crossfadeStarted = false;
-        this.#crossfadeTargetTrack = null;
         await this.#cleanupIncomingTempFile();
         return;
       }
@@ -668,8 +725,6 @@ export class GuildPlayer {
       if (this.#queue.current !== current || this.#forceSkip) {
         source.destroy();
         await this.#cleanupIncomingTempFile();
-        this.#crossfadeStarted = false;
-        this.#crossfadeTargetTrack = null;
         return;
       }
 
@@ -677,9 +732,11 @@ export class GuildPlayer {
       if (!started) {
         source.destroy();
         await this.#cleanupIncomingTempFile();
-        this.#crossfadeStarted = false;
-        this.#crossfadeTargetTrack = null;
+        return;
       }
+
+      this.#crossfadeStarted = true;
+      this.#crossfadeTargetTrack = next;
     } finally {
       this.#crossfadeArming = false;
     }
