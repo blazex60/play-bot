@@ -3,7 +3,14 @@ import { rm, mkdir, rename, access } from 'node:fs/promises'
 import { createAudioResource, StreamType } from '@discordjs/voice'
 import os from 'node:os'
 import path from 'node:path'
-import { SILENCE_TRIM_FILTER } from './audio/silenceTrim.js'
+import {
+  SILENCE_TRIM_THRESHOLD_DB,
+  SILENCE_TRIM_KEEP_SEC,
+  SILENCE_DETECT_MIN_SEC,
+  parseSilenceDetectLog,
+  resolveEdgeTrimWindow,
+  buildAtrimFilter,
+} from './audio/silenceTrim.js'
 import { probeDurationSec } from './audio/duration.js'
 
 export const MAX_NORMALIZE_DURATION_SEC = 1800
@@ -96,11 +103,15 @@ export async function analyzeLoudness(filePath) {
 
 /**
  * Trim leading/trailing silence in-place (rewrite via temp file).
+ * Uses silencedetect + atrim so mid-track pauses stay and RAM stays bounded
+ * (no areverse whole-clip buffer).
  * Fail-soft: on error or over-aggressive trim, leave the original file untouched.
  * @returns {Promise<boolean>} true when the file was rewritten
  */
 export async function trimSilence(filePath, {
-  filter = SILENCE_TRIM_FILTER,
+  thresholdDb = SILENCE_TRIM_THRESHOLD_DB,
+  keepSec = SILENCE_TRIM_KEEP_SEC,
+  detectMinSec = SILENCE_DETECT_MIN_SEC,
   spawnFn = spawnBuffered,
   probeDurationFn = probeDurationSec,
   minDurationSec = MIN_TRIMMED_DURATION_SEC,
@@ -115,12 +126,33 @@ export async function trimSilence(filePath, {
     }
     // Move instead of copy: same rollback guarantee without duplicating the file.
     await rename(filePath, backupPath)
+
+    const detect = await spawnFn('ffmpeg', [
+      '-hide_banner',
+      '-loglevel', 'info',
+      '-i', backupPath,
+      '-af', `silencedetect=noise=${thresholdDb}dB:d=${detectMinSec}`,
+      '-f', 'null',
+      '-',
+    ])
+    const { starts, ends } = parseSilenceDetectLog(detect.stderr)
+    const window = resolveEdgeTrimWindow({
+      durationSec: beforeSec,
+      silenceStarts: starts,
+      silenceEnds: ends,
+      keepSec,
+    })
+    if (!window.changed) {
+      await rename(backupPath, filePath)
+      return false
+    }
+
     await spawnFn('ffmpeg', [
       '-hide_banner',
       '-loglevel', 'error',
       '-y',
       '-i', backupPath,
-      '-af', filter,
+      '-af', buildAtrimFilter(window),
       // Re-encode: filters cannot stream-copy. Opus keeps temp size reasonable.
       '-c:a', 'libopus',
       '-b:a', '160k',

@@ -277,7 +277,9 @@ export class MixStream extends Readable {
     if (!frame) {
       if (this.#current?.ended) {
         this.#finishCurrent();
-        if (this.#current && !this.#current.ended) {
+        // Adopted/promoted sources may already be producer-EOF while PCM remains
+        // buffered — drain that buffer instead of inserting a silence frame.
+        if (this.#current) {
           const adopted = this.#readExact(this.#current, FRAME_BYTES);
           if (adopted) {
             this.#consumedBytes += FRAME_BYTES;

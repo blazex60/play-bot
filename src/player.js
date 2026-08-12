@@ -23,6 +23,8 @@ import { LoopMode } from './queue.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
+/** Start downloading/decoding the next track this many seconds before overlap. */
+const CROSSFADE_PREP_LEAD_SEC = 15;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
 
@@ -353,6 +355,10 @@ export class GuildPlayer {
     if (!source) return;
 
     if (!adopt(source, { durationSec: this.#resolvePlaybackDurationSec(next) })) {
+      // Failed adopt (e.g. prefetched decoder already errored): drop the bad
+      // prepared entry so trackend / playNext retries a fresh source.
+      this.#clearPreparedIncoming();
+      await this.#cleanupIncomingTempFile();
       return;
     }
 
@@ -660,6 +666,8 @@ export class GuildPlayer {
     const normalizeOn = this.#mixerEnabled || getGuildSettings(this.#guildId).normalize;
     if (!normalizeOn || !isNormalizeDurationAllowed(track)) {
       if (!forIncoming) this.#discardPrefetch();
+      // Live/untrimmed stream — do not keep a prior trimmed duration.
+      if (track.videoId) this.#probedDurationCache.delete(track.videoId);
       return createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
     }
 
@@ -694,6 +702,7 @@ export class GuildPlayer {
     } catch (err) {
       if (err?.code === 'INCOMING_PREP_CANCELLED') throw err;
       console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err.message);
+      if (track.videoId) this.#probedDurationCache.delete(track.videoId);
       return createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
     }
   }
@@ -856,7 +865,10 @@ export class GuildPlayer {
       if (plan.mode === 'gapless' || !(plan.fadeSec > 0)) return;
 
       const fadeWindow = plan.fadeSec + 0.35;
-      if (remaining <= fadeWindow) {
+      // Late-queued successors (no prep at track start) need download/trim/decode
+      // lead time; fadeWindow alone is too late for a silent-gap-free handoff.
+      const prepWindow = plan.fadeSec + CROSSFADE_PREP_LEAD_SEC;
+      if (remaining <= prepWindow) {
         this.#ensureIncomingPrep(next);
       }
       if (remaining > fadeWindow) return;

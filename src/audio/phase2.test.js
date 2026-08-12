@@ -339,6 +339,36 @@ test('MixStream rejects late asynchronous snaphandoff adopt', async () => {
   mix.endMixer();
 });
 
+test('MixStream drains buffered PCM from already-ended adopted source', async () => {
+  const mix = new MixStream();
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(9000);
+  const outgoing = PcmSource.fromBuffers([Buffer.from(frame)]);
+  const incoming = PcmSource.fromBuffers(Array.from({ length: 3 }, () => Buffer.from(frame)));
+
+  // Fully decode incoming before handoff so ended=true while PCM remains buffered.
+  await new Promise((resolve) => {
+    if (incoming.ended) return resolve();
+    incoming.on('end', resolve);
+  });
+  assert.equal(incoming.ended, true);
+  assert.ok(incoming.available >= FRAME_BYTES);
+
+  let adopted = false;
+  mix.on('snaphandoff', ({ adopt }) => {
+    adopted = adopt(incoming, { durationSec: 1 });
+  });
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 60 }), true);
+  // First frame is outgoing; next read hits EOF → snap adopt → drain incoming buffer.
+  assert.ok(await readFramePaused(mix));
+  const firstIncoming = await readFramePaused(mix);
+  assert.equal(adopted, true);
+  assert.ok(firstIncoming, 'expected buffered frame from ended adopted source');
+  assert.equal(firstIncoming.length, FRAME_BYTES);
+  mix.endMixer();
+});
+
 test('MixStream promoted source errors emit sourceerror', async () => {
   const mix = new MixStream();
   const frame = Buffer.alloc(FRAME_BYTES);

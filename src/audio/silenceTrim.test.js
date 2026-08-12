@@ -6,6 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildSilenceTrimFilter,
+  buildAtrimFilter,
+  parseSilenceDetectLog,
+  resolveEdgeTrimWindow,
   SILENCE_TRIM_FILTER,
   SILENCE_TRIM_THRESHOLD_DB,
 } from './silenceTrim.js';
@@ -20,22 +23,56 @@ function spawnBuffered(cmd, args) {
     proc.on('error', reject);
     proc.on('close', (code) => {
       if (code !== 0) reject(new Error(stderr.trim() || `${cmd} exited ${code}`));
-      else resolve();
+      else resolve({ stderr });
     });
   });
 }
 
-test('buildSilenceTrimFilter includes leading and trailing trim', () => {
+test('buildSilenceTrimFilter is leading-only (no areverse / stop_periods)', () => {
   const filter = buildSilenceTrimFilter({ thresholdDb: -45, keepSec: 0.03 });
-  assert.match(filter, /areverse,/);
   assert.match(filter, /silenceremove=/);
   assert.match(filter, /start_periods=1/);
+  assert.doesNotMatch(filter, /areverse/);
   assert.doesNotMatch(filter, /stop_periods=/);
   assert.match(filter, /-45dB/);
   assert.match(filter, /start_silence=0\.03/);
   assert.equal(SILENCE_TRIM_THRESHOLD_DB, -50);
-  assert.match(SILENCE_TRIM_FILTER, /areverse,/);
-  assert.doesNotMatch(SILENCE_TRIM_FILTER, /stop_periods=/);
+  assert.doesNotMatch(SILENCE_TRIM_FILTER, /areverse/);
+});
+
+test('parseSilenceDetectLog extracts starts and ends', () => {
+  const log = [
+    '[silencedetect @ 0x1] silence_start: 0.01',
+    '[silencedetect @ 0x1] silence_end: 1.02 | silence_duration: 1.01',
+    '[silencedetect @ 0x1] silence_start: 5.5',
+  ].join('\n');
+  const { starts, ends } = parseSilenceDetectLog(log);
+  assert.deepEqual(starts, [0.01, 5.5]);
+  assert.deepEqual(ends, [1.02]);
+});
+
+test('resolveEdgeTrimWindow trims edge pads and keeps mid silence', () => {
+  const mid = resolveEdgeTrimWindow({
+    durationSec: 1.8,
+    silenceStarts: [0.5],
+    silenceEnds: [1.3],
+    keepSec: 0.02,
+  });
+  assert.equal(mid.changed, false);
+
+  const padded = resolveEdgeTrimWindow({
+    durationSec: 3,
+    silenceStarts: [0, 2],
+    silenceEnds: [1],
+    keepSec: 0.02,
+  });
+  assert.equal(padded.changed, true);
+  assert.ok(padded.startSec > 0.9 && padded.startSec < 1.05);
+  assert.ok(padded.endSec > 1.95 && padded.endSec < 2.1);
+
+  const filter = buildAtrimFilter(padded);
+  assert.match(filter, /atrim=start=/);
+  assert.match(filter, /asetpts=PTS-STARTPTS/);
 });
 
 test('trimSilence removes leading and trailing padding from a synthetic file', async () => {
@@ -85,7 +122,7 @@ test('trimSilence leaves original when output would be empty', async () => {
   }
 });
 
-test('trimSilence preserves mid-track silence (areverse head/tail only)', async () => {
+test('trimSilence preserves mid-track silence (edge detect only)', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'silence-trim-mid-'));
   const src = path.join(dir, 'mid-silence.wav');
   try {
@@ -106,12 +143,12 @@ test('trimSilence preserves mid-track silence (areverse head/tail only)', async 
     assert.ok(before > 1.6 && before < 2.0, `expected ~1.8s before, got ${before}`);
 
     const trimmed = await trimSilence(src);
-    assert.equal(trimmed, true);
+    // No edge pads → unchanged (or tiny keep pads only).
+    assert.equal(trimmed, false);
 
     const after = await probeDurationSec(src);
-    // Mid silence must remain: if stop_periods=-1 wiped it, duration would be ~1.0s.
     assert.ok(after > 1.5, `mid silence was removed: before=${before} after=${after}`);
-    assert.ok(after < before + 0.05, `duration grew unexpectedly: before=${before} after=${after}`);
+    assert.ok(Math.abs(after - before) < 0.1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
