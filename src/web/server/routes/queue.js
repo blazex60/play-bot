@@ -1,6 +1,6 @@
 import { requireBotPermission, requireCommandPermission, withAuditedBotAction } from './route-utils.js'
 
-const QUEUE_ACTIONS = new Set(['remove', 'move'])
+const QUEUE_ACTIONS = new Set(['remove', 'move', 'optimize'])
 
 export async function queueRoutes(app, { botClient, db } = {}) {
   app.post('/api/guilds/:guildId/queue/:action', (request, reply) => withAuditedBotAction(request, reply, {
@@ -16,9 +16,8 @@ export async function queueRoutes(app, { botClient, db } = {}) {
       }
       if (!botClient) throw new Error('botClient is required for queue routes')
       await requireBotPermission({ botClient, guildId, userId: user.discordId })
-      // Both queue actions (remove/move) fall under the 'queue' command
-      // permission — the same one gating /queue and its editor buttons.
-      await requireCommandPermission({ botClient, guildId, userId: user.discordId, command: 'queue' })
+      const command = action === 'optimize' ? 'mix' : 'queue'
+      await requireCommandPermission({ botClient, guildId, userId: user.discordId, command })
     },
     run: async ({ request, user }) => {
       const { guildId, action } = request.params

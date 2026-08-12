@@ -133,3 +133,15 @@ test('moveUpcoming: 先頭への移動(toIndex=0)後next()で正しい曲が再�
   assert.equal(nextTrack.title, 'C')
   assert.equal(queue.current.title, 'C')
 })
+
+test('reorderUpcoming: applies a full permutation to upcoming tracks', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
+  assert.equal(queue.reorderUpcoming([2, 0, 1]), true)
+  assert.deepEqual(queue.upcoming().map((t) => t.title), ['C', 'A', 'B'])
+})
+
+test('reorderUpcoming: rejects invalid permutations', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B'])
+  assert.equal(queue.reorderUpcoming([0, 0]), false)
+  assert.equal(queue.reorderUpcoming([0]), false)
+})

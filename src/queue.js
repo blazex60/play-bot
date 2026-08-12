@@ -89,4 +89,27 @@ export class GuildQueue {
     return true;
   }
 
+  /**
+   * Reorder upcoming tracks by a full permutation of upcoming indices.
+   * @param {number[]} order upcoming-relative indices 0..upcoming().length-1
+   * @returns {boolean}
+   */
+  reorderUpcoming(order) {
+    const upcoming = this.upcoming();
+    const len = upcoming.length;
+    if (len === 0) return false;
+    if (len === 1 && order.length === 1 && order[0] === 0) return true;
+    if (!Array.isArray(order) || order.length !== len) return false;
+    const seen = new Set();
+    for (const idx of order) {
+      if (!Number.isInteger(idx) || idx < 0 || idx >= len || seen.has(idx)) return false;
+      seen.add(idx);
+    }
+    const reordered = order.map((idx) => upcoming[idx]);
+    for (let i = 0; i < len; i += 1) {
+      this.#tracks[this.#currentIndex + 1 + i] = reordered[i];
+    }
+    return true;
+  }
+
 }

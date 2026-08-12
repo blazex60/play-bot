@@ -271,6 +271,28 @@ test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async 
   assert.equal(get.json().analysis.tailShape, 'fade-out')
 })
 
+test('POST /internal/optimize-order returns a valid permutation', async (t) => {
+  const { app, config } = await setup(t)
+  const response = await app.inject({
+    method: 'POST',
+    url: '/internal/optimize-order',
+    headers: authHeaders(config),
+    payload: {
+      anchorVideoId: 'anchor',
+      tracks: [
+        { videoId: 'a', title: 'Fast', duration: 180 },
+        { videoId: 'b', title: 'Faster', duration: 180 },
+        { videoId: 'c', title: 'Slow', duration: 180 },
+      ],
+    },
+  })
+  assert.equal(response.statusCode, 200)
+  const body = response.json()
+  assert.equal(body.order.length, 3)
+  assert.deepEqual([...body.order].sort(), [0, 1, 2])
+  assert.equal(body.source, 'algorithm')
+})
+
 test('PUT /internal/track-analysis normalizes analyzedAt milliseconds to seconds', async (t) => {
   const { app, config, db } = await setup(t)
   const ms = Date.UTC(2026, 0, 15, 12, 0, 0)

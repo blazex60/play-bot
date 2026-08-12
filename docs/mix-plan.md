@@ -217,11 +217,11 @@ prefetch 時に末尾の RMS 包絡を 100ms 刻みで取得し、形状で分�
 **不採用**: センター成分のみのボーカル検出。Demucs は保留。  
 **残作業**: 実 J-POP での再キャリブレーション、PitchMelodia 評価、Docker への aubio/essentia 追加。
 
-### Phase 2 — クロスフェード本実装 ✅ 進行中（PR 分離）
+### Phase 2 — クロスフェード本実装 ✅ 完了（PR #21）
 
-Phase 1.5 の結論に従って実装中。優先順位は 5.4 の A → B → C → E → D。
+Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C → E → D。
 
-実装済み（本ブランチ）:
+実装済み:
 - `fade.js` — equal-power/linear、`-3dB` マージン、ソフトリミッタ
 - `eq.js` — ベーススワップ用 biquad（highpass / lowshelf）
 - `trackAnalysis.js` — 曲末形状 + aubiotrack BPM（キーはキャッシュ列のみ・essentia は次）
@@ -230,15 +230,14 @@ Phase 1.5 の結論に従って実装中。優先順位は 5.4 の A → B → C
 - `player.js` — クロスフェード arm、normalize 強制、解析キャッシュ接続
 - migration `006_track_analysis.sql` + `/internal/track-analysis/:videoId`
 
-### Phase 3 — 曲順最適化 + Gemini 導入
+残作業（Phase 2 後追い）: essentia キー runtime、テンポ合わせ(D)、Docker aubio/essentia
 
-**着手前に Phase 5 の法務部分を済ませること。** データを送り始めてからポリシーを直すのは順序が逆になる。
+### Phase 3 — 曲順最適化 + Gemini 導入 🚧 進行中
 
-- `src/mix/ordering.js` — 経路探索（8章）
-- `gemini.js` — API クライアント（8章）
-- `webClient.js` に `optimizeOrder`、`botApi.js` に並べ替えエンドポイント
-- スラッシュコマンドと Web UI のキューパネルにボタン
-- `.env.example` に `GEMINI_API_KEY`
+- `src/mix/ordering.js` + `camelot.js` — BPM/キー隣接コストの経路探索
+- `src/web/server/services/gemini.js` — 任意の Gemini 補助（失敗時は algorithm のみ）
+- `/internal/optimize-order` + `webClient.optimizeOrder`
+- `/mix order` + Web ダッシュボード「MIX 並べ替え」
 
 ### Phase 4 — リクエストからの自動プレイリスト生成
 
@@ -301,6 +300,7 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 0 | ✅ | PR #19 / `src/player.acceptance.test.js` |
 | 1 | ✅ | PR #19 / `MIXER_ENABLED` で切替。重畳なし |
 | 1.5 | ✅ 初回完了 | `docs/mix-analysis-spike.md`。実 J-POP 再計測は残 |
-| 2 | 🚧 進行中 | `cursor/mix-crossfade-phase2-78b7`。重畳・解析キャッシュ・二段階フォールバック。キー(essentia)/テンポ合わせは残 |
-| 3–4 | 未着手 | 依存は 10章の通り |
+| 2 | ✅ | PR #21 merged。重畳・解析キャッシュ・二段階フォールバック |
+| 3 | 🚧 進行中 | `cursor/mix-order-phase3-78b7`。ordering + Gemini + `/mix order` |
+| 4 | 未着手 | 依存は 10章の通り |
 | 5 法務 | ✅ 文面更新済み | privacy / CLAUDE / AGENTS / README。PR #19/#20 |

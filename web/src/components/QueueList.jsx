@@ -1,11 +1,21 @@
-/** @param {{ queue: import('../api/client.js').Track[], busy: boolean, onMove: (fromIndex: number, toIndex: number) => void, onRemove: (index: number) => void }} props */
+/** @param {{ queue: import('../api/client.js').Track[], busy: boolean, onMove: (fromIndex: number, toIndex: number) => void, onRemove: (index: number) => void, onOptimize?: () => void }} props */
 export function QueueList(props) {
-  const { queue, busy, onMove, onRemove } = props
+  const { queue, busy, onMove, onRemove, onOptimize } = props
   return (
     <section className="panel queue-panel" aria-labelledby="queue-title">
       <div className="section-heading">
         <p className="eyebrow">Queue</p>
         <h2 id="queue-title">キュー</h2>
+        {onOptimize ? (
+          <button
+            type="button"
+            className="ghost"
+            onClick={onOptimize}
+            disabled={busy || queue.length < 2}
+          >
+            MIX 並べ替え
+          </button>
+        ) : null}
       </div>
       {queue.length === 0 ? (
         <p className="empty-copy">次の曲はありません。</p>

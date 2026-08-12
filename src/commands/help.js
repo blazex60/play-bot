@@ -10,6 +10,7 @@ const PLAYBACK_COMMANDS = [
   ['leave', 'ボットをVCから退出させます'],
   ['queue', '現在のキューを表示します'],
   ['shuffle', 'キューをシャッフルします'],
+  ['mix order', 'upcoming を BPM/キーに基づいて MIX 向けに並べ替えます'],
   ['loop', 'ループモードを切り替えます（オフ→1曲→キュー→オフ）'],
   ['nowplaying', '現在再生中の曲を表示します'],
 ]

@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 
-import { getOrCreateSession, cancelPendingRecommendations, bumpPlanToken } from './sessions.js';
+import { getOrCreateSession, cancelPendingRecommendations, bumpPlanToken, webClient } from './sessions.js';
 import { resolveWebPermission } from './webPermission.js';
 import {
   getGuildSettings,
@@ -288,19 +288,42 @@ export function buildBotApi({
     const guildId = request.params.guildId;
     const session = requireSession(sessions, guildId, reply);
     if (!session) return;
-    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: 'queue' });
+    const action = request.params.action;
+    const command = action === 'optimize' ? 'mix' : 'queue';
+    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command });
     if (!permission) return;
 
-    if (request.params.action === 'remove') {
+    if (action === 'remove') {
       const index = Number.parseInt(String(request.body?.index), 10);
       const ok = session.queue.removeUpcoming(index);
       return { ok, state: serializeSession(session) };
     }
-    if (request.params.action === 'move') {
+    if (action === 'move') {
       const fromIndex = Number.parseInt(String(request.body?.fromIndex), 10);
       const toIndex = Number.parseInt(String(request.body?.toIndex), 10);
       const ok = session.queue.moveUpcoming(fromIndex, toIndex);
       return { ok, state: serializeSession(session) };
+    }
+    if (action === 'optimize') {
+      const upcoming = session.queue.upcoming();
+      if (upcoming.length < 2) {
+        return { ok: false, reason: 'too_few_tracks', state: serializeSession(session) };
+      }
+      const current = session.queue.current;
+      const result = await webClient.optimizeOrder({
+        anchorVideoId: current?.videoId ?? null,
+        tracks: upcoming.map((track) => ({
+          videoId: track.videoId,
+          title: track.title,
+          channel: track.channel,
+          duration: track.duration,
+        })),
+      });
+      if (!result?.order) {
+        return { ok: false, reason: 'optimize_failed', state: serializeSession(session) };
+      }
+      const ok = session.queue.reorderUpcoming(result.order);
+      return { ok, source: result.source ?? 'algorithm', state: serializeSession(session) };
     }
     reply.code(404).send({ error: 'unknown_action' });
   });

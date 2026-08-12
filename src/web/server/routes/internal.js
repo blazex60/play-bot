@@ -1,4 +1,5 @@
 import { nowUnix, recordOperationLog } from './route-utils.js'
+import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js'
 
 // Mirrors the operation_logs CHECK(source IN (...)) constraint. recordOperationLog
 // only console.errors on an insert failure (never rethrows), so without this
@@ -26,7 +27,7 @@ function upsertDiscordUser(db, { discordId, username }) {
 // Web -> Bot direction (src/botApi.js). Guarded by the same BOT_API_TOKEN
 // shared secret rather than the cookie-session requireAuth middleware, since
 // the caller here is the bot process, not a browser.
-export async function internalRoutes(app, { db, token } = {}) {
+export async function internalRoutes(app, { db, token, gemini = null } = {}) {
   app.addHook('onRequest', async (request, reply) => {
     if (!token || getBearerToken(request) !== token) {
       return reply.code(401).send({ error: 'unauthorized' })
@@ -150,5 +151,49 @@ export async function internalRoutes(app, { db, token } = {}) {
       analyzedAtSec,
     )
     return reply.send({ ok: true })
+  })
+
+  function loadAnalysis(videoId) {
+    if (!videoId || !db) return null
+    const row = db.prepare(`
+      SELECT payload_json AS payloadJson FROM track_analysis WHERE video_id = ?
+    `).get(videoId)
+    if (!row) return null
+    try {
+      return JSON.parse(row.payloadJson)
+    } catch {
+      return null
+    }
+  }
+
+  app.post('/internal/optimize-order', async (request, reply) => {
+    if (!db) throw new Error('db is required for internal routes')
+    const { anchorVideoId = null, tracks } = request.body ?? {}
+    if (!Array.isArray(tracks) || tracks.length === 0) {
+      return reply.code(400).send({ error: 'missing_fields' })
+    }
+
+    const analyses = tracks.map((track) => {
+      if (track?.analysis && typeof track.analysis === 'object') return track.analysis
+      return loadAnalysis(track?.videoId)
+    });
+    const anchorAnalysis = anchorVideoId ? loadAnalysis(anchorVideoId) : null
+
+    let order = optimizeTrackOrder({ anchorAnalysis, tracks, analyses })
+    let source = 'algorithm'
+
+    if (gemini && tracks.length >= 2) {
+      const enriched = tracks.map((track, idx) => ({ ...track, analysis: analyses[idx] }))
+      const refined = await gemini.refineOrder({
+        tracks: enriched,
+        algorithmOrder: order,
+      })
+      if (refined && isValidPermutation(refined, tracks.length)) {
+        order = refined
+        source = 'gemini'
+      }
+    }
+
+    return reply.send({ order, source })
   })
 }
