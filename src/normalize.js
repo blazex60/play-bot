@@ -1,11 +1,22 @@
 import { spawn } from 'node:child_process'
-import { rm, mkdir } from 'node:fs/promises'
+import { rm, mkdir, rename, access } from 'node:fs/promises'
 import { createAudioResource, StreamType } from '@discordjs/voice'
 import os from 'node:os'
 import path from 'node:path'
+import {
+  SILENCE_TRIM_THRESHOLD_DB,
+  SILENCE_TRIM_KEEP_SEC,
+  SILENCE_DETECT_MIN_SEC,
+  parseSilenceDetectLog,
+  resolveEdgeTrimWindow,
+  buildAtrimFilter,
+} from './audio/silenceTrim.js'
+import { probeDurationSec } from './audio/duration.js'
 
 export const MAX_NORMALIZE_DURATION_SEC = 1800
 export const TEMP_DIR = path.join(os.tmpdir(), 'music-bot-normalize')
+/** Reject silence-trim results shorter than this (likely wiped the whole track). */
+export const MIN_TRIMMED_DURATION_SEC = 1
 
 const LOUDNORM_TARGET = 'I=-16:TP=-1.5:LRA=11'
 
@@ -90,6 +101,93 @@ export async function analyzeLoudness(filePath) {
   return parseLoudnormJson(stderr)
 }
 
+/**
+ * Trim leading/trailing silence in-place (rewrite via temp file).
+ * Uses silencedetect + atrim so mid-track pauses stay and RAM stays bounded
+ * (no areverse whole-clip buffer).
+ * Fail-soft: on error or over-aggressive trim, leave the original file untouched.
+ * @returns {Promise<boolean>} true when the file was rewritten
+ */
+export async function trimSilence(filePath, {
+  thresholdDb = SILENCE_TRIM_THRESHOLD_DB,
+  keepSec = SILENCE_TRIM_KEEP_SEC,
+  detectMinSec = SILENCE_DETECT_MIN_SEC,
+  spawnFn = spawnBuffered,
+  probeDurationFn = probeDurationSec,
+  minDurationSec = MIN_TRIMMED_DURATION_SEC,
+} = {}) {
+  if (!filePath) return false
+  const outPath = `${filePath}.silence-trim`
+  const backupPath = `${filePath}.pre-silence-trim`
+  try {
+    const beforeSec = await probeDurationFn(filePath).catch(() => null)
+    if (beforeSec == null) {
+      throw new NormalizeError('source duration unknown; skipping silence trim')
+    }
+    // Move instead of copy: same rollback guarantee without duplicating the file.
+    await rename(filePath, backupPath)
+
+    const detect = await spawnFn('ffmpeg', [
+      '-hide_banner',
+      '-loglevel', 'info',
+      '-i', backupPath,
+      '-af', `silencedetect=noise=${thresholdDb}dB:d=${detectMinSec}`,
+      '-f', 'null',
+      '-',
+    ])
+    const { starts, ends } = parseSilenceDetectLog(detect.stderr)
+    const window = resolveEdgeTrimWindow({
+      durationSec: beforeSec,
+      silenceStarts: starts,
+      silenceEnds: ends,
+      keepSec,
+    })
+    if (!window.changed) {
+      await rename(backupPath, filePath)
+      return false
+    }
+
+    await spawnFn('ffmpeg', [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-y',
+      '-i', backupPath,
+      '-af', buildAtrimFilter(window),
+      // Re-encode: filters cannot stream-copy. Opus keeps temp size reasonable.
+      '-c:a', 'libopus',
+      '-b:a', '160k',
+      '-f', 'opus',
+      outPath,
+    ])
+    await access(outPath)
+    const afterSec = await probeDurationFn(outPath).catch(() => null)
+    if (afterSec == null || afterSec < minDurationSec) {
+      throw new NormalizeError(
+        `silence trim produced unusable duration (${afterSec ?? 'unknown'}s)`,
+      )
+    }
+    // Guard against wiping nearly the whole track (e.g. very quiet masters).
+    if (afterSec < beforeSec * 0.2) {
+      throw new NormalizeError(
+        `silence trim too aggressive (${beforeSec.toFixed(1)}s -> ${afterSec.toFixed(1)}s)`,
+      )
+    }
+    await rename(outPath, filePath)
+    await cleanupTempFile(backupPath)
+    return true
+  } catch (err) {
+    await cleanupTempFile(outPath)
+    try {
+      await access(backupPath)
+      await rename(backupPath, filePath)
+    } catch {
+      await cleanupTempFile(backupPath)
+    }
+    console.warn(`[normalize] silence trim skipped: ${err.message}`)
+    return false
+  }
+}
+
 export function createNormalizedResource(filePath, measured) {
   const proc = spawn('ffmpeg', [
     '-i', filePath,
@@ -132,11 +230,16 @@ export async function prefetchTrack(track) {
   const filePath = tempFilePath(track)
   try {
     await downloadAudio(track.webpageUrl, filePath)
+    // Trim YouTube/source padding before loudnorm + MIX analysis so
+    // remainingSec and crossfade sit on audible audio.
+    await trimSilence(filePath)
     const measured = await analyzeLoudness(filePath)
     return { filePath, measured }
   } catch (err) {
     await cleanupTempFile(filePath)
     await cleanupTempFile(`${filePath}.part`)
+    await cleanupTempFile(`${filePath}.silence-trim`)
+    await cleanupTempFile(`${filePath}.pre-silence-trim`)
     throw err
   }
 }

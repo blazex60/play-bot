@@ -99,8 +99,9 @@ export class MixStream extends Readable {
     source.on('data', () => this.#scheduleRead());
     source.on('end', () => this.#scheduleRead());
     source.on('error', (err) => {
+      // Consumer (GuildPlayer) dropCurrent/advances; do not finishCurrent here —
+      // that would race snaphandoff against the error handoff.
       this.emit('sourceerror', err);
-      this.#finishCurrent();
     });
 
     this.#scheduleRead();
@@ -274,8 +275,17 @@ export class MixStream extends Readable {
 
     const frame = this.#readExact(this.#current, FRAME_BYTES);
     if (!frame) {
-      if (this.#current.ended) {
+      if (this.#current?.ended) {
         this.#finishCurrent();
+        // Adopted/promoted sources may already be producer-EOF while PCM remains
+        // buffered — drain that buffer instead of inserting a silence frame.
+        if (this.#current) {
+          const adopted = this.#readExact(this.#current, FRAME_BYTES);
+          if (adopted) {
+            this.#consumedBytes += FRAME_BYTES;
+            return adopted;
+          }
+        }
       }
       return null;
     }
@@ -383,7 +393,6 @@ export class MixStream extends Readable {
     next.on('end', () => this.#scheduleRead());
     next.on('error', (err) => {
       this.emit('sourceerror', err);
-      this.#finishCurrent();
     });
   }
 
@@ -401,15 +410,76 @@ export class MixStream extends Readable {
     this.#heldInFrame = null;
   }
 
+  /**
+   * Replace the outgoing source without entering betweenTracks silence.
+   * Used when the next track was prefetched but crossfade did not arm in time.
+   * @param {object} source
+   * @param {{ durationSec?: number|null }} [options]
+   * @returns {boolean}
+   */
+  adoptCurrent(source, { durationSec = null } = {}) {
+    if (this.#destroyed || !source) {
+      source?.destroy?.();
+      return false;
+    }
+    if (source.error) {
+      source.destroy();
+      return false;
+    }
+
+    if (this.#current) {
+      this.#current.removeAllListeners();
+      this.#current.destroy();
+    }
+    this.#clearIncoming();
+
+    this.#current = source;
+    this.#consumedBytes = 0;
+    this.#durationSec = durationSec;
+    this.#underrunSince = null;
+    this.#betweenTracks = false;
+
+    source.on('data', () => this.#scheduleRead());
+    source.on('end', () => this.#scheduleRead());
+    source.on('error', (err) => {
+      this.emit('sourceerror', err);
+    });
+
+    // Do not #scheduleRead here: natural-end snap runs inside #readFrame while
+    // #pendingRead is still true; scheduling would re-enter #tryPushFrame and
+    // double-push. The caller reads the first adopted frame instead (like promote).
+    return true;
+  }
+
   #finishCurrent() {
-    const source = this.#current;
-    this.#current = null;
-    source?.removeAllListeners();
-    source?.destroy();
+    const outgoing = this.#current;
     if (this.#incoming) {
       this.#promoteIncoming();
       return;
     }
+
+    let adopted = false;
+    let adoptWindowOpen = true;
+    // Listeners must call adopt() synchronously during this emit. Async adopt
+    // after emit returns races trackend / queue advance and is rejected.
+    this.emit('snaphandoff', {
+      adopt: (source, opts = {}) => {
+        if (!adoptWindowOpen) {
+          source?.destroy?.();
+          return false;
+        }
+        adopted = this.adoptCurrent(source, opts);
+        return adopted;
+      },
+    });
+    adoptWindowOpen = false;
+    if (adopted) {
+      return;
+    }
+
+    this.#current = null;
+    outgoing?.removeAllListeners();
+    outgoing?.destroy();
     this.#betweenTracks = true;
     this.#underrunSince = null;
     this.emit('trackend');

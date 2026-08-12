@@ -101,7 +101,11 @@ export class PcmSource extends EventEmitter {
   }
 
   _onFrameConsumed() {
-    this.#resumeIfPaused();
+    // Keep the pause watermark effective: resuming unconditionally lets a fast
+    // decoder grow #buffer toward the full track after the first pause.
+    if (this.#buffer.length <= MAX_BUFFER_BYTES) {
+      this.#resumeIfPaused();
+    }
   }
 
   static fromBuffers(chunks) {
