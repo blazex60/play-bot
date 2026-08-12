@@ -185,8 +185,16 @@ export class MixStream extends Readable {
 
     const frame = this.#readFrame();
     if (frame === null) {
+      // Between tracks (handoff / prefetch) we MUST keep delivering frames.
+      // Starving the AudioPlayer for ~5 packets (~100ms) makes it Idle, and
+      // @discordjs/voice then destroy()s this MixStream — killing the mixer
+      // for the rest of the session (2nd track never audible, queue races).
       if (this.#betweenTracks) {
+        this.push(SILENCE_FRAME);
         this.#pendingRead = false;
+        // Flowing-mode consumers (tests using 'data') would otherwise sync-spin
+        // on endless silence. AudioPlayer uses paused reads, so it is unaffected.
+        if (this.readableFlowing) this.pause();
         return;
       }
       if (!this.#underrunSince) {
@@ -208,6 +216,16 @@ export class MixStream extends Readable {
     this.#pendingRead = false;
     this.#current?._onFrameConsumed?.();
     this.#incoming?._onFrameConsumed?.();
+  }
+
+  _destroy(err, callback) {
+    this.#destroyed = true;
+    this.#current?.destroy();
+    this.#incoming?.destroy();
+    this.#current = null;
+    this.#incoming = null;
+    this.#crossfade = null;
+    callback(err);
   }
 
   #readExact(source, bytes) {

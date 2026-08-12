@@ -322,3 +322,48 @@ test('acceptance (mixer): skip advances to the next track', async () => {
 
   await player.stop();
 });
+
+test('acceptance (mixer): slow handoff keeps queue on track 2 after mixer stream destroy', async () => {
+  // Mimics @discordjs/voice: leaving Playing destroys playStream. A slow
+  // createPcmSource for track 2 used to race with that destroy and either
+  // skip track 2 or leave an empty queue while the bot stayed in VC.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let createCount = 0;
+  let disconnected = false;
+  let exhausted = false;
+
+  const { player, audioPlayer, queue } = makePlayer({
+    mixerEnabled: true,
+    trackDuration: 3,
+    onDisconnect: async () => { disconnected = true; },
+    handleQueueExhausted: async () => { exhausted = true; return true; },
+    createPcmSourceFn: async () => {
+      createCount += 1;
+      if (createCount === 2) {
+        await new Promise(resolve => setTimeout(resolve, 30));
+      }
+      return PcmSource.fromBuffers([frame, frame, frame]);
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3 }));
+
+  await player.playNext();
+
+  // Natural track end + AudioPlayer destroying the mixer stream mid-handoff.
+  const oldMix = player.mixStream;
+  triggerTrackEnd({ mixStream: oldMix });
+  oldMix.destroy();
+  audioPlayer.state = { status: AudioPlayerStatus.Idle };
+  audioPlayer.events.get(AudioPlayerStatus.Idle)?.();
+
+  await new Promise(resolve => setTimeout(resolve, 80));
+
+  assert.equal(queue.current?.title, 'Track B');
+  assert.equal(queue.isEmpty, false);
+  assert.equal(disconnected, false);
+  assert.equal(exhausted, false);
+  assert.equal(createCount, 2);
+  assert.equal(player.mixStream.destroyed, false);
+
+  await player.stop();
+});
