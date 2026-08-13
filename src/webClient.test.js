@@ -143,3 +143,61 @@ test('logOperation never throws, even when the Web API is unreachable', async ()
 
   await assert.doesNotReject(() => client.logOperation({ guildId: 'g1', discordUserId: 'u1', source: 'command', action: 'skip', success: true }))
 })
+
+test('generatePlaylist posts with an idempotency key and a generation-specific timeout', async () => {
+  const fetchImpl = fakeFetch([{ body: { playlist: { id: 7, name: 'Mix' } } }])
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl, requestTimeoutMs: 20 })
+
+  const playlist = await client.generatePlaylist({
+    discordUserId: 'u1',
+    username: 'user',
+    prompt: '夏',
+    targetCount: 8,
+    name: 'Summer',
+  })
+
+  assert.equal(playlist.id, 7)
+  const body = JSON.parse(fetchImpl.calls[0].options.body)
+  assert.equal(body.discordUserId, 'u1')
+  assert.equal(body.prompt, '夏')
+  assert.equal(typeof body.idempotencyKey, 'string')
+  assert.ok(body.idempotencyKey.length > 0)
+  assert.equal(new URL(fetchImpl.calls[0].url).pathname, '/internal/generate-playlist')
+})
+
+test('generatePlaylist returns { ambiguous: true } when the request is aborted', async () => {
+  const client = createWebClient({
+    baseUrl: 'http://127.0.0.1:9',
+    token: 'tok',
+    fetchImpl: hangingFetch(),
+    generateTimeoutMs: 20,
+  })
+  const result = await client.generatePlaylist({
+    discordUserId: 'u1',
+    username: 'user',
+    prompt: '夏',
+  })
+  assert.deepEqual(result, { ambiguous: true })
+})
+
+test('generatePlaylist returns { ambiguous: true } on a 500 after persistence may have succeeded', async () => {
+  const fetchImpl = fakeFetch([{ ok: false, status: 500, body: { error: 'boom' } }])
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl })
+  const result = await client.generatePlaylist({
+    discordUserId: 'u1',
+    username: 'user',
+    prompt: '夏',
+  })
+  assert.deepEqual(result, { ambiguous: true })
+})
+
+test('generatePlaylist returns null on a confirmed generation failure', async () => {
+  const fetchImpl = fakeFetch([{ ok: false, status: 422, body: { error: 'generation_failed' } }])
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl })
+  const result = await client.generatePlaylist({
+    discordUserId: 'u1',
+    username: 'user',
+    prompt: '夏',
+  })
+  assert.equal(result, null)
+})

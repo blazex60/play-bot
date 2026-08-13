@@ -103,13 +103,16 @@ export async function generatePlaylistFromPrompt({
 
   const count = clampTargetCount(targetCount);
   const minResolved = Math.max(1, Math.floor(count * MIN_RESOLVED_RATIO));
+  const seen = new Set();
+  const accumulated = [];
   let excludeTitles = [];
   let playlistName = null;
 
   for (let attempt = 0; attempt < MAX_GENERATION_ATTEMPTS; attempt += 1) {
+    const remaining = Math.max(1, count - accumulated.length);
     const generated = await gemini.generateTrackList({
       prompt: trimmedPrompt,
-      targetCount: count,
+      targetCount: remaining,
       excludeTitles,
     });
     if (!generated?.tracks?.length) break;
@@ -123,24 +126,34 @@ export async function generatePlaylistFromPrompt({
       requestedById,
     });
 
-    if (resolved.length < minResolved) {
-      excludeTitles = generated.tracks.map((t) => t.title).filter(Boolean);
-      continue;
+    for (const track of resolved) {
+      const key = track.videoId ?? track.webpageUrl;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      accumulated.push(track);
     }
 
-    const analyses = await Promise.all(
-      resolved.map((track) => loadAnalysisFn(track.videoId ?? null)),
-    );
-    const order = optimizeTrackOrderFn({ tracks: resolved, analyses });
-    const ordered = order.map((idx) => resolved[idx]);
+    if (accumulated.length >= count) break;
 
-    return {
-      playlistName: playlistName ?? defaultPlaylistName(trimmedPrompt),
-      tracks: ordered,
-      resolvedCount: ordered.length,
-      requestedCount: count,
-    };
+    excludeTitles = [...new Set([
+      ...excludeTitles,
+      ...generated.tracks.map((t) => t.title).filter(Boolean),
+    ])];
   }
 
-  return null;
+  if (accumulated.length < minResolved) return null;
+
+  const resolved = accumulated.slice(0, count);
+  const analyses = await Promise.all(
+    resolved.map((track) => loadAnalysisFn(track.videoId ?? null)),
+  );
+  const order = optimizeTrackOrderFn({ tracks: resolved, analyses });
+  const ordered = order.map((idx) => resolved[idx]);
+
+  return {
+    playlistName: playlistName ?? defaultPlaylistName(trimmedPrompt),
+    tracks: ordered,
+    resolvedCount: ordered.length,
+    requestedCount: count,
+  };
 }

@@ -20,7 +20,7 @@ import { importRoutes } from './routes/import.js'
 import { importEditRoutes } from './routes/import-edit.js'
 import { playlistsRoutes } from './routes/playlists.js'
 import { internalRoutes } from './routes/internal.js'
-import { createGeminiClient } from './services/gemini.js'
+import { createGeminiClient, createGenerateRateLimiter } from './services/gemini.js'
 import { adminRoutes } from './routes/admin.js'
 
 const thisDir = dirname(fileURLToPath(import.meta.url))
@@ -99,10 +99,13 @@ export async function buildWebServer({
     })
     : gemini
 
+  const generateLimiter = createGenerateRateLimiter()
+
   await app.register(internalRoutes, {
     db: database,
     token: config.botApi.token,
     gemini: geminiClient,
+    generateLimiter,
   })
 
   registerDiscordAuthRoutes(app, { db: database, config, fetchImpl })
@@ -120,7 +123,7 @@ export async function buildWebServer({
     await authenticated.register(queueRoutes, { botClient, db: database })
     await authenticated.register(importRoutes, { db: database, botClient })
     await authenticated.register(importEditRoutes, { db: database, botClient })
-    await authenticated.register(playlistsRoutes, { db: database, botClient, gemini: geminiClient })
+    await authenticated.register(playlistsRoutes, { db: database, botClient, gemini: geminiClient, generateLimiter })
     await authenticated.register(adminRoutes, { db: database, botClient })
   })
 

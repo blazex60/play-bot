@@ -45,9 +45,18 @@ export default {
         name,
       });
 
+      if (playlist?.ambiguous) {
+        await interaction.editReply({
+          content: '⚠️ 生成の完了を確認できませんでした。ダッシュボードの My Playlists に保存されていないか確認してください。',
+          allowedMentions: { parse: [] },
+        });
+        return false;
+      }
+
       if (!playlist?.id) {
         await interaction.editReply({
           content: '❌ プレイリストの自動生成に失敗しました（`GEMINI_API_KEY` の設定と YouTube 検索を確認してください）',
+          allowedMentions: { parse: [] },
         });
         return false;
       }
@@ -68,8 +77,11 @@ export default {
       const trackCount = playlist.trackCount ?? playlist.tracks?.length ?? 0;
       await interaction.editReply({
         content: `🎵 「${playlist.name}」を生成しました（${trackCount} 曲）。ダッシュボードの My Playlists から確認・キュー投入できます。`,
+        allowedMentions: { parse: [] },
       });
-      return true;
+      // Subcommand-specific audit row; return null so the dispatcher does not
+      // also insert a generic `mix` success (see src/index.js deferred-outcome).
+      return null;
     }
 
     if (subcommand !== 'order') return false;

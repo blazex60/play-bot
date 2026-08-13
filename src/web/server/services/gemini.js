@@ -17,7 +17,11 @@ export const REFINE_TIMEOUT_MS = 3_500;
 /** Per-guild cooldown between paid Gemini refine attempts. */
 export const REFINE_COOLDOWN_MS = 15_000;
 /** Playlist generation may take longer than order refine. */
-const GENERATE_TIMEOUT_MS = 15_000;
+export const GENERATE_TIMEOUT_MS = 15_000;
+/** Per-user cooldown between paid Gemini playlist-generation attempts. */
+export const GENERATE_COOLDOWN_MS = 20_000;
+/** Process-wide cap on concurrent playlist-generation jobs. */
+export const GENERATE_MAX_CONCURRENT = 2;
 const DEFAULT_MODEL = 'gemini-2.5-pro';
 
 /**
@@ -95,6 +99,78 @@ export function createRefineRateLimiter({ cooldownMs = REFINE_COOLDOWN_MS } = {}
 }
 
 /**
+ * Per-user in-flight + cooldown, plus a process-wide concurrency cap.
+ * Callers should fail the request (429) when tryBegin returns false.
+ * @param {{ cooldownMs?: number, maxConcurrent?: number }} [options]
+ */
+export function createGenerateRateLimiter({
+  cooldownMs = GENERATE_COOLDOWN_MS,
+  maxConcurrent = GENERATE_MAX_CONCURRENT,
+} = {}) {
+  /** @type {Map<string, number>} */
+  const lastStarted = new Map();
+  /** @type {Set<string>} */
+  const inFlight = new Set();
+  let globalInFlight = 0;
+
+  return {
+    /**
+     * @param {string | null | undefined} key
+     * @returns {boolean}
+     */
+    tryBegin(key) {
+      const id = key || 'global';
+      if (inFlight.has(id)) return false;
+      if (globalInFlight >= maxConcurrent) return false;
+      const last = lastStarted.get(id) ?? 0;
+      if (Date.now() - last < cooldownMs) return false;
+      inFlight.add(id);
+      lastStarted.set(id, Date.now());
+      globalInFlight += 1;
+      return true;
+    },
+    /**
+     * @param {string | null | undefined} key
+     */
+    end(key) {
+      const id = key || 'global';
+      if (inFlight.delete(id)) globalInFlight = Math.max(0, globalInFlight - 1);
+    },
+  };
+}
+
+/**
+ * True when Gemini playlist generation is configured (not the no-key stub).
+ * @param {{ available?: boolean, generateTrackList?: Function } | null | undefined} gemini
+ */
+export function isGeminiGenerateAvailable(gemini) {
+  return Boolean(gemini)
+    && gemini.available !== false
+    && typeof gemini.generateTrackList === 'function';
+}
+
+/**
+ * @param {{ tryBegin: Function, end: Function } | null | undefined} limiter
+ * @param {string | null | undefined} key
+ * @param {() => Promise<unknown>} run
+ */
+export async function withGenerateLimit(limiter, key, run) {
+  if (!limiter?.tryBegin) return run();
+  if (!limiter.tryBegin(key)) {
+    const error = new Error('rate_limited');
+    error.statusCode = 429;
+    error.code = 'rate_limited';
+    error.publicMessage = 'プレイリスト生成の頻度上限に達しました。しばらく待ってから再試行してください';
+    throw error;
+  }
+  try {
+    return await run();
+  } finally {
+    limiter.end(key);
+  }
+}
+
+/**
  * @param {{
  *   apiKey: string,
  *   model?: string,
@@ -110,6 +186,7 @@ export function createGeminiClient({
 } = {}) {
   if (!apiKey) {
     return {
+      available: false,
       async refineOrder() {
         return null;
       },
@@ -150,6 +227,7 @@ export function createGeminiClient({
   }
 
   return {
+    available: true,
     /**
      * Optional polish pass; returns null on any failure.
      * @param {{ tracks: object[], algorithmOrder: number[], timeoutMs?: number }} args

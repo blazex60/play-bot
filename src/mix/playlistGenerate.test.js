@@ -83,3 +83,63 @@ test('generatePlaylistFromPrompt retries when too few tracks resolve', async () 
   assert.equal(result.playlistName, 'Summer MIX');
   assert.equal(result.tracks.length, 2);
 });
+
+test('generatePlaylistFromPrompt keeps first-attempt hits and retries below full count', async () => {
+  let calls = 0;
+  const result = await generatePlaylistFromPrompt({
+    prompt: '夜ドライブ',
+    targetCount: 4,
+    gemini: {
+      async generateTrackList({ excludeTitles }) {
+        calls += 1;
+        if (excludeTitles.length === 0) {
+          return {
+            playlistName: 'Night Drive',
+            tracks: [{ title: 'keep-a' }, { title: 'miss-a' }],
+          };
+        }
+        return {
+          tracks: [{ title: 'keep-b' }, { title: 'keep-c' }],
+        };
+      },
+    },
+    searchYoutubeFn: async (query) => (query.startsWith('keep') ? [{ id: query }] : []),
+    resolveYoutubeTrackFn: (entry) => ({
+      status: 'matched',
+      track: { title: entry.id, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
+    }),
+    optimizeTrackOrderFn: ({ tracks }) => tracks.map((_, i) => i),
+    requestedBy: 'tester',
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(result.tracks.map((t) => t.videoId), ['keep-a', 'keep-b', 'keep-c']);
+});
+
+test('generatePlaylistFromPrompt retries even when the 50% floor is already met', async () => {
+  let calls = 0;
+  const result = await generatePlaylistFromPrompt({
+    prompt: 'full count',
+    targetCount: 4,
+    gemini: {
+      async generateTrackList() {
+        calls += 1;
+        return {
+          tracks: calls === 1
+            ? [{ title: 'a' }, { title: 'b' }]
+            : [{ title: 'c' }, { title: 'd' }],
+        };
+      },
+    },
+    searchYoutubeFn: async (query) => [{ id: query }],
+    resolveYoutubeTrackFn: (entry) => ({
+      status: 'matched',
+      track: { title: entry.id, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
+    }),
+    optimizeTrackOrderFn: ({ tracks }) => tracks.map((_, i) => i),
+    requestedBy: 'tester',
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(result.tracks.length, 4);
+});

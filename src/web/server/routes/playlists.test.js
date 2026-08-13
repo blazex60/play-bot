@@ -21,12 +21,12 @@ function fakeBotClient({ permission = { basic: true, extended: false }, commandA
   }
 }
 
-async function buildTestApp({ db, botClient, searchYoutube, resolveMetadata, userId = 'user-1' } = {}) {
+async function buildTestApp({ db, botClient, searchYoutube, resolveMetadata, gemini, generateLimiter, userId = 'user-1' } = {}) {
   const app = Fastify({ logger: false })
   app.addHook('preHandler', async (request) => {
     request.user = { discordId: userId, username: 'tester' }
   })
-  await app.register(playlistsRoutes, { db, botClient, searchYoutube, resolveMetadata })
+  await app.register(playlistsRoutes, { db, botClient, searchYoutube, resolveMetadata, gemini, generateLimiter })
   return app
 }
 
@@ -232,4 +232,59 @@ test('POST /api/playlists/mine/:id/queue rejects an empty playlist', async (t) =
   })
   assert.equal(response.statusCode, 400)
   assert.equal(response.json().error, 'playlist_empty')
+})
+
+test('POST /api/playlists/mine/generate returns 503 when Gemini is unavailable', async (t) => {
+  const { createGeminiClient } = await import('../services/gemini.js')
+  const { app } = await setup(t, { gemini: createGeminiClient({}) })
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/playlists/mine/generate',
+    payload: { prompt: '夏のJ-POP' },
+  })
+  assert.equal(response.statusCode, 503)
+  assert.equal(response.json().error, 'gemini_unavailable')
+})
+
+test('POST /api/playlists/mine/generate saves a playlist from Gemini suggestions', async (t) => {
+  const { createGenerateRateLimiter } = await import('../services/gemini.js')
+  const gemini = {
+    available: true,
+    async generateTrackList() {
+      return { playlistName: 'Summer', tracks: [{ title: '夜に駆ける' }] }
+    },
+  }
+  const searchYoutube = async () => [{ id: 'vid-gen', title: '夜に駆ける' }]
+  const { app } = await setup(t, {
+    gemini,
+    searchYoutube,
+    generateLimiter: createGenerateRateLimiter({ cooldownMs: 0, maxConcurrent: 4 }),
+  })
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/playlists/mine/generate',
+    payload: { prompt: 'YOASOBI 夏', count: 3 },
+  })
+  assert.equal(response.statusCode, 200)
+  assert.equal(response.json().playlist.name, 'Summer')
+  assert.equal(response.json().playlist.tracks[0].videoId, 'vid-gen')
+})
+
+test('POST /api/playlists/mine/generate returns 429 when rate-limited', async (t) => {
+  const { createGenerateRateLimiter } = await import('../services/gemini.js')
+  const generateLimiter = createGenerateRateLimiter({ cooldownMs: 60_000, maxConcurrent: 1 })
+  assert.equal(generateLimiter.tryBegin('user-1'), true)
+  const { app } = await setup(t, {
+    gemini: { available: true, generateTrackList: async () => ({ tracks: [{ title: 'A' }] }) },
+    generateLimiter,
+  })
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/playlists/mine/generate',
+    payload: { prompt: 'rate limit me' },
+  })
+  assert.equal(response.statusCode, 429)
+  assert.equal(response.json().error, 'rate_limited')
+  generateLimiter.end('user-1')
 })
