@@ -18,7 +18,7 @@ const PLAYBACK_COMMANDS = [
 
 const SETTINGS_COMMANDS = [
   ['bitrate', 'VCのビットレートを設定します（省略時はサーバー最大値）'],
-  ['normalize', '曲ごとの音量ノーマライズ設定を切り替えます'],
+  ['normalize', '音量ノーマライズ設定（尺が分かる30分以内の曲はミキサー経路で常に loudnorm）'],
   ['autoplay', 'キューが空になった時の自動再生を設定します'],
   ['adminrole', 'Web管理画面の権限ロールをこのサーバー専用に設定します（要 Administrator）'],
 ]

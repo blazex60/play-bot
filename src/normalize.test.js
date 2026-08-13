@@ -58,12 +58,13 @@ test('parseLoudnormJson: 必須フィールド欠損は例外', () => {
   )
 })
 
-test('isNormalizeDurationAllowed: 30分以下または不明なら許可する', () => {
+test('isNormalizeDurationAllowed: 尺が分かる30分以下なら許可する', () => {
   assert.equal(isNormalizeDurationAllowed({ duration: MAX_NORMALIZE_DURATION_SEC }), true)
-  assert.equal(isNormalizeDurationAllowed({ duration: null }), true)
-  assert.equal(isNormalizeDurationAllowed({}), true)
+  assert.equal(isNormalizeDurationAllowed({ duration: 1 }), true)
 })
 
-test('isNormalizeDurationAllowed: 30分超は拒否する', () => {
+test('isNormalizeDurationAllowed: 尺不明や30分超は拒否する', () => {
+  assert.equal(isNormalizeDurationAllowed({ duration: null }), false)
+  assert.equal(isNormalizeDurationAllowed({}), false)
   assert.equal(isNormalizeDurationAllowed({ duration: MAX_NORMALIZE_DURATION_SEC + 1 }), false)
 })

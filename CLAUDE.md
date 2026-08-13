@@ -88,21 +88,36 @@ Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用
 
 ### VC 接続 (`src/sessions.js`)
 
-```
+```text
 joinVoiceChannel({ selfDeaf: true }) → entersState(Ready, 30s)
 ```
 
 - **`network_mode: host` 必須** — Docker の bridge NAT が UDP をブロックし `entersState(Ready)` がタイムアウトする。`docker-compose.yml` に `network_mode: "host"` を設定すること（Linux 専用、Mac/Windows 不可）
 - **`@discordjs/voice` は `^0.19.2` 以上を使うこと** — Discord が 2024年11月に旧暗号化方式（`xsalsa20_poly1305` 系）を廃止し、`aead_xchacha20_poly1305_rtpsize` / `aead_aes256_gcm_rtpsize` が必須になった。0.17.x 以前は接続しても UDP ハンドシェイクが失敗する
 
-### 音声ストリーム (`src/search.js` → `src/player.js`)
+### 音声ストリーム (`src/search.js` → `src/audio/` → `src/player.js`)
+
+`MIXER_ENABLED=true`（Phase 6 本番想定）:
+
+```text
+resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
+                                              ↓
+                              MixStream (20ms PCM frames)
+                                              ↓
+                         createAudioResource(StreamType.Raw)
+```
+
+- **yt-dlp の stdout を ffmpeg にパイプして s16le にする** — `PcmSource` が ffmpeg で PCM 化する
+- **`StreamType.Raw`** — セッション中ずっと生きる単一の `MixStream` を 1 度だけ resource 化。曲送りは `MixStream` の `trackend` / クロスフェード完了で駆動
+- **normalize** — ミキサー経路では尺が分かる曲は loudnorm + 無音トリムを強制（詳細は `docs/mix-transition-phase6.md`）
+
+`MIXER_ENABLED=false`（移行期間の旧経路）:
 
 ```
 resolveAudioStream(url)  →  yt-dlp stdout  →  createAudioResource(stream)
 ```
 
-- **yt-dlp の stdout を直接パイプする** — `yt-dlp --get-url` で URL 文字列を取得して FFmpeg に渡す方式は、googlevideo URL へのアクセスに必要なヘッダーが揃わず音声がストールする。`yt-dlp -o -` で stdout にパイプし、そのまま `createAudioResource` に渡すこと
-- **`StreamType.Arbitrary`** — yt-dlp が出力するコンテナ形式（webm/opus、m4a/aac 等）を FFmpeg が自動検出してトランスコードする
+- **`StreamType.Arbitrary`** — 1 曲 = 1 AudioResource、Idle 駆動
 
 ### ウォッチドッグ (`src/player.js`)
 
@@ -114,12 +129,12 @@ resolveAudioStream(url)  →  yt-dlp stdout  →  createAudioResource(stream)
 ## 設計上の制約
 
 - **selfDeaf はネイティブ対応** — `joinVoiceChannel({ selfDeaf: true })` を使用
-- **AudioPlayerStatus.Idle イベント** — 曲終了後の次曲再生はこのイベントで駆動
+- **AudioPlayerStatus.Idle イベント** — ミキサー経路では曲終了の合図ではない。想定外 Idle は mixer resource の再 `play()` / 現在曲の再 `playNext()` で復旧。旧経路では Idle 駆動
 - **循環インポート防止** — `sessions.js` が共有状態を管理。`index.js` と `play.js` の双方向依存を排除
 
 ## Gemini / MIX
 
-MIX プレイリスト機能（曲順最適化の補助・リクエスト文からの自動プレイリスト生成）では Google Gemini API を使う。クライアントは **Web process 専用**（`src/web/server/services/gemini.js`）。Bot process から直接呼ばない。送信するのは曲タイトル・チャンネル名・duration・ユーザーのリクエスト文に限定し、音声ファイルや OAuth トークンは送らない。Gemini 失敗時も再生は止めず、当該機能のみ縮退する。API キーは `.env` の `GEMINI_API_KEY`（モデルは `GEMINI_MODEL`）。運用前提は **課金設定済み（Paid）の Google Cloud プロジェクト**（無料枠では Google がプロンプト/応答を製品改善に利用し得るため。詳細は `legal/privacy.html`）。ミキサー移行の詳細は `docs/mix-plan.md` を参照（移行期間の `MIXER_ENABLED` は Phase 1 安定後に撤去予定。現時点では削除しない）。
+MIX プレイリスト機能（曲順最適化の補助・リクエスト文からの自動プレイリスト生成）では Google Gemini API を使う。クライアントは **Web process 専用**（`src/web/server/services/gemini.js`）。Bot process から直接呼ばない。送信するのは曲タイトル・チャンネル名・duration・ユーザーのリクエスト文に限定し、音声ファイルや OAuth トークンは送らない。Gemini 失敗時も再生は止めず、当該機能のみ縮退する。API キーは `.env` の `GEMINI_API_KEY`（モデルは `GEMINI_MODEL`）。運用前提は **課金設定済み（Paid）の Google Cloud プロジェクト**（無料枠では Google がプロンプト/応答を製品改善に利用し得るため。詳細は `legal/privacy.html`）。**Phase 6（つなぎ品質）の正本は [`docs/mix-transition-phase6.md`](docs/mix-transition-phase6.md)**（PR #27）。`MIXER_ENABLED=true` でミキサー経路を有効にする。
 
 ## シークレット管理
 
