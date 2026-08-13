@@ -11,6 +11,7 @@ const PLAYBACK_COMMANDS = [
   ['queue', '現在のキューを表示します'],
   ['shuffle', 'キューをシャッフルします'],
   ['mix order', 'upcoming を BPM/キーに基づいて MIX 向けに並べ替えます'],
+  ['mix create', 'リクエスト文からプレイリストを自動生成して My Playlists に保存します'],
   ['loop', 'ループモードを切り替えます（オフ→1曲→キュー→オフ）'],
   ['nowplaying', '現在再生中の曲を表示します'],
 ]

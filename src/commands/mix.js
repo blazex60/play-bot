@@ -11,10 +11,80 @@ export default {
       sub
         .setName('order')
         .setDescription('キューの残り曲を BPM/キーに基づいて並べ替えます'),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('create')
+        .setDescription('リクエスト文からプレイリストを自動生成して保存します')
+        .addStringOption((opt) =>
+          opt.setName('prompt').setDescription('作りたいプレイリストのイメージ').setRequired(true),
+        )
+        .addIntegerOption((opt) =>
+          opt.setName('count').setDescription('曲数（3〜25、既定10）').setMinValue(3).setMaxValue(25),
+        )
+        .addStringOption((opt) =>
+          opt.setName('name').setDescription('保存名（省略時は自動）'),
+        ),
     ),
 
   async execute(interaction, sessions) {
     const subcommand = interaction.options.getSubcommand();
+
+    if (subcommand === 'create') {
+      await interaction.deferReply(replyFlags(interaction.guildId, 'mix'));
+
+      const prompt = interaction.options.getString('prompt', true);
+      const count = interaction.options.getInteger('count') ?? 10;
+      const name = interaction.options.getString('name');
+
+      const playlist = await webClient.generatePlaylist({
+        discordUserId: interaction.user.id,
+        username: interaction.member?.displayName ?? interaction.user.username,
+        prompt,
+        targetCount: count,
+        name,
+      });
+
+      if (playlist?.ambiguous) {
+        await interaction.editReply({
+          content: '⚠️ 生成の完了を確認できませんでした。ダッシュボードの My Playlists に保存されていないか確認してください。',
+          allowedMentions: { parse: [] },
+        });
+        // Unknown outcome: the playlist may already be saved. Do not log a failed `mix`.
+        return null;
+      }
+
+      if (!playlist?.id) {
+        await interaction.editReply({
+          content: '❌ プレイリストの自動生成に失敗しました（`GEMINI_API_KEY` の設定と YouTube 検索を確認してください）',
+          allowedMentions: { parse: [] },
+        });
+        return false;
+      }
+
+      await webClient.logOperation({
+        guildId: interaction.guildId,
+        discordUserId: interaction.user.id,
+        username: interaction.member?.displayName ?? interaction.user.username,
+        source: 'command',
+        action: 'mix:create',
+        detail: JSON.stringify({
+          playlistId: playlist.id,
+          trackCount: playlist.trackCount ?? playlist.tracks?.length ?? 0,
+        }),
+        success: true,
+      });
+
+      const trackCount = playlist.trackCount ?? playlist.tracks?.length ?? 0;
+      await interaction.editReply({
+        content: `🎵 「${playlist.name}」を生成しました（${trackCount} 曲）。ダッシュボードの My Playlists から確認・キュー投入できます。`,
+        allowedMentions: { parse: [] },
+      });
+      // Subcommand-specific audit row; return null so the dispatcher does not
+      // also insert a generic `mix` success (see src/index.js deferred-outcome).
+      return null;
+    }
+
     if (subcommand !== 'order') return false;
 
     const session = await requireSessionInSameVoice(interaction, sessions, {

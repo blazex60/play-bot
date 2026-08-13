@@ -1,8 +1,14 @@
-import { nowUnix, recordOperationLog } from './route-utils.js'
+import { bindRouteError, nowUnix, recordOperationLog } from './route-utils.js'
 import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js'
+import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
+import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
+import { resolveYoutubeTrack } from '../matching.js'
 import {
   REFINE_TIMEOUT_MS,
   createRefineRateLimiter,
+  createGenerateRateLimiter,
+  isGeminiGenerateAvailable,
+  withGenerateLimit,
 } from '../services/gemini.js'
 
 function delay(ms) {
@@ -37,7 +43,14 @@ function upsertDiscordUser(db, { discordId, username }) {
 // Web -> Bot direction (src/botApi.js). Guarded by the same BOT_API_TOKEN
 // shared secret rather than the cookie-session requireAuth middleware, since
 // the caller here is the bot process, not a browser.
-export async function internalRoutes(app, { db, token, gemini = null, refineLimiter = createRefineRateLimiter() } = {}) {
+export async function internalRoutes(app, {
+  db,
+  token,
+  gemini = null,
+  refineLimiter = createRefineRateLimiter(),
+  generateLimiter = createGenerateRateLimiter(),
+  searchYoutube = defaultSearchYoutube,
+} = {}) {
   app.addHook('onRequest', async (request, reply) => {
     if (!token || getBearerToken(request) !== token) {
       return reply.code(401).send({ error: 'unauthorized' })
@@ -217,5 +230,50 @@ export async function internalRoutes(app, { db, token, gemini = null, refineLimi
     }
 
     return reply.send({ order, source })
+  })
+
+  app.post('/internal/generate-playlist', async (request, reply) => {
+    try {
+      if (!db) throw new Error('db is required for internal routes')
+      if (!isGeminiGenerateAvailable(gemini)) {
+        const error = new Error('gemini_unavailable')
+        error.statusCode = 503
+        error.code = 'gemini_unavailable'
+        throw error
+      }
+
+      const {
+        discordUserId,
+        username,
+        prompt,
+        targetCount,
+        name = null,
+        idempotencyKey = null,
+      } = request.body ?? {}
+
+      if (!discordUserId || !username || !prompt) {
+        return reply.code(400).send({ error: 'missing_fields' })
+      }
+
+      upsertDiscordUser(db, { discordId: discordUserId, username })
+
+      const playlist = await withGenerateLimit(generateLimiter, discordUserId, () => createGeneratedUserPlaylist({
+        db,
+        gemini,
+        userId: discordUserId,
+        username,
+        prompt,
+        targetCount,
+        name,
+        idempotencyKey,
+        searchYoutubeFn: searchYoutube,
+        resolveYoutubeTrackFn: resolveYoutubeTrack,
+        loadAnalysisFn: async (videoId) => loadAnalysis(videoId),
+      }))
+
+      return reply.send({ playlist })
+    } catch (error) {
+      return bindRouteError(reply, error)
+    }
   })
 }

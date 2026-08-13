@@ -1,6 +1,8 @@
 import { createTrack } from '../../../queue.js'
 import { resolveMetadata as defaultResolveMetadata, searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
+import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
+import { createGenerateRateLimiter, isGeminiGenerateAvailable, withGenerateLimit } from '../services/gemini.js'
 import { bindRouteError, enqueueImportTracks, getSessionUser, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 import {
   serializePlaylistRow,
@@ -71,6 +73,8 @@ async function resolveTrackInput(body, { user, resolveMetadataFn }) {
 export async function playlistsRoutes(app, {
   db,
   botClient,
+  gemini = null,
+  generateLimiter = createGenerateRateLimiter(),
   searchYoutube = defaultSearchYoutube,
   resolveMetadata = defaultResolveMetadata,
 } = {}) {
@@ -92,6 +96,53 @@ export async function playlistsRoutes(app, {
       if (!name) return reply.code(400).send({ error: 'name_required' })
       const id = createPlaylist(db, user.discordId, name)
       return reply.send(serializePlaylistRow({ ...getOwnedPlaylist(db, user.discordId, id), track_count: 0 }))
+    } catch (error) {
+      return bindRouteError(reply, error)
+    }
+  })
+
+  app.post('/api/playlists/mine/generate', async (request, reply) => {
+    try {
+      const user = getSessionUser(request)
+      if (!db) throw new Error('db is required for playlist routes')
+      if (!isGeminiGenerateAvailable(gemini)) {
+        const error = new Error('gemini_unavailable')
+        error.statusCode = 503
+        error.code = 'gemini_unavailable'
+        throw error
+      }
+      const prompt = typeof request.body?.prompt === 'string' ? request.body.prompt.trim() : ''
+      if (!prompt) return reply.code(400).send({ error: 'prompt_required' })
+      const rawCount = request.body?.count ?? request.body?.targetCount
+      const targetCount = rawCount == null ? undefined : Number.parseInt(String(rawCount), 10)
+      const name = typeof request.body?.name === 'string' ? request.body.name.trim() : null
+      const idempotencyKey = typeof request.body?.idempotencyKey === 'string' ? request.body.idempotencyKey : null
+
+      const loadAnalysis = (videoId) => {
+        if (!videoId) return null
+        const row = db.prepare('SELECT payload_json AS payloadJson FROM track_analysis WHERE video_id = ?').get(videoId)
+        if (!row) return null
+        try {
+          return JSON.parse(row.payloadJson)
+        } catch {
+          return null
+        }
+      }
+
+      const playlist = await withGenerateLimit(generateLimiter, user.discordId, () => createGeneratedUserPlaylist({
+        db,
+        gemini,
+        userId: user.discordId,
+        username: user.username,
+        prompt,
+        targetCount: Number.isFinite(targetCount) ? targetCount : undefined,
+        name,
+        idempotencyKey,
+        searchYoutubeFn: searchYoutube,
+        resolveYoutubeTrackFn: resolveYoutubeTrack,
+        loadAnalysisFn: async (videoId) => loadAnalysis(videoId),
+      }))
+      return reply.send({ playlist })
     } catch (error) {
       return bindRouteError(reply, error)
     }

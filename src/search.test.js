@@ -6,6 +6,7 @@ import {
   parseFirstJsonLine,
   parseJsonLines,
   mapEntryToTrack,
+  spawnAsync,
 } from './search.js'
 
 test('isPlaylistUrl: playlist URLs are detected', () => {
@@ -68,4 +69,13 @@ test('mapEntryToTrack: picks the last thumbnail when only a thumbnails array is 
     { requestedBy: 'user' }
   )
   assert.equal(track.thumbnail, 'https://example.com/large.jpg')
+})
+
+test('spawnAsync kills a hung process when timeoutMs elapses', async () => {
+  const started = Date.now()
+  await assert.rejects(
+    () => spawnAsync('sleep', ['5'], { timeoutMs: 40 }),
+    (err) => err instanceof YtdlpError && /timed out after 40ms/.test(err.message),
+  )
+  assert.ok(Date.now() - started < 1000)
 })

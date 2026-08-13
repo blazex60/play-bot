@@ -393,3 +393,131 @@ test('PUT /internal/track-analysis normalizes analyzedAt milliseconds to seconds
   const row = db.prepare('SELECT analyzed_at AS analyzedAt FROM track_analysis WHERE video_id = ?').get('vid-ms')
   assert.equal(row.analyzedAt, Math.floor(ms / 1000))
 })
+
+function fakeGenerateGemini(tracks = [{ title: 'Song A', artist: 'Artist' }]) {
+  return {
+    available: true,
+    async generateTrackList() {
+      return { playlistName: 'Generated Mix', tracks }
+    },
+  }
+}
+
+test('POST /internal/generate-playlist returns 503 when Gemini is the no-key stub', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+  const { createGeminiClient } = await import('../services/gemini.js')
+  const dedicated = Fastify({ logger: false })
+  await dedicated.register(internalRoutes, {
+    db,
+    token: config.botApi.token,
+    gemini: createGeminiClient({}),
+  })
+  t.after(() => dedicated.close())
+
+  const response = await dedicated.inject({
+    method: 'POST',
+    url: '/internal/generate-playlist',
+    headers: authHeaders(config),
+    payload: { discordUserId: 'u1', username: 'tester', prompt: '夏' },
+  })
+  assert.equal(response.statusCode, 503)
+  assert.equal(response.json().error, 'gemini_unavailable')
+})
+
+test('POST /internal/generate-playlist serializes generation_failed via bindRouteError', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+  const dedicated = Fastify({ logger: false })
+  await dedicated.register(internalRoutes, {
+    db,
+    token: config.botApi.token,
+    gemini: fakeGenerateGemini([{ title: 'missing' }]),
+    searchYoutube: async () => [],
+  })
+  t.after(() => dedicated.close())
+
+  const response = await dedicated.inject({
+    method: 'POST',
+    url: '/internal/generate-playlist',
+    headers: authHeaders(config),
+    payload: { discordUserId: 'u1', username: 'tester', prompt: '夏' },
+  })
+  assert.equal(response.statusCode, 422)
+  assert.equal(response.json().error, 'generation_failed')
+  assert.ok(response.json().message)
+})
+
+test('POST /internal/generate-playlist persists a generated playlist', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+  const { createGenerateRateLimiter } = await import('../services/gemini.js')
+  const dedicated = Fastify({ logger: false })
+  await dedicated.register(internalRoutes, {
+    db,
+    token: config.botApi.token,
+    gemini: fakeGenerateGemini([{ title: '夜に駆ける' }]),
+    generateLimiter: createGenerateRateLimiter({ cooldownMs: 0, maxConcurrent: 4 }),
+    searchYoutube: async () => [{ id: 'vid-a', title: '夜に駆ける' }],
+  })
+  t.after(() => dedicated.close())
+
+  const response = await dedicated.inject({
+    method: 'POST',
+    url: '/internal/generate-playlist',
+    headers: authHeaders(config),
+    payload: { discordUserId: 'u1', username: 'tester', prompt: 'YOASOBI', targetCount: 3, idempotencyKey: 'k1' },
+  })
+  assert.equal(response.statusCode, 200)
+  const playlist = response.json().playlist
+  assert.equal(playlist.tracks.length, 1)
+  assert.equal(playlist.tracks[0].videoId, 'vid-a')
+
+  const replay = await dedicated.inject({
+    method: 'POST',
+    url: '/internal/generate-playlist',
+    headers: authHeaders(config),
+    payload: { discordUserId: 'u1', username: 'tester', prompt: 'YOASOBI', targetCount: 3, idempotencyKey: 'k1' },
+  })
+  assert.equal(replay.statusCode, 200)
+  assert.equal(replay.json().playlist.id, playlist.id)
+})
+
+test('POST /internal/generate-playlist returns 429 when rate-limited', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+  const { createGenerateRateLimiter } = await import('../services/gemini.js')
+  const generateLimiter = createGenerateRateLimiter({ cooldownMs: 60_000, maxConcurrent: 1 })
+  assert.equal(generateLimiter.tryBegin('u1'), true)
+
+  const dedicated = Fastify({ logger: false })
+  await dedicated.register(internalRoutes, {
+    db,
+    token: config.botApi.token,
+    gemini: fakeGenerateGemini(),
+    generateLimiter,
+  })
+  t.after(() => dedicated.close())
+
+  const response = await dedicated.inject({
+    method: 'POST',
+    url: '/internal/generate-playlist',
+    headers: authHeaders(config),
+    payload: { discordUserId: 'u1', username: 'tester', prompt: '夏' },
+  })
+  assert.equal(response.statusCode, 429)
+  assert.equal(response.json().error, 'rate_limited')
+  generateLimiter.end('u1')
+})

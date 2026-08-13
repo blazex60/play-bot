@@ -12,6 +12,7 @@ const PLAYBACK_COMMANDS = [
   { title: '/queue', copy: '現在のキューを一覧表示します。並び替え・削除用のボタンが付いたエディタとして開きます。' },
   { title: '/shuffle', copy: 'キューの曲順をシャッフルします。' },
   { title: '/mix order', copy: 'キューの残り曲を BPM/キー解析に基づいて MIX 向けに並べ替えます（2曲以上必要）。' },
+  { title: '/mix create', copy: 'リクエスト文から Gemini が曲を提案し、YouTube 検索で解決して My Playlists に保存します。' },
   { title: '/loop', copy: 'ループモードを「オフ → 1曲リピート → キューリピート → オフ」の順に切り替えます。実行するたびに次のモードへ進みます。' },
   { title: '/nowplaying', copy: '現在再生中の曲のタイトル・長さ・リクエストしたユーザー・ループモードを表示します。' },
 ]

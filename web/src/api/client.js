@@ -118,6 +118,8 @@ export const api = {
   mySavedPlaylists: () => request('/api/playlists/mine'),
   /** @param {string} name */
   createSavedPlaylist: (name) => request('/api/playlists/mine', { method: 'POST', body: { name } }),
+  /** @param {{ prompt: string, count?: number, name?: string }} body */
+  generateSavedPlaylist: (body) => request('/api/playlists/mine/generate', { method: 'POST', body }),
   /** @param {number} id */
   savedPlaylist: (id) => request(`/api/playlists/mine/${encodeURIComponent(id)}`),
   /** @param {number} id @param {string} name */

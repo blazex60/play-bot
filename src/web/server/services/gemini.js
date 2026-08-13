@@ -4,11 +4,24 @@ const OrderSchema = z.object({
   order: z.array(z.number().int().nonnegative()),
 });
 
+const TrackListSchema = z.object({
+  playlistName: z.string().min(1).max(80).optional(),
+  tracks: z.array(z.object({
+    title: z.string().min(1).max(200),
+    artist: z.string().max(200).optional(),
+  })).min(1),
+});
+
 /** Keep under bot webClient's 5s abort so algorithm order still returns. */
 export const REFINE_TIMEOUT_MS = 3_500;
 /** Per-guild cooldown between paid Gemini refine attempts. */
 export const REFINE_COOLDOWN_MS = 15_000;
-
+/** Playlist generation may take longer than order refine. */
+export const GENERATE_TIMEOUT_MS = 15_000;
+/** Per-user cooldown between paid Gemini playlist-generation attempts. */
+export const GENERATE_COOLDOWN_MS = 20_000;
+/** Process-wide cap on concurrent playlist-generation jobs. */
+export const GENERATE_MAX_CONCURRENT = 2;
 const DEFAULT_MODEL = 'gemini-2.5-pro';
 
 /**
@@ -33,6 +46,21 @@ function buildPrompt(tracks, algorithmOrder) {
     '',
     'Algorithm proposal:',
     ...lines,
+  ].join('\n');
+}
+
+function buildGeneratePrompt(prompt, targetCount, excludeTitles = []) {
+  const excludeBlock = excludeTitles.length
+    ? `\nDo NOT suggest these titles again:\n${excludeTitles.map((t) => `- ${t}`).join('\n')}`
+    : '';
+  return [
+    'You suggest vocal tracks (mainly J-POP / anime songs) for a DJ-style playlist.',
+    `Return ONLY JSON: {"playlistName":"short name","tracks":[{"title":"song title","artist":"optional"}]}`,
+    `Suggest about ${targetCount} distinct tracks matching the user request.`,
+    'Use real, searchable song titles. Do not include URLs or track numbers.',
+    excludeBlock,
+    '',
+    `User request: ${prompt}`,
   ].join('\n');
 }
 
@@ -71,6 +99,78 @@ export function createRefineRateLimiter({ cooldownMs = REFINE_COOLDOWN_MS } = {}
 }
 
 /**
+ * Per-user in-flight + cooldown, plus a process-wide concurrency cap.
+ * Callers should fail the request (429) when tryBegin returns false.
+ * @param {{ cooldownMs?: number, maxConcurrent?: number }} [options]
+ */
+export function createGenerateRateLimiter({
+  cooldownMs = GENERATE_COOLDOWN_MS,
+  maxConcurrent = GENERATE_MAX_CONCURRENT,
+} = {}) {
+  /** @type {Map<string, number>} */
+  const lastStarted = new Map();
+  /** @type {Set<string>} */
+  const inFlight = new Set();
+  let globalInFlight = 0;
+
+  return {
+    /**
+     * @param {string | null | undefined} key
+     * @returns {boolean}
+     */
+    tryBegin(key) {
+      const id = key || 'global';
+      if (inFlight.has(id)) return false;
+      if (globalInFlight >= maxConcurrent) return false;
+      const last = lastStarted.get(id) ?? 0;
+      if (Date.now() - last < cooldownMs) return false;
+      inFlight.add(id);
+      lastStarted.set(id, Date.now());
+      globalInFlight += 1;
+      return true;
+    },
+    /**
+     * @param {string | null | undefined} key
+     */
+    end(key) {
+      const id = key || 'global';
+      if (inFlight.delete(id)) globalInFlight = Math.max(0, globalInFlight - 1);
+    },
+  };
+}
+
+/**
+ * True when Gemini playlist generation is configured (not the no-key stub).
+ * @param {{ available?: boolean, generateTrackList?: Function } | null | undefined} gemini
+ */
+export function isGeminiGenerateAvailable(gemini) {
+  return Boolean(gemini)
+    && gemini.available !== false
+    && typeof gemini.generateTrackList === 'function';
+}
+
+/**
+ * @param {{ tryBegin: Function, end: Function } | null | undefined} limiter
+ * @param {string | null | undefined} key
+ * @param {() => Promise<unknown>} run
+ */
+export async function withGenerateLimit(limiter, key, run) {
+  if (!limiter?.tryBegin) return run();
+  if (!limiter.tryBegin(key)) {
+    const error = new Error('rate_limited');
+    error.statusCode = 429;
+    error.code = 'rate_limited';
+    error.publicMessage = 'プレイリスト生成の頻度上限に達しました。しばらく待ってから再試行してください';
+    throw error;
+  }
+  try {
+    return await run();
+  } finally {
+    limiter.end(key);
+  }
+}
+
+/**
  * @param {{
  *   apiKey: string,
  *   model?: string,
@@ -86,7 +186,11 @@ export function createGeminiClient({
 } = {}) {
   if (!apiKey) {
     return {
+      available: false,
       async refineOrder() {
+        return null;
+      },
+      async generateTrackList() {
         return null;
       },
     };
@@ -123,6 +227,7 @@ export function createGeminiClient({
   }
 
   return {
+    available: true,
     /**
      * Optional polish pass; returns null on any failure.
      * @param {{ tracks: object[], algorithmOrder: number[], timeoutMs?: number }} args
@@ -139,7 +244,30 @@ export function createGeminiClient({
         return null;
       }
     },
+
+    /**
+     * Generate track title suggestions from a user prompt.
+     * @param {{ prompt: string, targetCount?: number, excludeTitles?: string[] }} args
+     */
+    async generateTrackList({ prompt, targetCount = 10, excludeTitles = [] }) {
+      try {
+        const parsed = TrackListSchema.safeParse(
+          await generateJson(
+            buildGeneratePrompt(prompt, targetCount, excludeTitles),
+            GENERATE_TIMEOUT_MS,
+          ),
+        );
+        if (!parsed.success) return null;
+        return {
+          playlistName: parsed.data.playlistName,
+          tracks: parsed.data.tracks.slice(0, Math.max(1, targetCount)),
+        };
+      } catch (err) {
+        console.error('[gemini] generateTrackList failed:', err.message);
+        return null;
+      }
+    },
   };
 }
 
-export { OrderSchema, buildPrompt };
+export { OrderSchema, TrackListSchema, buildPrompt };

@@ -7,6 +7,8 @@
  *     renameValue: string,
  *     trackUrl: string,
  *     trackSearchQuery: string,
+ *     generatePrompt: string,
+ *     generateCount: number,
  *     searchResults: import('../api/client.js').SavedPlaylistTrack[],
  *     canQueue: boolean,
  *     busy: boolean,
@@ -22,6 +24,9 @@
  *     onAddByUrl: () => void,
  *     onTrackSearchQueryChange: (value: string) => void,
  *     onSearchTracks: () => void,
+ *     onGeneratePromptChange: (value: string) => void,
+ *     onGenerateCountChange: (value: number) => void,
+ *     onGenerateFromPrompt: () => void,
  *     onAddFromSearchResult: (track: import('../api/client.js').SavedPlaylistTrack) => void,
  *     onMoveTrack: (fromIndex: number, toIndex: number) => void,
  *     onRemoveTrack: (trackId: number) => void,
@@ -37,6 +42,8 @@ export function PlaylistBuilder({ state, actions }) {
     renameValue,
     trackUrl,
     trackSearchQuery,
+    generatePrompt,
+    generateCount,
     searchResults,
     canQueue,
     busy,
@@ -52,6 +59,9 @@ export function PlaylistBuilder({ state, actions }) {
     onAddByUrl,
     onTrackSearchQueryChange,
     onSearchTracks,
+    onGeneratePromptChange,
+    onGenerateCountChange,
+    onGenerateFromPrompt,
     onAddFromSearchResult,
     onMoveTrack,
     onRemoveTrack,
@@ -82,6 +92,32 @@ export function PlaylistBuilder({ state, actions }) {
         />
         <button type="submit" disabled={busy || !newPlaylistName.trim()}>
           作成
+        </button>
+      </form>
+
+      <form
+        className="playlist-generate-form"
+        onSubmit={(event) => {
+          event.preventDefault()
+          onGenerateFromPrompt()
+        }}
+      >
+        <input
+          value={generatePrompt}
+          onChange={(event) => onGeneratePromptChange(event.target.value)}
+          placeholder="例: 2020年代の夏向けアニソン MIX"
+          aria-label="Gemini プレイリスト生成のリクエスト"
+        />
+        <input
+          type="number"
+          min={3}
+          max={25}
+          value={generateCount}
+          onChange={(event) => onGenerateCountChange(Number(event.target.value) || 10)}
+          aria-label="生成する曲数"
+        />
+        <button type="submit" disabled={busy || !generatePrompt.trim()}>
+          Gemini で生成
         </button>
       </form>
 
