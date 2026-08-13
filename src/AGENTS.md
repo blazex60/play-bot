@@ -14,7 +14,7 @@ Bot 本体のソース。Discord client のエントリーポイント、VC セ�
 | `index.js` | Discord Bot エントリーポイント。client 起動、コマンドロード、interaction イベント処理、`botApi.js` の起動 |
 | `sessions.js` | Guild ごとの VC セッション共有状態（`Map<guildId, { connection, player, queue }>`）。`joinVoiceChannel` + `entersState(Ready)`。queue-exhaustion 時の autoplay/recommend ポリシーは `queueExhaustion.js` に分離されている |
 | `queueExhaustion.js` | キュー枯渇時の自動再生/おすすめモード継続ロジック（`createQueueExhaustionHandler`）。`sessions.js` を import しない一方向依存を保つため `getSession` サンクを受け取る |
-| `player.js` | `GuildPlayer`。AudioPlayer のラップ、ストール検出ウォッチドッグ、`#hadError` フラグによるトラックスキップ制御 |
+| `player.js` | `GuildPlayer`。PCM ミキサー（`MixStream`）駆動、クロスフェード、ストール検出ウォッチドッグ、`#hadError` フラグによるトラックスキップ制御 |
 | `queue.js` | `GuildQueue`。トラック配列と `LoopMode`（OFF/TRACK/QUEUE）を管理 |
 | `search.js` | yt-dlp を `child_process.spawn` で呼び出し、検索・メタデータ取得を行う。`resolveAudioStream()` は yt-dlp の stdout をそのまま返す（URL を解決して FFmpeg に渡す方式ではない。詳細はルート `CLAUDE.md`） |
 | `format.js` | 表示用の共有ヘルパー（`fmtDuration`, `LOOP_LABELS`）。`commands/` と `queueEditorView.js`/`recommendFlow.js` が共有する |
@@ -40,9 +40,9 @@ Bot 本体のソース。Discord client のエントリーポイント、VC セ�
 ### Working In This Directory
 - **循環インポート防止**: `sessions.js` が VC セッションの共有状態を保持するハブ。`index.js` と `commands/*.js` の双方向依存を作らないこと。`queueExhaustion.js` のように `sessions.js` から呼ばれる側のモジュールは `sessions.js` を import せず、必要な値は関数引数（`getSession` サンク等）で受け取ること
 - Bot process は `better-sqlite3` を絶対に import しない。DB が必要な操作は `src/web/server/` 経由の internal API を使う
-- `player.js` のウォッチドッグは `state.playbackDuration` の増加を見て判定する。`stateChange` イベント自体はループ再生開始時にしか発火しないため使わない
+- `player.js` のウォッチドッグは `state.playbackDuration` の増加を見て判定する。`stateChange` イベント自体はループ再生開始時にしか発火しないため使わない。ストール時は `MixStream.dropCurrent()` する
 - `#hadError` フラグは `queue.next({ forceAdvance: true })` を呼ぶ**前**に退避してからリセットする（順序が逆だと無限リトライになる）
-- 音声ストリームは常に yt-dlp の stdout を直接 `createAudioResource` にパイプする（`--get-url` + FFmpeg 方式は使わない、詳細はルート `CLAUDE.md`）
+- 音声は yt-dlp stdout を `PcmSource` 経由で s16le 化し、セッション寿命の `MixStream` に載せる。`StreamType.Arbitrary` で曲ごとに `createAudioResource` する旧経路は使わない（詳細はルート `CLAUDE.md`）
 
 ### Testing Requirements
 - 各モジュールに対応する `*.test.js` が同じディレクトリにある（`node:test` + `node:assert/strict`）

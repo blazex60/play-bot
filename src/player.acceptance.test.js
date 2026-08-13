@@ -4,9 +4,15 @@ import { AudioPlayerStatus } from '@discordjs/voice';
 import { LoopMode, createTrack } from './queue.js';
 import { isShortTrack, shouldReconnectRetry } from './player/playbackPolicy.js';
 import { triggerTrackEnd } from './player/playbackDrive.js';
-import { makeAudioPlayer, makePlayer, nextTurn } from './player/test-helpers.js';
+import { makePlayer, nextTurn } from './player/test-helpers.js';
 import { FRAME_BYTES } from './audio/fade.js';
 import { PcmSource } from './audio/pcmSource.js';
+
+const silentFrame = Buffer.alloc(FRAME_BYTES);
+
+async function waitMs(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 test('playbackPolicy: isShortTrack is true when duration is under 5 seconds', () => {
   assert.equal(isShortTrack({ duration: 4 }), true);
@@ -26,7 +32,9 @@ test('playbackPolicy: shouldReconnectRetry skips short tracks and errors', () =>
 });
 
 test('acceptance: stream error automatically skips an unplayable track', async () => {
-  const { player, audioPlayer, resources, queue } = makePlayer();
+  const { player, queue } = makePlayer({
+    createPcmSourceFn: async () => PcmSource.fromBuffers([silentFrame]),
+  });
   queue.add(createTrack({
     title: 'Track B',
     webpageUrl: 'https://example.com/b',
@@ -34,50 +42,33 @@ test('acceptance: stream error automatically skips an unplayable track', async (
   }));
 
   await player.playNext();
-  audioPlayer.events.get('error')(new Error('Private video'));
-
-  await new Promise(resolve => setTimeout(resolve, 10));
+  player.mixStream.emit('sourceerror', new Error('Private video'));
+  await nextTurn();
   assert.equal(queue.current.title, 'Track B');
-  assert.equal(audioPlayer.resource, resources[1]);
 
   await player.stop();
 });
 
-test('acceptance: error during an active handoff advances once it finishes', async () => {
-  const audioPlayer = makeAudioPlayer();
-  const originalPlay = audioPlayer.play;
-  let failNextTrack = false;
-  let resolveTrackCPlayed;
-  const trackCPlayed = new Promise(resolve => { resolveTrackCPlayed = resolve; });
-  audioPlayer.play = function (resource) {
-    originalPlay.call(this, resource);
-    if (failNextTrack) {
-      failNextTrack = false;
-      this.events.get('error')(new Error('Private video'));
-    }
-    if (resource.stream.url === 'https://example.com/c') resolveTrackCPlayed();
-  };
-
+test('acceptance: pcm source failure during handoff advances to the next track', async () => {
   let exhaustedCalls = 0;
   let disconnected = false;
-  const { player, resources, queue } = makePlayer({
-    audioPlayer,
+  const { player, queue } = makePlayer({
     trackDuration: 3,
     handleQueueExhausted: async () => { exhaustedCalls += 1; return false; },
-    onDisconnect: async () => { disconnected = true },
+    onDisconnect: async () => { disconnected = true; },
+    createPcmSourceFn: async (track) => {
+      if (track.title === 'Track B') throw new Error('Private video');
+      return PcmSource.fromBuffers([silentFrame]);
+    },
   });
   queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60 }));
   queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60 }));
   queue.add(createTrack({ title: 'Track D', webpageUrl: 'https://example.com/d', duration: 60 }));
 
   await player.playNext();
-  failNextTrack = true;
-  triggerTrackEnd({ audioPlayer });
-
-  await trackCPlayed;
-  await nextTurn();
+  triggerTrackEnd({ mixStream: player.mixStream });
+  await waitMs(40);
   assert.equal(queue.current.title, 'Track C');
-  assert.equal(resources.length, 3);
   assert.equal(exhaustedCalls, 0);
   assert.equal(disconnected, false);
 
@@ -85,29 +76,15 @@ test('acceptance: error during an active handoff advances once it finishes', asy
 });
 
 test('acceptance: error while replaying a looped track advances past it', async () => {
-  const audioPlayer = makeAudioPlayer();
-  const originalPlay = audioPlayer.play;
-  let failReplay = false;
-  let resolveTrackBPlayed;
-  const trackBPlayed = new Promise(resolve => { resolveTrackBPlayed = resolve });
-  audioPlayer.play = function (resource) {
-    originalPlay.call(this, resource);
-    if (failReplay) {
-      failReplay = false;
-      this.events.get('error')(new Error('Private video'));
-    }
-    if (resource.stream.url === 'https://example.com/b') resolveTrackBPlayed();
-  };
-
-  const { player, audioPlayer: playerAudio, queue } = makePlayer({ audioPlayer, trackDuration: 3 });
+  const { player, queue } = makePlayer({
+    trackDuration: 3,
+    createPcmSourceFn: async () => PcmSource.fromBuffers([silentFrame, silentFrame]),
+  });
   queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60 }));
   queue.loopMode = LoopMode.TRACK;
 
   await player.playNext();
-  failReplay = true;
-  triggerTrackEnd({ audioPlayer: playerAudio });
-
-  await trackBPlayed;
+  player.mixStream.emit('sourceerror', new Error('Private video'));
   await nextTurn();
   assert.equal(queue.current.title, 'Track B');
 
@@ -116,24 +93,24 @@ test('acceptance: error while replaying a looped track advances past it', async 
 
 test('acceptance: queue exhaustion with no handler disconnects', async () => {
   let disconnected = false;
-  const { player, audioPlayer } = makePlayer({
+  const { player } = makePlayer({
     trackDuration: 3,
-    onDisconnect: async () => { disconnected = true },
+    onDisconnect: async () => { disconnected = true; },
   });
 
   await player.playNext();
-  triggerTrackEnd({ audioPlayer });
+  triggerTrackEnd({ mixStream: player.mixStream });
 
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitMs(20);
   assert.equal(disconnected, true);
 });
 
 test('acceptance: handleQueueExhausted returning true skips disconnect', async () => {
   let disconnected = false;
   let handledCalled = false;
-  const { player, audioPlayer } = makePlayer({
+  const { player } = makePlayer({
     trackDuration: 3,
-    onDisconnect: async () => { disconnected = true },
+    onDisconnect: async () => { disconnected = true; },
     handleQueueExhausted: async (finishedTrack) => {
       handledCalled = true;
       assert.equal(finishedTrack.title, 'Track A');
@@ -142,39 +119,39 @@ test('acceptance: handleQueueExhausted returning true skips disconnect', async (
   });
 
   await player.playNext();
-  triggerTrackEnd({ audioPlayer });
+  triggerTrackEnd({ mixStream: player.mixStream });
 
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitMs(20);
   assert.equal(handledCalled, true);
   assert.equal(disconnected, false);
 });
 
 test('acceptance: handleQueueExhausted throwing falls back to disconnect', async () => {
   let disconnected = false;
-  const { player, audioPlayer } = makePlayer({
+  const { player } = makePlayer({
     trackDuration: 3,
-    onDisconnect: async () => { disconnected = true },
+    onDisconnect: async () => { disconnected = true; },
     handleQueueExhausted: async () => { throw new Error('boom'); },
   });
 
   await player.playNext();
-  triggerTrackEnd({ audioPlayer });
+  triggerTrackEnd({ mixStream: player.mixStream });
 
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitMs(20);
   assert.equal(disconnected, true);
 });
 
 test('acceptance: QUEUE loop returns to the first track after the last', async () => {
-  const { player, audioPlayer, queue } = makePlayer({ trackDuration: 3 });
+  const { player, queue } = makePlayer({ trackDuration: 3 });
   queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3 }));
   queue.loopMode = LoopMode.QUEUE;
 
   await player.playNext();
-  triggerTrackEnd({ audioPlayer });
+  triggerTrackEnd({ mixStream: player.mixStream });
   await nextTurn();
   assert.equal(queue.current.title, 'Track B');
 
-  triggerTrackEnd({ audioPlayer });
+  triggerTrackEnd({ mixStream: player.mixStream });
   await nextTurn();
   assert.equal(queue.current.title, 'Track A');
 
@@ -183,15 +160,15 @@ test('acceptance: QUEUE loop returns to the first track after the last', async (
 
 test('acceptance: short tracks do not trigger reconnect retry', async () => {
   let disconnected = false;
-  const { player, audioPlayer } = makePlayer({
+  const { player } = makePlayer({
     trackDuration: 3,
-    onDisconnect: async () => { disconnected = true },
+    onDisconnect: async () => { disconnected = true; },
   });
 
   await player.playNext();
-  triggerTrackEnd({ audioPlayer });
+  triggerTrackEnd({ mixStream: player.mixStream });
 
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitMs(20);
   assert.equal(disconnected, true);
 });
 
@@ -287,7 +264,6 @@ test('acceptance (mixer): gapless playback advances through trackend', async () 
   const frame = Buffer.alloc(FRAME_BYTES);
   let createCount = 0;
   const { player, audioPlayer, queue } = makePlayer({
-    mixerEnabled: true,
     trackDuration: 3,
     createPcmSourceFn: async () => {
       createCount += 1;
@@ -309,7 +285,6 @@ test('acceptance (mixer): gapless playback advances through trackend', async () 
 test('acceptance (mixer): skip advances to the next track', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   const { player, queue } = makePlayer({
-    mixerEnabled: true,
     trackDuration: 60,
     createPcmSourceFn: async () => PcmSource.fromBuffers([frame, frame, frame]),
   });
@@ -333,7 +308,6 @@ test('acceptance (mixer): slow handoff keeps queue on track 2 after mixer stream
   let exhausted = false;
 
   const { player, audioPlayer, queue } = makePlayer({
-    mixerEnabled: true,
     trackDuration: 3,
     onDisconnect: async () => { disconnected = true; },
     handleQueueExhausted: async () => { exhausted = true; return true; },
@@ -372,7 +346,6 @@ test('acceptance (mixer): crossfade arms without cached analysis using fallback 
   const frame = Buffer.alloc(FRAME_BYTES);
   let crossfadeStarted = false;
   const { player, queue } = makePlayer({
-    mixerEnabled: true,
     trackDuration: 3,
     getTrackAnalysisFn: async () => null,
     analyzeTrackFileFn: null,
@@ -402,7 +375,6 @@ test('acceptance (mixer): snap handoff when metadata outlasts actual PCM', async
   const frame = Buffer.alloc(FRAME_BYTES);
   let createCount = 0;
   const { player, queue } = makePlayer({
-    mixerEnabled: true,
     trackDuration: 60,
     createPcmSourceFn: async () => {
       createCount += 1;
@@ -433,7 +405,6 @@ test('acceptance (mixer): trackend handoff reuses prepared incoming', async () =
   const frame = Buffer.alloc(FRAME_BYTES);
   let createCount = 0;
   const { player, queue } = makePlayer({
-    mixerEnabled: true,
     trackDuration: 3,
     createPcmSourceFn: async () => {
       createCount += 1;

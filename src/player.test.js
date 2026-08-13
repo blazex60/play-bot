@@ -13,14 +13,14 @@ test('GuildPlayer.status reflects the audio player state', () => {
   assert.equal(player.status, AudioPlayerStatus.Playing)
 })
 
-test('GuildPlayer.playNext creates a resource and tracks it as the current resource', async () => {
+test('GuildPlayer.playNext plays the mixer resource as StreamType.Raw', async () => {
   const { player, audioPlayer, resources } = makePlayer()
 
   await player.playNext()
 
   assert.equal(audioPlayer.resource, resources[0])
   assert.deepEqual(resources[0].options, {
-    inputType: StreamType.Arbitrary,
+    inputType: StreamType.Raw,
   })
 
   await player.stop()
@@ -50,7 +50,7 @@ test('GuildPlayer: queue exhaustion with no handleQueueExhausted disconnects as 
   const { player, audioPlayer } = makePlayer({ trackDuration: 3, onDisconnect })
 
   await player.playNext()
-  triggerTrackEnd({ audioPlayer })
+  triggerTrackEnd({ mixStream: player.mixStream })
 
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(disconnected, true)
