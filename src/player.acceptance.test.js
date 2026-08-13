@@ -298,6 +298,31 @@ test('acceptance (mixer): skip advances to the next track', async () => {
   await player.stop();
 });
 
+test('acceptance: unexpected Idle rebuilds mixer and restarts the current track', async () => {
+  let createCount = 0;
+  const { player, audioPlayer, queue } = makePlayer({
+    createPcmSourceFn: async () => {
+      createCount += 1;
+      return PcmSource.fromBuffers([silentFrame, silentFrame, silentFrame]);
+    },
+  });
+
+  await player.playNext();
+  assert.equal(createCount, 1);
+  const oldMix = player.mixStream;
+  oldMix.destroy();
+  audioPlayer.state = { status: AudioPlayerStatus.Idle };
+  audioPlayer.events.get(AudioPlayerStatus.Idle)?.();
+  await waitMs(40);
+
+  assert.equal(queue.current.title, 'Track A');
+  assert.equal(createCount, 2);
+  assert.notEqual(player.mixStream, oldMix);
+  assert.equal(player.mixStream.isDestroyed(), false);
+
+  await player.stop();
+});
+
 test('acceptance (mixer): slow handoff keeps queue on track 2 after mixer stream destroy', async () => {
   // Mimics @discordjs/voice: leaving Playing destroys playStream. A slow
   // createPcmSource for track 2 used to race with that destroy and either

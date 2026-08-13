@@ -54,6 +54,11 @@ export class MixStream extends Readable {
     return this.#crossfade != null;
   }
 
+  /** True after `endMixer()` / `_destroy()`. Distinct from Node's `.destroyed`. */
+  isDestroyed() {
+    return this.#destroyed;
+  }
+
   setDurationSec(durationSec) {
     this.#durationSec = durationSec;
   }

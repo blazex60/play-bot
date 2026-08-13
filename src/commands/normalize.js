@@ -13,8 +13,11 @@ export default {
   async execute(interaction) {
     const enabled = interaction.options.getBoolean('enabled', true)
     await setNormalize(interaction.guildId, enabled)
+    const content = enabled
+      ? '✅ ノーマライズを **有効** にしました。尺が分かる30分以内の曲は PCM ミキサー経路で loudnorm を適用します'
+      : '⚠️ 設定は保存しましたが、PCM ミキサー経路ではクロスフェード品質のため、尺が分かる30分以内の曲のノーマライズは無効になりません'
     await interaction.reply({
-      content: `✅ ノーマライズを **${enabled ? '有効' : '無効'}** にしました`,
+      content,
       ...replyFlags(interaction.guildId, 'normalize'),
     })
   },

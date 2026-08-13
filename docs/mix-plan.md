@@ -92,13 +92,15 @@ JS 側のサンプル加算も、1曲だけ流れている間は加算せずバ�
 - `playNext()` → `#playNextMixer()` → `#createPcmSource()` → `mix.setCurrent(source)`。初回だけ `#audioPlayer.play(#mixerResource)` で遅延開始し、以降は Playing 固定を目指す
 - `trackend` → `#advanceAfterPlayback()` → `#handleAfter()` が曲送りを駆動
 - `skip()` は `mix.dropCurrent()`
-- `AudioPlayerStatus.Idle` は異常として扱い、既存の `#mixerResource` を再度 `play()` して復旧する（resource の再生成はしない）
+- ウォッチドッグは `state.playbackDuration` の増加を監視し、ストール時は `MixStream.dropCurrent()` する（`source.lastDataAt` は使わない）
+- `stop()` は `endMixer()` のあと `#initMixerPipeline()` で MixStream を作り直す。セッションが残ったまま次の `/play` ができるようにする
+- `AudioPlayerStatus.Idle` は異常。`@discordjs/voice` が MixStream を destroy している場合はパイプラインを再生成し、キューの現在曲があれば `playNext()` で載せ直す
 
 ### 4.5 Idle が来なくなることで壊れる箇所
 
 | 箇所 | 影響と対応 |
 |---|---|
-| watchdog | `playbackDuration` はセッション累計で単調増加し続け、現行のストール検知が永久に発火しない。`source.lastDataAt` と連続 underrun 時間で判定する |
+| watchdog | `state.playbackDuration` が 10 秒間隔で増えているかを見てストール判定し、止まったら `MixStream.dropCurrent()` する。`source.lastDataAt` はポーズ中も止まるため使わない |
 | `/nowplaying` の経過時間 | 同上。MixStream の曲ごと再生位置を使う |
 | 曲送り | `trackend` 駆動に変更 |
 | `RECONNECT_GRACE`（5秒未満の再試行） | ソース生成失敗の検知に置き換える |
@@ -163,7 +165,7 @@ prefetch 時に末尾の RMS 包絡を 100ms 刻みで取得し、形状で分�
 
 ## 7. normalize 強制 ON の帰結
 
-- `MAX_NORMALIZE_DURATION_SEC = 1800` があるため、**30分超の曲はクロスフェード対象外**。仕様として `/help` とドキュメントに明記する
+- `MAX_NORMALIZE_DURATION_SEC = 1800` があるため、**30分超の曲はクロスフェード対象外**。尺不明（ライブ等）もフルファイル prefetch せずストリーム再生する。仕様として `/help` とドキュメントに明記する
 - 現行の prefetch は「次の1曲だけ」。解析が重くなるぶん前倒しが必要で、キューが1曲しかない場面では間に合わない。**間に合わない場合は単純フェード、さらに間に合わなければギャップレス接続へ、と二段階でフォールバックする**
 
 ---
@@ -251,6 +253,7 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - `legal/privacy.html` に Gemini への送信内容（曲名・チャンネル名・リクエスト文）を追記する。Google API 由来データを含むため、Google の Limited Use 要件との整合を確認すること
 - 音声アーキテクチャの節を Idle 駆動 → mixer 駆動に全面書き換え
 - `MIXER_ENABLED` フラグと Idle 駆動の旧再生経路を削除し、PCM ミキサーを常時経路にした
+- `stop()` 後は MixStream を作り直し、ウォッチドッグは `state.playbackDuration` の増加と `dropCurrent()` で復旧する
 
 ---
 

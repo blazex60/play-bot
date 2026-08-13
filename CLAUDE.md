@@ -88,7 +88,7 @@ Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用
 
 ### VC 接続 (`src/sessions.js`)
 
-```
+```text
 joinVoiceChannel({ selfDeaf: true }) → entersState(Ready, 30s)
 ```
 
@@ -97,7 +97,7 @@ joinVoiceChannel({ selfDeaf: true }) → entersState(Ready, 30s)
 
 ### 音声ストリーム (`src/search.js` → `src/audio/` → `src/player.js`)
 
-```
+```text
 resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
                                               ↓
                               MixStream (20ms PCM frames)
@@ -107,7 +107,7 @@ resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
 
 - **yt-dlp の stdout を ffmpeg にパイプして s16le にする** — `yt-dlp --get-url` で URL 文字列を取得して FFmpeg に渡す方式は、googlevideo URL へのアクセスに必要なヘッダーが揃わず音声がストールする。`yt-dlp -o -` で stdout にパイプし、`PcmSource` が ffmpeg で PCM 化する
 - **`StreamType.Raw`** — セッション中ずっと生きる単一の `MixStream` を 1 度だけ resource 化する。曲送りは `AudioPlayerStatus.Idle` ではなく `MixStream` の `trackend` / クロスフェード完了で駆動する
-- **normalize は再生経路で強制** — クロスフェード品質のため、長さ制限内の曲は loudnorm + 無音トリムを適用する。失敗時は未正規化のストリームソースへフォールバックする
+- **normalize は再生経路で強制** — クロスフェード品質のため、尺が分かる長さ制限内の曲は loudnorm + 無音トリムを適用する。尺不明（ライブ等）と 30 分超はストリームソースへ。失敗時も未正規化のストリームソースへフォールバックする
 
 ### ウォッチドッグ (`src/player.js`)
 

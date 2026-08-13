@@ -74,7 +74,10 @@ export function parseLoudnormJson(stderrText) {
 }
 
 export function isNormalizeDurationAllowed(track) {
-  return track?.duration == null || track.duration <= MAX_NORMALIZE_DURATION_SEC
+  const duration = track?.duration
+  // Unknown duration (live / missing metadata) must not take the full-file
+  // prefetch path — yt-dlp -o <file> would wait until EOF.
+  return Number.isFinite(duration) && duration <= MAX_NORMALIZE_DURATION_SEC
 }
 
 export const canNormalizeTrack = isNormalizeDurationAllowed

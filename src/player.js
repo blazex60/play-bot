@@ -73,6 +73,8 @@ export class GuildPlayer {
   #crossfadeStarted = false;
   #crossfadeArming = false;
   #crossfadeTargetTrack = null;
+  /** Prevents Idle recovery from stacking playNext() while a restart is in flight. */
+  #idleRecovering = false;
   /** @type {{ track: object, promise: Promise<object>, source: object|null } | null} */
   #preparedIncoming = null;
   /** Bumped when cancelling prep so in-flight #createPcmSource won't claim temps. */
@@ -116,9 +118,21 @@ export class GuildPlayer {
 
     this.#initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
-      if (!this.#mixerStarted) return;
+      if (!this.#mixerStarted || this.#idleRecovering) return;
       console.warn('[GuildPlayer] unexpected Idle, recovering mixer playback');
+      this.#idleRecovering = true;
       this.#recoverMixerPlayback();
+      const restartCurrent = this.#queue.current && !this.#handlingAfter && !this.#forceSkip;
+      const done = () => { this.#idleRecovering = false; };
+      if (restartCurrent) {
+        // @discordjs/voice destroy()s MixStream on Idle, so the rebuilt
+        // pipeline is empty until we put the current track back on it.
+        this.playNext().catch((err) => {
+          console.error('[GuildPlayer] mixer Idle restart failed:', err.message);
+        }).finally(done);
+      } else {
+        done();
+      }
     });
 
     this.#audioPlayer.on('stateChange', (oldState, newState) => {
@@ -184,10 +198,7 @@ export class GuildPlayer {
     this.#resetWatchdog();
     this.#playbackCount += 1;
 
-    if (!this.#mixerStarted) {
-      this.#audioPlayer.play(this.#mixerResource);
-      this.#mixerStarted = true;
-    } else {
+    if (!this.#mixerStarted || this.#isMixerDead()) {
       this.#ensureMixerPlaying();
     }
 
@@ -316,15 +327,19 @@ export class GuildPlayer {
     }
   }
 
+  #isMixerDead() {
+    return !this.#mixStream
+      || this.#mixStream.isDestroyed()
+      || this.#mixStream.destroyed
+      || this.#mixerResource?.ended;
+  }
+
   /**
    * @discordjs/voice destroys playStream when leaving Playing. If MixStream was
    * destroyed mid-session, rebuild it so later setCurrent/play can succeed.
    */
   #recoverMixerPlayback() {
-    const dead = !this.#mixStream
-      || this.#mixStream.destroyed
-      || this.#mixerResource?.ended;
-    if (dead) {
+    if (this.#isMixerDead()) {
       console.warn('[GuildPlayer] mixer resource ended; rebuilding pipeline');
       try {
         this.#mixStream?.removeAllListeners();
@@ -353,7 +368,7 @@ export class GuildPlayer {
 
   #ensureMixerPlaying() {
     if (!this.#mixerResource) return;
-    if (this.#mixerResource.ended || this.#mixStream?.destroyed) {
+    if (this.#isMixerDead()) {
       this.#recoverMixerPlayback();
       return;
     }
@@ -464,9 +479,19 @@ export class GuildPlayer {
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
-    this.#mixStream?.endMixer();
+    // Ignore Idle from stop()/endMixer so recovery does not fight teardown.
     this.#mixerStarted = false;
+    this.#idleRecovering = false;
+    try {
+      this.#mixStream?.removeAllListeners();
+      this.#mixStream?.endMixer();
+    } catch {
+      // already ended
+    }
     this.#audioPlayer.stop();
+    // endMixer() permanently closes MixStream. Rebuild so a later playNext()
+    // (same session, no /leave) can setCurrent on a live mixer.
+    this.#initMixerPipeline();
   }
 
   #advanceAfterPlayback() {
