@@ -1,8 +1,12 @@
 import { spawn } from 'node:child_process';
 import { unlink } from 'node:fs/promises';
 import { BYTES_PER_SECOND } from './fade.js';
+import { analyzeVocalActivity } from './vocalActivity.js';
+import { analyzeKeys } from './keyAnalysis.js';
 
-export const ANALYSIS_VERSION = 1;
+export const ANALYSIS_VERSION = 2;
+export const HEAD_BPM_WINDOW_SEC = 20;
+export const TAIL_BPM_WINDOW_SEC = 45;
 
 function spawnCapture(cmd, args, { timeoutMs = 120_000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -66,37 +70,43 @@ async function analyzeTailShape(filePath, durationSec) {
   };
 }
 
-async function analyzeBpm(filePath) {
+function beatsToBpm(beats) {
+  if (beats.length < 4) return { bpm: null, firstBeatSec: null };
+  const intervals = [];
+  for (let i = 1; i < beats.length; i++) intervals.push(beats[i] - beats[i - 1]);
+  intervals.sort((a, b) => a - b);
+  const median = intervals[Math.floor(intervals.length / 2)];
+  const bpm = median > 0 ? Number((60 / median).toFixed(2)) : null;
+  return { bpm, firstBeatSec: beats[0] ?? null };
+}
+
+async function analyzeBpmWindow(filePath, { startSec, windowSec }) {
   const which = await spawnCapture('bash', ['-lc', 'command -v aubiotrack || true']);
   if (!which.stdout.trim()) {
-    return { available: false, bpm: null, confidence: 0 };
+    return { available: false, bpm: null, confidence: 0, firstBeatSec: null, beatCount: 0 };
   }
-  const wavPath = `${filePath}.analysis.wav`;
+  const wavPath = `${filePath}.bpm.${Math.round(startSec * 1000)}.wav`;
   try {
     const conv = await spawnCapture('ffmpeg', [
       '-y', '-hide_banner', '-loglevel', 'error',
-      '-t', '60', '-i', filePath,
+      '-ss', String(Math.max(0, startSec)),
+      '-t', String(windowSec),
+      '-i', filePath,
       '-ac', '1', '-ar', '44100', wavPath,
     ]);
     if (conv.code !== 0) {
-      return { available: true, ok: false, bpm: null, beatCount: 0, confidence: 0 };
+      return { available: true, ok: false, bpm: null, beatCount: 0, confidence: 0, firstBeatSec: null };
     }
     const { stdout, code } = await spawnCapture('aubiotrack', ['-i', wavPath]);
     const beats = stdout.trim().split('\n').map(Number).filter((n) => Number.isFinite(n));
-    let bpm = null;
-    if (beats.length >= 4) {
-      const intervals = [];
-      for (let i = 1; i < beats.length; i++) intervals.push(beats[i] - beats[i - 1]);
-      intervals.sort((a, b) => a - b);
-      const median = intervals[Math.floor(intervals.length / 2)];
-      if (median > 0) bpm = Number((60 / median).toFixed(2));
-    }
+    const { bpm, firstBeatSec } = beatsToBpm(beats);
+    const absFirst = firstBeatSec != null ? startSec + firstBeatSec : null;
     return {
       available: true,
       ok: code === 0 && bpm != null,
       bpm,
       beatCount: beats.length,
-      // Without Percival cross-check in this path, treat as medium confidence.
+      firstBeatSec: absFirst,
       confidence: bpm != null ? 0.6 : 0,
     };
   } finally {
@@ -104,8 +114,14 @@ async function analyzeBpm(filePath) {
   }
 }
 
+function isHalfDouble(a, b) {
+  if (!(a > 0) || !(b > 0)) return false;
+  const ratio = a > b ? a / b : b / a;
+  return ratio > 1.8 && ratio < 2.2;
+}
+
 /**
- * Recommend overlap seconds from tail shape. Vocal-safe clamp applied in transition.js.
+ * Recommend overlap seconds from tail shape. Vocal window is applied in transition.js.
  */
 export function recommendOverlapSec(shape, durationSec) {
   let sec;
@@ -129,9 +145,15 @@ export function recommendOverlapSec(shape, durationSec) {
   return Math.min(sec, cap);
 }
 
+function compositeConfidence({ vocalConfidence, bpmConfidence, tailOk }) {
+  const vocal = vocalConfidence ?? 0;
+  const bpm = bpmConfidence ?? 0;
+  const tail = tailOk ? 0.8 : 0.3;
+  return Number(((vocal * 0.5) + (bpm * 0.3) + (tail * 0.2)).toFixed(3));
+}
+
 /**
  * Analyze a downloaded audio file for MIX transitions.
- * Key detection (essentia) is optional and currently left null with low harmonic confidence.
  */
 export async function analyzeTrackFile(filePath, { videoId = null, durationSec = null } = {}) {
   let duration = durationSec;
@@ -148,23 +170,29 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
     throw new Error('unable to determine track duration for analysis');
   }
 
-  const [tail, bpm] = await Promise.all([
+  const tailStart = Math.max(0, duration - TAIL_BPM_WINDOW_SEC);
+  const headWindow = Math.min(HEAD_BPM_WINDOW_SEC, duration);
+
+  const [tail, headBpm, tailBpm, vocal, keys] = await Promise.all([
     analyzeTailShape(filePath, duration),
-    analyzeBpm(filePath).catch(() => ({ available: false, bpm: null, confidence: 0 })),
+    analyzeBpmWindow(filePath, { startSec: 0, windowSec: headWindow })
+      .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null })),
+    analyzeBpmWindow(filePath, { startSec: tailStart, windowSec: Math.min(TAIL_BPM_WINDOW_SEC, duration) })
+      .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null })),
+    analyzeVocalActivity(filePath, { durationSec: duration })
+      .catch(() => ({ ok: false, lastVocalEndSec: null, vocalGaps: [], vocalConfidence: 0, source: 'none' })),
+    analyzeKeys(filePath, duration)
+      .catch(() => ({ headKey: null, tailKey: null, harmonicConfidence: 0 })),
   ]);
 
   const overlapSec = recommendOverlapSec(tail.shape, duration);
-  // Phase 1.5: center-only vocal detection rejected. Until PitchMelodia lands,
-  // keep vocalConfidence low so transition clamps overlap aggressively.
-  const vocalConfidence = 0.2;
-  const harmonicConfidence = 0;
-  const bpmConfidence = bpm.confidence ?? 0;
-
-  const confidence = Math.min(
-    tail.ok ? 0.8 : 0.3,
-    0.4 + bpmConfidence * 0.3,
-    0.35 + vocalConfidence,
-  );
+  const bpm = tailBpm.bpm ?? headBpm.bpm ?? null;
+  let bpmConfidence = tailBpm.confidence || headBpm.confidence || 0;
+  if (isHalfDouble(headBpm.bpm, tailBpm.bpm)) {
+    bpmConfidence = Math.min(bpmConfidence, 0.35);
+  }
+  const vocalConfidence = vocal.vocalConfidence ?? 0;
+  const harmonicConfidence = keys.harmonicConfidence ?? 0;
 
   return {
     version: ANALYSIS_VERSION,
@@ -172,15 +200,24 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
     durationSec: duration,
     tailShape: tail.shape,
     lastRms: tail.lastRms,
-    bpm: bpm.bpm,
+    bpm,
     bpmConfidence,
-    headKey: null,
-    tailKey: null,
+    headBpm: headBpm.bpm ?? null,
+    tailBpm: tailBpm.bpm ?? null,
+    headBeatOffsetSec: headBpm.firstBeatSec ?? 0,
+    headKey: keys.headKey ?? null,
+    tailKey: keys.tailKey ?? null,
     harmonicConfidence,
     vocalConfidence,
+    lastVocalEndSec: vocal.lastVocalEndSec ?? null,
+    vocalGaps: vocal.vocalGaps ?? [],
+    analysisSource: vocal.source ?? 'none',
     recommendedOverlapSec: overlapSec,
-    confidence,
-    // Unix seconds — matches track_analysis.analyzed_at / nowUnix().
+    confidence: compositeConfidence({
+      vocalConfidence,
+      bpmConfidence,
+      tailOk: tail.ok,
+    }),
     analyzedAt: Math.floor(Date.now() / 1000),
   };
 }

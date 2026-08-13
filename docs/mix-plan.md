@@ -230,7 +230,7 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - `player.js` — クロスフェード arm、normalize 強制、解析キャッシュ接続
 - migration `006_track_analysis.sql` + `/internal/track-analysis/:videoId`
 
-残作業（Phase 2 後追い）: essentia キー runtime、テンポ合わせ(D)、Docker aubio/essentia
+残作業（Phase 2 後追い）: テンポ合わせ(D)。aubio / Demucs / essentia キーは Phase 6
 
 ### Phase 3 — 曲順最適化 + Gemini 導入 ✅ 完了（PR #22）
 
@@ -239,7 +239,7 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - `/internal/optimize-order` + `webClient.optimizeOrder`
 - `/mix order` + Web ダッシュボード「MIX 並べ替え」
 
-### Phase 4 — リクエストからの自動プレイリスト生成 🚧 進行中
+### Phase 4 — リクエストからの自動プレイリスト生成 ✅ 完了（PR #25）
 
 - `src/mix/playlistGenerate.js` — Gemini 曲名提案 → YouTube 解決 → `ordering.js` で並べ替え
 - `/internal/generate-playlist` + `POST /api/playlists/mine/generate`
@@ -252,6 +252,16 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - 音声アーキテクチャの節を Idle 駆動 → mixer 駆動に全面書き換え
 - Phase 1 の安定確認後、`MIXER_ENABLED` フラグと旧経路を削除
 
+### Phase 6 — 曲ごとの DJ つなぎ 🚧
+
+詳細は [`docs/mix-transition-phase6.md`](mix-transition-phase6.md)。
+
+- Demucs（末尾 45 秒・`--two-stems=vocals`）で `lastVocalEndSec` を取り、歌のない窓でのみ `crossfade` + ベーススワップ
+- 最後まで歌っている曲は非重畳の `tail-fade`
+- runtime イメージを `node:22-bookworm-slim` にし aubio / Demucs venv を同梱
+- 解析は直列キュー。arm はキャッシュのみ（Demucs 待ちでクロスフェードを止めない）
+- essentia.js キーはベストエフォート
+
 ---
 
 ## 10. 依存関係
@@ -260,6 +270,7 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
                    │                          ├→ Phase 3 → Phase 4
                    └→ Phase 5(法務) ──────────┘
+                                      Phase 2 → Phase 6（つなぎ品質）
 ```
 
 - Phase 1 と Phase 1.5 の間に本番投入を1回挟む
@@ -281,11 +292,11 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 
 | 項目 | 状態 |
 |---|---|
-| ボーカル検出の採用手法 | **センター成分は不採用。** PitchMelodia 系を次評価、Demucs は保留（spike 済み） |
+| ボーカル検出の採用手法 | **Demucs（末尾 45 秒・two-stems）を Phase 6 で採用。** センター成分は不採用 |
 | 拍/BPM 検出ライブラリ（aubio / essentia.js） | **aubiotrack 第一**、essentia はキー同梱時にクロスチェック |
 | ffmpeg 解析パスを何回にするか | loudnorm+silence+tail は **1-pass**。BPM/キーは別 |
 | 検出信頼度の閾値 | 暫定: key strength&lt;0.55、BPM 半/倍不一致 → 単純フェード。実 J-POP で再調整 |
-| 音源分離採用時の Docker 構成変更 | 現時点では不採用のため見送り |
+| 音源分離採用時の Docker 構成変更 | Phase 6: runtime を bookworm-slim + Demucs venv |
 | スラッシュコマンド名 | `/mix order` / `/mix create` を仮置き |
 | 使用する Gemini のモデル名 | 未定（`.env.example` に `gemini-2.5-pro` を仮記載済み。確定前に確認） |
 | 解析キャッシュのスキーマ（新テーブル / 既存拡張） | 未定 |
@@ -302,5 +313,6 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 1.5 | ✅ 初回完了 | `docs/mix-analysis-spike.md`。実 J-POP 再計測は残 |
 | 2 | ✅ | PR #21 merged。重畳・解析キャッシュ・二段階フォールバック |
 | 3 | ✅ | PR #22。ordering + Gemini refine + `/mix order` |
-| 4 | 🚧 進行中 | `cursor/mix-create-phase4-78b7`。`/mix create` + Web 生成 |
+| 4 | ✅ | PR #25。`/mix create` + Web 生成 |
 | 5 法務 | ✅ 文面更新済み | privacy / CLAUDE / AGENTS / README。PR #19/#20 |
+| 6 | 🚧 | `docs/mix-transition-phase6.md`。Demucs 末尾ボーカル + tail-fade |

@@ -237,13 +237,14 @@ test('GET /internal/play-history/recent clamps a negative limit instead of retur
 test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async (t) => {
   const { app, config } = await setup(t)
   const analysis = {
-    version: 1,
+    version: 2,
     durationSec: 180,
     tailShape: 'fade-out',
     bpm: 128,
     confidence: 0.7,
     recommendedOverlapSec: 2,
-    vocalConfidence: 0.2,
+    vocalConfidence: 0.85,
+    lastVocalEndSec: 176,
   }
 
   const missing = await app.inject({
@@ -269,6 +270,32 @@ test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async 
   assert.equal(get.statusCode, 200)
   assert.equal(get.json().analysis.bpm, 128)
   assert.equal(get.json().analysis.tailShape, 'fade-out')
+})
+
+test('GET /internal/track-analysis treats version 1 rows as a cache miss', async (t) => {
+  const { app, config } = await setup(t)
+  const put = await app.inject({
+    method: 'PUT',
+    url: '/internal/track-analysis/vid-stale',
+    headers: authHeaders(config),
+    payload: {
+      analysis: {
+        version: 1,
+        durationSec: 120,
+        tailShape: 'fade-out',
+        bpm: 100,
+        confidence: 0.4,
+      },
+    },
+  })
+  assert.equal(put.statusCode, 200)
+
+  const get = await app.inject({
+    method: 'GET',
+    url: '/internal/track-analysis/vid-stale',
+    headers: authHeaders(config),
+  })
+  assert.equal(get.statusCode, 404)
 })
 
 test('POST /internal/optimize-order returns a valid permutation', async (t) => {

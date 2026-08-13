@@ -23,6 +23,18 @@ export function gainForPosition({ positionSec, fadeSec = 0, curve = 'equal-power
   return role === 'out' ? Math.cos(angle) : Math.sin(angle);
 }
 
+/** Scale a s16le frame by gain (0..1). Returns a copy. */
+export function scaleFrame(frame, gain) {
+  const out = Buffer.from(frame);
+  const view = new Int16Array(out.buffer, out.byteOffset, out.byteLength / 2);
+  const g = Number.isFinite(gain) ? gain : 1;
+  for (let i = 0; i < view.length; i++) {
+    const sample = Math.round(view[i] * g);
+    view[i] = sample > 32767 ? 32767 : sample < -32768 ? -32768 : sample;
+  }
+  return out;
+}
+
 /** Soft-clip samples in-place on an Int16 interleaved stereo frame. */
 export function softLimitFrame(frame, ceiling = 0.95) {
   const view = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2);

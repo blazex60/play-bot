@@ -167,22 +167,29 @@ export class PcmSource extends EventEmitter {
     return source;
   }
 
-  static createFileSource(filePath, { measured }) {
+  static createFileSource(filePath, { measured, startSec = 0 } = {}) {
     const source = new PcmSource();
     const filter = measured
       ? `loudnorm=${LOUDNORM_TARGET}:measured_I=${measured.measured_I}:measured_TP=${measured.measured_TP}:measured_LRA=${measured.measured_LRA}:measured_thresh=${measured.measured_thresh}:offset=${measured.offset}:linear=true`
       : 'anull';
 
-    const proc = spawn('ffmpeg', [
+    const args = [
       '-hide_banner',
       '-loglevel', 'error',
+    ];
+    if (startSec > 0.001) {
+      args.push('-ss', String(startSec));
+    }
+    args.push(
       '-i', filePath,
       '-af', filter,
       '-f', 's16le',
       '-ar', String(48000),
       '-ac', '2',
       'pipe:1',
-    ], {
+    );
+
+    const proc = spawn('ffmpeg', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

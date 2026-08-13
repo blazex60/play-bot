@@ -398,6 +398,56 @@ test('acceptance (mixer): crossfade arms without cached analysis using fallback 
   await player.stop();
 });
 
+test('acceptance (mixer): cached lastVocalEnd starts a vocal-free crossfade', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let startedPlan = null;
+  const durationSec = 3;
+  const analysis = {
+    version: 2,
+    durationSec,
+    lastVocalEndSec: 1.2,
+    vocalConfidence: 0.85,
+    recommendedOverlapSec: 5,
+    tailShape: 'abrupt',
+    confidence: 0.8,
+    bpm: 120,
+    bpmConfidence: 0.6,
+  };
+  const { player, queue } = makePlayer({
+    mixerEnabled: true,
+    trackDuration: durationSec,
+    track: createTrack({
+      title: 'Track A',
+      webpageUrl: 'https://example.com/a',
+      duration: durationSec,
+      videoId: 'vid-a',
+    }),
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 200 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: durationSec,
+    videoId: 'vid-b',
+  }));
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  for (let i = 0; i < 160; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 450));
+
+  assert.ok(startedPlan, 'expected analysis-driven crossfade to start');
+  assert.equal(startedPlan.mode, 'crossfade');
+  assert.equal(startedPlan.baseSwap, true);
+  assert.ok(startedPlan.startSec >= 1.2);
+  await player.stop();
+});
+
 test('acceptance (mixer): snap handoff when metadata outlasts actual PCM', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   let createCount = 0;

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { gainForPosition, mixFrames, FRAME_BYTES, OVERLAP_GAIN } from './fade.js';
-import { planTransition } from './transition.js';
+import { planTransition, snapStartToBar } from './transition.js';
 import { recommendOverlapSec } from './trackAnalysis.js';
 import { designHighpass, createBiquadProcessor } from './eq.js';
 import { MixStream } from './mixStream.js';
@@ -63,46 +63,77 @@ test('planTransition uses simple-fade when outgoing analysis is missing', () => 
   assert.equal(plan.reason, 'missing-outgoing-analysis');
 });
 
-test('planTransition uses simple-fade for medium confidence', () => {
+test('planTransition uses simple-fade when vocal analysis is not ready', () => {
   const plan = planTransition(
     { confidence: 0.4, recommendedOverlapSec: 4, durationSec: 180, vocalConfidence: 0.2 },
     { confidence: 0.4, bpm: 120 },
   );
   assert.equal(plan.mode, 'simple-fade');
   assert.ok(plan.fadeSec > 0);
+  assert.equal(plan.reason, 'analysis-not-ready');
 });
 
-test('planTransition uses simple-fade when incoming analysis is missing', () => {
+test('planTransition crossfades from outgoing vocal window even without incoming analysis', () => {
   const plan = planTransition(
     {
-      confidence: 0.7,
-      recommendedOverlapSec: 4,
-      durationSec: 180,
-      vocalConfidence: 0.6,
+      confidence: 0.8,
+      recommendedOverlapSec: 5,
+      durationSec: 200,
+      vocalConfidence: 0.85,
+      lastVocalEndSec: 195,
+      tailShape: 'abrupt',
       bpm: 120,
+      bpmConfidence: 0.6,
     },
     null,
   );
-  assert.equal(plan.mode, 'simple-fade');
-  assert.ok(plan.fadeSec > 0);
-  assert.equal(plan.baseSwap, false);
-  assert.equal(plan.reason, 'missing-incoming-analysis');
+  assert.equal(plan.mode, 'crossfade');
+  assert.equal(plan.baseSwap, true);
+  assert.ok(plan.fadeSec >= 3);
+  assert.ok(plan.startSec >= 195);
 });
 
-test('planTransition clamps vocal-weak overlaps to 2s', () => {
+test('planTransition uses tail-fade when vocals run to the end', () => {
   const plan = planTransition(
     {
-      confidence: 0.7,
+      confidence: 0.8,
       recommendedOverlapSec: 5,
       durationSec: 200,
-      vocalConfidence: 0.2,
+      vocalConfidence: 0.85,
+      lastVocalEndSec: 199.7,
+      tailShape: 'abrupt',
       bpm: 120,
+      bpmConfidence: 0.6,
     },
-    { confidence: 0.7, bpm: 122 },
+    { confidence: 0.8, bpm: 122, bpmConfidence: 0.6 },
   );
-  assert.equal(plan.mode, 'crossfade');
-  assert.ok(plan.fadeSec <= 2);
-  assert.equal(plan.baseSwap, true);
+  assert.equal(plan.mode, 'tail-fade');
+  assert.equal(plan.baseSwap, false);
+  assert.ok(plan.fadeSec <= 0.8);
+});
+
+test('snapStartToBar does not move start into the vocal region', () => {
+  const snapped = snapStartToBar({
+    startSec: 10,
+    fadeSec: 2,
+    lastVocalEndSec: 9.5,
+    durationSec: 12,
+    bpm: 120,
+    allowSnap: true,
+  });
+  assert.ok(snapped.startSec >= 9.5);
+});
+
+test('snapStartToBar disables snap when the remaining window is too short', () => {
+  const snapped = snapStartToBar({
+    startSec: 11.5,
+    fadeSec: 0.5,
+    lastVocalEndSec: 11.4,
+    durationSec: 12,
+    bpm: 120,
+    allowSnap: true,
+  });
+  assert.equal(snapped.snapToBeat, false);
 });
 
 test('biquad highpass processes a frame without throwing', () => {
@@ -150,6 +181,39 @@ test('MixStream startCrossfade mixes then promotes', async () => {
   }
 
   assert.equal(promoted, true);
+  mix.endMixer();
+});
+
+test('MixStream tail-fade does not consume incoming until promote', async () => {
+  const mix = new MixStream();
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(8000);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 12 }, () => Buffer.from(frame)));
+  const incomingChunks = Array.from({ length: 12 }, () => Buffer.from(frame));
+  incomingChunks[0] = Buffer.alloc(FRAME_BYTES, 7);
+  const incoming = PcmSource.fromBuffers(incomingChunks);
+
+  let promoted = false;
+  mix.on('trackend', (info) => {
+    if (info?.promoted) promoted = true;
+  });
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    fadeSec: 0.06,
+    curve: 'equal-power',
+    mode: 'tail-fade',
+  }), true);
+
+  for (let i = 0; i < 8 && !promoted; i++) {
+    assert.ok(await readFramePaused(mix));
+  }
+  assert.equal(promoted, true);
+
+  const firstIncoming = await readFramePaused(mix);
+  assert.ok(firstIncoming);
+  assert.equal(firstIncoming[0], 7, 'incoming must start at its first frame after tail-fade');
   mix.endMixer();
 });
 
