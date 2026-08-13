@@ -9,23 +9,40 @@ function buildYtdlpArgs(...args) {
   return [...YTDLP_JS_RUNTIME_ARGS, ...args];
 }
 
-function spawnAsync(cmd, args) {
+export function spawnAsync(cmd, args, { timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args);
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? setTimeout(() => {
+          proc.kill('SIGKILL');
+          settle(() => reject(new YtdlpError(`yt-dlp timed out after ${timeoutMs}ms`)));
+        }, timeoutMs)
+      : null;
+
+    function settle(fn) {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn();
+    }
+
     proc.stdout.on('data', d => { stdout += d; });
     proc.stderr.on('data', d => { stderr += d; });
-    proc.on('error', reject);
+    proc.on('error', (err) => settle(() => reject(err)));
     proc.on('close', code => {
-      if (code !== 0) reject(new YtdlpError(stderr.trim() || `yt-dlp exited with ${code}`));
-      else resolve(stdout.trim());
+      settle(() => {
+        if (code !== 0) reject(new YtdlpError(stderr.trim() || `yt-dlp exited with ${code}`));
+        else resolve(stdout.trim());
+      });
     });
   });
 }
 
-export async function searchYoutube(query) {
-  const output = await spawnAsync('yt-dlp', buildYtdlpArgs('--dump-json', '--flat-playlist', `ytsearch5:${query}`));
+export async function searchYoutube(query, { timeoutMs } = {}) {
+  const output = await spawnAsync('yt-dlp', buildYtdlpArgs('--dump-json', '--flat-playlist', `ytsearch5:${query}`), { timeoutMs });
   return parseJsonLines(output, 'youtube search results');
 }
 

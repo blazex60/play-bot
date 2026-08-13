@@ -18,6 +18,7 @@ function isAmbiguousGenerateFailure(err) {
   if (err?.name === 'AbortError') return true
   const status = err?.status
   if (status == null) return true
+  if (status === 503 && err?.body?.error === 'gemini_unavailable') return false
   return status >= 500
 }
 

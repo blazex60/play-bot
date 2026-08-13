@@ -201,3 +201,14 @@ test('generatePlaylist returns null on a confirmed generation failure', async ()
   })
   assert.equal(result, null)
 })
+
+test('generatePlaylist treats gemini_unavailable 503 as a confirmed failure', async () => {
+  const fetchImpl = fakeFetch([{ ok: false, status: 503, body: { error: 'gemini_unavailable' } }])
+  const client = createWebClient({ baseUrl: 'http://127.0.0.1:9', token: 'tok', fetchImpl })
+  const result = await client.generatePlaylist({
+    discordUserId: 'u1',
+    username: 'user',
+    prompt: '夏',
+  })
+  assert.equal(result, null)
+})

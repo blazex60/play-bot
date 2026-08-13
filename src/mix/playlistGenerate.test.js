@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  SEARCH_TIMEOUT_MS,
   buildSearchQuery,
   clampTargetCount,
   defaultPlaylistName,
@@ -41,6 +42,42 @@ test('resolveGeneratedTracks skips misses and dedupes videoId', async () => {
   });
   assert.equal(tracks.length, 2);
   assert.deepEqual(tracks.map((t) => t.videoId), ['vid-a', 'vid-b']);
+});
+
+test('resolveGeneratedTracks passes a per-search timeout to searchYoutubeFn', async () => {
+  let options;
+  await resolveGeneratedTracks({
+    suggestions: [{ title: 'A' }],
+    searchYoutubeFn: async (_query, opts) => {
+      options = opts;
+      return [{ id: 'a', title: 'A' }];
+    },
+    resolveYoutubeTrackFn: (entry) => ({
+      status: 'matched',
+      track: { title: entry.title, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
+    }),
+    requestedBy: 'tester',
+  });
+  assert.equal(options.timeoutMs, SEARCH_TIMEOUT_MS);
+});
+
+test('resolveGeneratedTracks skips a search that rejects on timeout', async () => {
+  const tracks = await resolveGeneratedTracks({
+    suggestions: [{ title: 'slow' }, { title: 'fast' }],
+    searchYoutubeFn: async (query) => {
+      if (query === 'slow') {
+        const err = new Error('yt-dlp timed out after 12ms');
+        throw err;
+      }
+      return [{ id: 'fast', title: query }];
+    },
+    resolveYoutubeTrackFn: (entry) => ({
+      status: 'matched',
+      track: { title: entry.title, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
+    }),
+    requestedBy: 'tester',
+  });
+  assert.deepEqual(tracks.map((t) => t.videoId), ['fast']);
 });
 
 test('generatePlaylistFromPrompt retries when too few tracks resolve', async () => {

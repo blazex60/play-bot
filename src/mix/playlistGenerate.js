@@ -5,6 +5,8 @@ export const MIN_TARGET_COUNT = 3;
 export const MAX_TARGET_COUNT = 25;
 export const MIN_RESOLVED_RATIO = 0.5;
 export const MAX_GENERATION_ATTEMPTS = 2;
+/** Per-suggestion yt-dlp search bound so a hung child cannot pin generation slots. */
+export const SEARCH_TIMEOUT_MS = 12_000;
 
 /**
  * @param {string | null | undefined} prompt
@@ -43,6 +45,7 @@ export function clampTargetCount(count) {
  *   resolveYoutubeTrackFn: (entry: object, ctx: object) => { status: string, track?: object },
  *   requestedBy: string,
  *   requestedById?: string | null,
+ *   searchTimeoutMs?: number,
  * }} args
  */
 export async function resolveGeneratedTracks({
@@ -51,6 +54,7 @@ export async function resolveGeneratedTracks({
   resolveYoutubeTrackFn,
   requestedBy,
   requestedById = null,
+  searchTimeoutMs = SEARCH_TIMEOUT_MS,
 }) {
   const tracks = [];
   const seen = new Set();
@@ -58,7 +62,7 @@ export async function resolveGeneratedTracks({
     const query = buildSearchQuery(suggestion);
     if (!query) continue;
     try {
-      const entries = await searchYoutubeFn(query);
+      const entries = await searchYoutubeFn(query, { timeoutMs: searchTimeoutMs });
       if (!entries?.length) continue;
       const result = resolveYoutubeTrackFn(entries[0], { requestedBy, requestedById });
       if (result.status !== 'matched' || !result.track) continue;
@@ -124,6 +128,7 @@ export async function generatePlaylistFromPrompt({
       resolveYoutubeTrackFn,
       requestedBy,
       requestedById,
+      searchTimeoutMs: SEARCH_TIMEOUT_MS,
     });
 
     for (const track of resolved) {

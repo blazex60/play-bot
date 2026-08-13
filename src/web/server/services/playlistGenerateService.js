@@ -2,8 +2,11 @@ import { generatePlaylistFromPrompt, defaultPlaylistName } from '../../../mix/pl
 import { createPlaylist, getOwnedPlaylist, getPlaylistTracks, insertTrack, serializePlaylistRow, serializeTrackRow } from '../routes/playlists-db.js';
 
 export const GENERATION_DEDUPE_TTL_MS = 120_000;
+export const GENERATION_DEDUPE_MAX_ENTRIES = 256;
 
-/** @type {Map<string, { playlistId: number, expiresAt: number }>} */
+let dedupeMaxEntries = GENERATION_DEDUPE_MAX_ENTRIES;
+
+/** @type {Map<string, { playlistId: number, requestedCount: number, expiresAt: number }>} */
 const recentGenerations = new Map();
 
 /**
@@ -18,29 +21,52 @@ function generationDedupeKeys({ userId, prompt, targetCount, name, idempotencyKe
   return keys;
 }
 
-function takeRecentPlaylistId(keys) {
-  const now = Date.now();
+function sweepExpiredGenerations(now = Date.now()) {
+  for (const [key, entry] of recentGenerations) {
+    if (now > entry.expiresAt) recentGenerations.delete(key);
+  }
+}
+
+function evictOverflow() {
+  while (recentGenerations.size > dedupeMaxEntries) {
+    const oldestKey = recentGenerations.keys().next().value;
+    recentGenerations.delete(oldestKey);
+  }
+}
+
+function takeRecentGeneration(keys) {
+  sweepExpiredGenerations();
   for (const key of keys) {
     const entry = recentGenerations.get(key);
-    if (!entry) continue;
-    if (now > entry.expiresAt) {
-      recentGenerations.delete(key);
-      continue;
-    }
-    return entry.playlistId;
+    if (entry) return entry;
   }
   return null;
 }
 
-function rememberGeneration(keys, playlistId) {
-  const expiresAt = Date.now() + GENERATION_DEDUPE_TTL_MS;
+function rememberGeneration(keys, playlistId, requestedCount) {
+  const now = Date.now();
+  sweepExpiredGenerations(now);
+  const expiresAt = now + GENERATION_DEDUPE_TTL_MS;
+  const payload = { playlistId, requestedCount, expiresAt };
   for (const key of keys) {
-    recentGenerations.set(key, { playlistId, expiresAt });
+    recentGenerations.delete(key);
+    recentGenerations.set(key, payload);
   }
+  evictOverflow();
 }
 
-export function clearGeneratedPlaylistDedupe() {
+export function clearGeneratedPlaylistDedupe({ maxEntries } = {}) {
   recentGenerations.clear();
+  dedupeMaxEntries = maxEntries ?? GENERATION_DEDUPE_MAX_ENTRIES;
+}
+
+export function getGeneratedPlaylistDedupeSize() {
+  return recentGenerations.size;
+}
+
+export function sweepGeneratedPlaylistDedupe(now = Date.now()) {
+  sweepExpiredGenerations(now);
+  evictOverflow();
 }
 
 function serializeSavedPlaylist(db, userId, id) {
@@ -87,14 +113,14 @@ export async function createGeneratedUserPlaylist({
   loadAnalysisFn,
 }) {
   const dedupeKeys = generationDedupeKeys({ userId, prompt, targetCount, name, idempotencyKey });
-  const cachedId = takeRecentPlaylistId(dedupeKeys);
-  if (cachedId != null) {
+  const cached = takeRecentGeneration(dedupeKeys);
+  if (cached != null) {
     try {
-      const cached = serializeSavedPlaylist(db, userId, cachedId);
+      const playlist = serializeSavedPlaylist(db, userId, cached.playlistId);
       return {
-        ...cached,
-        resolvedCount: cached.tracks.length,
-        requestedCount: targetCount ?? cached.tracks.length,
+        ...playlist,
+        resolvedCount: playlist.tracks.length,
+        requestedCount: cached.requestedCount,
       };
     } catch {
       // Playlist was deleted; generate a new one.
@@ -125,7 +151,7 @@ export async function createGeneratedUserPlaylist({
     : (result.playlistName ?? defaultPlaylistName(prompt));
 
   const id = persistGeneratedPlaylist(db, userId, playlistName, result.tracks);
-  rememberGeneration(dedupeKeys, id);
+  rememberGeneration(dedupeKeys, id, result.requestedCount);
 
   return {
     ...serializeSavedPlaylist(db, userId, id),

@@ -50,7 +50,8 @@ export default {
           content: '⚠️ 生成の完了を確認できませんでした。ダッシュボードの My Playlists に保存されていないか確認してください。',
           allowedMentions: { parse: [] },
         });
-        return false;
+        // Unknown outcome: the playlist may already be saved. Do not log a failed `mix`.
+        return null;
       }
 
       if (!playlist?.id) {
