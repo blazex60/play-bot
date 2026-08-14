@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { AudioPlayerStatus } from '@discordjs/voice';
 import { LoopMode, createTrack } from './queue.js';
 import { isShortTrack, shouldReconnectRetry } from './player/playbackPolicy.js';
@@ -7,6 +10,11 @@ import { triggerTrackEnd } from './player/playbackDrive.js';
 import { makePlayer, nextTurn } from './player/test-helpers.js';
 import { FRAME_BYTES } from './audio/fade.js';
 import { PcmSource } from './audio/pcmSource.js';
+import {
+  configureSettingsPathForTest,
+  getSettingsPathForTest,
+  setFade,
+} from './settings.js';
 
 const silentFrame = Buffer.alloc(FRAME_BYTES);
 
@@ -433,6 +441,183 @@ test('acceptance (mixer): crossfade arms without cached analysis using fallback 
   await player.stop();
 });
 
+test('acceptance (mixer): crossfade waits until planned startSec', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let startedPlan = null;
+  const durationSec = 4;
+  const analysis = {
+    version: 2,
+    durationSec,
+    lastVocalEndSec: 2.5,
+    vocalConfidence: 0.85,
+    recommendedOverlapSec: 5,
+    tailShape: 'abrupt',
+    confidence: 0.8,
+    bpm: 120,
+    bpmConfidence: 0.6,
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: durationSec,
+    track: createTrack({
+      title: 'Track A',
+      webpageUrl: 'https://example.com/a',
+      duration: durationSec,
+      videoId: 'vid-a',
+    }),
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 250 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: durationSec,
+    videoId: 'vid-b',
+  }));
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  // 20ms frames: 80 reads ≈ 1.6s, still before lastVocalEndSec 2.5.
+  for (let i = 0; i < 80; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(startedPlan, null, 'must not start the fade before lastVocalEndSec');
+  assert.equal(player.mixStream.isCrossfading, false);
+
+  for (let i = 0; i < 80; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.ok(startedPlan, 'expected crossfade after the vocal-safe boundary');
+  assert.ok(startedPlan.startSec >= 2.5);
+  await player.stop();
+});
+
+test('acceptance (mixer): cached lastVocalEnd starts a vocal-free crossfade', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let startedPlan = null;
+  const durationSec = 3;
+  const analysis = {
+    version: 2,
+    durationSec,
+    lastVocalEndSec: 1.2,
+    vocalConfidence: 0.85,
+    recommendedOverlapSec: 5,
+    tailShape: 'abrupt',
+    confidence: 0.8,
+    bpm: 120,
+    bpmConfidence: 0.6,
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: durationSec,
+    track: createTrack({
+      title: 'Track A',
+      webpageUrl: 'https://example.com/a',
+      duration: durationSec,
+      videoId: 'vid-a',
+    }),
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 200 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: durationSec,
+    videoId: 'vid-b',
+  }));
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  for (let i = 0; i < 160; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 450));
+
+  assert.ok(startedPlan, 'expected analysis-driven crossfade to start');
+  assert.equal(startedPlan.mode, 'crossfade');
+  assert.equal(startedPlan.baseSwap, true);
+  assert.ok(startedPlan.startSec >= 1.2);
+  await player.stop();
+});
+
+test('acceptance (mixer): /fade off skips crossfade and stays gapless', async () => {
+  const previousSettingsPath = getSettingsPathForTest();
+  const dir = await mkdtemp(join(tmpdir(), 'music-bot-fade-player-test-'));
+  configureSettingsPathForTest(join(dir, 'data', 'guild-settings.json'));
+  try {
+    await setFade('guild-1', false);
+    const frame = Buffer.alloc(FRAME_BYTES);
+    let crossfadeStarted = false;
+    const { player, queue } = makePlayer({
+      trackDuration: 3,
+      getTrackAnalysisFn: async () => null,
+      analyzeTrackFileFn: null,
+      createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+    });
+    queue.add(createTrack({
+      title: 'Track B',
+      webpageUrl: 'https://example.com/b',
+      duration: 3,
+      videoId: 'vid-b',
+    }));
+
+    player.mixStream.on('crossfadestart', () => { crossfadeStarted = true; });
+
+    await player.playNext();
+    for (let i = 0; i < 135; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 450));
+
+    assert.equal(crossfadeStarted, false, 'expected fade-off guilds to skip simple-fade/crossfade');
+    assert.equal(player.mixStream.isCrossfading, false);
+    await player.stop();
+  } finally {
+    configureSettingsPathForTest(previousSettingsPath);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('acceptance (mixer): disabling fade during arm prevents a late startCrossfade', async () => {
+  const previousSettingsPath = getSettingsPathForTest();
+  const dir = await mkdtemp(join(tmpdir(), 'music-bot-fade-recheck-test-'));
+  configureSettingsPathForTest(join(dir, 'data', 'guild-settings.json'));
+  try {
+    const frame = Buffer.alloc(FRAME_BYTES);
+    let crossfadeStarted = false;
+    const { player, queue } = makePlayer({
+      trackDuration: 3,
+      getTrackAnalysisFn: async () => null,
+      analyzeTrackFileFn: null,
+      createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+    });
+    queue.add(createTrack({
+      title: 'Track B',
+      webpageUrl: 'https://example.com/b',
+      duration: 3,
+      videoId: 'vid-b',
+    }));
+    player.mixStream.on('crossfadestart', () => { crossfadeStarted = true; });
+
+    await player.playNext();
+    await setFade('guild-1', false);
+    for (let i = 0; i < 135; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 450));
+
+    assert.equal(crossfadeStarted, false, 'fade-off after arm start must still skip startCrossfade');
+    await player.stop();
+  } finally {
+    configureSettingsPathForTest(previousSettingsPath);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('acceptance (mixer): crossfade timer defers analysis until the transition window', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   let analysisRequests = 0;
@@ -513,5 +698,129 @@ test('acceptance (mixer): trackend handoff reuses prepared incoming', async () =
 
   assert.equal(queue.current.title, 'Track B');
   assert.equal(createCount, 2);
+  await player.stop();
+});
+
+test('acceptance (mixer): persistent analysis cache skips Demucs lookahead', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let analyzeCalls = 0;
+  let prefetchCalls = 0;
+  const analysis = {
+    version: 2,
+    durationSec: 60,
+    lastVocalEndSec: 50,
+    vocalConfidence: 0.85,
+    recommendedOverlapSec: 3,
+    tailShape: 'abrupt',
+    confidence: 0.8,
+    bpm: 120,
+    bpmConfidence: 0.6,
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: async () => {
+      analyzeCalls += 1;
+      return analysis;
+    },
+    prefetchTrackFn: async () => {
+      prefetchCalls += 1;
+      return { filePath: `/tmp/musicbot-prefetch-${prefetchCalls}`, measured: {} };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+    videoId: 'vid-b',
+  }));
+  queue.add(createTrack({
+    title: 'Track C',
+    webpageUrl: 'https://example.com/c',
+    duration: 60,
+    videoId: 'vid-c',
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.equal(analyzeCalls, 0, 'cached version-2 analysis must not launch Demucs');
+  assert.equal(prefetchCalls, 1, 'analysis-only lookahead must not download when cache hits');
+  await player.stop();
+});
+
+test('acceptance (mixer): early queue refill is a single shared attempt', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let calls = 0;
+  const { player } = makePlayer({
+    trackDuration: 3,
+    handleQueueExhausted: async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      return false;
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+  });
+
+  await player.playNext();
+  for (let i = 0; i < 10; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assert.equal(calls, 1, 'arm polls must not start overlapping exhaustion rounds');
+  await player.stop();
+});
+
+test('acceptance (mixer): lookahead analysis does not persist YouTube metadata duration', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const seenDurations = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({
+      title: 'Track A',
+      webpageUrl: 'https://example.com/a',
+      duration: 60,
+      videoId: 'vid-a',
+    }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async (_filePath, opts) => {
+      seenDurations.push(opts.durationSec);
+      return {
+        version: 2,
+        durationSec: 54,
+        lastVocalEndSec: 50,
+        vocalConfidence: 0.8,
+        confidence: 0.7,
+      };
+    },
+    prefetchTrackFn: async (track) => ({
+      filePath: `/tmp/musicbot-prefetch-${track.videoId}`,
+      measured: {},
+    }),
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+    videoId: 'vid-b',
+  }));
+  queue.add(createTrack({
+    title: 'Track C',
+    webpageUrl: 'https://example.com/c',
+    duration: 60,
+    videoId: 'vid-c',
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.ok(seenDurations.length > 0, 'lookahead must still run analysis on a cache miss');
+  assert.ok(
+    seenDurations.every((durationSec) => durationSec == null || durationSec !== 60),
+    'analysis must not use untrimmed YouTube metadata duration',
+  );
   await player.stop();
 });

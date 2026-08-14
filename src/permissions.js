@@ -17,6 +17,7 @@ const DEFAULT_VISIBILITY = {
   nowplaying: 'personal',
   bitrate: 'personal',
   normalize: 'personal',
+  fade: 'personal',
   autoplay: 'personal',
   mix: 'personal',
 }

@@ -102,3 +102,14 @@ test('MixStream reports playback position in seconds', async () => {
   await collectFrames(mix, 2);
   assert.ok(mix.positionSec > 0);
 });
+
+test('MixStream emits underrunClear only after recovering from underrun', async () => {
+  const mix = new MixStream();
+  let clears = 0;
+  mix.on('underrunClear', () => { clears += 1; });
+  const source = PcmSource.fromBuffers([silence(FRAME_BYTES * 3)]);
+  mix.setCurrent(source);
+  await collectFrames(mix, 3);
+  assert.equal(clears, 0, 'healthy frames must not clear another guild underrun');
+  mix.endMixer();
+});

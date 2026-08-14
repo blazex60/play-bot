@@ -10,12 +10,33 @@ RUN npm install
 COPY web/ ./web/
 RUN node node_modules/vite/bin/vite.js build --config web/vite.config.js --outDir dist
 
-FROM node:22-alpine
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-RUN apk add --no-cache ffmpeg python3 py3-pip build-base && \
-    pip3 install --break-system-packages -U "yt-dlp[default]"
+ENV TORCH_HOME=/opt/torch-cache
+ENV DEMUCS_VENV=/opt/demucs-venv
+ENV PATH="/opt/demucs-venv/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg \
+      aubio-tools \
+      python3 \
+      python3-pip \
+      python3-venv \
+      python3-dev \
+      build-essential \
+      ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages -U "yt-dlp[default]"
+
+RUN python3 -m venv /opt/demucs-venv \
+  && /opt/demucs-venv/bin/pip install --no-cache-dir --upgrade pip \
+  && /opt/demucs-venv/bin/pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cpu torch \
+  && /opt/demucs-venv/bin/pip install --no-cache-dir demucs \
+  && /opt/demucs-venv/bin/python -c "from demucs.pretrained import get_model; get_model('htdemucs')"
 
 COPY package*.json ./
 RUN npm install --omit=dev

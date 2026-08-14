@@ -1,5 +1,6 @@
 import { bindRouteError, nowUnix, recordOperationLog } from './route-utils.js'
 import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js'
+import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
 import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
 import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
@@ -116,6 +117,9 @@ export async function internalRoutes(app, {
       FROM track_analysis WHERE video_id = ?
     `).get(videoId)
     if (!row) return reply.code(404).send({ error: 'not_found' })
+    if ((row.version ?? 1) < ANALYSIS_VERSION) {
+      return reply.code(404).send({ error: 'stale_analysis' })
+    }
     return reply.send({
       version: row.version,
       analyzedAt: row.analyzedAt,
@@ -139,8 +143,9 @@ export async function internalRoutes(app, {
       INSERT INTO track_analysis (
         video_id, version, duration_sec, tail_shape, last_rms, bpm, bpm_confidence,
         head_key, tail_key, harmonic_confidence, vocal_confidence,
-        recommended_overlap_sec, confidence, payload_json, analyzed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        recommended_overlap_sec, confidence, payload_json, analyzed_at,
+        last_vocal_end_sec, vocal_gaps_json, analysis_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(video_id) DO UPDATE SET
         version = excluded.version,
         duration_sec = excluded.duration_sec,
@@ -155,10 +160,13 @@ export async function internalRoutes(app, {
         recommended_overlap_sec = excluded.recommended_overlap_sec,
         confidence = excluded.confidence,
         payload_json = excluded.payload_json,
-        analyzed_at = excluded.analyzed_at
+        analyzed_at = excluded.analyzed_at,
+        last_vocal_end_sec = excluded.last_vocal_end_sec,
+        vocal_gaps_json = excluded.vocal_gaps_json,
+        analysis_source = excluded.analysis_source
     `).run(
       videoId,
-      analysis.version ?? 1,
+      analysis.version ?? ANALYSIS_VERSION,
       analysis.durationSec ?? null,
       analysis.tailShape ?? null,
       analysis.lastRms ?? null,
@@ -172,6 +180,9 @@ export async function internalRoutes(app, {
       analysis.confidence ?? null,
       JSON.stringify(analysis),
       analyzedAtSec,
+      analysis.lastVocalEndSec ?? null,
+      analysis.vocalGaps ? JSON.stringify(analysis.vocalGaps) : null,
+      analysis.analysisSource ?? analysis.source ?? null,
     )
     return reply.send({ ok: true })
   })
@@ -183,7 +194,9 @@ export async function internalRoutes(app, {
     `).get(videoId)
     if (!row) return null
     try {
-      return JSON.parse(row.payloadJson)
+      const parsed = JSON.parse(row.payloadJson)
+      if ((parsed.version ?? 1) < ANALYSIS_VERSION) return null
+      return parsed
     } catch {
       return null
     }

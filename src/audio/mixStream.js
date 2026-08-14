@@ -5,6 +5,7 @@ import {
   BYTES_PER_SECOND,
   gainForPosition,
   mixFrames,
+  scaleFrame,
 } from './fade.js';
 import {
   createOutgoingBaseSwapProcessor,
@@ -32,6 +33,8 @@ export class MixStream extends Readable {
   /** Held partner frame when only one side of a crossfade frame is ready */
   #heldOutFrame = null;
   #heldInFrame = null;
+  #incomingSkipSec = 0;
+  #incomingSkippedSec = 0;
 
   constructor() {
     super();
@@ -100,6 +103,8 @@ export class MixStream extends Readable {
     this.#inEq = null;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;
+    this.#incomingSkipSec = 0;
+    this.#incomingSkippedSec = 0;
 
     source.on('data', () => this.#scheduleRead());
     source.on('end', () => this.#scheduleRead());
@@ -116,7 +121,7 @@ export class MixStream extends Readable {
   /**
    * Begin overlapping the current track with an incoming source.
    * @param {object} source
-   * @param {{ fadeSec: number, curve?: string, baseSwap?: boolean, highpassHz?: number, lowshelfGainDb?: number }} plan
+   * @param {{ fadeSec: number, curve?: string, baseSwap?: boolean, highpassHz?: number, lowshelfGainDb?: number, mode?: string, incomingOffsetSec?: number }} plan
    */
   startCrossfade(source, plan) {
     if (this.#destroyed || !this.#current || this.#crossfade) {
@@ -134,17 +139,21 @@ export class MixStream extends Readable {
       return false;
     }
 
+    const mode = plan.mode === 'tail-fade' ? 'tail-fade' : 'crossfade';
     this.#incoming = source;
     this.#crossfade = {
       fadeSec: plan.fadeSec,
       curve: plan.curve ?? 'equal-power',
-      baseSwap: plan.baseSwap === true,
+      baseSwap: plan.baseSwap === true && mode !== 'tail-fade',
+      mode,
     };
     this.#fadeElapsedSec = 0;
-    this.#outEq = plan.baseSwap
+    this.#incomingSkipSec = mode === 'tail-fade' ? 0 : Math.max(0, plan.incomingOffsetSec ?? 0);
+    this.#incomingSkippedSec = 0;
+    this.#outEq = this.#crossfade.baseSwap
       ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120)
       : null;
-    this.#inEq = plan.baseSwap
+    this.#inEq = this.#crossfade.baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
       : null;
 
@@ -226,7 +235,9 @@ export class MixStream extends Readable {
       return;
     }
 
+    const recovering = this.#underrunSince != null;
     this.#underrunSince = null;
+    if (recovering) this.emit('underrunClear');
     this.push(frame);
     this.#pendingRead = false;
     this.#current?._onFrameConsumed?.();
@@ -242,6 +253,8 @@ export class MixStream extends Readable {
     this.#crossfade = null;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;
+    this.#incomingSkipSec = 0;
+    this.#incomingSkippedSec = 0;
     callback(err);
   }
 
@@ -270,6 +283,9 @@ export class MixStream extends Readable {
   }
 
   #readFrame() {
+    if (this.#crossfade?.mode === 'tail-fade' && this.#current) {
+      return this.#readTailFadeFrame();
+    }
     if (this.#crossfade && this.#current && this.#incoming) {
       return this.#readCrossfadeFrame();
     }
@@ -298,7 +314,55 @@ export class MixStream extends Readable {
     return frame;
   }
 
+  #readTailFadeFrame() {
+    const outFrame = this.#heldOutFrame ?? this.#readExact(this.#current, FRAME_BYTES);
+    this.#heldOutFrame = null;
+
+    if (!outFrame) {
+      if (this.#current?.ended) {
+        this.#promoteIncoming({ consumeIncoming: false });
+        return this.#current ? this.#readExact(this.#current, FRAME_BYTES) : SILENCE_FRAME;
+      }
+      return null;
+    }
+
+    const outGain = gainForPosition({
+      positionSec: this.#fadeElapsedSec,
+      fadeSec: this.#crossfade.fadeSec,
+      curve: this.#crossfade.curve,
+      role: 'out',
+    });
+    const faded = scaleFrame(outFrame, outGain);
+    this.#consumedBytes += FRAME_BYTES;
+    this.#fadeElapsedSec += FRAME_MS / 1000;
+
+    if (this.#fadeElapsedSec >= this.#crossfade.fadeSec) {
+      this.#promoteIncoming({ consumeIncoming: false });
+    }
+    return faded;
+  }
+
+  #skipIncomingLead() {
+    while (this.#incomingSkipSec >= FRAME_MS / 1000 && this.#incoming) {
+      const skipped = this.#readExact(this.#incoming, FRAME_BYTES);
+      if (!skipped) return false;
+      this.#incomingSkipSec -= FRAME_MS / 1000;
+      this.#incomingSkippedSec += FRAME_MS / 1000;
+    }
+    return true;
+  }
+
   #readCrossfadeFrame() {
+    if (!this.#skipIncomingLead()) {
+      const outFrame = this.#heldOutFrame ?? this.#readExact(this.#current, FRAME_BYTES);
+      this.#heldOutFrame = null;
+      if (outFrame) {
+        this.#consumedBytes += FRAME_BYTES;
+        return outFrame;
+      }
+      return null;
+    }
+
     const outFrame = this.#heldOutFrame ?? this.#readExact(this.#current, FRAME_BYTES);
     this.#heldOutFrame = null;
     const inFrame = this.#heldInFrame ?? this.#readExact(this.#incoming, FRAME_BYTES);
@@ -354,16 +418,19 @@ export class MixStream extends Readable {
     this.#fadeElapsedSec += FRAME_MS / 1000;
 
     if (this.#fadeElapsedSec >= this.#crossfade.fadeSec) {
-      this.#promoteIncoming();
+      this.#promoteIncoming({ consumeIncoming: true });
     }
     return mixed;
   }
 
-  #promoteIncoming() {
+  #promoteIncoming({ consumeIncoming = true } = {}) {
     const next = this.#incoming;
     // Incoming already played fadeElapsedSec of PCM during overlap; keep that
     // offset so remainingSec matches real audio left after setDurationSec.
-    const promotedConsumedBytes = Math.round(this.#fadeElapsedSec * BYTES_PER_SECOND);
+    const playedSec = consumeIncoming
+      ? this.#fadeElapsedSec + this.#incomingSkippedSec
+      : 0;
+    const promotedConsumedBytes = Math.round(playedSec * BYTES_PER_SECOND);
     if (this.#current) {
       this.#current.removeAllListeners();
       this.#current.destroy();
@@ -375,6 +442,8 @@ export class MixStream extends Readable {
     this.#fadeElapsedSec = 0;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;
+    this.#incomingSkipSec = 0;
+    this.#incomingSkippedSec = 0;
 
     // Emit trackend for the outgoing track; GuildPlayer advances queue metadata
     // without calling setCurrent again when already crossfading.
@@ -413,6 +482,8 @@ export class MixStream extends Readable {
     this.#fadeElapsedSec = 0;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;
+    this.#incomingSkipSec = 0;
+    this.#incomingSkippedSec = 0;
   }
 
   /**

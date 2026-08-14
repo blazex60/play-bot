@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
   configureSettingsPathForTest,
@@ -10,6 +10,7 @@ import {
   loadSettings,
   setAutoplayMode,
   setNormalize,
+  setFade,
   setPersonalize,
   setAutoNotify,
   setDefaultCommandPermission,
@@ -24,6 +25,7 @@ import {
 
 const DEFAULT_RECORD = {
   normalize: false,
+  fade: true,
   autoplayMode: 'off',
   personalize: false,
   autoNotify: false,
@@ -43,7 +45,7 @@ async function withTempSettings(fn) {
   }
 }
 
-test('settings: missing file defaults normalize/autoplayMode/personalize', async () => {
+test('settings: missing file defaults normalize/fade/autoplayMode/personalize', async () => {
   await withTempSettings(async ({ filePath }) => {
     loadSettings()
     assert.equal(existsSync(filePath), false)
@@ -75,6 +77,40 @@ test('settings: atomic write leaves a valid JSON settings file', async () => {
 
     const files = await readdir(join(dir, 'data'))
     assert.deepEqual(files, ['guild-settings.json'])
+  })
+})
+
+test('settings: missing fade field defaults to enabled', async () => {
+  await withTempSettings(async ({ filePath }) => {
+    await mkdir(dirname(filePath), { recursive: true })
+    await writeFile(filePath, `${JSON.stringify({
+      'guild-1': {
+        normalize: true,
+        autoplayMode: 'off',
+        personalize: false,
+        autoNotify: false,
+      },
+    }, null, 2)}\n`, 'utf8')
+
+    loadSettings()
+    assert.equal(getGuildSettings('guild-1').fade, true)
+    assert.equal(getGuildSettings('guild-1').normalize, true)
+  })
+})
+
+test('settings: setFade persists independently of normalize', async () => {
+  await withTempSettings(async ({ filePath }) => {
+    await setFade('guild-1', false)
+    assert.deepEqual(getGuildSettings('guild-1'), { ...DEFAULT_RECORD, fade: false })
+
+    await setNormalize('guild-1', true)
+    assert.equal(getGuildSettings('guild-1').fade, false)
+    assert.equal(getGuildSettings('guild-1').normalize, true)
+
+    configureSettingsPathForTest(filePath)
+    loadSettings()
+    assert.equal(getGuildSettings('guild-1').fade, false)
+    assert.equal(getGuildSettings('guild-1').normalize, true)
   })
 })
 
@@ -113,10 +149,12 @@ test('settings: setters merge instead of clobbering other fields (regression)', 
     await setAutoplayMode('guild-1', 'auto')
     await setPersonalize('guild-1', true)
     await setNormalize('guild-1', true)
+    await setFade('guild-1', false)
     await setAutoNotify('guild-1', true)
     assert.deepEqual(getGuildSettings('guild-1'), {
       ...DEFAULT_RECORD,
       normalize: true,
+      fade: false,
       autoplayMode: 'auto',
       personalize: true,
       autoNotify: true,
@@ -127,6 +165,7 @@ test('settings: setters merge instead of clobbering other fields (regression)', 
     assert.deepEqual(getGuildSettings('guild-1'), {
       ...DEFAULT_RECORD,
       normalize: false,
+      fade: false,
       autoplayMode: 'auto',
       personalize: true,
       autoNotify: true,

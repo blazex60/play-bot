@@ -45,6 +45,7 @@ export function makePlayer({
   createPcmSourceFn = null,
   getTrackAnalysisFn = null,
   analyzeTrackFileFn = null,
+  prefetchTrackFn = async () => ({ filePath: '/tmp/musicbot-test-prefetch', measured: { measured_I: -16 } }),
   framesPerTrack = 2,
 } = {}) {
   const queue = new GuildQueue();
@@ -70,6 +71,7 @@ export function makePlayer({
     createPcmSourceFn: resolvedCreatePcmSourceFn,
     getTrackAnalysisFn,
     analyzeTrackFileFn,
+    prefetchTrackFn,
     connection: {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer);

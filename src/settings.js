@@ -53,6 +53,8 @@ function normalizeAdminRoleId(value) {
 function normalizeRecord(record) {
   return {
     normalize: record?.normalize === true,
+    // Missing fade defaults to on so existing guilds keep DJ transitions.
+    fade: record?.fade !== false,
     autoplayMode: AUTOPLAY_MODES.has(record?.autoplayMode) ? record.autoplayMode : 'off',
     personalize: record?.personalize === true,
     autoNotify: record?.autoNotify === true,
@@ -87,6 +89,7 @@ export function loadSettings() {
 function defaultGuildSettings() {
   return {
     normalize: false,
+    fade: true,
     autoplayMode: 'off',
     personalize: false,
     autoNotify: false,
@@ -120,6 +123,10 @@ async function updateGuildSettings(guildId, patch) {
 
 export function setNormalize(guildId, enabled) {
   return updateGuildSettings(guildId, { normalize: enabled === true })
+}
+
+export function setFade(guildId, enabled) {
+  return updateGuildSettings(guildId, { fade: enabled === true })
 }
 
 export function setAutoplayMode(guildId, mode) {

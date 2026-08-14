@@ -110,7 +110,10 @@ export function createMemoryDb() {
       recommended_overlap_sec REAL,
       confidence REAL,
       payload_json TEXT NOT NULL,
-      analyzed_at INTEGER NOT NULL
+      analyzed_at INTEGER NOT NULL,
+      last_vocal_end_sec REAL,
+      vocal_gaps_json TEXT,
+      analysis_source TEXT
     );
     CREATE INDEX idx_track_analysis_analyzed_at
       ON track_analysis(analyzed_at DESC);

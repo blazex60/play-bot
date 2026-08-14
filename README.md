@@ -39,6 +39,7 @@ Bot process は SQLite を開かない。ライブ状態は Bot process の `ses
 | `/nowplaying` | 現在再生中の曲を表示 | 全員 |
 | `/bitrate [kbps]` | VC のビットレートを設定（省略時は Boost tier 上限） | 全員 |
 | `/normalize <enabled>` | 音量ノーマライズ設定。尺が分かる30分以内の曲はミキサー経路で常に loudnorm | 全員 |
+| `/fade <enabled>` | Guild 単位の曲間フェード（クロスフェード）on/off。既定はオン | 全員 |
 | `/autoplay mode/personalize/notify` | キュー枯渇時の自動再生モード・パーソナライズ・通知設定 | 全員 |
 | `/help` | コマンド一覧を表示 | 全員 |
 

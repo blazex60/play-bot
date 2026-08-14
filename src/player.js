@@ -5,6 +5,7 @@ import {
   StreamType,
 } from '@discordjs/voice';
 import { resolveAudioStream } from './search.js';
+import { getGuildSettings } from './settings.js';
 import {
   cleanupTempFile,
   isNormalizeDurationAllowed,
@@ -13,10 +14,11 @@ import {
 import { shouldReconnectRetry } from './player/playbackPolicy.js';
 import { MixStream } from './audio/mixStream.js';
 import { createStreamSource, createFileSource } from './audio/pcmSource.js';
-import { analyzeTrackFile } from './audio/trackAnalysis.js';
-import { planTransition } from './audio/transition.js';
+import { analyzeTrackFile, ANALYSIS_VERSION } from './audio/trackAnalysis.js';
+import { planTransition, DEFAULT_OVERLAP_SEC } from './audio/transition.js';
 import { probeDurationSec } from './audio/duration.js';
 import { LoopMode } from './queue.js';
+import { getAnalysisQueue } from './audio/analysisQueue.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
@@ -40,6 +42,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function analysisKilledError() {
+  const err = new Error('analysis killed');
+  err.code = 'ANALYSIS_KILLED';
+  return err;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw analysisKilledError();
+}
+
 export class GuildPlayer {
   #guildId;
   #connection;
@@ -56,8 +68,7 @@ export class GuildPlayer {
   #lastActiveAt = 0;
   #watchdogTimer = null;
   #currentTempFile = null;
-  #prefetchTrack = null;
-  #prefetchPromise = null;
+  #prefetchEntries = new Map();
   #createAudioResource;
   #resolveAudioStream;
   #handlingAfter = false;
@@ -85,6 +96,10 @@ export class GuildPlayer {
   #getTrackAnalysisFn;
   #putTrackAnalysisFn;
   #analyzeTrackFileFn;
+  #analysisQueue;
+  /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
+  #queueRefill = null;
+  #prefetchTrackFn;
 
   constructor({
     guildId,
@@ -102,6 +117,8 @@ export class GuildPlayer {
     getTrackAnalysisFn = null,
     putTrackAnalysisFn = null,
     analyzeTrackFileFn = analyzeTrackFile,
+    analysisQueue = null,
+    prefetchTrackFn = prefetchTrack,
   }) {
     this.#guildId = guildId;
     this.#connection = connection;
@@ -118,6 +135,8 @@ export class GuildPlayer {
     this.#getTrackAnalysisFn = getTrackAnalysisFn;
     this.#putTrackAnalysisFn = putTrackAnalysisFn;
     this.#analyzeTrackFileFn = analyzeTrackFileFn;
+    this.#analysisQueue = analysisQueue;
+    this.#prefetchTrackFn = prefetchTrackFn;
 
     this.#initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
@@ -164,6 +183,9 @@ export class GuildPlayer {
   }
 
   async #playNextMixer(track) {
+    if (this.#queueRefill && this.#queueRefill.key !== this.#queueRefillKey(track)) {
+      this.#queueRefill = null;
+    }
     let source;
     try {
       source = await this.#takePreparedIncoming(track, { forPlayback: true });
@@ -279,6 +301,16 @@ export class GuildPlayer {
         console.warn('[GuildPlayer] snap handoff failed:', err.message);
       });
     });
+    this.#mixStream.on('underrun', () => {
+      this.#analysisQ().noteUnderrun(this);
+    });
+    this.#mixStream.on('underrunClear', () => {
+      this.#analysisQ().noteUnderrunCleared(this);
+    });
+  }
+
+  #analysisQ() {
+    return this.#analysisQueue ?? getAnalysisQueue();
   }
 
   async #onSnapHandoff(adopt) {
@@ -487,6 +519,8 @@ export class GuildPlayer {
     this.#clearWatchdog();
     this.#clearCrossfadeArm();
     this.#clearPreparedIncoming();
+    this.#queueRefill = null;
+    this.#analysisQ().noteUnderrunCleared(this);
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
@@ -576,8 +610,9 @@ export class GuildPlayer {
       // waits on a user pick (recommend mode) needs a clean slate rather than
       // an interval left ticking against an idle player forever.
       this.#clearWatchdog();
-      const handled = await this.#tryHandleQueueExhausted(finishedTrack);
-      if (handled) return;
+      const handled = await this.#startQueueRefill(finishedTrack);
+      // null = another round already owns the autoplay lock; do not disconnect.
+      if (handled !== false) return;
       await this.#onDisconnect();
     } else {
       await this.playNext();
@@ -660,15 +695,39 @@ export class GuildPlayer {
   }
 
   #scheduleAnalysis(track, filePath) {
-    if (!track?.videoId || !filePath) return;
-    queueMicrotask(() => {
-      this.#resolveAnalysis(track, filePath).catch((err) => {
-        console.warn('[GuildPlayer] analysis failed:', err.message);
-      });
+    if (!track?.videoId || !filePath || !this.#analyzeTrackFileFn) return;
+    this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
+      const cached = await this.#lookupPersistentAnalysis(track);
+      if (cached) return cached;
+      return this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
+    }).catch((err) => {
+      if (err?.code === 'ANALYSIS_KILLED') {
+        console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
+        return;
+      }
+      console.warn('[GuildPlayer] analysis failed:', err.message);
     });
   }
 
-  async #resolveAnalysis(track, filePath = null) {
+  async #lookupPersistentAnalysis(track) {
+    if (!track?.videoId) return null;
+    if (this.#analysisCache.has(track.videoId)) {
+      const cached = this.#analysisCache.get(track.videoId);
+      this.#maybeApplyAnalysisDuration(track, cached);
+      return cached;
+    }
+    if (!this.#getTrackAnalysisFn) return null;
+    const cached = await this.#getTrackAnalysisFn(track.videoId);
+    if (cached && (cached.version ?? 1) >= ANALYSIS_VERSION) {
+      this.#analysisMissAt.delete(track.videoId);
+      this.#analysisCache.set(track.videoId, cached);
+      this.#maybeApplyAnalysisDuration(track, cached);
+      return cached;
+    }
+    return null;
+  }
+
+  async #getCachedAnalysis(track) {
     if (!track) return null;
     if (track.videoId && this.#analysisCache.has(track.videoId)) {
       const cached = this.#analysisCache.get(track.videoId);
@@ -677,11 +736,11 @@ export class GuildPlayer {
     }
     if (track.videoId && this.#getTrackAnalysisFn) {
       const missedAt = this.#analysisMissAt.get(track.videoId);
-      if (!filePath && missedAt != null && Date.now() - missedAt < ANALYSIS_MISS_BACKOFF_MS) {
+      if (missedAt != null && Date.now() - missedAt < ANALYSIS_MISS_BACKOFF_MS) {
         return null;
       }
       const cached = await this.#getTrackAnalysisFn(track.videoId);
-      if (cached) {
+      if (cached && (cached.version ?? 1) >= ANALYSIS_VERSION) {
         this.#analysisMissAt.delete(track.videoId);
         this.#analysisCache.set(track.videoId, cached);
         this.#maybeApplyAnalysisDuration(track, cached);
@@ -689,18 +748,39 @@ export class GuildPlayer {
       }
       this.#analysisMissAt.set(track.videoId, Date.now());
     }
+    return null;
+  }
+
+  async #runAnalysis(track, filePath, { spawnFn, signal, durationSec } = {}) {
+    throwIfAborted(signal);
     if (!filePath || !this.#analyzeTrackFileFn) return null;
+    const probedDuration = durationSec
+      ?? (track.videoId ? this.#probedDurationCache.get(track.videoId) : null)
+      ?? null;
     const analysis = await this.#analyzeTrackFileFn(filePath, {
       videoId: track.videoId,
-      // Prefer probed post-trim duration so tail analysis seeks within EOF.
-      durationSec: this.#resolvePlaybackDurationSec(track) ?? track.duration,
+      durationSec: probedDuration,
+      spawnFn,
+      signal,
     });
+    throwIfAborted(signal);
+    if (!analysis) return null;
     if (track.videoId) {
       this.#analysisCache.set(track.videoId, analysis);
       this.#putTrackAnalysisFn?.(track.videoId, analysis);
+      if (analysis.durationSec != null) {
+        this.#probedDurationCache.set(track.videoId, analysis.durationSec);
+      }
     }
     this.#maybeApplyAnalysisDuration(track, analysis);
     return analysis;
+  }
+
+  async #resolveAnalysis(track, filePath = null) {
+    const cached = await this.#getCachedAnalysis(track);
+    if (cached) return cached;
+    if (!filePath) return null;
+    return this.#runAnalysis(track, filePath);
   }
 
   #maybeApplyAnalysisDuration(track, analysis) {
@@ -789,6 +869,7 @@ export class GuildPlayer {
 
   async #maybeStartCrossfade() {
     if (this.#crossfadeArming || this.#crossfadeStarted) return;
+    if (getGuildSettings(this.#guildId).fade === false) return;
     if (this.#mixStream?.isCrossfading) return;
     if (this.#forceSkip || this.#handlingAfter) return;
     if (this.#audioPlayer.state.status !== AudioPlayerStatus.Playing) return;
@@ -800,7 +881,7 @@ export class GuildPlayer {
 
       let remaining = this.#mixStream?.remainingSec;
       if (remaining == null) {
-        await this.#resolveAnalysis(current);
+        await this.#getCachedAnalysis(current);
         remaining = this.#mixStream?.remainingSec;
       }
       if (remaining == null) {
@@ -817,21 +898,36 @@ export class GuildPlayer {
       const next = this.#queue.loopMode === LoopMode.TRACK
         ? current
         : this.#queue.upcoming()[0];
-      if (!next) return;
+      if (!next) {
+        if (remaining <= CROSSFADE_PREP_LEAD_SEC + DEFAULT_OVERLAP_SEC) {
+          this.#maybeRefillQueue();
+        }
+        return;
+      }
 
-      const outAnalysis = (await this.#resolveAnalysis(current)) ?? fallbackAnalysis(current);
-      const inAnalysis = (await this.#resolveAnalysis(next)) ?? fallbackAnalysis(next);
+      const outAnalysis = (await this.#getCachedAnalysis(current)) ?? fallbackAnalysis(current);
+      const inAnalysis = (await this.#getCachedAnalysis(next)) ?? fallbackAnalysis(next);
       const plan = planTransition(outAnalysis, inAnalysis);
       if (plan.mode === 'gapless' || !(plan.fadeSec > 0)) return;
 
-      const fadeWindow = plan.fadeSec + 0.35;
-      // Late-queued successors (no prep at track start) need download/trim/decode
-      // lead time; fadeWindow alone is too late for a silent-gap-free handoff.
+      const durationSec = outAnalysis.durationSec
+        ?? this.#resolvePlaybackDurationSec(current)
+        ?? current.duration;
+      const positionSec = this.#mixStream?.positionSec ?? 0;
+      const startSec = plan.startSec != null && durationSec != null
+        ? plan.startSec
+        : (durationSec != null ? Math.max(0, durationSec - plan.fadeSec) : null);
+
+      const fadeWindow = plan.fadeSec;
       const prepWindow = plan.fadeSec + CROSSFADE_PREP_LEAD_SEC;
       if (remaining <= prepWindow) {
         this.#ensureIncomingPrep(next);
       }
-      if (remaining > fadeWindow) return;
+
+      const readyToFade = startSec != null
+        ? positionSec >= startSec
+        : remaining <= fadeWindow;
+      if (!readyToFade) return;
 
       let source;
       try {
@@ -843,6 +939,11 @@ export class GuildPlayer {
       }
 
       if (this.#queue.current !== current || this.#forceSkip) {
+        source.destroy();
+        await this.#cleanupIncomingTempFile();
+        return;
+      }
+      if (getGuildSettings(this.#guildId).fade === false) {
         source.destroy();
         await this.#cleanupIncomingTempFile();
         return;
@@ -871,52 +972,149 @@ export class GuildPlayer {
   }
 
   async #getPrefetchedOrFetch(track) {
-    if (this.#prefetchTrack === track && this.#prefetchPromise) {
-      const promise = this.#prefetchPromise;
-      this.#prefetchTrack = null;
-      this.#prefetchPromise = null;
-      const result = await promise;
+    const key = this.#prefetchKey(track);
+    const entry = key ? this.#prefetchEntries.get(key) : null;
+    if (entry?.kind === 'full' && entry.promise) {
+      this.#prefetchEntries.delete(key);
+      const result = await entry.promise;
       if (result.error) throw result.error;
-      return result.value;
+      if (result.value?.filePath) return result.value;
     }
 
     this.#discardPrefetch(track);
-    return prefetchTrack(track);
+    return this.#prefetchTrackFn(track);
+  }
+
+  #prefetchKey(track) {
+    return track?.videoId || track?.webpageUrl || null;
   }
 
   #prefetchUpcoming() {
-    // TRACK loop re-arms the current track; upcoming() is empty in that mode.
-    const track = this.#queue.loopMode === LoopMode.TRACK
-      ? this.#queue.current
-      : this.#queue.upcoming()[0];
-    if (!track || !isNormalizeDurationAllowed(track)) {
-      this.#discardPrefetch();
-      return;
+    const upcoming = this.#queue.loopMode === LoopMode.TRACK
+      ? (this.#queue.current ? [this.#queue.current] : [])
+      : this.#queue.upcoming().slice(0, 3);
+
+    const keep = new Set(upcoming.map((t) => this.#prefetchKey(t)).filter(Boolean));
+    for (const key of [...this.#prefetchEntries.keys()]) {
+      if (!keep.has(key)) this.#discardPrefetchKey(key);
     }
 
-    if (this.#prefetchTrack === track) return;
+    const first = upcoming[0];
+    if (first && isNormalizeDurationAllowed(first)) {
+      this.#ensureFullPrefetch(first);
+    }
+    for (const track of upcoming.slice(1)) {
+      if (track && isNormalizeDurationAllowed(track)) {
+        this.#ensureAnalysisPrefetch(track);
+      }
+    }
+  }
 
-    this.#discardPrefetch(track);
-    this.#prefetchTrack = track;
-    this.#prefetchPromise = prefetchTrack(track).then(
-      value => ({ value }),
-      error => ({ error })
-    );
+  #ensureFullPrefetch(track) {
+    const key = this.#prefetchKey(track);
+    if (!key) return;
+    const existing = this.#prefetchEntries.get(key);
+    if (existing?.kind === 'full' && existing.track === track) return;
+    if (existing) this.#discardPrefetchKey(key);
+
+    this.#prefetchEntries.set(key, {
+      kind: 'full',
+      track,
+      promise: this.#prefetchTrackFn(track).then(
+        (value) => {
+          this.#scheduleAnalysis(track, value.filePath);
+          return { value };
+        },
+        (error) => ({ error }),
+      ),
+    });
+  }
+
+  #ensureAnalysisPrefetch(track) {
+    const key = this.#prefetchKey(track);
+    if (!key) return;
+    if (track.videoId && this.#analysisCache.has(track.videoId)) return;
+    if (this.#prefetchEntries.has(key)) return;
+
+    this.#prefetchEntries.set(key, {
+      kind: 'analysis',
+      track,
+      promise: this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
+        const cached = await this.#lookupPersistentAnalysis(track);
+        if (cached) return { analyzed: true };
+        throwIfAborted(signal);
+        const downloaded = await this.#prefetchTrackFn(track);
+        try {
+          throwIfAborted(signal);
+          const probed = await probeDurationSec(downloaded.filePath).catch(() => null);
+          if (track.videoId && probed != null) {
+            this.#probedDurationCache.set(track.videoId, probed);
+          }
+          await this.#runAnalysis(track, downloaded.filePath, {
+            spawnFn: spawnNice,
+            signal,
+            durationSec: probed,
+          });
+        } finally {
+          await cleanupTempFile(downloaded.filePath);
+        }
+        return { analyzed: true };
+      }).then((value) => ({ value }), (error) => {
+        if (error?.code !== 'ANALYSIS_KILLED') {
+          console.warn('[GuildPlayer] lookahead analysis failed:', error.message);
+        }
+        return { error };
+      }),
+    });
+  }
+
+  #queueRefillKey(track) {
+    return track?.videoId || track?.webpageUrl || track || null;
+  }
+
+  #startQueueRefill(track) {
+    const key = this.#queueRefillKey(track);
+    if (this.#queueRefill?.key === key) return this.#queueRefill.promise;
+    const promise = this.#tryHandleQueueExhausted(track);
+    this.#queueRefill = { key, promise };
+    return promise;
+  }
+
+  #maybeRefillQueue() {
+    if (this.#queue.loopMode === LoopMode.TRACK) return;
+    if (this.#queue.upcoming().length > 0) return;
+    if (!this.#handleQueueExhausted) return;
+    const current = this.#queue.current;
+    if (!current) return;
+    if (this.#queueRefill?.key === this.#queueRefillKey(current)) return;
+    this.#startQueueRefill(current)
+      .then((handled) => {
+        if (handled) this.#prefetchUpcoming();
+      })
+      .catch((err) => {
+        console.warn('[GuildPlayer] early queue refill failed:', err.message);
+      });
   }
 
   #discardPrefetch(keepTrack = null) {
-    if (!this.#prefetchPromise || this.#prefetchTrack === keepTrack) return;
+    const keepKey = keepTrack ? this.#prefetchKey(keepTrack) : null;
+    for (const key of [...this.#prefetchEntries.keys()]) {
+      if (key === keepKey) continue;
+      this.#discardPrefetchKey(key);
+    }
+  }
 
-    const promise = this.#prefetchPromise;
-    this.#prefetchTrack = null;
-    this.#prefetchPromise = null;
-    promise.then(result => {
+  #discardPrefetchKey(key) {
+    const entry = this.#prefetchEntries.get(key);
+    if (!entry) return;
+    this.#prefetchEntries.delete(key);
+    entry.promise.then((result) => {
       if (result.value?.filePath) {
-        cleanupTempFile(result.value.filePath).catch(err => {
+        cleanupTempFile(result.value.filePath).catch((err) => {
           console.error('[GuildPlayer] prefetch cleanup error:', err);
         });
       }
-    });
+    }).catch(() => {});
   }
 
   async #cleanupCurrentTempFile() {
