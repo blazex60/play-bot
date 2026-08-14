@@ -323,6 +323,39 @@ test('acceptance: unexpected Idle rebuilds mixer and restarts the current track'
   await player.stop();
 });
 
+test('acceptance: Idle recovery does not play an empty mixer while the source is still preparing', async () => {
+  let createCount = 0;
+  let releaseSecond;
+  const secondSource = new Promise((resolve) => { releaseSecond = resolve; });
+  const { player, audioPlayer, queue } = makePlayer({
+    createPcmSourceFn: async () => {
+      createCount += 1;
+      if (createCount === 2) await secondSource;
+      return PcmSource.fromBuffers([silentFrame, silentFrame, silentFrame]);
+    },
+  });
+
+  await player.playNext();
+  const oldMix = player.mixStream;
+  oldMix.destroy();
+  audioPlayer.state = { status: AudioPlayerStatus.Idle };
+  audioPlayer.events.get(AudioPlayerStatus.Idle)?.();
+  await waitMs(20);
+
+  assert.equal(createCount, 2);
+  assert.equal(audioPlayer.state.status, AudioPlayerStatus.Idle);
+  assert.equal(player.mixStream.currentSource, null);
+
+  releaseSecond();
+  await waitMs(20);
+
+  assert.equal(queue.current.title, 'Track A');
+  assert.equal(audioPlayer.state.status, AudioPlayerStatus.Playing);
+  assert.ok(player.mixStream.currentSource);
+
+  await player.stop();
+});
+
 test('acceptance (mixer): slow handoff keeps queue on track 2 after mixer stream destroy', async () => {
   // Mimics @discordjs/voice: leaving Playing destroys playStream. A slow
   // createPcmSource for track 2 used to race with that destroy and either
@@ -355,6 +388,9 @@ test('acceptance (mixer): slow handoff keeps queue on track 2 after mixer stream
   audioPlayer.state = { status: AudioPlayerStatus.Idle };
   audioPlayer.events.get(AudioPlayerStatus.Idle)?.();
 
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(audioPlayer.state.status, AudioPlayerStatus.Idle, 'must not play empty mixer during slow handoff');
+
   await new Promise(resolve => setTimeout(resolve, 80));
 
   assert.equal(queue.current?.title, 'Track B');
@@ -363,6 +399,7 @@ test('acceptance (mixer): slow handoff keeps queue on track 2 after mixer stream
   assert.equal(exhausted, false);
   assert.equal(createCount, 2);
   assert.equal(player.mixStream.destroyed, false);
+  assert.equal(audioPlayer.state.status, AudioPlayerStatus.Playing);
 
   await player.stop();
 });

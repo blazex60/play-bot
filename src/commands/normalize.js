@@ -5,7 +5,7 @@ import { replyFlags } from '../permissions.js'
 export default {
   data: new SlashCommandBuilder()
     .setName('normalize')
-    .setDescription('曲ごとの音量ノーマライズ設定を切り替えます')
+    .setDescription('音量ノーマライズ設定（30分以内は loudnorm、尺不明・30分超はストリーム再生）')
     .addBooleanOption(opt =>
       opt.setName('enabled').setDescription('ノーマライズを有効にするか').setRequired(true)
     ),

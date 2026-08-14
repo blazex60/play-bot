@@ -124,18 +124,17 @@ export class GuildPlayer {
       if (!this.#mixerStarted || this.#idleRecovering) return;
       console.warn('[GuildPlayer] unexpected Idle, recovering mixer playback');
       this.#idleRecovering = true;
+      // Never play the rebuilt mixer empty: MixStream's 8s underrun guard
+      // would sourceerror while playNext is still downloading/analyzing.
+      // handleAfter already calls playNext; mid-track Idle must restart here.
+      this.#recoverMixerPlayback({ play: false });
       const restartCurrent = this.#queue.current && !this.#handlingAfter && !this.#forceSkip;
       const done = () => { this.#idleRecovering = false; };
       if (restartCurrent) {
-        // @discordjs/voice destroy()s MixStream on Idle, so the rebuilt
-        // pipeline must stay unplayed until playNext attaches the replacement
-        // source; otherwise MixStream's underrun guard can race slow analysis.
-        this.#recoverMixerPlayback({ play: false });
         this.playNext().catch((err) => {
           console.error('[GuildPlayer] mixer Idle restart failed:', err.message);
         }).finally(done);
       } else {
-        this.#recoverMixerPlayback();
         done();
       }
     });
@@ -203,15 +202,18 @@ export class GuildPlayer {
     this.#resetWatchdog();
     this.#playbackCount += 1;
 
-    if (!this.#mixerStarted || this.#isMixerDead()) {
-      this.#ensureMixerPlaying();
+    // Rebuild first if Idle/stop ended the mixer, attach PCM, then play.
+    // Playing before setCurrent leaves MixStream with no current source and
+    // starts the underrun guard against silence.
+    if (this.#isMixerDead()) {
+      this.#recoverMixerPlayback({ play: false });
     }
-
-    // Pre-failed sources emit sourceerror (which advances) and return false —
-    // skip recordPlay/onTrackStart just like the createPcmSource throw path.
     const durationSec = this.#resolvePlaybackDurationSec(track);
     if (!this.#mixStream.setCurrent(source, { durationSec })) {
       return;
+    }
+    if (!this.#mixerStarted) {
+      this.#ensureMixerPlaying();
     }
     this.#clearPreparedIncoming();
     this.#crossfadeStarted = false;

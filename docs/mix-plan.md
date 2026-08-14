@@ -94,7 +94,7 @@ JS 側のサンプル加算も、1曲だけ流れている間は加算せずバ�
 - `skip()` は `mix.dropCurrent()`
 - ウォッチドッグは `state.playbackDuration` の増加を監視し、ストール時は `MixStream.dropCurrent()` する（`source.lastDataAt` は使わない）
 - `stop()` は `endMixer()` のあと `#initMixerPipeline()` で MixStream を作り直す。セッションが残ったまま次の `/play` ができるようにする
-- `AudioPlayerStatus.Idle` は異常。`@discordjs/voice` が MixStream を destroy している場合はパイプラインを再生成し、キューの現在曲があれば `playNext()` で載せ直す
+- `AudioPlayerStatus.Idle` は異常。MixStream を作り直すが空のまま `play()` はしない。ソースを `setCurrent` してから再生する（曲送り中は `#handleAfter` の `playNext()`、再生中は Idle ハンドラが `playNext()`）
 
 ### 4.5 Idle が来なくなることで壊れる箇所
 
