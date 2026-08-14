@@ -20,6 +20,7 @@ const PLAYBACK_COMMANDS = [
 const SETTINGS_COMMANDS = [
   { title: '/bitrate [kbps]', copy: '参加しているボイスチャンネルのビットレートを設定します。数値を省略するとサーバーの Boost レベル（Premium Tier）に応じた上限値が使われます。指定した値が上限を超える場合は自動的に上限まで丸められます。' },
   { title: '/normalize <enabled>', copy: '曲ごとの音量ノーマライズを有効・無効にします。サーバー単位の設定で、以降に再生する曲に適用されます。' },
+  { title: '/fade <enabled>', copy: '曲間のフェード（クロスフェード / tail-fade）を有効・無効にします。サーバー単位の設定で、無効にすると曲の切り替わりはギャップレスになります。ミキサーが有効なときだけ再生に反映されます。' },
   { title: '/autoplay mode <value>', copy: 'キューが空になったときの自動再生モードを設定します。オフ / 自動（関連動画から自動追加）/ おすすめ（DM でおすすめを提示し選んで追加）の3種類です。' },
   { title: '/autoplay personalize <value>', copy: '自動再生のパーソナライズ機能を on/off します。有効にすると、これまでの再生履歴を考慮した候補が選ばれやすくなります。' },
   { title: '/autoplay notify <value>', copy: '自動再生で曲がキューに追加された際に通知を送るかどうかを切り替えます。' },

@@ -101,6 +101,8 @@ const confidence = Math.min(
 
 歌に食い込むときは `fadeSec` を縮めて終端に寄せるのではなく、**重畳の開始点を `lastVocalEndSec` 以降に置く**。
 
+Guild 単位の `/fade enabled` でクロスフェード / tail-fade を切れる。既定はオン。無効時はギャップレス接続になる。進行中のフェードは止めない。
+
 ---
 
 ## 5. 完了条件（Phase 6 全体）

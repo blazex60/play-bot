@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { AudioPlayerStatus } from '@discordjs/voice';
 import { LoopMode, createTrack } from './queue.js';
 import { isShortTrack, shouldReconnectRetry } from './player/playbackPolicy.js';
@@ -7,6 +10,11 @@ import { triggerTrackEnd } from './player/playbackDrive.js';
 import { makeAudioPlayer, makePlayer, nextTurn } from './player/test-helpers.js';
 import { FRAME_BYTES } from './audio/fade.js';
 import { PcmSource } from './audio/pcmSource.js';
+import {
+  configureSettingsPathForTest,
+  getSettingsPathForTest,
+  setFade,
+} from './settings.js';
 
 test('playbackPolicy: isShortTrack is true when duration is under 5 seconds', () => {
   assert.equal(isShortTrack({ duration: 4 }), true);
@@ -446,6 +454,45 @@ test('acceptance (mixer): cached lastVocalEnd starts a vocal-free crossfade', as
   assert.equal(startedPlan.baseSwap, true);
   assert.ok(startedPlan.startSec >= 1.2);
   await player.stop();
+});
+
+test('acceptance (mixer): /fade off skips crossfade and stays gapless', async () => {
+  const previousSettingsPath = getSettingsPathForTest();
+  const dir = await mkdtemp(join(tmpdir(), 'music-bot-fade-player-test-'));
+  configureSettingsPathForTest(join(dir, 'data', 'guild-settings.json'));
+  try {
+    await setFade('guild-1', false);
+    const frame = Buffer.alloc(FRAME_BYTES);
+    let crossfadeStarted = false;
+    const { player, queue } = makePlayer({
+      mixerEnabled: true,
+      trackDuration: 3,
+      getTrackAnalysisFn: async () => null,
+      analyzeTrackFileFn: null,
+      createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+    });
+    queue.add(createTrack({
+      title: 'Track B',
+      webpageUrl: 'https://example.com/b',
+      duration: 3,
+      videoId: 'vid-b',
+    }));
+
+    player.mixStream.on('crossfadestart', () => { crossfadeStarted = true; });
+
+    await player.playNext();
+    for (let i = 0; i < 135; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 450));
+
+    assert.equal(crossfadeStarted, false, 'expected fade-off guilds to skip simple-fade/crossfade');
+    assert.equal(player.mixStream.isCrossfading, false);
+    await player.stop();
+  } finally {
+    configureSettingsPathForTest(previousSettingsPath);
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('acceptance (mixer): snap handoff when metadata outlasts actual PCM', async () => {

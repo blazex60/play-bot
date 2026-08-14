@@ -861,6 +861,7 @@ export class GuildPlayer {
 
   async #maybeStartCrossfade() {
     if (!this.#mixerEnabled || this.#crossfadeArming || this.#crossfadeStarted) return;
+    if (getGuildSettings(this.#guildId).fade === false) return;
     if (this.#mixStream?.isCrossfading) return;
     if (this.#forceSkip || this.#handlingAfter) return;
     if (this.#audioPlayer.state.status !== AudioPlayerStatus.Playing) return;

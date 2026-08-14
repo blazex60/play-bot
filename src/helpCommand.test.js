@@ -45,6 +45,7 @@ test('help: normalizes the detailed-help URL and uses the configured visibility'
       assert.match(detailField.value, /https:\/\/example\.com\/help/)
       assert.doesNotMatch(detailField.value, /example\.com\/\/help/)
       const settingsField = fields.find((field) => field.name === '設定')
+      assert.match(settingsField.value, /`\/fade`/)
       assert.match(settingsField.value, /`\/adminrole`/)
     } finally {
       if (previousBaseUrl === undefined) {

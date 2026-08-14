@@ -261,6 +261,7 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - runtime イメージを `node:22-bookworm-slim` にし aubio / Demucs venv を同梱
 - 解析は直列キュー。arm はキャッシュのみ（Demucs 待ちでクロスフェードを止めない）
 - essentia.js キーはベストエフォート
+- Guild 単位の `/fade` でクロスフェード / tail-fade を切れる（既定はオン。無効時はギャップレス）
 
 ---
 

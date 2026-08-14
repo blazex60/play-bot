@@ -41,7 +41,7 @@ docker compose up --build
 | `src/queue.js` | GuildQueue（LoopMode: OFF/TRACK/QUEUE） |
 | `src/search.js` | yt-dlp 連携（検索・メタデータ取得・ストリーム URL 解決） |
 | `src/views.js` | 検索結果ボタン UI（ActionRowBuilder） |
-| `src/commands/` | 11 個のスラッシュコマンド |
+| `src/commands/` | 17 個のスラッシュコマンド |
 | `src/deploy.js` | スラッシュコマンド登録スクリプト |
 | `src/botApi.js` | Web process から呼ぶ loopback-only internal API |
 | `src/web/server/` | Fastify Web server、OAuth、SQLite-backed session/token/import routes |
