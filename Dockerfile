@@ -31,11 +31,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip3 install --break-system-packages -U "yt-dlp[default]"
 
+# demucs 4.1.0 only declares numpy on Intel macOS, but transformer.py
+# imports it on Linux too. Install numpy explicitly after the CPU torch
+# wheel (which no longer pulls numpy in as a hard dependency).
 RUN python3 -m venv /opt/demucs-venv \
   && /opt/demucs-venv/bin/pip install --no-cache-dir --upgrade pip \
   && /opt/demucs-venv/bin/pip install --no-cache-dir \
       --index-url https://download.pytorch.org/whl/cpu torch \
-  && /opt/demucs-venv/bin/pip install --no-cache-dir demucs \
+  && /opt/demucs-venv/bin/pip install --no-cache-dir numpy demucs \
   && /opt/demucs-venv/bin/python -c "from demucs.pretrained import get_model; get_model('htdemucs')"
 
 COPY package*.json ./
