@@ -13,7 +13,7 @@
 |------|--------------|
 | `bun-cli.mjs` | bun / Node 実行ファイル解決とバージョン確認 |
 | `build-web.mjs` | `web/vite.config.js` で Vite ビルドを `bun --bun` 経由で実行し、一時ディレクトリ経由で成果物を配置する（`bun run build:web`） |
-| `run-node-tests.mjs` | `src/`, `scripts/` 配下の `*.test.js` を再帰的に検出して `bun test` で実行する。`web/` ディレクトリは除外するが `src/web/` は除外**しない**よう明示的にコメントで注意書きされている（basename 一致で誤除外した過去のバグの再発防止） |
+| `run-node-tests.mjs` | `src/`, `scripts/` 配下の `*.test.js` を再帰的に検出して `node --test` で実行する（Fastify inject が bun の HTTP と合わないためサーバスイートは Node）。`web/` ディレクトリは除外するが `src/web/` は除外**しない**よう明示的にコメントで注意書きされている（basename 一致で誤除外した過去のバグの再発防止） |
 | `run-browser-tests.mjs` | Playwright を `test/browser/playwright.config.mjs` で実行する（`bun run test:e2e`） |
 | `qa-manifest.mjs` | QA manifest（`test/qa/manifests/*.json`）を zod スキーマで検証・パースする。`assertionSchema`（`outputIncludes`/`pathExists`）や `resourceSchema`（port/database/browserProfile/composeProject の割り当て）を定義 |
 | `qa-safety.mjs` | QA タスク実行時のサンドボックス化ヘルパー: 環境変数のホワイトリスト化（`createChildEnvironment`）、シンボリックリンク拒否、出力の秘匿情報redaction、排他的ファイル書き込み |

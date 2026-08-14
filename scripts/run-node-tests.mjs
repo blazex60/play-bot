@@ -3,7 +3,7 @@ import { readdir, stat } from 'node:fs/promises'
 import { relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { assertSupportedBunVersion, bunExecutable } from './bun-cli.mjs'
+import { assertSupportedNodeVersion, nodeExecutable } from './bun-cli.mjs'
 
 const serverExcludedParts = new Set([
   'node_modules',
@@ -67,7 +67,7 @@ async function discoverContainerTests(projectRoot) {
   }
 }
 
-export async function buildBunTestArguments(projectRoot, files) {
+export async function buildNodeTestArguments(projectRoot, files) {
   const sortedFiles = [...files].sort()
   if (!files.every((file, index) => file === sortedFiles[index])) {
     throw new Error('Test files must be sorted before invocation')
@@ -78,11 +78,11 @@ export async function buildBunTestArguments(projectRoot, files) {
       throw new Error(`Test argv is not a regular test file: ${file}`)
     }
   }
-  return files
+  return ['--test', ...files]
 }
 
 async function main() {
-  assertSupportedBunVersion()
+  assertSupportedNodeVersion()
   const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
   const suiteIndex = process.argv.indexOf('--suite')
   const suite = suiteIndex === -1 ? 'server' : process.argv[suiteIndex + 1]
@@ -103,8 +103,8 @@ async function main() {
   }
   console.log(`NODE_TEST_FILES=${JSON.stringify(files)}`)
   const result = spawnSync(
-    bunExecutable(),
-    ['test', ...await buildBunTestArguments(projectRoot, files)],
+    nodeExecutable(),
+    await buildNodeTestArguments(projectRoot, files),
     { cwd: projectRoot, stdio: 'inherit' }
   )
   if (result.error) {

@@ -13,7 +13,7 @@ React + Vite 製の Web ダッシュボード SPA。`bun run build:web`（`scrip
 |------|--------------|
 | `index.html` | Vite のエントリー HTML（`#root` に `main.jsx` をマウント） |
 | `vite.config.js` | Vite ビルド設定 |
-| `bun-test-setup.js` | `bun run test:web` 用の happy-dom + Testing Library cleanup preload |
+| `happy-dom-register.js` / `bun-test-setup.js` | `bun run test:web` 用の happy-dom 登録と Testing Library cleanup（この順で preload） |
 | `tsconfig.json` | `bun run typecheck`（`tsc --noEmit`）が使う JSDoc 型チェック設定。プロジェクトは TypeScript を書かず JSDoc + `.jsx` で型注釈する |
 
 ## Subdirectories

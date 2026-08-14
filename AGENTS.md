@@ -41,7 +41,7 @@ Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.
 
 ### Testing Requirements
 ```bash
-bun run test:server    # bun test（src/, scripts/ 配下の *.test.js。API は node:test のまま）
+bun run test:server    # node --test（src/, scripts/ 配下の *.test.js。Fastify inject のため Node）
 bun run test:web       # bun:test + happy-dom（web/ 配下）
 bun run test:e2e       # Playwright（test/browser/）
 bun run typecheck      # tsc --noEmit（web/tsconfig.json）

@@ -14,7 +14,7 @@
     "deploy": "node src/deploy.js",
     "test": "bun run test:server",
     "test:server": "bun scripts/run-node-tests.mjs --suite server",
-    "test:web": "bun test --preload ./web/bun-test-setup.js web/src",
+    "test:web": "bun test --preload ./web/happy-dom-register.js --preload ./web/bun-test-setup.js web/src",
     "test:browser": "bun scripts/run-browser-tests.mjs",
     "test:e2e": "bun run test:browser",
     "test:container": "bun scripts/run-node-tests.mjs --suite container",
@@ -43,6 +43,7 @@
     "zod": "^4.1.12"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "^20.11.2",
     "@playwright/test": "^1.56.1",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^14.6.1",

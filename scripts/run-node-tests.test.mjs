@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import { assertSupportedNodeVersion } from './bun-cli.mjs'
 import {
   assertSupportedBunVersion,
-  buildBunTestArguments,
+  buildNodeTestArguments,
   discoverServerTests,
 } from './run-node-tests.mjs'
 
@@ -47,13 +47,13 @@ test('discoverServerTests returns sorted test files when forbidden roots exist',
   }
 })
 
-test('buildBunTestArguments rejects directory argv when a directory resembles a test', async () => {
+test('buildNodeTestArguments rejects directory argv when a directory resembles a test', async () => {
   const root = await mkdtemp(join(tmpdir(), 'music-bot-directory-argv-'))
   try {
     await mkdir(join(root, 'fake.test.js'))
 
     await assert.rejects(
-      buildBunTestArguments(root, ['fake.test.js']),
+      buildNodeTestArguments(root, ['fake.test.js']),
       /not a regular test file/
     )
   } finally {
@@ -61,14 +61,14 @@ test('buildBunTestArguments rejects directory argv when a directory resembles a 
   }
 })
 
-test('buildBunTestArguments rejects unsorted input before invoking bun test', async () => {
+test('buildNodeTestArguments rejects unsorted input before invoking node test', async () => {
   const root = await mkdtemp(join(tmpdir(), 'music-bot-unsorted-argv-'))
   try {
     await createFile(root, 'z.test.js')
     await createFile(root, 'a.test.js')
 
     await assert.rejects(
-      buildBunTestArguments(root, ['z.test.js', 'a.test.js']),
+      buildNodeTestArguments(root, ['z.test.js', 'a.test.js']),
       /sorted/
     )
   } finally {

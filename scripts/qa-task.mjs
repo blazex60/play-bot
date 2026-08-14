@@ -66,6 +66,27 @@ async function assertBunTestFiles(step, cwd) {
   }
 }
 
+async function assertNodeTestFiles(step, cwd) {
+  const testFlag = step.command.indexOf('--test')
+  if (testFlag === -1) {
+    return
+  }
+  for (const argument of step.command.slice(testFlag + 1)) {
+    if (argument.startsWith('-')) {
+      continue
+    }
+    const path = resolve(cwd, argument)
+    const linkInfo = await lstat(path)
+    if (linkInfo.isSymbolicLink()) {
+      throw new Error(`Symbolic link argv is forbidden for node --test: ${argument}`)
+    }
+    const info = await stat(path)
+    if (info.isDirectory()) {
+      throw new Error(`Directory argv is forbidden for node --test: ${argument}`)
+    }
+  }
+}
+
 function executeStep(step, cwd) {
   return new Promise((resolveResult, rejectResult) => {
     const child = spawn(step.command[0], step.command.slice(1), {
@@ -141,6 +162,7 @@ export async function runQaCase({ manifest, caseId, projectRoot, evidenceDir }) 
   for (const step of qaCase.steps) {
     const cwd = resolve(projectRoot, step.cwd)
     await assertBunTestFiles(step, cwd)
+    await assertNodeTestFiles(step, cwd)
     const logPath = resolve(evidenceDir, `${caseId}-${step.id}.log`)
     if (await pathExists(logPath)) {
       throw new Error(`Manifest collision: ${logPath}`)
