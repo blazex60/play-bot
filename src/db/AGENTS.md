@@ -12,10 +12,12 @@ better-sqlite3 を使った永続化層。**Web process (`src/web/server/`) 専�
 | File | Description |
 |------|--------------|
 | `index.js` | DB ハンドル取得（`getDatabase()`）。DB パスは `MUSICBOT_DB_PATH` 環境変数（既定: `data/musicbot.db`） |
+| `sqlite.js` | Node では `better-sqlite3`、bun では `sqlite-bun.js`（`bun:sqlite` の better-sqlite3 互換ラッパ）を選ぶ。本番 Web process は Node |
+| `sqlite-bun.js` | `bun test` 用。better-sqlite3 の native addon は bun でロードできない（oven-sh/bun#4290） |
 | `migrate.js` | `migrations/*.sql` を `schema_migrations` テーブルで管理しながら順次適用する（`runMigrations(db)`） |
 | `crypto.js` | AES-256-GCM によるトークン暗号化/復号（`encrypt`/`decrypt`）。鍵は `MUSICBOT_TOKEN_ENC_KEY`（32-byte base64）。鍵ローテーション用に `getKeyId()` あり |
 | `tokenStore.js` | YouTube の OAuth token を暗号化して保存し、期限切れ間近なら自動リフレッシュする（`getValidAccessToken`, `upsertServiceLink`）。同時リフレッシュを `inflightRefreshes` で防止 |
-| `inspect.js` | 各テーブルの行数を表示するデバッグ用 CLI（`npm run db:inspect`） |
+| `inspect.js` | 各テーブルの行数を表示するデバッグ用 CLI（`bun run db:inspect`） |
 
 ## Subdirectories
 
@@ -41,6 +43,6 @@ better-sqlite3 を使った永続化層。**Web process (`src/web/server/`) 専�
 ## Dependencies
 
 ### External
-- better-sqlite3
+- better-sqlite3（本番 Node）。bun テスト時のみ `bun:sqlite`
 
 <!-- MANUAL: -->

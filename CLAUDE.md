@@ -11,8 +11,8 @@ discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で構成。MIX 機能向け
 
 | 項目 | 内容 |
 |---|---|
-| Runtime | Node.js >= 20 |
-| パッケージ管理 | npm |
+| Runtime | Node.js >= 20（本番 Bot / Web）。テストとパッケージ管理は bun >= 1.2 |
+| パッケージ管理 | bun |
 | Discord ライブラリ | discord.js v14 + @discordjs/voice |
 | 音楽取得 | yt-dlp (child_process.spawn) |
 | 音声処理 | FFmpeg |
@@ -23,7 +23,7 @@ discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で構成。MIX 機能向け
 ## よく使うコマンド
 
 ```bash
-npm install
+bun install
 node src/deploy.js      # スラッシュコマンドを Discord に登録
 node src/index.js       # Bot 起動
 docker compose up --build

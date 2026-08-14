@@ -17,7 +17,7 @@ GitHub Actions のワークフロー定義。
 
 ### Working In This Directory
 - このワークフローは `music-bot`（Docker Compose 3 service）のデプロイ専用。`legal/`（Cloudflare Pages）はこのワークフローの対象外で、Cloudflare 側の Git integration が別途自動デプロイする
-- `scripts/deploy.sh` は変更ファイル一覧を検査して選択的にビルド・再起動する：`web/**`・`src/web/server/**` 変更 → `music-web` のみ再起動、その他の `src/**` 変更 → `music-bot` のみ再起動、`Dockerfile`・`docker-compose.yml`・`package*.json` 変更 → 両方、ドキュメント・`legal/` のみの変更 → no-op
+- `scripts/deploy.sh` は変更ファイル一覧を検査して選択的にビルド・再起動する：`web/**`・`src/web/server/**` 変更 → `music-web` のみ再起動、その他の `src/**` 変更 → `music-bot` のみ再起動、`Dockerfile`・`docker-compose.yml`・`package.json`・`bun.lock` 変更 → 両方、ドキュメント・`legal/` のみの変更 → no-op
 - 必要な secrets: `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET`, `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`（GitHub repository secrets）
 - デプロイ先ホストの `~/music-bot/.env` は Actions の外で管理される前提（このワークフローは `.env` を触らない）
 

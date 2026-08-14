@@ -10,7 +10,7 @@ Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.
 
 | File | Description |
 |------|--------------|
-| `package.json` | npm scripts（`start`/`deploy`/`test:*`/`build:web`/`check`）と依存関係定義 |
+| `package.json` | bun scripts（`start`/`deploy`/`test:*`/`build:web`/`check`）と依存関係定義 |
 | `docker-compose.yml` | `music-bot` / `music-web` / `cloudflared` の 3 service 構成。`network_mode: host` が Discord voice UDP のため必須 |
 | `Dockerfile` | 3 service 共通の単一 image ビルド定義 |
 | `wrangler.jsonc` | `legal/` を Cloudflare Pages にデプロイするための Wrangler 設定（`pages_build_output_dir: ./legal`） |
@@ -23,9 +23,9 @@ Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.
 |-----------|---------|
 | `src/` | Bot 本体（Discord client、VC 接続、スラッシュコマンド、Web process 用の内部 API）と SQLite 層（`src/db/`）、Web server（`src/web/`）（see `src/AGENTS.md`） |
 | `web/` | React + Vite 製の Web ダッシュボード SPA。`music-web` process が `web/dist` をビルド成果物として配信する（see `web/AGENTS.md`） |
-| `scripts/` | ビルド・QA 用の Node スクリプト群（web ビルド、テストランナー、QA manifest 実行） (see `scripts/AGENTS.md`) |
+| `scripts/` | ビルド・QA 用のスクリプト群（web ビルド、テストランナー、QA manifest 実行） (see `scripts/AGENTS.md`) |
 | `test/` | ブラウザ E2E テスト（Playwright）と QA タスクランナーのテスト（see `test/AGENTS.md`） |
-| `legal/` | Cloudflare Pages で配信する利用規約・プライバシーポリシーの静的サイト。npm プロジェクトとは独立（see `legal/AGENTS.md`） |
+| `legal/` | Cloudflare Pages で配信する利用規約・プライバシーポリシーの静的サイト。アプリの bun/Node プロジェクトとは独立（see `legal/AGENTS.md`） |
 | `.github/workflows/` | Tailscale 経由 SSH で本番ホストに `docker compose up --build -d` する deploy workflow (see `.github/workflows/AGENTS.md`) |
 | `data/` | SQLite DB (`musicbot.db`) と guild 設定 JSON の永続化先。`.gitignore` 対象、空ディレクトリなので AGENTS.md なし |
 
@@ -37,15 +37,15 @@ Discord VC で YouTube 音楽をストリーミング再生する Bot。discord.
 - Bot process（`src/index.js` 系）は SQLite を一切開かない。DB は Web process（`src/web/server/`）専用。この境界を壊さないこと
 - Bot API（`src/botApi.js`）は loopback (`127.0.0.1:${BOT_API_PORT}`) 限定で bearer token 必須。Cloudflare Tunnel には絶対に出さない
 - シークレットは全て `.env` のみ（`GEMINI_API_KEY` 含む）。ソースコードに書かない
-- `legal/` はこのリポジトリの npm/Node プロジェクトとは無関係の独立した静的サイトで、別の Cloudflare Pages project としてデプロイされる
+- `legal/` はこのリポジトリの bun/Node プロジェクトとは無関係の独立した静的サイトで、別の Cloudflare Pages project としてデプロイされる
 
 ### Testing Requirements
 ```bash
-npm run test:server    # Node 標準 test runner（src/, scripts/ 配下の *.test.js）
-npm run test:web       # vitest（web/ 配下）
-npm run test:e2e       # Playwright（test/browser/）
-npm run typecheck      # tsc --noEmit（web/tsconfig.json）
-npm run check          # 上記一式 + build:web
+bun run test:server    # bun test（src/, scripts/ 配下の *.test.js。API は node:test のまま）
+bun run test:web       # bun:test + happy-dom（web/ 配下）
+bun run test:e2e       # Playwright（test/browser/）
+bun run typecheck      # tsc --noEmit（web/tsconfig.json）
+bun run check          # 上記一式 + build:web
 ```
 
 ### Common Patterns
@@ -57,27 +57,27 @@ npm run check          # 上記一式 + build:web
 
 ### External
 - discord.js v14 / @discordjs/voice — Discord Bot・VC 接続
-- yt-dlp（外部バイナリ、npm 依存ではない） / FFmpeg — 音声取得・トランスコード
+- yt-dlp（外部バイナリ、bun/npm 依存ではない） / FFmpeg — 音声取得・トランスコード
 - Google Gemini API — MIX の曲順補助・リクエスト文からのプレイリスト生成（Web process のみ）
 - Fastify + better-sqlite3 — Web server と永続化
 - React 19 + Vite + react-router-dom — Web ダッシュボード
 - zod — QA manifest のスキーマ検証
-- Playwright / vitest / node:test — テスト
+- Playwright / bun:test / node:test — テスト
 
 <!-- MANUAL: Any manually added notes below this line are preserved on regeneration -->
 
 ## Cursor Cloud specific instructions
 
-Standard commands live in `README.md` and `package.json` scripts. The notes below are non-obvious startup/run caveats for this environment (the update script already ran `npm install`, installed `yt-dlp`, and installed the Playwright Chromium browser).
+Standard commands live in `README.md` and `package.json` scripts. The notes below are non-obvious startup/run caveats for this environment (install bun, then `bun install`; yt-dlp and the Playwright Chromium browser still need to be on the machine).
 
 ### Env loading differs per process
-- The **bot** process (`src/index.js`, `src/deploy.js`) loads `.env` itself via `dotenv/config`, so `npm start` / `node src/index.js` pick it up automatically.
+- The **bot** process (`src/index.js`, `src/deploy.js`) loads `.env` itself via `dotenv/config`, so `bun start` / `node src/index.js` pick it up automatically.
 - The **web** process (`src/web/server/index.js`) does **not** import dotenv (in Docker it relies on compose `env_file`). Run it locally with Node's flag: `node --env-file=.env src/web/server/index.js`.
 - Create a local `.env` from `.env.example`. `MUSICBOT_TOKEN_ENC_KEY` must be a base64 32-byte key (`openssl rand -base64 32`); `WEB_SESSION_SECRET` / `BOT_API_TOKEN` any long random value.
 
 ### `build:web` does not produce `web/dist`
-- `npm run build:web` is only a build-**validation** smoke test: it builds into a temp dir and deletes it (prints `P0_VITE_BUILD_OK`). It does **not** create `web/dist`.
-- To actually populate `web/dist` so `music-web` can serve the SPA, run: `node node_modules/vite/bin/vite.js build --config web/vite.config.js --outDir dist`. The `music-web` server only registers static routes if `web/dist` exists at startup, so build it before (or restart after) generating it.
+- `bun run build:web` is only a build-**validation** smoke test: it builds into a temp dir and deletes it (prints `P0_VITE_BUILD_OK`). It does **not** create `web/dist`.
+- To actually populate `web/dist` so `music-web` can serve the SPA, run: `bun --bun node_modules/vite/bin/vite.js build --config web/vite.config.js --outDir dist`. The `music-web` server only registers static routes if `web/dist` exists at startup, so build it before (or restart after) generating it.
 - For iterative UI dev, the Vite dev server on port 5173 is what the Playwright e2e config launches.
 
 ### Running the stack without real Discord credentials
@@ -87,5 +87,5 @@ Standard commands live in `README.md` and `package.json` scripts. The notes belo
 - `yt-dlp` (used by `src/search.js` via bare `spawn('yt-dlp', ...)`) must be on `PATH`; the update script symlinks it into `/usr/local/bin`.
 
 ### Test suite notes
-- `npm run test:server` takes several minutes (some tests spawn `yt-dlp` / do real work) — it is not hung.
-- `npm run test:e2e`: the `landing route is public` spec currently fails on a stale copy assertion (the landing `<h1>` reads `Play-bot は Discord VC 用の音楽 Bot です。` while the test expects a heading matching `/Discord の音楽 Bot/`). This is a pre-existing test/code mismatch unrelated to environment setup; the other 5 browser specs pass.
+- `bun run test:server` takes several minutes (some tests spawn `yt-dlp` / do real work) — it is not hung.
+- `bun run test:e2e`: the `landing route is public` spec currently fails on a stale copy assertion (the landing `<h1>` reads `Play-bot は Discord VC 用の音楽 Bot です。` while the test expects a heading matching `/Discord の音楽 Bot/`). This is a pre-existing test/code mismatch unrelated to environment setup; the other 5 browser specs pass.

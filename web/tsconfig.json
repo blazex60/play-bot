@@ -13,8 +13,8 @@
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "strict": true,
-    "target": "ES2023",
-    "types": ["vitest/globals"]
+    "target": "ES2023"
   },
-  "include": ["src", "vitest.config.js", "vitest.setup.js", "vite.config.js"]
+  "include": ["src", "vite.config.js"],
+  "exclude": ["**/*.test.js", "**/*.test.jsx"]
 }

@@ -1,0 +1,6 @@
+# Suites are invoked with explicit paths.
+# `bun run test:server` passes a file list from scripts/run-node-tests.mjs.
+# `bun run test:web` passes --preload ./web/bun-test-setup.js and web/src
+# so default `bun test` does not mix the React DOM suite into server files.
+[test]
+root = "."

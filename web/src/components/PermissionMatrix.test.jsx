@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, mock } from 'bun:test'
 
 import { PermissionMatrix } from './PermissionMatrix.jsx'
 
@@ -17,15 +17,15 @@ function baseProps(overrides = {}) {
     overrides: {},
     knownUsers: [{ discordId: 'u1', username: 'someone' }],
     busy: false,
-    onSetDefault: vi.fn(),
-    onSetUserOverride: vi.fn(),
+    onSetDefault: mock(),
+    onSetUserOverride: mock(),
     ...overrides,
   }
 }
 
 describe('PermissionMatrix', () => {
   it('renders a default row and calls onSetDefault when changed', async () => {
-    const onSetDefault = vi.fn()
+    const onSetDefault = mock()
     render(<PermissionMatrix {...baseProps({ onSetDefault })} />)
 
     const defaultRow = assertElement(screen.getByText('デフォルト').closest('tr'))
@@ -48,7 +48,7 @@ describe('PermissionMatrix', () => {
   })
 
   it('calls onSetUserOverride with null when switching an override back to inherit', async () => {
-    const onSetUserOverride = vi.fn()
+    const onSetUserOverride = mock()
     render(
       <PermissionMatrix
         {...baseProps({
@@ -66,7 +66,7 @@ describe('PermissionMatrix', () => {
   })
 
   it('adds a known user row showing "inherit" for every command, without granting any permission', async () => {
-    const onSetUserOverride = vi.fn()
+    const onSetUserOverride = mock()
     render(<PermissionMatrix {...baseProps({ onSetUserOverride })} />)
 
     const addSelect = assertElement(assertElement(screen.getByText('ユーザーを追加').parentElement).querySelector('select'))
@@ -82,7 +82,7 @@ describe('PermissionMatrix', () => {
   })
 
   it('persists a permission only once the admin picks a value for the newly added row', async () => {
-    const onSetUserOverride = vi.fn()
+    const onSetUserOverride = mock()
     render(<PermissionMatrix {...baseProps({ onSetUserOverride })} />)
 
     const addSelect = assertElement(assertElement(screen.getByText('ユーザーを追加').parentElement).querySelector('select'))

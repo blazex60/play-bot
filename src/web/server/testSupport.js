@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3'
+import Database from '../../db/sqlite.js'
 import { createWebConfig } from './config.js'
 
 // NOTE: this schema is hand-maintained in parallel with

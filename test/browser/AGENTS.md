@@ -5,13 +5,13 @@
 
 ## Purpose
 
-Playwright によるブラウザ E2E テスト。`npm run test:e2e`（`scripts/run-browser-tests.mjs`）から実行される。テスト実行時は Vite dev server（port 5173）が `webServer` として自動起動する。
+Playwright によるブラウザ E2E テスト。`bun run test:e2e`（`scripts/run-browser-tests.mjs`）から実行される。テスト実行時は Vite dev server（port 5173）が `webServer` として自動起動する。
 
 ## Key Files
 
 | File | Description |
 |------|--------------|
-| `playwright.config.mjs` | `testMatch: '*.spec.js'`, `fullyParallel: false`, `workers: 1`（VC/DB 等の共有状態を避けるため直列実行）。`webServer.command` が `cd ../.. && node node_modules/vite/bin/vite.js ...` で Vite dev server を起動する |
+| `playwright.config.mjs` | `testMatch: '*.spec.js'`, `fullyParallel: false`, `workers: 1`（VC/DB 等の共有状態を避けるため直列実行）。`webServer.command` が `cd ../.. && bun --bun node_modules/vite/bin/vite.js ...` で Vite dev server を起動する |
 | `p0-smoke.spec.js` | Chromium harness 自体が正しく起動・アサート・終了できるかを確認する P0 smoke test |
 | `dashboard.spec.js` | ダッシュボード UI の E2E テスト。`statePayload` 等のフィクスチャで API レスポンスをモックし、Now playing/queue 表示を検証する |
 
@@ -24,7 +24,7 @@ Playwright によるブラウザ E2E テスト。`npm run test:e2e`（`scripts/r
 
 ### Testing Requirements
 ```bash
-npm run test:e2e
+bun run test:e2e
 ```
 
 <!-- MANUAL: -->

@@ -4,13 +4,15 @@ import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { bunExecutable } from './bun-cli.mjs'
+
 const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const outputDir = mkdtempSync(resolve(tmpdir(), 'music-bot-vite-'))
 try {
   const vite = resolve(projectRoot, 'node_modules/vite/bin/vite.js')
   const result = spawnSync(
-    process.execPath,
-    [vite, 'build', '--config', 'web/vite.config.js', '--outDir', outputDir],
+    bunExecutable(),
+    ['--bun', vite, 'build', '--config', 'web/vite.config.js', '--outDir', outputDir],
     { cwd: projectRoot, stdio: 'inherit' }
   )
   if (result.error) {

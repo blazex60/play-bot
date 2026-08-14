@@ -1,18 +1,18 @@
 import { act, renderHook } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test'
 
-vi.mock('../api/client.js', () => ({
+mock.module('../api/client.js', () => ({
   api: {
-    mySavedPlaylists: vi.fn(),
-    createSavedPlaylist: vi.fn(),
-    savedPlaylist: vi.fn(),
-    renameSavedPlaylist: vi.fn(),
-    deleteSavedPlaylist: vi.fn(),
-    addSavedPlaylistTrack: vi.fn(),
-    searchSavedPlaylistTrack: vi.fn(),
-    removeSavedPlaylistTrack: vi.fn(),
-    moveSavedPlaylistTrack: vi.fn(),
-    queueSavedPlaylist: vi.fn(),
+    mySavedPlaylists: mock(),
+    createSavedPlaylist: mock(),
+    savedPlaylist: mock(),
+    renameSavedPlaylist: mock(),
+    deleteSavedPlaylist: mock(),
+    addSavedPlaylistTrack: mock(),
+    searchSavedPlaylistTrack: mock(),
+    removeSavedPlaylistTrack: mock(),
+    moveSavedPlaylistTrack: mock(),
+    queueSavedPlaylist: mock(),
   },
 }))
 
@@ -30,13 +30,13 @@ function renderSavedPlaylists() {
 
 describe('useSavedPlaylists — refresh-after-mutation', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
-    vi.spyOn(console, 'error').mockImplementation(() => {})
+    mock.clearAllMocks()
+    spyOn(console, 'error').mockImplementation(() => {})
   })
 
   it('reports the create mutation as successful even when the follow-up refresh fails', async () => {
-    vi.mocked(api.createSavedPlaylist).mockResolvedValue({ id: 1 })
-    vi.mocked(api.mySavedPlaylists).mockRejectedValue(new Error('network down'))
+    api.createSavedPlaylist.mockResolvedValue({ id: 1 })
+    api.mySavedPlaylists.mockRejectedValue(new Error('network down'))
 
     const { result } = renderSavedPlaylists()
 
@@ -53,8 +53,8 @@ describe('useSavedPlaylists — refresh-after-mutation', () => {
   })
 
   it('still applies the refreshed list when the follow-up refresh succeeds', async () => {
-    vi.mocked(api.createSavedPlaylist).mockResolvedValue({ id: 1 })
-    vi.mocked(api.mySavedPlaylists).mockResolvedValue({ playlists: [{ id: 1, name: 'My Mix' }] })
+    api.createSavedPlaylist.mockResolvedValue({ id: 1 })
+    api.mySavedPlaylists.mockResolvedValue({ playlists: [{ id: 1, name: 'My Mix' }] })
 
     const { result } = renderSavedPlaylists()
 
@@ -70,9 +70,9 @@ describe('useSavedPlaylists — refresh-after-mutation', () => {
   })
 
   it('reports the delete mutation as successful even when the follow-up refresh fails', async () => {
-    vi.mocked(api.savedPlaylist).mockResolvedValue({ id: 1, name: 'My Mix', tracks: [] })
-    vi.mocked(api.deleteSavedPlaylist).mockResolvedValue({})
-    vi.mocked(api.mySavedPlaylists).mockRejectedValue(new Error('network down'))
+    api.savedPlaylist.mockResolvedValue({ id: 1, name: 'My Mix', tracks: [] })
+    api.deleteSavedPlaylist.mockResolvedValue({})
+    api.mySavedPlaylists.mockRejectedValue(new Error('network down'))
 
     const { result } = renderSavedPlaylists()
 
@@ -80,7 +80,7 @@ describe('useSavedPlaylists — refresh-after-mutation', () => {
       await result.current.savedPlaylists.actions.onSelect({ id: 1, name: 'My Mix' })
     })
 
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    spyOn(window, 'confirm').mockReturnValue(true)
     await act(async () => {
       await result.current.savedPlaylists.actions.onDelete()
     })

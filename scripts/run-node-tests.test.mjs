@@ -4,9 +4,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+import { assertSupportedNodeVersion } from './bun-cli.mjs'
 import {
-  assertSupportedNodeVersion,
-  buildNodeTestArguments,
+  assertSupportedBunVersion,
+  buildBunTestArguments,
   discoverServerTests,
 } from './run-node-tests.mjs'
 
@@ -46,13 +47,13 @@ test('discoverServerTests returns sorted test files when forbidden roots exist',
   }
 })
 
-test('buildNodeTestArguments rejects directory argv when a directory resembles a test', async () => {
+test('buildBunTestArguments rejects directory argv when a directory resembles a test', async () => {
   const root = await mkdtemp(join(tmpdir(), 'music-bot-directory-argv-'))
   try {
     await mkdir(join(root, 'fake.test.js'))
 
     await assert.rejects(
-      buildNodeTestArguments(root, ['fake.test.js']),
+      buildBunTestArguments(root, ['fake.test.js']),
       /not a regular test file/
     )
   } finally {
@@ -60,14 +61,14 @@ test('buildNodeTestArguments rejects directory argv when a directory resembles a
   }
 })
 
-test('buildNodeTestArguments rejects unsorted input before invoking node test', async () => {
+test('buildBunTestArguments rejects unsorted input before invoking bun test', async () => {
   const root = await mkdtemp(join(tmpdir(), 'music-bot-unsorted-argv-'))
   try {
     await createFile(root, 'z.test.js')
     await createFile(root, 'a.test.js')
 
     await assert.rejects(
-      buildNodeTestArguments(root, ['z.test.js', 'a.test.js']),
+      buildBunTestArguments(root, ['z.test.js', 'a.test.js']),
       /sorted/
     )
   } finally {
@@ -78,4 +79,9 @@ test('buildNodeTestArguments rejects unsorted input before invoking node test', 
 test('assertSupportedNodeVersion rejects Node versions below 20', () => {
   assert.throws(() => assertSupportedNodeVersion('19.9.0'), /Node.js 20 or newer/)
   assert.doesNotThrow(() => assertSupportedNodeVersion('20.0.0'))
+})
+
+test('assertSupportedBunVersion rejects a missing Bun version', () => {
+  assert.throws(() => assertSupportedBunVersion(''), /Bun is required/)
+  assert.doesNotThrow(() => assertSupportedBunVersion('1.2.0'))
 })

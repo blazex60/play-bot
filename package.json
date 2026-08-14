@@ -6,23 +6,24 @@
   "main": "src/index.js",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=20",
+    "bun": ">=1.2.0"
   },
   "scripts": {
     "start": "node src/deploy.js --if-changed && node src/index.js",
     "deploy": "node src/deploy.js",
-    "test": "npm run test:server",
-    "test:server": "node scripts/run-node-tests.mjs --suite server",
-    "test:web": "vitest run --config web/vitest.config.js --reporter=verbose",
-    "test:browser": "node scripts/run-browser-tests.mjs",
-    "test:e2e": "npm run test:browser",
-    "test:container": "node scripts/run-node-tests.mjs --suite container",
-    "typecheck": "tsc --noEmit -p web/tsconfig.json && node -e \"console.log('P0_TYPECHECK_OK')\"",
-    "build:web": "node scripts/build-web.mjs",
+    "test": "bun run test:server",
+    "test:server": "bun scripts/run-node-tests.mjs --suite server",
+    "test:web": "bun test --preload ./web/bun-test-setup.js web/src",
+    "test:browser": "bun scripts/run-browser-tests.mjs",
+    "test:e2e": "bun run test:browser",
+    "test:container": "bun scripts/run-node-tests.mjs --suite container",
+    "typecheck": "tsc --noEmit -p web/tsconfig.json && bun -e \"console.log('P0_TYPECHECK_OK')\"",
+    "build:web": "bun scripts/build-web.mjs",
     "db:inspect": "node src/db/inspect.js",
     "plan:validate": "node test/plan/validate-plan.mjs",
-    "qa:task": "node scripts/qa-task.mjs",
-    "check": "npm run test:server && npm run test:web && npm run typecheck && npm run build:web && npm run test:e2e"
+    "qa:task": "bun scripts/qa-task.mjs",
+    "check": "bun run test:server && bun run test:web && bun run typecheck && bun run build:web && bun run test:e2e"
   },
   "dependencies": {
     "@discordjs/opus": "^0.10.0",
@@ -47,14 +48,13 @@
     "@testing-library/user-event": "^14.6.1",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
-    "jsdom": "^26.1.0",
+    "happy-dom": "^20.0.0",
     "typescript": "^5.9.3",
-    "vite": "^6.4.1",
-    "vitest": "^3.2.4"
+    "vite": "^6.4.1"
   },
-  "allowScripts": {
-    "@discordjs/opus@0.10.0": true,
-    "better-sqlite3@12.11.1": true,
-    "esbuild@0.25.12": true
-  }
+  "trustedDependencies": [
+    "@discordjs/opus",
+    "better-sqlite3",
+    "esbuild"
+  ]
 }

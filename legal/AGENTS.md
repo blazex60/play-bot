@@ -5,7 +5,7 @@
 
 ## Purpose
 
-利用規約・プライバシーポリシー公開用の静的サイト。npm/Node のビルドパイプラインとは無関係で、Cloudflare Pages の Git integration が `main` への push を検知して `legal/` ディレクトリをそのまま配信する（`../wrangler.jsonc` の `pages_build_output_dir`）。ビルドコマンドは空欄（プレーン HTML/CSS のみ）。
+利用規約・プライバシーポリシー公開用の静的サイト。bun/Node のビルドパイプラインとは無関係で、Cloudflare Pages の Git integration が `main` への push を検知して `legal/` ディレクトリをそのまま配信する（`../wrangler.jsonc` の `pages_build_output_dir`）。ビルドコマンドは空欄（プレーン HTML/CSS のみ）。
 
 ## Key Files
 
@@ -20,9 +20,9 @@
 ## For AI Agents
 
 ### Working In This Directory
-- ここは独立した Cloudflare Pages project（`music-bot-legal`）としてデプロイされる。npm scripts・Vite・Fastify のいずれとも連携しない
+- ここは独立した Cloudflare Pages project（`music-bot-legal`）としてデプロイされる。package.json scripts・Vite・Fastify のいずれとも連携しない
 - 文面を更新したら `main` に push するだけで Cloudflare Pages が自動デプロイする（ビルドステップなし）
-- ローカル確認は `npx wrangler pages dev legal --port 8788`
+- ローカル確認は `bunx wrangler pages dev legal --port 8788`
 
 ### Testing Requirements
 - 自動テストはない。ローカルで `wrangler pages dev` を使って目視確認する

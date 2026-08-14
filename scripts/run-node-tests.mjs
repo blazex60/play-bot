@@ -3,6 +3,8 @@ import { readdir, stat } from 'node:fs/promises'
 import { relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { assertSupportedBunVersion, bunExecutable } from './bun-cli.mjs'
+
 const serverExcludedParts = new Set([
   'node_modules',
   'fixtures',
@@ -18,7 +20,7 @@ const serverExcludedParts = new Set([
 // backend web server lives at <root>/src/web/ and its tests (auth, routes,
 // index.test.js) need to run. A prior version of this exclusion matched any
 // directory named 'web' anywhere in the tree, which silently dropped every
-// src/web/**/*.test.js file from `npm run test:server` / `npm run check`.
+// src/web/**/*.test.js file from `bun run test:server` / `bun run check`.
 const topLevelExcludedDirs = new Set(['web'])
 
 function toPortablePath(path) {
@@ -49,12 +51,7 @@ export async function discoverServerTests(projectRoot) {
   return files.sort()
 }
 
-export function assertSupportedNodeVersion(version = process.versions.node) {
-  const major = Number.parseInt(version.split('.')[0], 10)
-  if (!Number.isInteger(major) || major < 20) {
-    throw new Error(`Node.js 20 or newer is required; received ${version}`)
-  }
-}
+export { assertSupportedBunVersion, assertSupportedNodeVersion } from './bun-cli.mjs'
 
 async function discoverContainerTests(projectRoot) {
   const containerRoot = resolve(projectRoot, 'test/container')
@@ -70,22 +67,22 @@ async function discoverContainerTests(projectRoot) {
   }
 }
 
-export async function buildNodeTestArguments(projectRoot, files) {
+export async function buildBunTestArguments(projectRoot, files) {
   const sortedFiles = [...files].sort()
   if (!files.every((file, index) => file === sortedFiles[index])) {
-    throw new Error('Node test files must be sorted before invocation')
+    throw new Error('Test files must be sorted before invocation')
   }
   for (const file of files) {
     const info = await stat(resolve(projectRoot, file))
     if (!info.isFile() || !/\.test\.(?:js|mjs)$/.test(file)) {
-      throw new Error(`Node test argv is not a regular test file: ${file}`)
+      throw new Error(`Test argv is not a regular test file: ${file}`)
     }
   }
-  return ['--test', ...files]
+  return files
 }
 
 async function main() {
-  assertSupportedNodeVersion()
+  assertSupportedBunVersion()
   const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
   const suiteIndex = process.argv.indexOf('--suite')
   const suite = suiteIndex === -1 ? 'server' : process.argv[suiteIndex + 1]
@@ -95,7 +92,7 @@ async function main() {
   } else if (suite === 'container') {
     files = await discoverContainerTests(projectRoot)
   } else {
-    throw new Error(`Unknown Node test suite: ${suite}`)
+    throw new Error(`Unknown test suite: ${suite}`)
   }
   if (files.length === 0) {
     if (suite === 'container') {
@@ -106,8 +103,8 @@ async function main() {
   }
   console.log(`NODE_TEST_FILES=${JSON.stringify(files)}`)
   const result = spawnSync(
-    process.execPath,
-    await buildNodeTestArguments(projectRoot, files),
+    bunExecutable(),
+    ['test', ...await buildBunTestArguments(projectRoot, files)],
     { cwd: projectRoot, stdio: 'inherit' }
   )
   if (result.error) {

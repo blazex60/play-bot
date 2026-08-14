@@ -36,8 +36,8 @@ React SPA 本体。`App.jsx` がルーティング（`/`, `/dashboard`, `/admin`
 - ページ間で重複しがちなロジック（`guildId` 解決、API エラー処理、busy/message 状態）は `hooks/` に切り出す
 
 ### Testing Requirements
-- `p0-smoke.test.jsx` が vitest + @testing-library/react での基本的なレンダリング確認の雛形
-- `npm run test:web` で実行
+- `p0-smoke.test.jsx` が bun:test + @testing-library/react での基本的なレンダリング確認の雛形
+- `bun run test:web` で実行
 
 ### Common Patterns
 - API 呼び出しは必ず `api/client.js` の `api` オブジェクト経由（コンポーネントから直接 `fetch` しない）

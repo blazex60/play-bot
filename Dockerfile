@@ -1,14 +1,18 @@
-FROM node:22-alpine AS web-build
+FROM oven/bun:1 AS web-build
 
 WORKDIR /app
 
-RUN apk add --no-cache python3 make g++
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 \
+      make \
+      g++ \
+  && rm -rf /var/lib/apt/lists/*
 
-COPY package*.json ./
-RUN npm install
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY web/ ./web/
-RUN node node_modules/vite/bin/vite.js build --config web/vite.config.js --outDir dist
+RUN bun --bun node_modules/vite/bin/vite.js build --config web/vite.config.js --outDir dist
 
 FROM node:22-bookworm-slim
 
@@ -29,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
+COPY --from=web-build /usr/local/bin/bun /usr/local/bin/bun
+
 RUN pip3 install --break-system-packages -U "yt-dlp[default]"
 
 RUN python3 -m venv /opt/demucs-venv \
@@ -38,10 +44,10 @@ RUN python3 -m venv /opt/demucs-venv \
   && /opt/demucs-venv/bin/pip install --no-cache-dir demucs \
   && /opt/demucs-venv/bin/python -c "from demucs.pretrained import get_model; get_model('htdemucs')"
 
-COPY package*.json ./
-RUN npm install --omit=dev
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
 
 COPY src/ ./src/
 COPY --from=web-build /app/web/dist ./web/dist
 
-CMD ["npm", "start"]
+CMD ["sh", "-c", "node src/deploy.js --if-changed && node src/index.js"]

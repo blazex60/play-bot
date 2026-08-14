@@ -46,7 +46,7 @@ Bot 本体のソース。Discord client のエントリーポイント、VC セ�
 
 ### Testing Requirements
 - 各モジュールに対応する `*.test.js` が同じディレクトリにある（`node:test` + `node:assert/strict`）
-- `npm run test:server` で `scripts/run-node-tests.mjs` 経由で実行される
+- `bun run test:server` で `scripts/run-node-tests.mjs` 経由で実行される
 
 ### Common Patterns
 - スラッシュコマンドは `execute(interaction, sessions)` シグネチャで統一

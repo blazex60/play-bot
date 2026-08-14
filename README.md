@@ -4,7 +4,8 @@ Discord VC で YouTube 音楽をストリーミング再生し、Web UI から�
 
 ## 技術スタック
 
-- Node.js >= 20
+- Node.js >= 20（本番ランタイム）
+- bun >= 1.2（パッケージ管理・テスト・Vite 起動）
 - discord.js v14 + @discordjs/voice
 - yt-dlp + FFmpeg
 - Fastify Web server
@@ -47,7 +48,7 @@ Bot process は SQLite を開かない。ライブ状態は Bot process の `ses
 
 ```bash
 cp .env.example .env
-npm install
+bun install
 ```
 
 `.env` には Discord Bot token と application client ID に加え、Web UI 用の OAuth / session / internal API secret を設定する。再生は PCM ミキサー経路（`MixStream` + `StreamType.Raw`）が常時有効で、曲送りは `AudioPlayerStatus.Idle` ではなくミキサーの `trackend` / クロスフェード完了で駆動する（詳細は `docs/mix-plan.md`）。通常の再生に Gemini は不要で、`GEMINI_API_KEY`（任意で `GEMINI_MODEL`）が必要なのは `/mix order` や `/mix create` など Gemini を使う機能だけである。
@@ -64,12 +65,12 @@ Provider console に登録する redirect URI:
 ## ローカル開発
 
 ```bash
-npm run deploy
-npm start
-npm run build:web
-npm run test:web
-npm run test:e2e
-npm run check
+bun run deploy
+bun start
+bun run build:web
+bun run test:web
+bun run test:e2e
+bun run check
 ```
 
 Web UI の React dev server はテスト時に Playwright config が起動する。production では `music-web` が `web/dist` を Fastify static として配信する。
@@ -155,7 +156,7 @@ Cloudflare Pages がリポジトリの変更を検知して自動デプロイす
 ### ローカル確認
 
 ```bash
-npx wrangler pages dev legal --port 8788
+bunx wrangler pages dev legal --port 8788
 ```
 
 確認URL:
