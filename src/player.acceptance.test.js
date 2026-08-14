@@ -582,6 +582,42 @@ test('acceptance (mixer): /fade off skips crossfade and stays gapless', async ()
   }
 });
 
+test('acceptance (mixer): disabling fade during arm prevents a late startCrossfade', async () => {
+  const previousSettingsPath = getSettingsPathForTest();
+  const dir = await mkdtemp(join(tmpdir(), 'music-bot-fade-recheck-test-'));
+  configureSettingsPathForTest(join(dir, 'data', 'guild-settings.json'));
+  try {
+    const frame = Buffer.alloc(FRAME_BYTES);
+    let crossfadeStarted = false;
+    const { player, queue } = makePlayer({
+      trackDuration: 3,
+      getTrackAnalysisFn: async () => null,
+      analyzeTrackFileFn: null,
+      createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+    });
+    queue.add(createTrack({
+      title: 'Track B',
+      webpageUrl: 'https://example.com/b',
+      duration: 3,
+      videoId: 'vid-b',
+    }));
+    player.mixStream.on('crossfadestart', () => { crossfadeStarted = true; });
+
+    await player.playNext();
+    await setFade('guild-1', false);
+    for (let i = 0; i < 135; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 450));
+
+    assert.equal(crossfadeStarted, false, 'fade-off after arm start must still skip startCrossfade');
+    await player.stop();
+  } finally {
+    configureSettingsPathForTest(previousSettingsPath);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('acceptance (mixer): crossfade timer defers analysis until the transition window', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   let analysisRequests = 0;
@@ -734,5 +770,57 @@ test('acceptance (mixer): early queue refill is a single shared attempt', async 
   await new Promise((resolve) => setTimeout(resolve, 500));
 
   assert.equal(calls, 1, 'arm polls must not start overlapping exhaustion rounds');
+  await player.stop();
+});
+
+test('acceptance (mixer): lookahead analysis does not persist YouTube metadata duration', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const seenDurations = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({
+      title: 'Track A',
+      webpageUrl: 'https://example.com/a',
+      duration: 60,
+      videoId: 'vid-a',
+    }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async (_filePath, opts) => {
+      seenDurations.push(opts.durationSec);
+      return {
+        version: 2,
+        durationSec: 54,
+        lastVocalEndSec: 50,
+        vocalConfidence: 0.8,
+        confidence: 0.7,
+      };
+    },
+    prefetchTrackFn: async (track) => ({
+      filePath: `/tmp/musicbot-prefetch-${track.videoId}`,
+      measured: {},
+    }),
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+    videoId: 'vid-b',
+  }));
+  queue.add(createTrack({
+    title: 'Track C',
+    webpageUrl: 'https://example.com/c',
+    duration: 60,
+    videoId: 'vid-c',
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.ok(seenDurations.length > 0, 'lookahead must still run analysis on a cache miss');
+  assert.ok(
+    seenDurations.every((durationSec) => durationSec == null || durationSec !== 60),
+    'analysis must not use untrimmed YouTube metadata duration',
+  );
   await player.stop();
 });

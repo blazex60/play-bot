@@ -37,6 +37,8 @@ export function createAnalysisQueue({
   let stoppedAt = 0;
   let underrunSince = null;
   let spawnEpoch = 0;
+  const underrunSources = new Set();
+  const ANON_UNDERRUN = Symbol('analysis-underrun');
 
   function childPids() {
     return [...children].filter((proc) => proc.pid && !proc.killed);
@@ -63,6 +65,7 @@ export function createAnalysisQueue({
     children.clear();
     paused = false;
     stoppedAt = 0;
+    underrunSince = null;
     const reject = currentReject;
     const abort = currentAbort;
     currentReject = null;
@@ -128,24 +131,36 @@ export function createAnalysisQueue({
     stoppedAt = 0;
     underrunSince = null;
     currentReject = job.reject;
+    const abortController = new AbortController();
     let abortFn = null;
     const aborted = new Promise((_, reject) => {
       abortFn = () => {
+        abortController.abort();
         const err = new Error('analysis killed');
         err.code = 'ANALYSIS_KILLED';
         reject(err);
       };
     });
     currentAbort = abortFn;
+    const work = Promise.resolve().then(() => job.fn({
+      spawnNice,
+      register,
+      signal: abortController.signal,
+    }));
     try {
-      const result = await Promise.race([
-        job.fn({ spawnNice, register }),
-        aborted,
-      ]);
-      job.resolve(result);
+      const result = await Promise.race([work, aborted]);
+      if (abortController.signal.aborted) {
+        const err = new Error('analysis killed');
+        err.code = 'ANALYSIS_KILLED';
+        job.reject(err);
+      } else {
+        job.resolve(result);
+      }
     } catch (err) {
+      abortController.abort();
       job.reject(err);
     } finally {
+      abortController.abort();
       currentReject = null;
       currentAbort = null;
       spawnEpoch += 1;
@@ -184,8 +199,9 @@ export function createAnalysisQueue({
         pump();
       });
     },
-    noteUnderrun() {
+    noteUnderrun(source = ANON_UNDERRUN) {
       if (!running) return;
+      underrunSources.add(source);
       const now = clock();
       if (underrunSince == null) underrunSince = now;
       if (now - underrunSince < pauseAfterUnderrunMs) return;
@@ -206,7 +222,9 @@ export function createAnalysisQueue({
       stoppedAt = now;
       signalChildren('SIGSTOP');
     },
-    noteUnderrunCleared() {
+    noteUnderrunCleared(source = ANON_UNDERRUN) {
+      underrunSources.delete(source);
+      if (underrunSources.size > 0) return;
       underrunSince = null;
       if (!paused) return;
       paused = false;

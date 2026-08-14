@@ -42,6 +42,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function analysisKilledError() {
+  const err = new Error('analysis killed');
+  err.code = 'ANALYSIS_KILLED';
+  return err;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw analysisKilledError();
+}
+
 export class GuildPlayer {
   #guildId;
   #connection;
@@ -292,10 +302,10 @@ export class GuildPlayer {
       });
     });
     this.#mixStream.on('underrun', () => {
-      this.#analysisQ().noteUnderrun();
+      this.#analysisQ().noteUnderrun(this);
     });
     this.#mixStream.on('underrunClear', () => {
-      this.#analysisQ().noteUnderrunCleared();
+      this.#analysisQ().noteUnderrunCleared(this);
     });
   }
 
@@ -510,6 +520,7 @@ export class GuildPlayer {
     this.#clearCrossfadeArm();
     this.#clearPreparedIncoming();
     this.#queueRefill = null;
+    this.#analysisQ().noteUnderrunCleared(this);
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
@@ -685,10 +696,10 @@ export class GuildPlayer {
 
   #scheduleAnalysis(track, filePath) {
     if (!track?.videoId || !filePath || !this.#analyzeTrackFileFn) return;
-    this.#analysisQ().enqueue(async ({ spawnNice } = {}) => {
+    this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
       const cached = await this.#lookupPersistentAnalysis(track);
       if (cached) return cached;
-      return this.#runAnalysis(track, filePath, { spawnFn: spawnNice });
+      return this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
     }).catch((err) => {
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
@@ -740,16 +751,26 @@ export class GuildPlayer {
     return null;
   }
 
-  async #runAnalysis(track, filePath, { spawnFn } = {}) {
+  async #runAnalysis(track, filePath, { spawnFn, signal, durationSec } = {}) {
+    throwIfAborted(signal);
     if (!filePath || !this.#analyzeTrackFileFn) return null;
+    const probedDuration = durationSec
+      ?? (track.videoId ? this.#probedDurationCache.get(track.videoId) : null)
+      ?? null;
     const analysis = await this.#analyzeTrackFileFn(filePath, {
       videoId: track.videoId,
-      durationSec: this.#resolvePlaybackDurationSec(track) ?? track.duration,
+      durationSec: probedDuration,
       spawnFn,
+      signal,
     });
+    throwIfAborted(signal);
+    if (!analysis) return null;
     if (track.videoId) {
       this.#analysisCache.set(track.videoId, analysis);
       this.#putTrackAnalysisFn?.(track.videoId, analysis);
+      if (analysis.durationSec != null) {
+        this.#probedDurationCache.set(track.videoId, analysis.durationSec);
+      }
     }
     this.#maybeApplyAnalysisDuration(track, analysis);
     return analysis;
@@ -922,6 +943,11 @@ export class GuildPlayer {
         await this.#cleanupIncomingTempFile();
         return;
       }
+      if (getGuildSettings(this.#guildId).fade === false) {
+        source.destroy();
+        await this.#cleanupIncomingTempFile();
+        return;
+      }
 
       const started = this.#mixStream.startCrossfade(source, plan);
       if (!started) {
@@ -1013,12 +1039,22 @@ export class GuildPlayer {
     this.#prefetchEntries.set(key, {
       kind: 'analysis',
       track,
-      promise: this.#analysisQ().enqueue(async ({ spawnNice } = {}) => {
+      promise: this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
         const cached = await this.#lookupPersistentAnalysis(track);
         if (cached) return { analyzed: true };
+        throwIfAborted(signal);
         const downloaded = await this.#prefetchTrackFn(track);
         try {
-          await this.#runAnalysis(track, downloaded.filePath, { spawnFn: spawnNice });
+          throwIfAborted(signal);
+          const probed = await probeDurationSec(downloaded.filePath).catch(() => null);
+          if (track.videoId && probed != null) {
+            this.#probedDurationCache.set(track.videoId, probed);
+          }
+          await this.#runAnalysis(track, downloaded.filePath, {
+            spawnFn: spawnNice,
+            signal,
+            durationSec: probed,
+          });
         } finally {
           await cleanupTempFile(downloaded.filePath);
         }

@@ -15,7 +15,7 @@ function ensureMigrationTable(db) {
   `)
 }
 
-const DUPLICATE_COLUMN = /duplicate column name/i
+const ADD_COLUMN_RE = /^ALTER TABLE\s+["'`]?(\w+)["'`]?\s+ADD COLUMN\s+["'`]?(\w+)["'`]?/i
 
 function splitSqlStatements(sql) {
   return sql
@@ -25,18 +25,20 @@ function splitSqlStatements(sql) {
     .filter(Boolean)
 }
 
+function tableColumns(db, table) {
+  return new Set(
+    db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name)
+  )
+}
+
 function applyMigrationSql(db, sql) {
-  try {
-    db.exec(sql)
-  } catch (err) {
-    if (!DUPLICATE_COLUMN.test(err.message)) throw err
-    for (const statement of splitSqlStatements(sql)) {
-      try {
-        db.exec(statement)
-      } catch (inner) {
-        if (!DUPLICATE_COLUMN.test(inner.message)) throw inner
-      }
+  for (const statement of splitSqlStatements(sql)) {
+    const match = statement.match(ADD_COLUMN_RE)
+    if (match) {
+      const [, table, column] = match
+      if (tableColumns(db, table).has(column)) continue
     }
+    db.exec(statement)
   }
 }
 

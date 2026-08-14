@@ -235,8 +235,9 @@ export class MixStream extends Readable {
       return;
     }
 
+    const recovering = this.#underrunSince != null;
     this.#underrunSince = null;
-    this.emit('underrunClear');
+    if (recovering) this.emit('underrunClear');
     this.push(frame);
     this.#pendingRead = false;
     this.#current?._onFrameConsumed?.();

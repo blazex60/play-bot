@@ -421,6 +421,38 @@ test('PUT /internal/track-analysis normalizes analyzedAt milliseconds to seconds
   assert.equal(row.analyzedAt, Math.floor(ms / 1000))
 })
 
+test('PUT /internal/track-analysis writes vocal columns on createMemoryDb without migrations', async (t) => {
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+  const dedicated = Fastify({ logger: false })
+  await dedicated.register(internalRoutes, { db, token: config.botApi.token })
+  t.after(() => dedicated.close())
+
+  const put = await dedicated.inject({
+    method: 'PUT',
+    url: '/internal/track-analysis/vid-vocal',
+    headers: authHeaders(config),
+    payload: {
+      analysis: {
+        version: 2,
+        durationSec: 90,
+        lastVocalEndSec: 80,
+        vocalGaps: [{ startSec: 82, endSec: 90 }],
+        analysisSource: 'demucs',
+      },
+    },
+  })
+  assert.equal(put.statusCode, 200)
+  const row = db.prepare(
+    'SELECT last_vocal_end_sec AS lastVocalEndSec, analysis_source AS analysisSource FROM track_analysis WHERE video_id = ?',
+  ).get('vid-vocal')
+  assert.equal(row.lastVocalEndSec, 80)
+  assert.equal(row.analysisSource, 'demucs')
+})
+
 function fakeGenerateGemini(tracks = [{ title: 'Song A', artist: 'Artist' }]) {
   return {
     available: true,
