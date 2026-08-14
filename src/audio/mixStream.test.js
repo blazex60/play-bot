@@ -88,6 +88,13 @@ test('MixStream pushes silence between tracks so the player is not starved', asy
   mix.endMixer();
 });
 
+test('MixStream.isDestroyed is true after endMixer', () => {
+  const mix = new MixStream();
+  assert.equal(mix.isDestroyed(), false);
+  mix.endMixer();
+  assert.equal(mix.isDestroyed(), true);
+});
+
 test('MixStream reports playback position in seconds', async () => {
   const mix = new MixStream();
   const source = PcmSource.fromBuffers([silence(FRAME_BYTES * 5)]);

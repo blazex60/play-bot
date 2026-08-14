@@ -38,7 +38,7 @@ Bot process は SQLite を開かない。ライブ状態は Bot process の `ses
 | `/loop` | ループモード切り替え（オフ -> 1曲 -> キュー -> オフ） | VC 内のユーザーのみ |
 | `/nowplaying` | 現在再生中の曲を表示 | 全員 |
 | `/bitrate [kbps]` | VC のビットレートを設定（省略時は Boost tier 上限） | 全員 |
-| `/normalize <enabled>` | Guild 単位の音量ノーマライズ on/off | 全員 |
+| `/normalize <enabled>` | 音量ノーマライズ設定。尺が分かる30分以内の曲はミキサー経路で常に loudnorm | 全員 |
 | `/autoplay mode/personalize/notify` | キュー枯渇時の自動再生モード・パーソナライズ・通知設定 | 全員 |
 | `/help` | コマンド一覧を表示 | 全員 |
 
@@ -49,7 +49,7 @@ cp .env.example .env
 npm install
 ```
 
-`.env` には Discord Bot token と application client ID に加え、Web UI 用の OAuth / session / internal API secret を設定する。MIX 機能を使う場合は `GEMINI_API_KEY`（任意で `GEMINI_MODEL`）を設定する。音声ミキサー移行中は `MIXER_ENABLED=true` のときだけ新ミキサー経路が有効になり、それ以外の値（未設定・`false` など）では従来の再生経路のままになる（詳細は `docs/mix-plan.md`）。
+`.env` には Discord Bot token と application client ID に加え、Web UI 用の OAuth / session / internal API secret を設定する。再生は PCM ミキサー経路（`MixStream` + `StreamType.Raw`）が常時有効で、曲送りは `AudioPlayerStatus.Idle` ではなくミキサーの `trackend` / クロスフェード完了で駆動する（詳細は `docs/mix-plan.md`）。通常の再生に Gemini は不要で、`GEMINI_API_KEY`（任意で `GEMINI_MODEL`）が必要なのは `/mix order` や `/mix create` など Gemini を使う機能だけである。
 
 Provider console に登録する redirect URI:
 
@@ -95,7 +95,7 @@ docker compose up --build
 ## セキュリティ境界
 
 - `DISCORD_TOKEN`, OAuth client secrets, `WEB_SESSION_SECRET`, `BOT_API_TOKEN`, `MUSICBOT_TOKEN_ENC_KEY` は `.env` のみ
-- MIX / Gemini 向け: `GEMINI_API_KEY`（必須時）、任意の `GEMINI_MODEL`、移行期間の `MIXER_ENABLED` も `.env` のみ（詳細は `docs/mix-plan.md`）
+- MIX / Gemini 向け: `GEMINI_API_KEY`（必須時）、任意の `GEMINI_MODEL` も `.env` のみ（詳細は `docs/mix-plan.md`）
 - Bot API は loopback + bearer token 前提で、Cloudflare Tunnel には出さない
 - Web permissions は Bot API が Discord live voice state と実効管理者ロール（ギルド別 `/adminrole` 設定、未設定時は `ADMIN_ROLE_ID`）で判定する
 - Gemini API は Web process から MIX の曲順補助・リクエスト文からのプレイリスト生成にのみ使う。送信は曲メタデータとリクエスト文に限定し、失敗しても再生は継続する

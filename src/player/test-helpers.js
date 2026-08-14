@@ -42,7 +42,6 @@ export function makePlayer({
   recordPlayFn,
   onTrackStart,
   track,
-  mixerEnabled = false,
   createPcmSourceFn = null,
   getTrackAnalysisFn = null,
   analyzeTrackFileFn = null,
@@ -68,8 +67,7 @@ export function makePlayer({
     handleQueueExhausted,
     recordPlayFn,
     onTrackStart,
-    mixerEnabled,
-    createPcmSourceFn: mixerEnabled ? resolvedCreatePcmSourceFn : null,
+    createPcmSourceFn: resolvedCreatePcmSourceFn,
     getTrackAnalysisFn,
     analyzeTrackFileFn,
     connection: {

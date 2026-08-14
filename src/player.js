@@ -5,15 +5,12 @@ import {
   StreamType,
 } from '@discordjs/voice';
 import { resolveAudioStream } from './search.js';
-import { getGuildSettings } from './settings.js';
 import {
   cleanupTempFile,
-  createNormalizedResource,
   isNormalizeDurationAllowed,
   prefetchTrack,
 } from './normalize.js';
 import { shouldReconnectRetry } from './player/playbackPolicy.js';
-import { isMixerEnabled } from './audio/config.js';
 import { MixStream } from './audio/mixStream.js';
 import { createStreamSource, createFileSource } from './audio/pcmSource.js';
 import { analyzeTrackFile } from './audio/trackAnalysis.js';
@@ -25,6 +22,8 @@ const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
 /** Start downloading/decoding the next track this many seconds before overlap. */
 const CROSSFADE_PREP_LEAD_SEC = 15;
+const MAX_CROSSFADE_SEC = 6;
+const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
 
@@ -59,25 +58,26 @@ export class GuildPlayer {
   #currentTempFile = null;
   #prefetchTrack = null;
   #prefetchPromise = null;
-  #currentResource = null;
   #createAudioResource;
   #resolveAudioStream;
   #handlingAfter = false;
   #handlingAfterPlayback = 0;
   #pendingAfter = false;
   #playbackCount = 0;
-  #mixerEnabled;
   #mixStream = null;
   #mixerResource = null;
   #mixerStarted = false;
   #createPcmSourceFn;
   #incomingTempFile = null;
   #analysisCache = new Map();
+  #analysisMissAt = new Map();
   #probedDurationCache = new Map();
   #crossfadeArmTimer = null;
   #crossfadeStarted = false;
   #crossfadeArming = false;
   #crossfadeTargetTrack = null;
+  /** Prevents Idle recovery from stacking playNext() while a restart is in flight. */
+  #idleRecovering = false;
   /** @type {{ track: object, promise: Promise<object>, source: object|null } | null} */
   #preparedIncoming = null;
   /** Bumped when cancelling prep so in-flight #createPcmSource won't claim temps. */
@@ -99,7 +99,6 @@ export class GuildPlayer {
     createAudioResourceFn = createAudioResource,
     resolveAudioStreamFn = resolveAudioStream,
     createPcmSourceFn = null,
-    mixerEnabled = isMixerEnabled(),
     getTrackAnalysisFn = null,
     putTrackAnalysisFn = null,
     analyzeTrackFileFn = analyzeTrackFile,
@@ -115,24 +114,30 @@ export class GuildPlayer {
     this.#audioPlayer = audioPlayer;
     this.#createAudioResource = createAudioResourceFn;
     this.#resolveAudioStream = resolveAudioStreamFn;
-    this.#mixerEnabled = mixerEnabled;
     this.#createPcmSourceFn = createPcmSourceFn;
     this.#getTrackAnalysisFn = getTrackAnalysisFn;
     this.#putTrackAnalysisFn = putTrackAnalysisFn;
     this.#analyzeTrackFileFn = analyzeTrackFileFn;
 
-    if (this.#mixerEnabled) {
-      this.#initMixerPipeline();
-      this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
-        if (!this.#mixerStarted) return;
-        console.warn('[GuildPlayer] unexpected Idle in mixer mode, recovering');
-        this.#recoverMixerPlayback();
-      });
-    } else {
-      this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
-        this.#advanceAfterPlayback();
-      });
-    }
+    this.#initMixerPipeline();
+    this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
+      if (!this.#mixerStarted || this.#idleRecovering) return;
+      console.warn('[GuildPlayer] unexpected Idle, recovering mixer playback');
+      this.#idleRecovering = true;
+      // Never play the rebuilt mixer empty: MixStream's 8s underrun guard
+      // would sourceerror while playNext is still downloading/analyzing.
+      // handleAfter already calls playNext; mid-track Idle must restart here.
+      this.#recoverMixerPlayback({ play: false });
+      const restartCurrent = this.#queue.current && !this.#handlingAfter && !this.#forceSkip;
+      const done = () => { this.#idleRecovering = false; };
+      if (restartCurrent) {
+        this.playNext().catch((err) => {
+          console.error('[GuildPlayer] mixer Idle restart failed:', err.message);
+        }).finally(done);
+      } else {
+        done();
+      }
+    });
 
     this.#audioPlayer.on('stateChange', (oldState, newState) => {
       if (newState.status === AudioPlayerStatus.Playing) {
@@ -143,29 +148,7 @@ export class GuildPlayer {
     this.#audioPlayer.on('error', err => {
       console.error('[GuildPlayer] audioPlayer error:', err);
       this.#hadError = true;
-      const failedTrack = this.#queue.current;
-
-      if (this.#mixerEnabled) {
-        this.#mixStream?.dropCurrent();
-        return;
-      }
-
-      // A stream error does not reliably produce an Idle event (for example,
-      // when yt-dlp cannot read a private or deleted video). Stop explicitly
-      // so the failed track is advanced instead of leaving the queue stuck.
-      this.#audioPlayer.stop();
-
-      // Some AudioPlayer implementations do not emit Idle synchronously from
-      // stop(). Give an emitted Idle handler precedence, then advance here as
-      // a fallback once the player is confirmed idle.
-      queueMicrotask(() => {
-        if (
-          this.#audioPlayer.state.status === AudioPlayerStatus.Idle &&
-          this.#queue.current === failedTrack
-        ) {
-          this.#advanceAfterPlayback();
-        }
-      });
+      this.#mixStream?.dropCurrent();
     });
 
     this.#connection.subscribe(this.#audioPlayer);
@@ -177,47 +160,7 @@ export class GuildPlayer {
       await this.#onDisconnect();
       return;
     }
-
-    if (this.#mixerEnabled) {
-      await this.#playNextMixer(track);
-      return;
-    }
-
-    const resource = await this.#createResource(track);
-    this.#currentResource = resource;
-
-    // stop()/skip() may have been issued while the resource was being
-    // prepared (download + loudnorm analysis can take several seconds).
-    // The player was still Idle during that window, so no natural
-    // stateChange->Idle transition fired to drive #handleAfter(); recheck
-    // here instead of unconditionally playing a now-stale resource.
-    if (this.#queue.current !== track) {
-      await this.#discardStaleResource(resource);
-      if (!this.#queue.current) await this.#onDisconnect();
-      return;
-    }
-    if (this.#forceSkip) {
-      await this.#discardStaleResource(resource);
-      this.#forceSkip = false;
-      const nextTrack = this.#queue.next({ forceAdvance: true });
-      if (nextTrack === null) {
-        await this.#onDisconnect();
-      } else {
-        await this.playNext();
-      }
-      return;
-    }
-
-    this.#playbackStart = Date.now();
-    this.#lastActiveAt = Date.now();
-
-    this.#resetWatchdog();
-
-    this.#playbackCount += 1;
-    this.#audioPlayer.play(resource);
-    this.#prefetchUpcoming();
-    this.#recordPlay(track);
-    this.#onTrackStart?.(track.videoId);
+    await this.#playNextMixer(track);
   }
 
   async #playNextMixer(track) {
@@ -227,7 +170,11 @@ export class GuildPlayer {
     } catch (err) {
       console.warn(`[GuildPlayer] pcm source failed for ${track.title}:`, err.message);
       this.#hadError = true;
-      this.#advanceAfterPlayback();
+      if (this.#handlingAfter) {
+        this.#pendingAfter = true;
+      } else {
+        this.#advanceAfterPlayback();
+      }
       return;
     }
 
@@ -255,18 +202,18 @@ export class GuildPlayer {
     this.#resetWatchdog();
     this.#playbackCount += 1;
 
-    if (!this.#mixerStarted) {
-      this.#audioPlayer.play(this.#mixerResource);
-      this.#mixerStarted = true;
-    } else {
-      this.#ensureMixerPlaying();
+    // Rebuild first if Idle/stop ended the mixer, attach PCM, then play.
+    // Playing before setCurrent leaves MixStream with no current source and
+    // starts the underrun guard against silence.
+    if (this.#isMixerDead()) {
+      this.#recoverMixerPlayback({ play: false });
     }
-
-    // Pre-failed sources emit sourceerror (which advances) and return false —
-    // skip recordPlay/onTrackStart just like the createPcmSource throw path.
     const durationSec = this.#resolvePlaybackDurationSec(track);
     if (!this.#mixStream.setCurrent(source, { durationSec })) {
       return;
+    }
+    if (!this.#mixerStarted) {
+      this.#ensureMixerPlaying();
     }
     this.#clearPreparedIncoming();
     this.#crossfadeStarted = false;
@@ -291,7 +238,6 @@ export class GuildPlayer {
   }
 
   #ensureIncomingPrepForUpcoming() {
-    if (!this.#mixerEnabled) return;
     const current = this.#queue.current;
     if (!current) return;
     const next = this.#queue.loopMode === LoopMode.TRACK
@@ -388,16 +334,19 @@ export class GuildPlayer {
     }
   }
 
+  #isMixerDead() {
+    return !this.#mixStream
+      || this.#mixStream.isDestroyed()
+      || this.#mixStream.destroyed
+      || this.#mixerResource?.ended;
+  }
+
   /**
    * @discordjs/voice destroys playStream when leaving Playing. If MixStream was
    * destroyed mid-session, rebuild it so later setCurrent/play can succeed.
    */
-  #recoverMixerPlayback() {
-    if (!this.#mixerEnabled) return;
-    const dead = !this.#mixStream
-      || this.#mixStream.destroyed
-      || this.#mixerResource?.ended;
-    if (dead) {
+  #recoverMixerPlayback({ play = true } = {}) {
+    if (this.#isMixerDead()) {
       console.warn('[GuildPlayer] mixer resource ended; rebuilding pipeline');
       try {
         this.#mixStream?.removeAllListeners();
@@ -408,6 +357,10 @@ export class GuildPlayer {
         // already destroyed
       }
       this.#initMixerPipeline();
+    }
+    if (!play) {
+      this.#mixerStarted = false;
+      return;
     }
     try {
       this.#audioPlayer.play(this.#mixerResource);
@@ -425,8 +378,8 @@ export class GuildPlayer {
   }
 
   #ensureMixerPlaying() {
-    if (!this.#mixerEnabled || !this.#mixerResource) return;
-    if (this.#mixerResource.ended || this.#mixStream?.destroyed) {
+    if (!this.#mixerResource) return;
+    if (this.#isMixerDead()) {
       this.#recoverMixerPlayback();
       return;
     }
@@ -526,11 +479,7 @@ export class GuildPlayer {
 
   async skip() {
     this.#forceSkip = true;
-    if (this.#mixerEnabled) {
-      this.#mixStream?.dropCurrent();
-      return;
-    }
-    this.#audioPlayer.stop();
+    this.#mixStream?.dropCurrent();
   }
 
   async stop() {
@@ -541,14 +490,19 @@ export class GuildPlayer {
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
-    if (this.#mixerEnabled) {
+    // Ignore Idle from stop()/endMixer so recovery does not fight teardown.
+    this.#mixerStarted = false;
+    this.#idleRecovering = false;
+    try {
+      this.#mixStream?.removeAllListeners();
       this.#mixStream?.endMixer();
-      this.#mixerStarted = false;
-      this.#audioPlayer.stop();
-      return;
+    } catch {
+      // already ended
     }
     this.#audioPlayer.stop();
-    this.#currentResource = null;
+    // endMixer() permanently closes MixStream. Rebuild so a later playNext()
+    // (same session, no /leave) can setCurrent on a live mixer.
+    this.#initMixerPipeline();
   }
 
   #advanceAfterPlayback() {
@@ -583,7 +537,6 @@ export class GuildPlayer {
   }
 
   async #handleAfter() {
-    this.#currentResource = null;
     this.#clearCrossfadeArm();
     await this.#cleanupCurrentTempFile();
 
@@ -662,9 +615,8 @@ export class GuildPlayer {
       this.#currentTempFile = null;
     }
 
-    // MIX path forces normalize when duration allows (crossfade quality).
-    const normalizeOn = this.#mixerEnabled || getGuildSettings(this.#guildId).normalize;
-    if (!normalizeOn || !isNormalizeDurationAllowed(track)) {
+    // Mixer path forces normalize when duration allows (crossfade quality).
+    if (!isNormalizeDurationAllowed(track)) {
       if (!forIncoming) this.#discardPrefetch();
       // Live/untrimmed stream — do not keep a prior trimmed duration.
       if (track.videoId) this.#probedDurationCache.delete(track.videoId);
@@ -724,12 +676,18 @@ export class GuildPlayer {
       return cached;
     }
     if (track.videoId && this.#getTrackAnalysisFn) {
+      const missedAt = this.#analysisMissAt.get(track.videoId);
+      if (!filePath && missedAt != null && Date.now() - missedAt < ANALYSIS_MISS_BACKOFF_MS) {
+        return null;
+      }
       const cached = await this.#getTrackAnalysisFn(track.videoId);
       if (cached) {
+        this.#analysisMissAt.delete(track.videoId);
         this.#analysisCache.set(track.videoId, cached);
         this.#maybeApplyAnalysisDuration(track, cached);
         return cached;
       }
+      this.#analysisMissAt.set(track.videoId, Date.now());
     }
     if (!filePath || !this.#analyzeTrackFileFn) return null;
     const analysis = await this.#analyzeTrackFileFn(filePath, {
@@ -746,7 +704,7 @@ export class GuildPlayer {
   }
 
   #maybeApplyAnalysisDuration(track, analysis) {
-    if (!this.#mixerEnabled || !analysis?.durationSec) return;
+    if (!analysis?.durationSec) return;
     if (this.#queue.current !== track) return;
     if (this.#mixStream?.remainingSec == null) {
       this.#mixStream.setDurationSec(analysis.durationSec);
@@ -815,7 +773,6 @@ export class GuildPlayer {
 
   #startCrossfadeArm() {
     this.#clearCrossfadeArm();
-    if (!this.#mixerEnabled) return;
     this.#crossfadeArmTimer = setInterval(() => {
       this.#maybeStartCrossfade().catch((err) => {
         console.error('[GuildPlayer] crossfade arm error:', err.message);
@@ -831,7 +788,7 @@ export class GuildPlayer {
   }
 
   async #maybeStartCrossfade() {
-    if (!this.#mixerEnabled || this.#crossfadeArming || this.#crossfadeStarted) return;
+    if (this.#crossfadeArming || this.#crossfadeStarted) return;
     if (this.#mixStream?.isCrossfading) return;
     if (this.#forceSkip || this.#handlingAfter) return;
     if (this.#audioPlayer.state.status !== AudioPlayerStatus.Playing) return;
@@ -853,6 +810,9 @@ export class GuildPlayer {
         }
       }
       if (remaining == null) return;
+      // Analysis determines the exact overlap, but it cannot exceed six
+      // seconds. Avoid polling the Web process throughout a long track.
+      if (remaining > CROSSFADE_PREP_LEAD_SEC + MAX_CROSSFADE_SEC) return;
       // TRACK loop must re-arm the same track; upcoming()[0] would advance on promote.
       const next = this.#queue.loopMode === LoopMode.TRACK
         ? current
@@ -910,37 +870,6 @@ export class GuildPlayer {
     }
   }
 
-  #createFallbackResource(track) {
-    const stream = this.#resolveAudioStream(track.webpageUrl);
-    return this.#createAudioResource(stream, {
-      inputType: StreamType.Arbitrary,
-    });
-  }
-
-  async #createResource(track) {
-    this.#currentTempFile = null;
-
-    if (!getGuildSettings(this.#guildId).normalize || !isNormalizeDurationAllowed(track)) {
-      this.#discardPrefetch();
-      return this.#createFallbackResource(track);
-    }
-
-    try {
-      const prefetched = await this.#getPrefetchedOrFetch(track);
-
-      console.info(
-        `[normalize] applying: ${track.title} ` +
-        `(${prefetched.measured.measured_I} LUFS -> -16 LUFS)`
-      );
-
-      this.#currentTempFile = prefetched.filePath;
-      return createNormalizedResource(prefetched.filePath, prefetched.measured);
-    } catch (err) {
-      console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err);
-      return this.#createFallbackResource(track);
-    }
-  }
-
   async #getPrefetchedOrFetch(track) {
     if (this.#prefetchTrack === track && this.#prefetchPromise) {
       const promise = this.#prefetchPromise;
@@ -956,12 +885,6 @@ export class GuildPlayer {
   }
 
   #prefetchUpcoming() {
-    // Mixer path always prefers normalize prefetch so crossfade can use files.
-    if (!this.#mixerEnabled && !getGuildSettings(this.#guildId).normalize) {
-      this.#discardPrefetch();
-      return;
-    }
-
     // TRACK loop re-arms the current track; upcoming() is empty in that mode.
     const track = this.#queue.loopMode === LoopMode.TRACK
       ? this.#queue.current
@@ -996,14 +919,6 @@ export class GuildPlayer {
     });
   }
 
-  async #discardStaleResource(resource) {
-    if (this.#currentResource === resource) {
-      this.#currentResource = null;
-    }
-    resource.playStream.destroy();
-    await this.#cleanupCurrentTempFile();
-  }
-
   async #cleanupCurrentTempFile() {
     const filePath = this.#currentTempFile;
     this.#currentTempFile = null;
@@ -1014,9 +929,9 @@ export class GuildPlayer {
 
   #resetWatchdog() {
     this.#clearWatchdog();
-    // Both mixer and legacy paths measure Discord playbackDuration progress.
-    // Producer lastDataAt freezes on pause while PCM still buffers, and also
-    // misses stalls where frames are produced but Discord stops advancing.
+    // Discord playbackDuration progress detects stalls where frames are produced
+    // but the voice connection stops advancing. Producer lastDataAt freezes on
+    // pause while PCM still buffers, so it is not used as the stall signal.
     let lastPlaybackDuration = 0;
     this.#watchdogTimer = setInterval(() => {
       const state = this.#audioPlayer.state;
@@ -1033,11 +948,7 @@ export class GuildPlayer {
 
       console.warn('[GuildPlayer] watchdog: stall detected');
       this.#hadError = true;
-      if (this.#mixerEnabled) {
-        this.#mixStream?.dropCurrent();
-      } else {
-        this.#audioPlayer.stop();
-      }
+      this.#mixStream?.dropCurrent();
     }, WATCHDOG_INTERVAL);
   }
 

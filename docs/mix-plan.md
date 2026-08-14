@@ -28,7 +28,7 @@
 | 論点 | 決定 |
 |---|---|
 | クロスフェードの実現方式 | 連続 PCM ミキサーへの再設計（ffmpeg `acrossfade` は不採用） |
-| ミキサーの適用範囲 | 全再生経路をミキサーに統一する。移行期間中のみ `MIXER_ENABLED` フラグで旧経路を残す |
+| ミキサーの適用範囲 | 全再生経路をミキサーに統一する。`MIXER_ENABLED` と Idle 駆動の旧経路は Phase 5 で削除済み |
 | 「LLM・外部 AI API 不使用」の設計方針 | 撤回する。Gemini を採用する |
 | 既存 `autoplay.js` との関係 | 置き換えず、MIX は別機能として併存させる |
 | normalize との関係 | MIX 時は normalize を強制 ON にする |
@@ -41,7 +41,7 @@
 
 ## 3. なぜ再設計が必要か
 
-現在の `GuildPlayer` は「1曲 = 1 AudioResource」で、`AudioPlayerStatus.Idle` を受けてから次曲の resource を組み立てる（`src/player.js` の `#handleAfter`）。`@discordjs/voice` の AudioPlayer は同時に1つの resource しか再生できないため、**前の曲の終端と次の曲の先頭が重なる区間を作れない**。
+再設計前の `GuildPlayer` は「1曲 = 1 AudioResource」で、`AudioPlayerStatus.Idle` を受けてから次曲の resource を組み立てていた。`@discordjs/voice` の AudioPlayer は同時に1つの resource しか再生できないため、**前の曲の終端と次の曲の先頭が重なる区間を作れない**。
 
 したがって、セッション中ずっと生きる単一の `Readable` を `StreamType.Raw` で1度だけ resource 化し、その中に自前のミキサーが PCM フレームを書き込み、曲送りを Idle ではなくミキサーが駆動する構造が必要になる。
 
@@ -86,19 +86,21 @@ JS 側のサンプル加算も、1曲だけ流れている間は加算せずバ�
 
 ### 4.4 GuildPlayer の変更（実装済みライフサイクル）
 
-`MIXER_ENABLED=true` 時の実際の流れ:
+`GuildPlayer` の実際の流れ（Phase 5 以降は常時この経路）:
 
 - コンストラクタで `MixStream` と `#mixerResource`（`StreamType.Raw`）を作るが、この時点では `play()` しない
 - `playNext()` → `#playNextMixer()` → `#createPcmSource()` → `mix.setCurrent(source)`。初回だけ `#audioPlayer.play(#mixerResource)` で遅延開始し、以降は Playing 固定を目指す
 - `trackend` → `#advanceAfterPlayback()` → `#handleAfter()` が曲送りを駆動
 - `skip()` は `mix.dropCurrent()`
-- `AudioPlayerStatus.Idle` は異常として扱い、既存の `#mixerResource` を再度 `play()` して復旧する（resource の再生成はしない）
+- ウォッチドッグは `state.playbackDuration` の増加を監視し、ストール時は `MixStream.dropCurrent()` する（`source.lastDataAt` は使わない）
+- `stop()` は `endMixer()` のあと `#initMixerPipeline()` で MixStream を作り直す。セッションが残ったまま次の `/play` ができるようにする
+- `AudioPlayerStatus.Idle` は異常。MixStream を作り直すが空のまま `play()` はしない。ソースを `setCurrent` してから再生する（曲送り中は `#handleAfter` の `playNext()`、再生中は Idle ハンドラが `playNext()`）
 
 ### 4.5 Idle が来なくなることで壊れる箇所
 
 | 箇所 | 影響と対応 |
 |---|---|
-| watchdog | `playbackDuration` はセッション累計で単調増加し続け、現行のストール検知が永久に発火しない。`source.lastDataAt` と連続 underrun 時間で判定する |
+| watchdog | `state.playbackDuration` が 10 秒間隔で増えているかを見てストール判定し、止まったら `MixStream.dropCurrent()` する。`source.lastDataAt` はポーズ中も止まるため使わない |
 | `/nowplaying` の経過時間 | 同上。MixStream の曲ごと再生位置を使う |
 | 曲送り | `trackend` 駆動に変更 |
 | `RECONNECT_GRACE`（5秒未満の再試行） | ソース生成失敗の検知に置き換える |
@@ -163,7 +165,7 @@ prefetch 時に末尾の RMS 包絡を 100ms 刻みで取得し、形状で分�
 
 ## 7. normalize 強制 ON の帰結
 
-- `MAX_NORMALIZE_DURATION_SEC = 1800` があるため、**30分超の曲はクロスフェード対象外**。仕様として `/help` とドキュメントに明記する
+- `MAX_NORMALIZE_DURATION_SEC = 1800` があるため、**30分超の曲はクロスフェード対象外**。尺不明（ライブ等）もフルファイル prefetch せずストリーム再生する。仕様として `/help` とドキュメントに明記する
 - 現行の prefetch は「次の1曲だけ」。解析が重くなるぶん前倒しが必要で、キューが1曲しかない場面では間に合わない。**間に合わない場合は単純フェード、さらに間に合わなければギャップレス接続へ、と二段階でフォールバックする**
 
 ---
@@ -239,18 +241,19 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - `/internal/optimize-order` + `webClient.optimizeOrder`
 - `/mix order` + Web ダッシュボード「MIX 並べ替え」
 
-### Phase 4 — リクエストからの自動プレイリスト生成 🚧 進行中
+### Phase 4 — リクエストからの自動プレイリスト生成 ✅ 完了（PR #25）
 
 - `src/mix/playlistGenerate.js` — Gemini 曲名提案 → YouTube 解決 → `ordering.js` で並べ替え
 - `/internal/generate-playlist` + `POST /api/playlists/mine/generate`
 - `/mix create` + Web「Gemini で生成」
 
-### Phase 5 — ドキュメントと法務
+### Phase 5 — ドキュメントと法務 ✅ 完了
 
 - `CLAUDE.md` / `AGENTS.md` / `README.md` の「LLM・外部 AI API は一切使用しない」を削除し、Gemini の利用範囲・送信データ・失敗時挙動の記述に置き換える
 - `legal/privacy.html` に Gemini への送信内容（曲名・チャンネル名・リクエスト文）を追記する。Google API 由来データを含むため、Google の Limited Use 要件との整合を確認すること
 - 音声アーキテクチャの節を Idle 駆動 → mixer 駆動に全面書き換え
-- Phase 1 の安定確認後、`MIXER_ENABLED` フラグと旧経路を削除
+- `MIXER_ENABLED` フラグと Idle 駆動の旧再生経路を削除し、PCM ミキサーを常時経路にした
+- `stop()` 後は MixStream を作り直し、ウォッチドッグは `state.playbackDuration` の増加と `dropCurrent()` で復旧する
 
 ---
 
@@ -302,5 +305,5 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 1.5 | ✅ 初回完了 | `docs/mix-analysis-spike.md`。実 J-POP 再計測は残 |
 | 2 | ✅ | PR #21 merged。重畳・解析キャッシュ・二段階フォールバック |
 | 3 | ✅ | PR #22。ordering + Gemini refine + `/mix order` |
-| 4 | 🚧 進行中 | `cursor/mix-create-phase4-78b7`。`/mix create` + Web 生成 |
-| 5 法務 | ✅ 文面更新済み | privacy / CLAUDE / AGENTS / README。PR #19/#20 |
+| 4 | ✅ | PR #25。`/mix create` + Web 生成 |
+| 5 法務・常時ミキサー | ✅ | privacy / CLAUDE / AGENTS / README。`MIXER_ENABLED` と旧 Idle 経路を削除 |

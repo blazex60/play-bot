@@ -1,6 +1,5 @@
 import { spawn } from 'node:child_process'
 import { rm, mkdir, rename, access } from 'node:fs/promises'
-import { createAudioResource, StreamType } from '@discordjs/voice'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -75,7 +74,10 @@ export function parseLoudnormJson(stderrText) {
 }
 
 export function isNormalizeDurationAllowed(track) {
-  return track?.duration == null || track.duration <= MAX_NORMALIZE_DURATION_SEC
+  const duration = track?.duration
+  // Unknown duration (live / missing metadata) must not take the full-file
+  // prefetch path — yt-dlp -o <file> would wait until EOF.
+  return Number.isFinite(duration) && duration <= MAX_NORMALIZE_DURATION_SEC
 }
 
 export const canNormalizeTrack = isNormalizeDurationAllowed
@@ -186,35 +188,6 @@ export async function trimSilence(filePath, {
     console.warn(`[normalize] silence trim skipped: ${err.message}`)
     return false
   }
-}
-
-export function createNormalizedResource(filePath, measured) {
-  const proc = spawn('ffmpeg', [
-    '-i', filePath,
-    '-af',
-    `loudnorm=${LOUDNORM_TARGET}:measured_I=${measured.measured_I}:measured_TP=${measured.measured_TP}:measured_LRA=${measured.measured_LRA}:measured_thresh=${measured.measured_thresh}:offset=${measured.offset}:linear=true:print_format=summary`,
-    '-f', 's16le',
-    '-ar', '48000',
-    '-ac', '2',
-    'pipe:1',
-  ], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-
-  let stderr = ''
-  proc.stderr.on('data', data => { stderr += data })
-  proc.on('error', err => {
-    proc.stdout.destroy(err)
-  })
-  proc.on('close', code => {
-    if (code !== 0) {
-      proc.stdout.destroy(new NormalizeError(stderr.trim() || `ffmpeg exited with ${code}`))
-    }
-  })
-
-  return createAudioResource(proc.stdout, {
-    inputType: StreamType.Raw,
-  })
 }
 
 function tempFilePath(track) {
