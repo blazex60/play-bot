@@ -324,11 +324,13 @@ test('acceptance (mixer): skip advances to the next track', async () => {
 });
 
 test('acceptance: unexpected Idle rebuilds mixer and restarts the current track', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
   let createCount = 0;
   const { player, audioPlayer, queue } = makePlayer({
+    mixerEnabled: true,
     createPcmSourceFn: async () => {
       createCount += 1;
-      return PcmSource.fromBuffers([silentFrame, silentFrame, silentFrame]);
+      return PcmSource.fromBuffers([frame, frame, frame]);
     },
   });
 
@@ -338,7 +340,7 @@ test('acceptance: unexpected Idle rebuilds mixer and restarts the current track'
   oldMix.destroy();
   audioPlayer.state = { status: AudioPlayerStatus.Idle };
   audioPlayer.events.get(AudioPlayerStatus.Idle)?.();
-  await waitMs(40);
+  await new Promise((resolve) => setTimeout(resolve, 40));
 
   assert.equal(queue.current.title, 'Track A');
   assert.equal(createCount, 2);

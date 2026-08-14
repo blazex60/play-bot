@@ -55,6 +55,7 @@ test('GuildPlayer: stop() then a newly queued track can play', async () => {
   const { player, audioPlayer, queue, resources } = makePlayer({
     track: first,
     onTrackStart: (videoId) => started.push(videoId),
+    mixerEnabled: true,
   })
 
   await player.playNext()
