@@ -22,6 +22,8 @@ const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
 /** Start downloading/decoding the next track this many seconds before overlap. */
 const CROSSFADE_PREP_LEAD_SEC = 15;
+const MAX_CROSSFADE_SEC = 6;
+const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
 
@@ -68,6 +70,7 @@ export class GuildPlayer {
   #createPcmSourceFn;
   #incomingTempFile = null;
   #analysisCache = new Map();
+  #analysisMissAt = new Map();
   #probedDurationCache = new Map();
   #crossfadeArmTimer = null;
   #crossfadeStarted = false;
@@ -121,16 +124,18 @@ export class GuildPlayer {
       if (!this.#mixerStarted || this.#idleRecovering) return;
       console.warn('[GuildPlayer] unexpected Idle, recovering mixer playback');
       this.#idleRecovering = true;
-      this.#recoverMixerPlayback();
       const restartCurrent = this.#queue.current && !this.#handlingAfter && !this.#forceSkip;
       const done = () => { this.#idleRecovering = false; };
       if (restartCurrent) {
         // @discordjs/voice destroy()s MixStream on Idle, so the rebuilt
-        // pipeline is empty until we put the current track back on it.
+        // pipeline must stay unplayed until playNext attaches the replacement
+        // source; otherwise MixStream's underrun guard can race slow analysis.
+        this.#recoverMixerPlayback({ play: false });
         this.playNext().catch((err) => {
           console.error('[GuildPlayer] mixer Idle restart failed:', err.message);
         }).finally(done);
       } else {
+        this.#recoverMixerPlayback();
         done();
       }
     });
@@ -338,7 +343,7 @@ export class GuildPlayer {
    * @discordjs/voice destroys playStream when leaving Playing. If MixStream was
    * destroyed mid-session, rebuild it so later setCurrent/play can succeed.
    */
-  #recoverMixerPlayback() {
+  #recoverMixerPlayback({ play = true } = {}) {
     if (this.#isMixerDead()) {
       console.warn('[GuildPlayer] mixer resource ended; rebuilding pipeline');
       try {
@@ -350,6 +355,10 @@ export class GuildPlayer {
         // already destroyed
       }
       this.#initMixerPipeline();
+    }
+    if (!play) {
+      this.#mixerStarted = false;
+      return;
     }
     try {
       this.#audioPlayer.play(this.#mixerResource);
@@ -665,12 +674,18 @@ export class GuildPlayer {
       return cached;
     }
     if (track.videoId && this.#getTrackAnalysisFn) {
+      const missedAt = this.#analysisMissAt.get(track.videoId);
+      if (!filePath && missedAt != null && Date.now() - missedAt < ANALYSIS_MISS_BACKOFF_MS) {
+        return null;
+      }
       const cached = await this.#getTrackAnalysisFn(track.videoId);
       if (cached) {
+        this.#analysisMissAt.delete(track.videoId);
         this.#analysisCache.set(track.videoId, cached);
         this.#maybeApplyAnalysisDuration(track, cached);
         return cached;
       }
+      this.#analysisMissAt.set(track.videoId, Date.now());
     }
     if (!filePath || !this.#analyzeTrackFileFn) return null;
     const analysis = await this.#analyzeTrackFileFn(filePath, {
@@ -793,6 +808,9 @@ export class GuildPlayer {
         }
       }
       if (remaining == null) return;
+      // Analysis determines the exact overlap, but it cannot exceed six
+      // seconds. Avoid polling the Web process throughout a long track.
+      if (remaining > CROSSFADE_PREP_LEAD_SEC + MAX_CROSSFADE_SEC) return;
       // TRACK loop must re-arm the same track; upcoming()[0] would advance on promote.
       const next = this.#queue.loopMode === LoopMode.TRACK
         ? current

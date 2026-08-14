@@ -85,7 +85,9 @@ export function createQueueExhaustionHandler({
           const textChannelId = session.textChannelId
           const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
           if (textChannel) {
-            await textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
+            // Notification delivery is optional and must not keep the bounded
+            // queue-exhaustion continuation open after playback has started.
+            void textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
               console.error('[sessions] failed to post autoplay notification:', err.message)
             })
           }

@@ -396,6 +396,32 @@ test('acceptance (mixer): crossfade arms without cached analysis using fallback 
   await player.stop();
 });
 
+test('acceptance (mixer): crossfade timer defers analysis until the transition window', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let analysisRequests = 0;
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => {
+      analysisRequests += 1;
+      return null;
+    },
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+    videoId: 'vid-b',
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 450));
+
+  assert.equal(analysisRequests, 0);
+  await player.stop();
+});
+
 test('acceptance (mixer): snap handoff when metadata outlasts actual PCM', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   let createCount = 0;

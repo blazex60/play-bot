@@ -66,5 +66,7 @@ test('isNormalizeDurationAllowed: 尺が分かる30分以下なら許可する',
 test('isNormalizeDurationAllowed: 尺不明や30分超は拒否する', () => {
   assert.equal(isNormalizeDurationAllowed({ duration: null }), false)
   assert.equal(isNormalizeDurationAllowed({}), false)
+  assert.equal(isNormalizeDurationAllowed({ duration: Number.NaN }), false)
+  assert.equal(isNormalizeDurationAllowed({ duration: Number.POSITIVE_INFINITY }), false)
   assert.equal(isNormalizeDurationAllowed({ duration: MAX_NORMALIZE_DURATION_SEC + 1 }), false)
 })
