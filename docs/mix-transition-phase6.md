@@ -88,6 +88,7 @@ const confidence = Math.min(
 ### 3.3 イメージサイズと初回起動
 
 - torch は CPU 版を明示（`--index-url https://download.pytorch.org/whl/cpu`）
+- `numpy` は Demucs venv に明示インストールする（demucs 4.1.0 は Intel macOS にしか `numpy` を宣言せず、Linux では `import numpy` でビルドが落ちる）
 - モデル重みをビルド時に `TORCH_HOME=/opt/torch-cache` へ焼き込む
 
 ---
