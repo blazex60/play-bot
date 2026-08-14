@@ -72,12 +72,22 @@ export function createQueueExhaustionHandler({
         // while we were waiting, so only auto-start playback if still idle.
         const wasEmpty = queue.isEmpty
         queue.add(autoTrack)
-        if (wasEmpty) await session.player.playNext()
+        if (wasEmpty) {
+          // Do not await playNext here: GuildPlayer bounds this handler with
+          // a 30s timeout, and mixer startup (download + loudnorm) can exceed
+          // that. Returning handled as soon as the track is queued lets
+          // playback continue outside the planning timeout.
+          session.player.playNext().catch((err) => {
+            console.error('[sessions] autoplay playNext failed:', err.message)
+          })
+        }
         if (getGuildSettings(guildId).autoNotify === true) {
           const textChannelId = session.textChannelId
           const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null
           if (textChannel) {
-            await textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
+            // Notification delivery is optional and must not keep the bounded
+            // queue-exhaustion continuation open after playback has started.
+            void textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
               console.error('[sessions] failed to post autoplay notification:', err.message)
             })
           }

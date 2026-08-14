@@ -53,7 +53,7 @@ function normalizeAdminRoleId(value) {
 function normalizeRecord(record) {
   return {
     normalize: record?.normalize === true,
-    // Missing fade defaults to on so MIXER_ENABLED guilds keep current DJ transitions.
+    // Missing fade defaults to on so existing guilds keep DJ transitions.
     fade: record?.fade !== false,
     autoplayMode: AUTOPLAY_MODES.has(record?.autoplayMode) ? record.autoplayMode : 'off',
     personalize: record?.personalize === true,

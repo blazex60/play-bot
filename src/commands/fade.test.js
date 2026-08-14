@@ -48,36 +48,6 @@ test('fade: defaults to enabled and persists the guild toggle', async () => {
     const enable = createInteraction(true)
     await fadeCommand.execute(enable)
     assert.equal(getGuildSettings('guild-1').fade, true)
-    assert.match(enable.replies[0].content, /有効/)
-  })
-})
-
-test('fade: notes when the mixer process flag is off', async () => {
-  await withTempSettings(async () => {
-    const previous = process.env.MIXER_ENABLED
-    delete process.env.MIXER_ENABLED
-    try {
-      const interaction = createInteraction(false)
-      await fadeCommand.execute(interaction)
-      assert.match(interaction.replies[0].content, /ミキサーが無効/)
-    } finally {
-      if (previous === undefined) delete process.env.MIXER_ENABLED
-      else process.env.MIXER_ENABLED = previous
-    }
-  })
-})
-
-test('fade: omits the mixer note when MIXER_ENABLED is true', async () => {
-  await withTempSettings(async () => {
-    const previous = process.env.MIXER_ENABLED
-    process.env.MIXER_ENABLED = 'true'
-    try {
-      const interaction = createInteraction(true)
-      await fadeCommand.execute(interaction)
-      assert.equal(interaction.replies[0].content, '✅ フェードを **有効** にしました')
-    } finally {
-      if (previous === undefined) delete process.env.MIXER_ENABLED
-      else process.env.MIXER_ENABLED = previous
-    }
+    assert.equal(enable.replies[0].content, '✅ フェードを **有効** にしました')
   })
 })
