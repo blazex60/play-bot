@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { getAnalysisQueue } from './analysisQueue.js';
+import { spawnCapture } from './spawnCapture.js';
 
 /** Relative threshold: vocals are "present" when within this dB of the mix. */
 export const VOCAL_RELATIVE_DB = 25;
@@ -90,28 +91,6 @@ export function classifyVocalEnvelope({
     vocalConfidence,
     source: 'demucs',
   };
-}
-
-function spawnCapture(spawnFn, cmd, args, { timeoutMs = 180_000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const proc = spawnFn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      proc.kill('SIGKILL');
-      reject(new Error(`${cmd} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    proc.stdout?.on('data', (d) => { stdout += d; });
-    proc.stderr?.on('data', (d) => { stderr += d; });
-    proc.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr });
-    });
-  });
 }
 
 async function rmsEnvelope(spawnFn, filePath) {

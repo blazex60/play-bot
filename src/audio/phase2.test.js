@@ -124,6 +124,20 @@ test('snapStartToBar does not move start into the vocal region', () => {
   assert.ok(snapped.startSec >= 9.5);
 });
 
+test('snapStartToBar aligns to the tail beat grid, not the vocal-end timestamp', () => {
+  const snapped = snapStartToBar({
+    startSec: 12,
+    fadeSec: 4,
+    lastVocalEndSec: 8,
+    durationSec: 16,
+    bpm: 120,
+    beatAnchorSec: 0.5,
+    allowSnap: true,
+  });
+  assert.equal(snapped.snapToBeat, true);
+  assert.equal(snapped.startSec, 10.5);
+});
+
 test('snapStartToBar disables snap when the remaining window is too short', () => {
   const snapped = snapStartToBar({
     startSec: 11.5,

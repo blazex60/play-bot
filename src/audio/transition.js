@@ -21,7 +21,9 @@ export function overlapWindowSec(outgoing) {
 
 /**
  * Snap a crossfade start to a bar boundary inside the vocal-free window.
- * Only snaps earlier (toward lastVocalEnd). Never into vocals.
+ * Bar phase comes from the detected tail beat grid when available; vocals
+ * remain a hard floor (never snap earlier than lastVocalEndSec).
+ * Only snaps earlier than the planned start. Never into vocals.
  * @returns {{ startSec: number, fadeSec: number, snapToBeat: boolean }}
  */
 export function snapStartToBar({
@@ -30,6 +32,7 @@ export function snapStartToBar({
   lastVocalEndSec,
   durationSec,
   bpm,
+  beatAnchorSec = null,
   allowSnap,
 }) {
   if (!allowSnap || !(bpm > 0) || !(durationSec > 0)) {
@@ -40,13 +43,14 @@ export function snapStartToBar({
     return { startSec, fadeSec, snapToBeat: false };
   }
   const floor = lastVocalEndSec ?? 0;
-  const offset = startSec - floor;
-  if (offset < 0) {
-    return { startSec: floor, fadeSec: Math.max(0, durationSec - floor), snapToBeat: false };
-  }
-  const bars = Math.floor(offset / barSec + 1e-9);
-  const snapped = floor + bars * barSec;
+  const anchor = Number.isFinite(beatAnchorSec) ? beatAnchorSec : floor;
+  const n = Math.floor((startSec - anchor) / barSec + 1e-9);
+  let snapped = anchor + n * barSec;
   if (snapped < floor - 1e-6) {
+    const nFloor = Math.ceil((floor - anchor) / barSec - 1e-9);
+    snapped = anchor + nFloor * barSec;
+  }
+  if (snapped < floor - 1e-6 || snapped > startSec + 1e-6) {
     return { startSec, fadeSec, snapToBeat: false };
   }
   const snappedFade = durationSec - snapped;
@@ -162,6 +166,7 @@ export function planTransition(outgoing, incoming, { maxOverlapSec = 6 } = {}) {
     lastVocalEndSec: outgoing.lastVocalEndSec,
     durationSec,
     bpm,
+    beatAnchorSec: outgoing.tailBeatOffsetSec,
     allowSnap,
   });
 

@@ -87,7 +87,9 @@ export class GuildPlayer {
   #putTrackAnalysisFn;
   #analyzeTrackFileFn;
   #analysisQueue;
-  #refillingQueue = false;
+  /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
+  #queueRefill = null;
+  #prefetchTrackFn;
 
   constructor({
     guildId,
@@ -106,6 +108,7 @@ export class GuildPlayer {
     putTrackAnalysisFn = null,
     analyzeTrackFileFn = analyzeTrackFile,
     analysisQueue = null,
+    prefetchTrackFn = prefetchTrack,
   }) {
     this.#guildId = guildId;
     this.#connection = connection;
@@ -123,6 +126,7 @@ export class GuildPlayer {
     this.#putTrackAnalysisFn = putTrackAnalysisFn;
     this.#analyzeTrackFileFn = analyzeTrackFileFn;
     this.#analysisQueue = analysisQueue;
+    this.#prefetchTrackFn = prefetchTrackFn;
 
     this.#initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
@@ -169,6 +173,9 @@ export class GuildPlayer {
   }
 
   async #playNextMixer(track) {
+    if (this.#queueRefill && this.#queueRefill.key !== this.#queueRefillKey(track)) {
+      this.#queueRefill = null;
+    }
     let source;
     try {
       source = await this.#takePreparedIncoming(track, { forPlayback: true });
@@ -502,6 +509,7 @@ export class GuildPlayer {
     this.#clearWatchdog();
     this.#clearCrossfadeArm();
     this.#clearPreparedIncoming();
+    this.#queueRefill = null;
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
@@ -591,8 +599,9 @@ export class GuildPlayer {
       // waits on a user pick (recommend mode) needs a clean slate rather than
       // an interval left ticking against an idle player forever.
       this.#clearWatchdog();
-      const handled = await this.#tryHandleQueueExhausted(finishedTrack);
-      if (handled) return;
+      const handled = await this.#startQueueRefill(finishedTrack);
+      // null = another round already owns the autoplay lock; do not disconnect.
+      if (handled !== false) return;
       await this.#onDisconnect();
     } else {
       await this.playNext();
@@ -676,9 +685,10 @@ export class GuildPlayer {
 
   #scheduleAnalysis(track, filePath) {
     if (!track?.videoId || !filePath || !this.#analyzeTrackFileFn) return;
-    this.#analysisQ().enqueue(async () => {
-      if (this.#analysisCache.has(track.videoId)) return this.#analysisCache.get(track.videoId);
-      return this.#runAnalysis(track, filePath);
+    this.#analysisQ().enqueue(async ({ spawnNice } = {}) => {
+      const cached = await this.#lookupPersistentAnalysis(track);
+      if (cached) return cached;
+      return this.#runAnalysis(track, filePath, { spawnFn: spawnNice });
     }).catch((err) => {
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
@@ -686,6 +696,24 @@ export class GuildPlayer {
       }
       console.warn('[GuildPlayer] analysis failed:', err.message);
     });
+  }
+
+  async #lookupPersistentAnalysis(track) {
+    if (!track?.videoId) return null;
+    if (this.#analysisCache.has(track.videoId)) {
+      const cached = this.#analysisCache.get(track.videoId);
+      this.#maybeApplyAnalysisDuration(track, cached);
+      return cached;
+    }
+    if (!this.#getTrackAnalysisFn) return null;
+    const cached = await this.#getTrackAnalysisFn(track.videoId);
+    if (cached && (cached.version ?? 1) >= ANALYSIS_VERSION) {
+      this.#analysisMissAt.delete(track.videoId);
+      this.#analysisCache.set(track.videoId, cached);
+      this.#maybeApplyAnalysisDuration(track, cached);
+      return cached;
+    }
+    return null;
   }
 
   async #getCachedAnalysis(track) {
@@ -712,11 +740,12 @@ export class GuildPlayer {
     return null;
   }
 
-  async #runAnalysis(track, filePath) {
+  async #runAnalysis(track, filePath, { spawnFn } = {}) {
     if (!filePath || !this.#analyzeTrackFileFn) return null;
     const analysis = await this.#analyzeTrackFileFn(filePath, {
       videoId: track.videoId,
       durationSec: this.#resolvePlaybackDurationSec(track) ?? track.duration,
+      spawnFn,
     });
     if (track.videoId) {
       this.#analysisCache.set(track.videoId, analysis);
@@ -868,17 +897,16 @@ export class GuildPlayer {
         ? plan.startSec
         : (durationSec != null ? Math.max(0, durationSec - plan.fadeSec) : null);
 
-      const fadeWindow = plan.fadeSec + 0.35;
+      const fadeWindow = plan.fadeSec;
       const prepWindow = plan.fadeSec + CROSSFADE_PREP_LEAD_SEC;
       if (remaining <= prepWindow) {
         this.#ensureIncomingPrep(next);
       }
 
-      if (plan.mode === 'crossfade' && startSec != null) {
-        if (positionSec + 0.35 < startSec) return;
-      } else if (remaining > fadeWindow) {
-        return;
-      }
+      const readyToFade = startSec != null
+        ? positionSec >= startSec
+        : remaining <= fadeWindow;
+      if (!readyToFade) return;
 
       let source;
       try {
@@ -928,7 +956,7 @@ export class GuildPlayer {
     }
 
     this.#discardPrefetch(track);
-    return prefetchTrack(track);
+    return this.#prefetchTrackFn(track);
   }
 
   #prefetchKey(track) {
@@ -966,7 +994,7 @@ export class GuildPlayer {
     this.#prefetchEntries.set(key, {
       kind: 'full',
       track,
-      promise: prefetchTrack(track).then(
+      promise: this.#prefetchTrackFn(track).then(
         (value) => {
           this.#scheduleAnalysis(track, value.filePath);
           return { value };
@@ -985,42 +1013,50 @@ export class GuildPlayer {
     this.#prefetchEntries.set(key, {
       kind: 'analysis',
       track,
-      promise: prefetchTrack(track).then(async (value) => {
+      promise: this.#analysisQ().enqueue(async ({ spawnNice } = {}) => {
+        const cached = await this.#lookupPersistentAnalysis(track);
+        if (cached) return { analyzed: true };
+        const downloaded = await this.#prefetchTrackFn(track);
         try {
-          await this.#analysisQ().enqueue(async () => {
-            if (track.videoId && this.#analysisCache.has(track.videoId)) return;
-            await this.#runAnalysis(track, value.filePath);
-          });
-        } catch (err) {
-          if (err?.code !== 'ANALYSIS_KILLED') {
-            console.warn('[GuildPlayer] lookahead analysis failed:', err.message);
-          }
+          await this.#runAnalysis(track, downloaded.filePath, { spawnFn: spawnNice });
         } finally {
-          const current = this.#prefetchEntries.get(key);
-          if (current?.kind !== 'full') {
-            await cleanupTempFile(value.filePath);
-          }
+          await cleanupTempFile(downloaded.filePath);
         }
-        return { value: { analyzed: true } };
-      }, (error) => ({ error })),
+        return { analyzed: true };
+      }).then((value) => ({ value }), (error) => {
+        if (error?.code !== 'ANALYSIS_KILLED') {
+          console.warn('[GuildPlayer] lookahead analysis failed:', error.message);
+        }
+        return { error };
+      }),
     });
   }
 
+  #queueRefillKey(track) {
+    return track?.videoId || track?.webpageUrl || track || null;
+  }
+
+  #startQueueRefill(track) {
+    const key = this.#queueRefillKey(track);
+    if (this.#queueRefill?.key === key) return this.#queueRefill.promise;
+    const promise = this.#tryHandleQueueExhausted(track);
+    this.#queueRefill = { key, promise };
+    return promise;
+  }
+
   #maybeRefillQueue() {
-    if (this.#refillingQueue) return;
     if (this.#queue.loopMode === LoopMode.TRACK) return;
     if (this.#queue.upcoming().length > 0) return;
     if (!this.#handleQueueExhausted) return;
-    this.#refillingQueue = true;
-    this.#tryHandleQueueExhausted(this.#queue.current)
+    const current = this.#queue.current;
+    if (!current) return;
+    if (this.#queueRefill?.key === this.#queueRefillKey(current)) return;
+    this.#startQueueRefill(current)
       .then((handled) => {
         if (handled) this.#prefetchUpcoming();
       })
       .catch((err) => {
         console.warn('[GuildPlayer] early queue refill failed:', err.message);
-      })
-      .finally(() => {
-        this.#refillingQueue = false;
       });
   }
 

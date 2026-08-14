@@ -15,6 +15,31 @@ function ensureMigrationTable(db) {
   `)
 }
 
+const DUPLICATE_COLUMN = /duplicate column name/i
+
+function splitSqlStatements(sql) {
+  return sql
+    .replace(/--[^\n]*/g, '')
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean)
+}
+
+function applyMigrationSql(db, sql) {
+  try {
+    db.exec(sql)
+  } catch (err) {
+    if (!DUPLICATE_COLUMN.test(err.message)) throw err
+    for (const statement of splitSqlStatements(sql)) {
+      try {
+        db.exec(statement)
+      } catch (inner) {
+        if (!DUPLICATE_COLUMN.test(inner.message)) throw inner
+      }
+    }
+  }
+}
+
 export function runMigrations(db = getDatabase()) {
   ensureMigrationTable(db)
   const applied = new Set(
@@ -27,7 +52,7 @@ export function runMigrations(db = getDatabase()) {
 
   const applyMigration = db.transaction(file => {
     const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8')
-    db.exec(sql)
+    applyMigrationSql(db, sql)
     db.prepare(
       'INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)'
     ).run(file, Date.now())

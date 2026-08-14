@@ -1,44 +1,23 @@
-import { spawn } from 'node:child_process';
 import { unlink } from 'node:fs/promises';
 import { BYTES_PER_SECOND } from './fade.js';
 import { analyzeVocalActivity } from './vocalActivity.js';
 import { analyzeKeys } from './keyAnalysis.js';
+import { spawnCapture } from './spawnCapture.js';
 
 export const ANALYSIS_VERSION = 2;
 export const HEAD_BPM_WINDOW_SEC = 20;
 export const TAIL_BPM_WINDOW_SEC = 45;
 
-function spawnCapture(cmd, args, { timeoutMs = 120_000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      proc.kill('SIGKILL');
-      reject(new Error(`${cmd} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    proc.stdout.on('data', (d) => { stdout += d; });
-    proc.stderr.on('data', (d) => { stderr += d; });
-    proc.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ code, stdout, stderr });
-    });
-  });
+export function bpmTempPath(filePath, startSec, windowSec) {
+  const startMs = Math.round(Math.max(0, startSec) * 1000);
+  const windowMs = Math.round(Math.max(0, windowSec) * 1000);
+  return `${filePath}.bpm.${startMs}.${windowMs}.wav`;
 }
 
-function average(arr) {
-  if (!arr.length) return 0;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
-
-async function analyzeTailShape(filePath, durationSec) {
+async function analyzeTailShape(filePath, durationSec, spawnFn) {
   const tail = Math.min(30, Math.max(5, durationSec * 0.25));
   const start = Math.max(0, durationSec - tail);
-  const { stderr, code } = await spawnCapture('ffmpeg', [
+  const { stderr, code } = await spawnCapture(spawnFn, 'ffmpeg', [
     '-hide_banner', '-nostats',
     '-ss', String(start),
     '-i', filePath,
@@ -70,6 +49,11 @@ async function analyzeTailShape(filePath, durationSec) {
   };
 }
 
+function average(arr) {
+  if (!arr.length) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
 function beatsToBpm(beats) {
   if (beats.length < 4) return { bpm: null, firstBeatSec: null };
   const intervals = [];
@@ -80,14 +64,14 @@ function beatsToBpm(beats) {
   return { bpm, firstBeatSec: beats[0] ?? null };
 }
 
-async function analyzeBpmWindow(filePath, { startSec, windowSec }) {
-  const which = await spawnCapture('bash', ['-lc', 'command -v aubiotrack || true']);
+async function analyzeBpmWindow(filePath, { startSec, windowSec, spawnFn }) {
+  const which = await spawnCapture(spawnFn, 'bash', ['-lc', 'command -v aubiotrack || true']);
   if (!which.stdout.trim()) {
     return { available: false, bpm: null, confidence: 0, firstBeatSec: null, beatCount: 0 };
   }
-  const wavPath = `${filePath}.bpm.${Math.round(startSec * 1000)}.wav`;
+  const wavPath = bpmTempPath(filePath, startSec, windowSec);
   try {
-    const conv = await spawnCapture('ffmpeg', [
+    const conv = await spawnCapture(spawnFn, 'ffmpeg', [
       '-y', '-hide_banner', '-loglevel', 'error',
       '-ss', String(Math.max(0, startSec)),
       '-t', String(windowSec),
@@ -97,7 +81,7 @@ async function analyzeBpmWindow(filePath, { startSec, windowSec }) {
     if (conv.code !== 0) {
       return { available: true, ok: false, bpm: null, beatCount: 0, confidence: 0, firstBeatSec: null };
     }
-    const { stdout, code } = await spawnCapture('aubiotrack', ['-i', wavPath]);
+    const { stdout, code } = await spawnCapture(spawnFn, 'aubiotrack', ['-i', wavPath]);
     const beats = stdout.trim().split('\n').map(Number).filter((n) => Number.isFinite(n));
     const { bpm, firstBeatSec } = beatsToBpm(beats);
     const absFirst = firstBeatSec != null ? startSec + firstBeatSec : null;
@@ -154,11 +138,12 @@ function compositeConfidence({ vocalConfidence, bpmConfidence, tailOk }) {
 
 /**
  * Analyze a downloaded audio file for MIX transitions.
+ * Pass `spawnFn` from the analysis queue so underrun SIGSTOP covers ffmpeg/aubio.
  */
-export async function analyzeTrackFile(filePath, { videoId = null, durationSec = null } = {}) {
+export async function analyzeTrackFile(filePath, { videoId = null, durationSec = null, spawnFn } = {}) {
   let duration = durationSec;
   if (duration == null || !Number.isFinite(duration)) {
-    const { stdout } = await spawnCapture('ffprobe', [
+    const { stdout } = await spawnCapture(spawnFn, 'ffprobe', [
       '-v', 'error',
       '-show_entries', 'format=duration',
       '-of', 'default=noprint_wrappers=1:nokey=1',
@@ -172,16 +157,17 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
 
   const tailStart = Math.max(0, duration - TAIL_BPM_WINDOW_SEC);
   const headWindow = Math.min(HEAD_BPM_WINDOW_SEC, duration);
+  const tailWindow = Math.min(TAIL_BPM_WINDOW_SEC, duration);
 
   const [tail, headBpm, tailBpm, vocal, keys] = await Promise.all([
-    analyzeTailShape(filePath, duration),
-    analyzeBpmWindow(filePath, { startSec: 0, windowSec: headWindow })
+    analyzeTailShape(filePath, duration, spawnFn),
+    analyzeBpmWindow(filePath, { startSec: 0, windowSec: headWindow, spawnFn })
       .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null })),
-    analyzeBpmWindow(filePath, { startSec: tailStart, windowSec: Math.min(TAIL_BPM_WINDOW_SEC, duration) })
+    analyzeBpmWindow(filePath, { startSec: tailStart, windowSec: tailWindow, spawnFn })
       .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null })),
-    analyzeVocalActivity(filePath, { durationSec: duration })
+    analyzeVocalActivity(filePath, { durationSec: duration, spawnFn })
       .catch(() => ({ ok: false, lastVocalEndSec: null, vocalGaps: [], vocalConfidence: 0, source: 'none' })),
-    analyzeKeys(filePath, duration)
+    analyzeKeys(filePath, duration, { spawnFn })
       .catch(() => ({ headKey: null, tailKey: null, harmonicConfidence: 0 })),
   ]);
 
@@ -205,6 +191,7 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
     headBpm: headBpm.bpm ?? null,
     tailBpm: tailBpm.bpm ?? null,
     headBeatOffsetSec: headBpm.firstBeatSec ?? 0,
+    tailBeatOffsetSec: tailBpm.firstBeatSec ?? null,
     headKey: keys.headKey ?? null,
     tailKey: keys.tailKey ?? null,
     harmonicConfidence,

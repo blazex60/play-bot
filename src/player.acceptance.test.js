@@ -441,6 +441,60 @@ test('acceptance (mixer): crossfade arms without cached analysis using fallback 
   await player.stop();
 });
 
+test('acceptance (mixer): crossfade waits until planned startSec', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let startedPlan = null;
+  const durationSec = 4;
+  const analysis = {
+    version: 2,
+    durationSec,
+    lastVocalEndSec: 2.5,
+    vocalConfidence: 0.85,
+    recommendedOverlapSec: 5,
+    tailShape: 'abrupt',
+    confidence: 0.8,
+    bpm: 120,
+    bpmConfidence: 0.6,
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: durationSec,
+    track: createTrack({
+      title: 'Track A',
+      webpageUrl: 'https://example.com/a',
+      duration: durationSec,
+      videoId: 'vid-a',
+    }),
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 250 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: durationSec,
+    videoId: 'vid-b',
+  }));
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  // 20ms frames: 80 reads ≈ 1.6s, still before lastVocalEndSec 2.5.
+  for (let i = 0; i < 80; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(startedPlan, null, 'must not start the fade before lastVocalEndSec');
+  assert.equal(player.mixStream.isCrossfading, false);
+
+  for (let i = 0; i < 80; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.ok(startedPlan, 'expected crossfade after the vocal-safe boundary');
+  assert.ok(startedPlan.startSec >= 2.5);
+  await player.stop();
+});
+
 test('acceptance (mixer): cached lastVocalEnd starts a vocal-free crossfade', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   let startedPlan = null;
@@ -608,5 +662,77 @@ test('acceptance (mixer): trackend handoff reuses prepared incoming', async () =
 
   assert.equal(queue.current.title, 'Track B');
   assert.equal(createCount, 2);
+  await player.stop();
+});
+
+test('acceptance (mixer): persistent analysis cache skips Demucs lookahead', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let analyzeCalls = 0;
+  let prefetchCalls = 0;
+  const analysis = {
+    version: 2,
+    durationSec: 60,
+    lastVocalEndSec: 50,
+    vocalConfidence: 0.85,
+    recommendedOverlapSec: 3,
+    tailShape: 'abrupt',
+    confidence: 0.8,
+    bpm: 120,
+    bpmConfidence: 0.6,
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: async () => {
+      analyzeCalls += 1;
+      return analysis;
+    },
+    prefetchTrackFn: async () => {
+      prefetchCalls += 1;
+      return { filePath: `/tmp/musicbot-prefetch-${prefetchCalls}`, measured: {} };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+    videoId: 'vid-b',
+  }));
+  queue.add(createTrack({
+    title: 'Track C',
+    webpageUrl: 'https://example.com/c',
+    duration: 60,
+    videoId: 'vid-c',
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.equal(analyzeCalls, 0, 'cached version-2 analysis must not launch Demucs');
+  assert.equal(prefetchCalls, 1, 'analysis-only lookahead must not download when cache hits');
+  await player.stop();
+});
+
+test('acceptance (mixer): early queue refill is a single shared attempt', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let calls = 0;
+  const { player } = makePlayer({
+    trackDuration: 3,
+    handleQueueExhausted: async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      return false;
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+  });
+
+  await player.playNext();
+  for (let i = 0; i < 10; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assert.equal(calls, 1, 'arm polls must not start overlapping exhaustion rounds');
   await player.stop();
 });

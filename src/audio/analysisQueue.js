@@ -36,6 +36,7 @@ export function createAnalysisQueue({
   let pauseCount = 0;
   let stoppedAt = 0;
   let underrunSince = null;
+  let spawnEpoch = 0;
 
   function childPids() {
     return [...children].filter((proc) => proc.pid && !proc.killed);
@@ -92,6 +93,7 @@ export function createAnalysisQueue({
   }
 
   function spawnNice(command, args = [], options = {}) {
+    const epoch = spawnEpoch;
     const env = {
       ...process.env,
       ...THREAD_ENV,
@@ -104,6 +106,14 @@ export function createAnalysisQueue({
       proc = spawnFn('nice', ['-n', String(niceLevel), command, ...args], spawnOpts);
     } else {
       proc = spawnFn(command, args, spawnOpts);
+    }
+    if (epoch !== spawnEpoch) {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      return proc;
     }
     return register(proc);
   }
@@ -138,8 +148,16 @@ export function createAnalysisQueue({
     } finally {
       currentReject = null;
       currentAbort = null;
-      running = false;
+      spawnEpoch += 1;
+      for (const proc of childPids()) {
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+      }
       children.clear();
+      running = false;
       paused = false;
       queueMicrotask(pump);
     }
