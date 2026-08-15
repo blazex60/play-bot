@@ -454,6 +454,31 @@ test('PUT /internal/track-analysis writes vocal columns on createMemoryDb withou
   assert.equal(row.analysisSource, 'demucs')
 })
 
+test('PUT /internal/track-analysis maps a write failure through bindRouteError instead of a bare 500', async (t) => {
+  const config = createTestConfig()
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+  const throwingDb = {
+    prepare() {
+      throw new Error('disk full')
+    },
+  }
+  const dedicated = Fastify({ logger: false })
+  await dedicated.register(internalRoutes, { db: throwingDb, token: config.botApi.token })
+  t.after(() => dedicated.close())
+
+  const put = await dedicated.inject({
+    method: 'PUT',
+    url: '/internal/track-analysis/vid-fail',
+    headers: authHeaders(config),
+    payload: { analysis: { version: 3, durationSec: 90 } },
+  })
+  assert.equal(put.statusCode, 500)
+  // bindRouteError's shape ({ error, message }), not Fastify's default
+  // uncaught-error shape ({ statusCode, error: 'Internal Server Error' }).
+  assert.equal(put.json().error, 'disk full')
+})
+
 function fakeGenerateGemini(tracks = [{ title: 'Song A', artist: 'Artist' }]) {
   return {
     available: true,

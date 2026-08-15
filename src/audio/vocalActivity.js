@@ -15,6 +15,12 @@ export const HEAD_WINDOW_SEC = 30;
 export const VOCAL_FRAME_SEC = 0.1;
 export const VOCAL_GAP_MIN_SEC = 1.5;
 export const DEMUCS_MODEL = 'htdemucs';
+// astats' `reset` option is a frame count, not seconds — asetnsamples forces
+// one filter-frame per VOCAL_FRAME_SEC at a known rate so reset=1 actually
+// means "one RMS_level print per 100ms" (see downbeatAnalysis.js for the
+// same fix, and why -loglevel error would also silently drop this output).
+const VOCAL_ENVELOPE_SAMPLE_RATE = 44100;
+const VOCAL_ENVELOPE_SAMPLES_PER_FRAME = Math.round(VOCAL_ENVELOPE_SAMPLE_RATE * VOCAL_FRAME_SEC);
 
 export function parseRmsLevels(stderr) {
   return [...String(stderr ?? '').matchAll(/RMS_level=([-0-9.]+)/g)]
@@ -135,7 +141,9 @@ async function rmsEnvelope(spawnFn, filePath) {
   const { stderr, code } = await spawnCapture(spawnFn, 'ffmpeg', [
     '-hide_banner', '-nostats',
     '-i', filePath,
-    '-af', 'astats=metadata=1:reset=0.1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+    '-af',
+    `aresample=${VOCAL_ENVELOPE_SAMPLE_RATE},asetnsamples=n=${VOCAL_ENVELOPE_SAMPLES_PER_FRAME}:p=0,`
+      + 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
     '-f', 'null', '-',
   ]);
   return {
@@ -170,15 +178,19 @@ async function runDemucsVocals(run, tmpRoot, combinedWav) {
   return path.join(tmpRoot, DEMUCS_MODEL, 'combined', 'vocals.wav');
 }
 
-const EMPTY_RESULT = {
-  ok: false,
-  lastVocalEndSec: null,
-  vocalGaps: [],
-  vocalConfidence: 0,
-  source: 'none',
-  firstVocalStartSec: null,
-  headVocalGaps: [],
-};
+// Factory (not a shared constant): callers/consumers must never be able to
+// mutate one failure's arrays and have that leak into the next call.
+function emptyResult() {
+  return {
+    ok: false,
+    lastVocalEndSec: null,
+    vocalGaps: [],
+    vocalConfidence: 0,
+    source: 'none',
+    firstVocalStartSec: null,
+    headVocalGaps: [],
+  };
+}
 
 /**
  * Analyze both the head window (§2.4 — where does singing start) and the
@@ -195,7 +207,7 @@ export async function analyzeVocalActivity(filePath, {
   queue = null,
   spawnFn = null,
 } = {}) {
-  if (!filePath || !(durationSec > 0)) return EMPTY_RESULT;
+  if (!filePath || !(durationSec > 0)) return emptyResult();
 
   const analysisQueue = queue ?? getAnalysisQueue();
   const run = spawnFn ?? ((cmd, args, options) => analysisQueue.spawn(cmd, args, options));
@@ -212,12 +224,19 @@ export async function analyzeVocalActivity(filePath, {
 
   try {
     const combinedWav = path.join(tmpRoot, 'combined.wav');
-    let tailSegmentStartSec;
+    // Index range each window occupies within the combined clip's envelope,
+    // so both branches below share one slice-then-classify path instead of
+    // treating the whole clip as both windows at once (which leaked
+    // out-of-window activity into firstVocalStartSec/headVocalGaps/vocalGaps
+    // for tracks between headWindowSec and tailWindowSec+headWindowSec long).
+    let headSliceEnd;
+    let tailSliceStart;
 
     if (overlap) {
       const cut = await cutClip(run, filePath, combinedWav);
-      if (cut.code !== 0) return EMPTY_RESULT;
-      tailSegmentStartSec = 0;
+      if (cut.code !== 0) return emptyResult();
+      headSliceEnd = Math.round(headLen / VOCAL_FRAME_SEC);
+      tailSliceStart = Math.round(tailStart / VOCAL_FRAME_SEC);
     } else {
       const headWav = path.join(tmpRoot, 'head.wav');
       const tailWav = path.join(tmpRoot, 'tail.wav');
@@ -225,7 +244,7 @@ export async function analyzeVocalActivity(filePath, {
         cutClip(run, filePath, headWav, { startSec: headStart, lengthSec: headLen }),
         cutClip(run, filePath, tailWav, { startSec: tailStart, lengthSec: tailLen }),
       ]);
-      if (headCut.code !== 0 || tailCut.code !== 0) return EMPTY_RESULT;
+      if (headCut.code !== 0 || tailCut.code !== 0) return emptyResult();
 
       const concat = await spawnCapture(run, 'ffmpeg', [
         '-hide_banner', '-loglevel', 'error',
@@ -233,47 +252,39 @@ export async function analyzeVocalActivity(filePath, {
         '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1',
         combinedWav,
       ]);
-      if (concat.code !== 0) return EMPTY_RESULT;
-      tailSegmentStartSec = headLen;
+      if (concat.code !== 0) return emptyResult();
+      headSliceEnd = Math.round(headLen / VOCAL_FRAME_SEC);
+      tailSliceStart = headSliceEnd;
     }
 
     const vocalsWav = await runDemucsVocals(run, tmpRoot, combinedWav);
-    if (!vocalsWav) return EMPTY_RESULT;
+    if (!vocalsWav) return emptyResult();
 
     const [vocalEnv, mixEnv] = await Promise.all([
       rmsEnvelope(run, vocalsWav),
       rmsEnvelope(run, combinedWav),
     ]);
-    if (!vocalEnv.ok || vocalEnv.levels.length === 0) return EMPTY_RESULT;
+    if (!vocalEnv.ok || vocalEnv.levels.length === 0) return emptyResult();
+    if (!mixEnv.ok || mixEnv.levels.length === 0) return emptyResult();
 
-    if (overlap) {
-      const tailResult = classifyVocalEnvelope({
-        vocalLevels: vocalEnv.levels,
-        mixLevels: mixEnv.levels,
-        tailStartSec: 0,
-      });
-      const headResult = classifyFirstVocalStart({
-        vocalLevels: vocalEnv.levels,
-        mixLevels: mixEnv.levels,
-        headStartSec: 0,
-      });
-      return { ...tailResult, ...headResult };
-    }
+    // In the overlap branch the tail window ends mid-clip (tailStart +
+    // tailLen), not at the envelope's end — the concatenated branch's tail
+    // segment, by contrast, runs to the array end since nothing follows it.
+    const tailSliceEnd = overlap ? Math.round((tailStart + tailLen) / VOCAL_FRAME_SEC) : undefined;
 
-    const splitIndex = Math.round(tailSegmentStartSec / VOCAL_FRAME_SEC);
     const tailResult = classifyVocalEnvelope({
-      vocalLevels: vocalEnv.levels.slice(splitIndex),
-      mixLevels: mixEnv.levels.slice(splitIndex),
+      vocalLevels: vocalEnv.levels.slice(tailSliceStart, tailSliceEnd),
+      mixLevels: mixEnv.levels.slice(tailSliceStart, tailSliceEnd),
       tailStartSec: tailStart,
     });
     const headResult = classifyFirstVocalStart({
-      vocalLevels: vocalEnv.levels.slice(0, splitIndex),
-      mixLevels: mixEnv.levels.slice(0, splitIndex),
+      vocalLevels: vocalEnv.levels.slice(0, headSliceEnd),
+      mixLevels: mixEnv.levels.slice(0, headSliceEnd),
       headStartSec: headStart,
     });
     return { ...tailResult, ...headResult };
   } catch {
-    return EMPTY_RESULT;
+    return emptyResult();
   } finally {
     await rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
   }

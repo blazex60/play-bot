@@ -90,3 +90,53 @@ test('analyzeDownbeats returns an empty grid when filePath or beatGrid is missin
   const empty2 = await analyzeDownbeats('/tmp/track.wav', {});
   assert.deepEqual(empty2.head.downbeatsSec, []);
 });
+
+test('analyzeDownbeats degrades to an empty, zero-confidence grid when the ffmpeg spawn fails', async () => {
+  const spawnFn = () => {
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.kill = () => {};
+    queueMicrotask(() => proc.emit('close', 1));
+    return proc;
+  };
+  const beatsSec = [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5];
+  const result = await analyzeDownbeats('/tmp/track.wav', {
+    durationSec: 200,
+    beatGrid: {
+      head: { startSec: 0, beatsSec },
+      tail: { startSec: 155, beatsSec },
+    },
+    spawnFn,
+  });
+  assert.equal(result.source, 'heuristic');
+  assert.deepEqual(result.head.downbeatsSec, []);
+  assert.deepEqual(result.tail.downbeatsSec, []);
+  assert.equal(result.confidence, 0);
+});
+
+test('analyzeDownbeats selects meter 3 when its accent is unambiguous and 4/4 is a near-tie', async () => {
+  // 9 beats, 0.5s apart. Accent every 3rd beat (0, 1.5s, 3s) -> a clean 3/4
+  // reading. The same beats grouped by 4 straddle the accent almost evenly,
+  // so meter4's own margin comes out near zero (ambiguous).
+  const beatsSec = [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4];
+  const levels = new Array(45).fill(-24);
+  levels[Math.round(0 / DOWNBEAT_FRAME_SEC)] = -6;
+  levels[Math.round(1.5 / DOWNBEAT_FRAME_SEC)] = -6;
+  levels[Math.round(3 / DOWNBEAT_FRAME_SEC)] = -6;
+  const stderr = buildRmsStderr(levels);
+
+  const spawnFn = fakeEnvelopeSpawn([stderr, stderr]);
+  const result = await analyzeDownbeats('/tmp/track.wav', {
+    durationSec: 200,
+    beatGrid: {
+      head: { startSec: 0, beatsSec },
+      tail: { startSec: 155, beatsSec },
+    },
+    spawnFn,
+  });
+
+  assert.equal(result.meter, 3);
+  assert.deepEqual(result.head.downbeatsSec, [0, 1.5, 3]);
+  assert.ok(result.confidence > 0.5, `expected high confidence for a clean 3/4 accent, got ${result.confidence}`);
+});

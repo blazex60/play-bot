@@ -319,11 +319,14 @@ export async function analyzeDownbeats(filePath, {
   return {
     source,
     meter,
-    downbeatsSec,
+    head: { downbeatsSec },
+    tail: { downbeatsSec },
     confidence,
   };
 }
 ```
+
+`downbeatsSec` は head/tail 窓ごとにネストする（`beatGrid.head`/`beatGrid.tail` と同じ形）。単一の `meter` はどちらか confidence の高い窓から選ぶが、選ばれた `meter` で head/tail 双方の `downbeatsSec` を再計算すること — 窓ごとに別々の meter でフィルタした配列を返すと、`meter` フィールドと実際の配列内容が矛盾する。
 
 transition / player 側から backend 固有の実装を見えなくする。
 
@@ -875,7 +878,7 @@ underrun 時:
 
 **child process のみが対象。** downbeat heuristic（6.3、ffmpeg 子プロセス）はこのガードの対象内。essentia キー解析（`keyAnalysisWorker.js`）は worker thread のため対象外（30秒 timeout のみ）— 将来 downbeat を worker thread 化する場合は同じ制約を継承することに注意。
 
-`analyzeTrackFile()`（`trackAnalysis.js:143`）は `player.js:764` から `signal` を渡されているが、現状の関数シグネチャは `signal` を受け取らずキャンセルが no-op になっている。beat grid / downbeat / phrase の解析段が増える前に、この配線を直す（`signal` を destructure し、各非同期ステップの前後で `throwIfAborted` する）。
+**7A で対応済み。** `analyzeTrackFile()`（`trackAnalysis.js`）は `signal` を destructure し、duration 解決後・各 `Promise.all` の後に `throwIfAborted` する。子プロセスの強制終了自体は `analyzeTrackFile()` 側の役割ではない — `analysisQueue.js` の `spawnNice()` が spawn した子プロセスを全て `register()` で追跡し、`pump()` の `finally` が **ジョブの成功・失敗・abort を問わず**追跡中の子プロセスを無条件に SIGKILL する（`analysisQueue.js` の `killCurrent()` / `pump()` 参照）。したがって `analyzeTrackFile()` 内で `signal` を個々の `analyzeTailShape()` / `analyzeBpmWindow()` / `analyzeVocalActivity()` / `analyzeKeys()` 呼び出しへ追加で伝播させる必要はない — 伝播させなくても、queue が kill された時点で子プロセスは即座に殺される。`analyzeTrackFile()` 側の `throwIfAborted` は「もう使われない解析結果の計算・永続化を続けない」ためのものであり、プロセス終了の保証ではない。
 
 ---
 
@@ -1143,7 +1146,7 @@ J-POP を中心に最低 15 transition。
 5. phrase candidate
 6. incoming 側 vocal 解析（head 窓、§2.4）
 7. DB migration
-8. `analyzeTrackFile()` の `signal` 配線修正
+8. `analyzeTrackFile()` の `signal` 配線修正（§14 参照。子プロセスの kill 自体は既存の `analysisQueue.js` が担保しており、`analyzeTrackFile()` 側は「abort 後に無駄な計算/永続化をしない」ための `throwIfAborted` のみで足りる）
 9. unit tests
 
 **この時点では再生音を変更しない。** `bpmConfidence` を含む既存 `planTransition()` の分岐・`MixStream` の挙動は無変更。`src/player.acceptance.test.js` と `src/audio/phase2.test.js` が無変更で通過することを確認する。

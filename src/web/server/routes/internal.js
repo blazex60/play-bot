@@ -137,18 +137,19 @@ export async function internalRoutes(app, {
   })
 
   app.put('/internal/track-analysis/:videoId', async (request, reply) => {
-    if (!db) throw new Error('db is required for internal routes')
-    const { videoId } = request.params ?? {}
-    const analysis = request.body?.analysis
-    if (!videoId || !analysis || typeof analysis !== 'object') {
-      return reply.code(400).send({ error: 'missing_fields' })
-    }
-    const now = nowUnix()
-    // analyzeTrackFile may send ms (legacy) or seconds; store Unix seconds only.
-    const analyzedAtSec = Number.isFinite(analysis.analyzedAt)
-      ? Math.floor(analysis.analyzedAt > 1e11 ? analysis.analyzedAt / 1000 : analysis.analyzedAt)
-      : now
-    db.prepare(`
+    try {
+      if (!db) throw new Error('db is required for internal routes')
+      const { videoId } = request.params ?? {}
+      const analysis = request.body?.analysis
+      if (!videoId || !analysis || typeof analysis !== 'object') {
+        return reply.code(400).send({ error: 'missing_fields' })
+      }
+      const now = nowUnix()
+      // analyzeTrackFile may send ms (legacy) or seconds; store Unix seconds only.
+      const analyzedAtSec = Number.isFinite(analysis.analyzedAt)
+        ? Math.floor(analysis.analyzedAt > 1e11 ? analysis.analyzedAt / 1000 : analysis.analyzedAt)
+        : now
+      db.prepare(`
       INSERT INTO track_analysis (
         video_id, version, duration_sec, tail_shape, last_rms, bpm, bpm_confidence,
         head_key, tail_key, harmonic_confidence, vocal_confidence,
@@ -199,8 +200,11 @@ export async function internalRoutes(app, {
       analysis.downbeatGrid?.confidence ?? null,
       maxPhraseScore(analysis.phrases),
       analysis.downbeatGrid?.meter ?? null,
-    )
-    return reply.send({ ok: true })
+      )
+      return reply.send({ ok: true })
+    } catch (error) {
+      return bindRouteError(reply, error)
+    }
   })
 
   function loadAnalysis(videoId) {

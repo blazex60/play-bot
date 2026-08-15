@@ -87,8 +87,9 @@ test('classifyFirstVocalStart reports a long instrumental gap between two vocal 
 
 // --- analyzeVocalActivity: single Demucs pass covering head + tail ------
 
-function fakeVocalSpawn({ vocalsStderr, mixStderr }) {
+function fakeVocalSpawn({ vocalsStderr, mixStderr, cmds = [] }) {
   return (cmd, args = []) => {
+    cmds.push(cmd);
     const proc = new EventEmitter();
     proc.stdout = new EventEmitter();
     proc.stderr = new EventEmitter();
@@ -122,6 +123,7 @@ test('analyzeVocalActivity runs one Demucs pass and splits head/tail from the co
     ...new Array(30).fill(-8), ...new Array(10).fill(-60), // tail: 40 frames
   ];
   const mixLevels = new Array(vocalsLevels.length).fill(-6);
+  const cmds = [];
 
   const result = await analyzeVocalActivity('/tmp/fake-track.wav', {
     durationSec: 20,
@@ -130,9 +132,11 @@ test('analyzeVocalActivity runs one Demucs pass and splits head/tail from the co
     spawnFn: fakeVocalSpawn({
       vocalsStderr: levelsToStderr(vocalsLevels),
       mixStderr: levelsToStderr(mixLevels),
+      cmds,
     }),
   });
 
+  assert.equal(cmds.filter((c) => c.endsWith('demucs')).length, 1, 'must run exactly one Demucs pass');
   assert.equal(result.ok, true);
   assert.equal(result.source, 'demucs');
   assert.ok(Math.abs(result.firstVocalStartSec - 1.0) < 0.05, `got ${result.firstVocalStartSec}`);
@@ -159,6 +163,40 @@ test('analyzeVocalActivity analyzes the whole clip in one pass when head/tail wi
   assert.equal(result.ok, true);
   assert.ok(Math.abs(result.firstVocalStartSec - 0.5) < 0.05, `got ${result.firstVocalStartSec}`);
   assert.ok(Math.abs(result.lastVocalEndSec - 1.5) < 0.05, `got ${result.lastVocalEndSec}`);
+});
+
+test('analyzeVocalActivity slices the overlap-branch envelope to each window (medium track, gap straddling the boundary)', async () => {
+  // 60s track: headWindowSec=30 -> head=[0,30), tailWindowSec=45 ->
+  // tail=[15,60) -> overlap branch (head and tail both cover [15,30)).
+  // A 2s instrumental gap sits at [29,31), straddling the head/tail
+  // boundary: only 1.0s of it (29-30) is inside the head window (below the
+  // 1.5s VOCAL_GAP_MIN_SEC floor -> no head gap), while the full 2.0s falls
+  // inside the tail window (above the floor -> one tail gap). Before the
+  // slicing fix, both windows were classified from the same full-clip
+  // envelope and would have reported the same (29,31) gap for both.
+  const frameSec = 0.1;
+  const totalFrames = Math.round(60 / frameSec);
+  const gapStartFrame = Math.round(29 / frameSec);
+  const gapEndFrame = Math.round(31 / frameSec);
+  const vocalsLevels = new Array(totalFrames).fill(-8);
+  for (let i = gapStartFrame; i < gapEndFrame; i += 1) vocalsLevels[i] = -60;
+  const mixLevels = new Array(totalFrames).fill(-6);
+
+  const result = await analyzeVocalActivity('/tmp/fake-medium.wav', {
+    durationSec: 60,
+    spawnFn: fakeVocalSpawn({
+      vocalsStderr: levelsToStderr(vocalsLevels),
+      mixStderr: levelsToStderr(mixLevels),
+    }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.firstVocalStartSec, 0);
+  assert.deepEqual(result.headVocalGaps, [], 'the 1.0s visible-in-head portion of the gap is below the reporting floor');
+  assert.equal(result.vocalGaps.length, 1);
+  assert.ok(Math.abs(result.vocalGaps[0].startSec - 29) < 0.05, `got ${result.vocalGaps[0].startSec}`);
+  assert.ok(Math.abs(result.vocalGaps[0].endSec - 31) < 0.05, `got ${result.vocalGaps[0].endSec}`);
+  assert.ok(Math.abs(result.lastVocalEndSec - 60) < 0.05, `got ${result.lastVocalEndSec}`);
 });
 
 test('analyzeVocalActivity returns the neutral empty result when the ffmpeg/Demucs pipeline fails', async () => {

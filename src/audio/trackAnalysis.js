@@ -13,11 +13,23 @@ export const ANALYSIS_VERSION = 3;
 export const HEAD_BPM_WINDOW_SEC = 30;
 export const TAIL_BPM_WINDOW_SEC = 45;
 export const PHRASE_FEATURE_FRAME_SEC = 0.1;
+// astats' `reset` option is a frame count, not seconds — asetnsamples forces
+// one filter-frame per PHRASE_FEATURE_FRAME_SEC at a known rate so reset=1
+// actually means "one RMS_level print per 100ms" (see downbeatAnalysis.js).
+const PHRASE_FEATURE_SAMPLE_RATE = 44100;
+const PHRASE_FEATURE_SAMPLES_PER_FRAME = Math.round(PHRASE_FEATURE_SAMPLE_RATE * PHRASE_FEATURE_FRAME_SEC);
 
-export function bpmTempPath(filePath, startSec, windowSec) {
+/**
+ * `role` (e.g. 'head'/'tail') must be included: for tracks between
+ * HEAD_BPM_WINDOW_SEC and TAIL_BPM_WINDOW_SEC in length, the head and tail
+ * windows can resolve to the same startSec/windowSec, and the two parallel
+ * analyzeBpmWindow() calls would otherwise write/read/unlink the same file.
+ */
+export function bpmTempPath(filePath, startSec, windowSec, role = '') {
   const startMs = Math.round(Math.max(0, startSec) * 1000);
   const windowMs = Math.round(Math.max(0, windowSec) * 1000);
-  return `${filePath}.bpm.${startMs}.${windowMs}.wav`;
+  const roleSuffix = role ? `.${role}` : '';
+  return `${filePath}.bpm${roleSuffix}.${startMs}.${windowMs}.wav`;
 }
 
 function analysisAbortedError() {
@@ -110,12 +122,12 @@ export function beatGridConfidence(beatsSec, windowSec = null) {
 }
 
 /** Exported for direct fixture testing (trackAnalysis.test.js) without pulling in Demucs/essentia. */
-export async function analyzeBpmWindow(filePath, { startSec, windowSec, spawnFn }) {
+export async function analyzeBpmWindow(filePath, { startSec, windowSec, spawnFn, role = '' }) {
   const which = await spawnCapture(spawnFn, 'bash', ['-lc', 'command -v aubiotrack || true']);
   if (!which.stdout.trim()) {
     return { available: false, bpm: null, confidence: 0, firstBeatSec: null, beatCount: 0, beatsSec: [] };
   }
-  const wavPath = bpmTempPath(filePath, startSec, windowSec);
+  const wavPath = bpmTempPath(filePath, startSec, windowSec, role);
   try {
     const conv = await spawnCapture(spawnFn, 'ffmpeg', [
       '-y', '-hide_banner', '-loglevel', 'error',
@@ -149,12 +161,16 @@ export async function analyzeBpmWindow(filePath, { startSec, windowSec, spawnFn 
 }
 
 async function measureRmsEnvelope(filePath, { startSec, windowSec, spawnFn }) {
+  // -nostats (not -loglevel error): see lowBandEnvelope() in downbeatAnalysis.js
+  // for why -loglevel error silently empties the RMS_level stream.
   const { stderr, code } = await spawnCapture(spawnFn, 'ffmpeg', [
-    '-hide_banner', '-loglevel', 'error',
+    '-hide_banner', '-nostats',
     '-ss', String(Math.max(0, startSec)),
     '-t', String(windowSec),
     '-i', filePath,
-    '-af', 'astats=metadata=1:reset=0.1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+    '-af',
+    `aresample=${PHRASE_FEATURE_SAMPLE_RATE},asetnsamples=n=${PHRASE_FEATURE_SAMPLES_PER_FRAME}:p=0,`
+      + 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
     '-f', 'null', '-',
   ]);
   return { ok: code === 0, levels: parseRmsLevels(stderr) };
@@ -244,9 +260,9 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
 
   const [tail, headBpm, tailBpm, vocal, keys] = await Promise.all([
     analyzeTailShape(filePath, duration, spawnFn),
-    analyzeBpmWindow(filePath, { startSec: 0, windowSec: headWindow, spawnFn })
+    analyzeBpmWindow(filePath, { startSec: 0, windowSec: headWindow, spawnFn, role: 'head' })
       .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null, beatsSec: [] })),
-    analyzeBpmWindow(filePath, { startSec: tailStart, windowSec: tailWindow, spawnFn })
+    analyzeBpmWindow(filePath, { startSec: tailStart, windowSec: tailWindow, spawnFn, role: 'tail' })
       .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null, beatsSec: [] })),
     analyzeVocalActivity(filePath, { durationSec: duration, spawnFn })
       .catch(() => ({

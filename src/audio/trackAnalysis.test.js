@@ -21,6 +21,17 @@ test('bpmTempPath distinguishes overlapping start offsets by window length', () 
   assert.match(tail, /\.bpm\.0\.40000\.wav$/)
 })
 
+test('bpmTempPath disambiguates identical startSec/windowSec via role (20-30s tracks: head === tail window)', () => {
+  // For a 25s track, HEAD_BPM_WINDOW_SEC=30 and TAIL_BPM_WINDOW_SEC=45 both
+  // clamp to the same [0, 25] window — without a role suffix the two
+  // parallel analyzeBpmWindow() calls would race on one temp file.
+  const head = bpmTempPath('/tmp/track.m4a', 0, 25, 'head')
+  const tail = bpmTempPath('/tmp/track.m4a', 0, 25, 'tail')
+  assert.notEqual(head, tail)
+  assert.match(head, /\.bpm\.head\.0\.25000\.wav$/)
+  assert.match(tail, /\.bpm\.tail\.0\.25000\.wav$/)
+})
+
 test('analyzeKeys extracts PCM through the provided spawnFn', async () => {
   const cmds = []
   const spawnFn = (cmd) => {
@@ -87,6 +98,22 @@ function hasBinary(cmd) {
 
 const HAS_AUDIO_TOOLS = hasBinary('ffmpeg') && hasBinary('aubiotrack')
 
+/** Synthesizes a click track at `bpm` (a 1kHz click every 60/bpm seconds). */
+function synthesizeClickTrack(destPath, { bpm, durationSec = 8 }) {
+  const periodSec = 60 / bpm
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi',
+      '-i', `aevalsrc=exprs='if(lt(mod(t\\,${periodSec})\\,0.02)\\,sin(2*PI*1000*t)\\,0)':s=44100:d=${durationSec}`,
+      '-ac', '1',
+      destPath,
+    ])
+    proc.on('error', reject)
+    proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`))))
+  })
+}
+
 test(
   '120 BPM click-track fixture yields a beat grid at ~0.5s intervals',
   { skip: !HAS_AUDIO_TOOLS && 'ffmpeg/aubiotrack not installed' },
@@ -95,17 +122,7 @@ test(
     const src = path.join(dir, 'click120.wav')
     try {
       // 120 BPM = a 1kHz click every 0.5s, 8s of audio (~16 beats).
-      await new Promise((resolve, reject) => {
-        const proc = spawn('ffmpeg', [
-          '-hide_banner', '-loglevel', 'error', '-y',
-          '-f', 'lavfi',
-          '-i', "aevalsrc=exprs='if(lt(mod(t\\,0.5)\\,0.02)\\,sin(2*PI*1000*t)\\,0)':s=44100:d=8",
-          '-ac', '1',
-          src,
-        ])
-        proc.on('error', reject)
-        proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`))))
-      })
+      await synthesizeClickTrack(src, { bpm: 120 })
 
       const result = await analyzeBpmWindow(src, { startSec: 0, windowSec: 8, spawnFn: undefined })
       assert.equal(result.available, true)
@@ -135,26 +152,23 @@ test(
   async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'trackanalysis-halfdouble-'))
     const src60 = path.join(dir, 'click60.wav')
+    const src120 = path.join(dir, 'click120.wav')
     try {
-      // 60 BPM = a click every 1.0s.
-      await new Promise((resolve, reject) => {
-        const proc = spawn('ffmpeg', [
-          '-hide_banner', '-loglevel', 'error', '-y',
-          '-f', 'lavfi',
-          '-i', "aevalsrc=exprs='if(lt(mod(t\\,1.0)\\,0.02)\\,sin(2*PI*1000*t)\\,0)':s=44100:d=8",
-          '-ac', '1',
-          src60,
-        ])
-        proc.on('error', reject)
-        proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`))))
-      })
+      await Promise.all([
+        synthesizeClickTrack(src60, { bpm: 60 }),
+        synthesizeClickTrack(src120, { bpm: 120 }),
+      ])
 
-      const result60 = await analyzeBpmWindow(src60, { startSec: 0, windowSec: 8, spawnFn: undefined })
+      const [result60, result120] = await Promise.all([
+        analyzeBpmWindow(src60, { startSec: 0, windowSec: 8, spawnFn: undefined }),
+        analyzeBpmWindow(src120, { startSec: 0, windowSec: 8, spawnFn: undefined }),
+      ])
       assert.ok(result60.bpm > 45 && result60.bpm < 75, `expected ~60 BPM, got ${result60.bpm}`)
+      assert.ok(result120.bpm > 100 && result120.bpm < 140, `expected ~120 BPM, got ${result120.bpm}`)
 
-      // A 120 BPM reading of the same-period signal is what isHalfDouble()
-      // exists to catch when head/tail windows disagree by ~2x.
-      assert.equal(isHalfDouble(result60.bpm, result60.bpm * 2), true)
+      // Two independently-detected grids at a real ~2x tempo ratio is what
+      // isHalfDouble() exists to catch when head/tail windows disagree.
+      assert.equal(isHalfDouble(result60.bpm, result120.bpm), true)
       assert.equal(isHalfDouble(result60.bpm, result60.bpm), false)
     } finally {
       await rm(dir, { recursive: true, force: true })
