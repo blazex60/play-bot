@@ -22,9 +22,23 @@ export const DEMUCS_MODEL = 'htdemucs';
 const VOCAL_ENVELOPE_SAMPLE_RATE = 44100;
 const VOCAL_ENVELOPE_SAMPLES_PER_FRAME = Math.round(VOCAL_ENVELOPE_SAMPLE_RATE * VOCAL_FRAME_SEC);
 
+// A digitally silent 100ms block reports RMS_level=-inf, which the old
+// [-0-9.]+ pattern couldn't match at all — the frame was silently dropped,
+// shifting every later index one position early relative to real time. That
+// broke any fixed-cadence indexing over the result (buildLevelLookup(),
+// vocalActivity's head/tail slice indices, phrase feature lookups). -100dB
+// is safely below every silence/vocal threshold that consumes this array
+// (VOCAL_ABS_DB=-50, PHRASE_SILENCE_DB=-45), so it keeps the same
+// "silent" classification while preserving frame alignment.
+const SILENT_RMS_DB = -100;
+
 export function parseRmsLevels(stderr) {
-  return [...String(stderr ?? '').matchAll(/RMS_level=([-0-9.]+)/g)]
-    .map((m) => Number(m[1]))
+  return [...String(stderr ?? '').matchAll(/RMS_level=(-inf|inf|[-0-9.]+)/g)]
+    .map((m) => {
+      if (m[1] === '-inf') return SILENT_RMS_DB;
+      if (m[1] === 'inf') return -SILENT_RMS_DB;
+      return Number(m[1]);
+    })
     .filter((n) => Number.isFinite(n));
 }
 

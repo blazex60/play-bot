@@ -140,7 +140,13 @@ export async function analyzeBpmWindow(filePath, { startSec, windowSec, spawnFn,
       return { available: true, ok: false, bpm: null, beatCount: 0, confidence: 0, firstBeatSec: null, beatsSec: [] };
     }
     const { stdout, code } = await spawnCapture(spawnFn, 'aubiotrack', ['-i', wavPath]);
-    const beats = stdout.trim().split('\n').map(Number).filter((n) => Number.isFinite(n));
+    // Number('') === 0 (finite), not NaN — an empty aubiotrack stdout (zero
+    // beats detected) would otherwise fabricate a single beat at time 0.
+    const beats = stdout.trim().split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '')
+      .map(Number)
+      .filter((n) => Number.isFinite(n));
     const { bpm, firstBeatSec } = beatsToBpm(beats);
     const absFirst = firstBeatSec != null ? startSec + firstBeatSec : null;
     // Phase 7 §5: keep the timestamps instead of collapsing them into the
@@ -191,11 +197,16 @@ function collectBoundaries(...values) {
   return out;
 }
 
-/** Exported for direct unit testing; also used internally to clamp bpmConfidence. */
+/** Exported for direct unit testing; also used internally to clamp bpmConfidence/beatConfidence. */
 export function isHalfDouble(a, b) {
   if (!(a > 0) || !(b > 0)) return false;
   const ratio = a > b ? a / b : b / a;
   return ratio > 1.8 && ratio < 2.2;
+}
+
+/** Shared clamp applied to both bpmConfidence and beatConfidence when head/tail disagree by ~2x. */
+export function dampIfHalfDouble(confidence, headBpm, tailBpm) {
+  return isHalfDouble(headBpm, tailBpm) ? Math.min(confidence, 0.35) : confidence;
 }
 
 /**
@@ -276,10 +287,11 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
 
   const overlapSec = recommendOverlapSec(tail.shape, duration);
   const bpm = tailBpm.bpm ?? headBpm.bpm ?? null;
-  let bpmConfidence = tailBpm.confidence || headBpm.confidence || 0;
-  if (isHalfDouble(headBpm.bpm, tailBpm.bpm)) {
-    bpmConfidence = Math.min(bpmConfidence, 0.35);
-  }
+  const bpmConfidence = dampIfHalfDouble(
+    tailBpm.confidence || headBpm.confidence || 0,
+    headBpm.bpm,
+    tailBpm.bpm,
+  );
   const vocalConfidence = vocal.vocalConfidence ?? 0;
   const harmonicConfidence = keys.harmonicConfidence ?? 0;
 
@@ -290,7 +302,15 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
   };
   const headBeatConfidence = beatGridConfidence(beatGrid.head.beatsSec, headWindow);
   const tailBeatConfidence = beatGridConfidence(beatGrid.tail.beatsSec, tailWindow);
-  const beatConfidence = Number((((headBeatConfidence + tailBeatConfidence) / 2)).toFixed(3));
+  // Both windows can independently report a tight, regular grid while
+  // describing different (half/double-related) tempos — that's not a
+  // trustworthy beat grid for tempo sync, so dampen it the same way
+  // bpmConfidence already is.
+  const beatConfidence = dampIfHalfDouble(
+    Number((((headBeatConfidence + tailBeatConfidence) / 2)).toFixed(3)),
+    headBpm.bpm,
+    tailBpm.bpm,
+  );
 
   const [downbeatGrid, headFeatures, tailFeatures] = await Promise.all([
     analyzeDownbeats(filePath, { durationSec: duration, beatGrid, spawnFn })

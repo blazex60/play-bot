@@ -11,6 +11,7 @@ import {
   analyzeBpmWindow,
   beatGridConfidence,
   isHalfDouble,
+  dampIfHalfDouble,
 } from './trackAnalysis.js'
 
 test('bpmTempPath distinguishes overlapping start offsets by window length', () => {
@@ -87,6 +88,43 @@ test('isHalfDouble flags a 2x tempo ratio and ignores near-equal or unrelated BP
   assert.equal(isHalfDouble(120, 121), false)
   assert.equal(isHalfDouble(120, 90), false)
   assert.equal(isHalfDouble(null, 120), false)
+})
+
+test('dampIfHalfDouble clamps confidence to 0.35 only when head/tail BPM disagree by ~2x', () => {
+  // Head=60 BPM, tail=120 BPM: each window can independently report a
+  // clean, high-confidence grid while describing different tempos — not a
+  // trustworthy grid for tempo sync.
+  assert.equal(dampIfHalfDouble(0.95, 60, 120), 0.35)
+  assert.equal(dampIfHalfDouble(0.2, 60, 120), 0.2, 'never raises confidence, only clamps it down')
+  assert.equal(dampIfHalfDouble(0.95, 120, 121), 0.95, 'agreeing windows are untouched')
+})
+
+test('empty aubiotrack output does not fabricate a beat at time 0', async () => {
+  // Number('') === 0 (finite, not NaN): splitting an empty stdout on '\n'
+  // yields [''], and mapping that through Number() used to slip a bogus
+  // beat past the Number.isFinite() filter.
+  const spawnFn = (cmd) => {
+    const proc = new EventEmitter()
+    proc.stdout = new EventEmitter()
+    proc.stderr = new EventEmitter()
+    proc.kill = () => {}
+    if (cmd === 'bash') {
+      queueMicrotask(() => {
+        proc.stdout.emit('data', 'aubiotrack\n')
+        proc.emit('close', 0)
+      })
+    } else if (cmd === 'aubiotrack') {
+      queueMicrotask(() => proc.emit('close', 0)) // no stdout data at all -> ''
+    } else {
+      queueMicrotask(() => proc.emit('close', 0)) // ffmpeg conversion "succeeds"
+    }
+    return proc
+  }
+
+  const result = await analyzeBpmWindow('/tmp/fake.wav', { startSec: 0, windowSec: 8, spawnFn })
+  assert.deepEqual(result.beatsSec, [])
+  assert.equal(result.beatCount, 0)
+  assert.equal(result.bpm, null)
 })
 
 // --- Real ffmpeg/aubiotrack fixture (Phase 7 §5 completion condition) --

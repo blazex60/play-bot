@@ -13,6 +13,19 @@ test('parseRmsLevels extracts ffmpeg astats lines', () => {
   assert.deepEqual(levels, [-12.5, -40]);
 });
 
+test('parseRmsLevels preserves -inf frames as a silent value instead of dropping them', () => {
+  // Digital silence reports RMS_level=-inf. Dropping that entry (instead of
+  // keeping a placeholder) shifted every later frame's index one position
+  // early relative to real time, corrupting any fixed-cadence lookup over
+  // the array (buildLevelLookup, head/tail slice indices, phrase features).
+  const levels = parseRmsLevels('RMS_level=-inf\nRMS_level=-12.5\nRMS_level=-inf\nRMS_level=-8.2');
+  assert.equal(levels.length, 4, 'every frame must keep its position, including silent ones');
+  assert.ok(levels[0] < -50, `expected a silent placeholder, got ${levels[0]}`);
+  assert.equal(levels[1], -12.5);
+  assert.ok(levels[2] < -50, `expected a silent placeholder, got ${levels[2]}`);
+  assert.equal(levels[3], -8.2);
+});
+
 test('classifyVocalEnvelope finds last vocal end on a sung outro', () => {
   const vocal = [-8, -8, -8, -45, -60, -60];
   const mix = [-6, -6, -6, -20, -30, -40];
