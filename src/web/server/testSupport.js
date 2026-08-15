@@ -113,7 +113,10 @@ export function createMemoryDb() {
       analyzed_at INTEGER NOT NULL,
       last_vocal_end_sec REAL,
       vocal_gaps_json TEXT,
-      analysis_source TEXT
+      analysis_source TEXT,
+      downbeat_confidence REAL,
+      phrase_confidence REAL,
+      meter INTEGER
     );
     CREATE INDEX idx_track_analysis_analyzed_at
       ON track_analysis(analyzed_at DESC);

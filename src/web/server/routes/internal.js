@@ -31,6 +31,15 @@ function getBearerToken(request) {
   return token
 }
 
+// Phase 7A: phrases.{head,tail} are arrays of scored boundary candidates with
+// no single aggregate value; store the strongest candidate as a scalar so
+// ordering.js can filter without parsing payload_json.
+function maxPhraseScore(phrases) {
+  const candidates = [...(phrases?.head ?? []), ...(phrases?.tail ?? [])]
+  const scores = candidates.map((c) => c?.score).filter((n) => Number.isFinite(n))
+  return scores.length ? Math.max(...scores) : null
+}
+
 function upsertDiscordUser(db, { discordId, username }) {
   const now = nowUnix()
   db.prepare(`
@@ -128,24 +137,26 @@ export async function internalRoutes(app, {
   })
 
   app.put('/internal/track-analysis/:videoId', async (request, reply) => {
-    if (!db) throw new Error('db is required for internal routes')
-    const { videoId } = request.params ?? {}
-    const analysis = request.body?.analysis
-    if (!videoId || !analysis || typeof analysis !== 'object') {
-      return reply.code(400).send({ error: 'missing_fields' })
-    }
-    const now = nowUnix()
-    // analyzeTrackFile may send ms (legacy) or seconds; store Unix seconds only.
-    const analyzedAtSec = Number.isFinite(analysis.analyzedAt)
-      ? Math.floor(analysis.analyzedAt > 1e11 ? analysis.analyzedAt / 1000 : analysis.analyzedAt)
-      : now
-    db.prepare(`
+    try {
+      if (!db) throw new Error('db is required for internal routes')
+      const { videoId } = request.params ?? {}
+      const analysis = request.body?.analysis
+      if (!videoId || !analysis || typeof analysis !== 'object') {
+        return reply.code(400).send({ error: 'missing_fields' })
+      }
+      const now = nowUnix()
+      // analyzeTrackFile may send ms (legacy) or seconds; store Unix seconds only.
+      const analyzedAtSec = Number.isFinite(analysis.analyzedAt)
+        ? Math.floor(analysis.analyzedAt > 1e11 ? analysis.analyzedAt / 1000 : analysis.analyzedAt)
+        : now
+      db.prepare(`
       INSERT INTO track_analysis (
         video_id, version, duration_sec, tail_shape, last_rms, bpm, bpm_confidence,
         head_key, tail_key, harmonic_confidence, vocal_confidence,
         recommended_overlap_sec, confidence, payload_json, analyzed_at,
-        last_vocal_end_sec, vocal_gaps_json, analysis_source
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_vocal_end_sec, vocal_gaps_json, analysis_source,
+        downbeat_confidence, phrase_confidence, meter
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(video_id) DO UPDATE SET
         version = excluded.version,
         duration_sec = excluded.duration_sec,
@@ -163,7 +174,10 @@ export async function internalRoutes(app, {
         analyzed_at = excluded.analyzed_at,
         last_vocal_end_sec = excluded.last_vocal_end_sec,
         vocal_gaps_json = excluded.vocal_gaps_json,
-        analysis_source = excluded.analysis_source
+        analysis_source = excluded.analysis_source,
+        downbeat_confidence = excluded.downbeat_confidence,
+        phrase_confidence = excluded.phrase_confidence,
+        meter = excluded.meter
     `).run(
       videoId,
       analysis.version ?? ANALYSIS_VERSION,
@@ -183,8 +197,14 @@ export async function internalRoutes(app, {
       analysis.lastVocalEndSec ?? null,
       analysis.vocalGaps ? JSON.stringify(analysis.vocalGaps) : null,
       analysis.analysisSource ?? analysis.source ?? null,
-    )
-    return reply.send({ ok: true })
+      analysis.downbeatGrid?.confidence ?? null,
+      maxPhraseScore(analysis.phrases),
+      analysis.downbeatGrid?.meter ?? null,
+      )
+      return reply.send({ ok: true })
+    } catch (error) {
+      return bindRouteError(reply, error)
+    }
   })
 
   function loadAnalysis(videoId) {

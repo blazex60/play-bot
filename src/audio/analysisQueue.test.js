@@ -89,6 +89,31 @@ test('analysisQueue ignores underrunClear from a stream that is not underrunning
   }
 });
 
+test('queue.kill() SIGKILLs a subprocess spawned via spawnNice, even without the job checking signal', async () => {
+  // Regression for PR #31 review: analyzeTrackFile()'s sub-analysis calls do
+  // not thread `signal` down into spawnCapture(), but that's fine because
+  // spawnNice() registers every child, and pump()'s finally block kills all
+  // registered children unconditionally on every job settlement (including
+  // an abort) — independent of whether the job function itself ever reads
+  // `signal`.
+  const queue = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
+  let spawnedProc = null;
+  const job = queue.enqueue(({ spawnNice }) => {
+    spawnedProc = spawnNice('ffmpeg', ['-i', 'in.wav']);
+    // Never resolves on its own — only killCurrent()/abort can end this job,
+    // simulating a job that never inspects `signal`.
+    return new Promise(() => {});
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5)); // let the job start and spawn.
+  assert.ok(spawnedProc, 'expected the job to have spawned a child');
+  assert.equal(spawnedProc.killed, false);
+
+  queue.kill('underrun');
+  await assert.rejects(job, (err) => err.code === 'ANALYSIS_KILLED');
+  assert.equal(spawnedProc.killed, true, 'the spawned child must be killed even though the job never checked signal');
+  assert.equal(spawnedProc.lastSignal, 'SIGKILL');
+});
+
 test('killed analysis callback does not commit after abort', async () => {
   const queue = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
   let committed = false;

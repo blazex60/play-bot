@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { buildWebServer } from '../index.js'
 import { createMemoryDb, createTestConfig } from '../testSupport.js'
+import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
 
 async function setup(t) {
   const db = createMemoryDb()
@@ -237,7 +238,7 @@ test('GET /internal/play-history/recent clamps a negative limit instead of retur
 test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async (t) => {
   const { app, config } = await setup(t)
   const analysis = {
-    version: 2,
+    version: ANALYSIS_VERSION,
     durationSec: 180,
     tailShape: 'fade-out',
     bpm: 128,
@@ -451,6 +452,31 @@ test('PUT /internal/track-analysis writes vocal columns on createMemoryDb withou
   ).get('vid-vocal')
   assert.equal(row.lastVocalEndSec, 80)
   assert.equal(row.analysisSource, 'demucs')
+})
+
+test('PUT /internal/track-analysis maps a write failure through bindRouteError instead of a bare 500', async (t) => {
+  const config = createTestConfig()
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+  const throwingDb = {
+    prepare() {
+      throw new Error('disk full')
+    },
+  }
+  const dedicated = Fastify({ logger: false })
+  await dedicated.register(internalRoutes, { db: throwingDb, token: config.botApi.token })
+  t.after(() => dedicated.close())
+
+  const put = await dedicated.inject({
+    method: 'PUT',
+    url: '/internal/track-analysis/vid-fail',
+    headers: authHeaders(config),
+    payload: { analysis: { version: 3, durationSec: 90 } },
+  })
+  assert.equal(put.statusCode, 500)
+  // bindRouteError's shape ({ error, message }), not Fastify's default
+  // uncaught-error shape ({ statusCode, error: 'Internal Server Error' }).
+  assert.equal(put.json().error, 'disk full')
 })
 
 function fakeGenerateGemini(tracks = [{ title: 'Song A', artist: 'Artist' }]) {
