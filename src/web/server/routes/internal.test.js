@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { buildWebServer } from '../index.js'
 import { createMemoryDb, createTestConfig } from '../testSupport.js'
+import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
 
 async function setup(t) {
   const db = createMemoryDb()
@@ -237,7 +238,7 @@ test('GET /internal/play-history/recent clamps a negative limit instead of retur
 test('PUT/GET /internal/track-analysis stores and returns analysis JSON', async (t) => {
   const { app, config } = await setup(t)
   const analysis = {
-    version: 2,
+    version: ANALYSIS_VERSION,
     durationSec: 180,
     tailShape: 'fade-out',
     bpm: 128,

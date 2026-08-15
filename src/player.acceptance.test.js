@@ -10,6 +10,7 @@ import { triggerTrackEnd } from './player/playbackDrive.js';
 import { makePlayer, nextTurn } from './player/test-helpers.js';
 import { FRAME_BYTES } from './audio/fade.js';
 import { PcmSource } from './audio/pcmSource.js';
+import { ANALYSIS_VERSION } from './audio/trackAnalysis.js';
 import {
   configureSettingsPathForTest,
   getSettingsPathForTest,
@@ -446,7 +447,7 @@ test('acceptance (mixer): crossfade waits until planned startSec', async () => {
   let startedPlan = null;
   const durationSec = 4;
   const analysis = {
-    version: 2,
+    version: ANALYSIS_VERSION,
     durationSec,
     lastVocalEndSec: 2.5,
     vocalConfidence: 0.85,
@@ -500,7 +501,7 @@ test('acceptance (mixer): cached lastVocalEnd starts a vocal-free crossfade', as
   let startedPlan = null;
   const durationSec = 3;
   const analysis = {
-    version: 2,
+    version: ANALYSIS_VERSION,
     durationSec,
     lastVocalEndSec: 1.2,
     vocalConfidence: 0.85,
@@ -706,7 +707,7 @@ test('acceptance (mixer): persistent analysis cache skips Demucs lookahead', asy
   let analyzeCalls = 0;
   let prefetchCalls = 0;
   const analysis = {
-    version: 2,
+    version: ANALYSIS_VERSION,
     durationSec: 60,
     lastVocalEndSec: 50,
     vocalConfidence: 0.85,
@@ -745,7 +746,7 @@ test('acceptance (mixer): persistent analysis cache skips Demucs lookahead', asy
   await player.playNext();
   await new Promise((resolve) => setTimeout(resolve, 80));
 
-  assert.equal(analyzeCalls, 0, 'cached version-2 analysis must not launch Demucs');
+  assert.equal(analyzeCalls, 0, 'cached fresh-version analysis must not launch Demucs');
   assert.equal(prefetchCalls, 1, 'analysis-only lookahead must not download when cache hits');
   await player.stop();
 });
@@ -788,7 +789,7 @@ test('acceptance (mixer): lookahead analysis does not persist YouTube metadata d
     analyzeTrackFileFn: async (_filePath, opts) => {
       seenDurations.push(opts.durationSec);
       return {
-        version: 2,
+        version: ANALYSIS_VERSION,
         durationSec: 54,
         lastVocalEndSec: 50,
         vocalConfidence: 0.8,

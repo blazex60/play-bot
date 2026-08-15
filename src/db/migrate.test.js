@@ -32,3 +32,33 @@ test('runMigrations against createMemoryDb does not fail when 007 columns alread
   assert.ok(cols.includes('vocal_gaps_json'))
   assert.ok(cols.includes('analysis_source'))
 })
+
+test('runMigrations applies 008 beatmix columns', () => {
+  const db = new Database(':memory:')
+  runMigrations(db)
+  const cols = db.prepare('PRAGMA table_info(track_analysis)').all().map((row) => row.name)
+  assert.ok(cols.includes('downbeat_confidence'))
+  assert.ok(cols.includes('phrase_confidence'))
+  assert.ok(cols.includes('meter'))
+})
+
+test('008 beatmix columns can be reapplied when schema_migrations is missing', () => {
+  const db = new Database(':memory:')
+  runMigrations(db)
+  db.prepare("DELETE FROM schema_migrations WHERE version = '008_beatmix_analysis.sql'").run()
+  const result = runMigrations(db)
+  assert.equal(result.applied, 1)
+  const cols = db.prepare('PRAGMA table_info(track_analysis)').all().map((row) => row.name)
+  assert.ok(cols.includes('downbeat_confidence'))
+})
+
+test('runMigrations against createMemoryDb does not fail when 008 columns already exist', async () => {
+  const { createMemoryDb } = await import('../web/server/testSupport.js')
+  const db = createMemoryDb()
+  const result = runMigrations(db)
+  assert.ok(result.applied >= 1)
+  const cols = db.prepare('PRAGMA table_info(track_analysis)').all().map((row) => row.name)
+  assert.ok(cols.includes('downbeat_confidence'))
+  assert.ok(cols.includes('phrase_confidence'))
+  assert.ok(cols.includes('meter'))
+})

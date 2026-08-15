@@ -10,6 +10,8 @@ export const VOCAL_RELATIVE_DB = 25;
 /** Absolute floor — below this, treat as silence even if close to a quiet mix. */
 export const VOCAL_ABS_DB = -50;
 export const TAIL_WINDOW_SEC = 45;
+/** Phase 7 §2.4: entry-point search needs to know where singing starts. */
+export const HEAD_WINDOW_SEC = 30;
 export const VOCAL_FRAME_SEC = 0.1;
 export const VOCAL_GAP_MIN_SEC = 1.5;
 export const DEMUCS_MODEL = 'htdemucs';
@@ -27,6 +29,36 @@ function isVocalFrame(vocalDb, mixDb) {
   return true;
 }
 
+function flagFrames(vocalLevels, mixLevels) {
+  const n = Math.max(vocalLevels.length, mixLevels.length);
+  const flags = [];
+  for (let i = 0; i < n; i += 1) {
+    flags.push(isVocalFrame(vocalLevels[i], mixLevels[i]));
+  }
+  return flags;
+}
+
+function findVocalGaps(flags, anchorSec, frameSec) {
+  const gaps = [];
+  let gapStart = null;
+  for (let i = 0; i < flags.length; i += 1) {
+    if (!flags[i]) {
+      if (gapStart == null) gapStart = i;
+    } else if (gapStart != null) {
+      const startSec = anchorSec + gapStart * frameSec;
+      const endSec = anchorSec + i * frameSec;
+      if (endSec - startSec >= VOCAL_GAP_MIN_SEC) gaps.push({ startSec, endSec });
+      gapStart = null;
+    }
+  }
+  if (gapStart != null) {
+    const startSec = anchorSec + gapStart * frameSec;
+    const endSec = anchorSec + flags.length * frameSec;
+    if (endSec - startSec >= VOCAL_GAP_MIN_SEC) gaps.push({ startSec, endSec });
+  }
+  return gaps;
+}
+
 /**
  * Classify 100ms RMS envelopes from Demucs vocals vs the mix tail.
  * @param {{ vocalLevels: number[], mixLevels: number[], tailStartSec: number, frameSec?: number }} args
@@ -37,11 +69,8 @@ export function classifyVocalEnvelope({
   tailStartSec,
   frameSec = VOCAL_FRAME_SEC,
 }) {
-  const n = Math.max(vocalLevels.length, mixLevels.length);
-  const flags = [];
-  for (let i = 0; i < n; i += 1) {
-    flags.push(isVocalFrame(vocalLevels[i], mixLevels[i]));
-  }
+  const flags = flagFrames(vocalLevels, mixLevels);
+  const n = flags.length;
 
   const vocalConfidence = n >= 5 ? 0.85 : n > 0 ? 0.5 : 0;
   if (flags.every((v) => !v)) {
@@ -62,34 +91,43 @@ export function classifyVocalEnvelope({
   }
   const lastVocalEndSec = tailStartSec + (lastVocalIndex + 1) * frameSec;
 
-  const vocalGaps = [];
-  let gapStart = null;
-  for (let i = 0; i < flags.length; i += 1) {
-    if (!flags[i]) {
-      if (gapStart == null) gapStart = i;
-    } else if (gapStart != null) {
-      const startSec = tailStartSec + gapStart * frameSec;
-      const endSec = tailStartSec + i * frameSec;
-      if (endSec - startSec >= VOCAL_GAP_MIN_SEC) {
-        vocalGaps.push({ startSec, endSec });
-      }
-      gapStart = null;
-    }
-  }
-  if (gapStart != null) {
-    const startSec = tailStartSec + gapStart * frameSec;
-    const endSec = tailStartSec + flags.length * frameSec;
-    if (endSec - startSec >= VOCAL_GAP_MIN_SEC) {
-      vocalGaps.push({ startSec, endSec });
-    }
-  }
-
   return {
     ok: true,
     lastVocalEndSec,
-    vocalGaps,
+    vocalGaps: findVocalGaps(flags, tailStartSec, frameSec),
     vocalConfidence,
     source: 'demucs',
+  };
+}
+
+/**
+ * Head-window counterpart of `classifyVocalEnvelope()` — Phase 7 §2.4/§10
+ * needs to know where singing *starts* (and any silence gaps within the
+ * head window) to pick incoming entry points before the vocal begins.
+ * @param {{ vocalLevels: number[], mixLevels: number[], headStartSec: number, frameSec?: number }} args
+ */
+export function classifyFirstVocalStart({
+  vocalLevels,
+  mixLevels,
+  headStartSec,
+  frameSec = VOCAL_FRAME_SEC,
+}) {
+  const flags = flagFrames(vocalLevels, mixLevels);
+
+  let firstVocalIndex = -1;
+  for (let i = 0; i < flags.length; i += 1) {
+    if (flags[i]) {
+      firstVocalIndex = i;
+      break;
+    }
+  }
+  const firstVocalStartSec = firstVocalIndex === -1
+    ? null
+    : headStartSec + firstVocalIndex * frameSec;
+
+  return {
+    firstVocalStartSec,
+    headVocalGaps: findVocalGaps(flags, headStartSec, frameSec),
   };
 }
 
@@ -111,66 +149,131 @@ function resolveDemucsBin() {
     || (process.env.DEMUCS_VENV ? path.join(process.env.DEMUCS_VENV, 'bin', 'demucs') : 'demucs');
 }
 
+async function cutClip(run, filePath, outPath, { startSec = null, lengthSec = null } = {}) {
+  const args = ['-hide_banner', '-loglevel', 'error'];
+  if (startSec != null) args.push('-ss', String(startSec));
+  args.push('-i', filePath);
+  if (lengthSec != null) args.push('-t', String(lengthSec));
+  args.push('-ac', '2', '-ar', '44100', outPath);
+  return spawnCapture(run, 'ffmpeg', args);
+}
+
+async function runDemucsVocals(run, tmpRoot, combinedWav) {
+  const demucsBin = resolveDemucsBin();
+  const demucs = await spawnCapture(run, demucsBin, [
+    '--two-stems=vocals',
+    '-n', DEMUCS_MODEL,
+    '-o', tmpRoot,
+    combinedWav,
+  ], { timeoutMs: 300_000 });
+  if (demucs.code !== 0) return null;
+  return path.join(tmpRoot, DEMUCS_MODEL, 'combined', 'vocals.wav');
+}
+
+const EMPTY_RESULT = {
+  ok: false,
+  lastVocalEndSec: null,
+  vocalGaps: [],
+  vocalConfidence: 0,
+  source: 'none',
+  firstVocalStartSec: null,
+  headVocalGaps: [],
+};
+
 /**
+ * Analyze both the head window (§2.4 — where does singing start) and the
+ * tail window (Phase 6 — where does singing end) with a *single* Demucs
+ * invocation: the two windows are cut and concatenated into one clip before
+ * separation, instead of running `--two-stems=vocals` twice per track.
  * @param {string} filePath
- * @param {{ durationSec: number, tailWindowSec?: number, queue?: object, spawnFn?: Function }} [opts]
+ * @param {{ durationSec: number, tailWindowSec?: number, headWindowSec?: number, queue?: object, spawnFn?: Function }} [opts]
  */
 export async function analyzeVocalActivity(filePath, {
   durationSec,
   tailWindowSec = TAIL_WINDOW_SEC,
+  headWindowSec = HEAD_WINDOW_SEC,
   queue = null,
   spawnFn = null,
 } = {}) {
-  const empty = {
-    ok: false,
-    lastVocalEndSec: null,
-    vocalGaps: [],
-    vocalConfidence: 0,
-    source: 'none',
-  };
-  if (!filePath || !(durationSec > 0)) return empty;
+  if (!filePath || !(durationSec > 0)) return EMPTY_RESULT;
 
   const analysisQueue = queue ?? getAnalysisQueue();
   const run = spawnFn ?? ((cmd, args, options) => analysisQueue.spawn(cmd, args, options));
 
+  const headStart = 0;
+  const headLen = Math.min(headWindowSec, durationSec);
   const tailStart = Math.max(0, durationSec - tailWindowSec);
+  const tailLen = Math.min(tailWindowSec, durationSec);
+  // Short track: the two windows cover (nearly) the whole file, so there is
+  // nothing to gain from cutting/concatenating — analyze it as one clip.
+  const overlap = headStart + headLen >= tailStart;
+
   const tmpRoot = await mkdtemp(path.join(tmpdir(), 'musicbot-vocal-'));
-  const tailWav = path.join(tmpRoot, 'tail.wav');
 
   try {
-    const cut = await spawnCapture(run, 'ffmpeg', [
-      '-hide_banner', '-loglevel', 'error',
-      '-ss', String(tailStart),
-      '-i', filePath,
-      '-ac', '2',
-      '-ar', '44100',
-      tailWav,
-    ]);
-    if (cut.code !== 0) return empty;
+    const combinedWav = path.join(tmpRoot, 'combined.wav');
+    let tailSegmentStartSec;
 
-    const demucsBin = resolveDemucsBin();
-    const demucs = await spawnCapture(run, demucsBin, [
-      '--two-stems=vocals',
-      '-n', DEMUCS_MODEL,
-      '-o', tmpRoot,
-      tailWav,
-    ], { timeoutMs: 300_000 });
-    if (demucs.code !== 0) return empty;
+    if (overlap) {
+      const cut = await cutClip(run, filePath, combinedWav);
+      if (cut.code !== 0) return EMPTY_RESULT;
+      tailSegmentStartSec = 0;
+    } else {
+      const headWav = path.join(tmpRoot, 'head.wav');
+      const tailWav = path.join(tmpRoot, 'tail.wav');
+      const [headCut, tailCut] = await Promise.all([
+        cutClip(run, filePath, headWav, { startSec: headStart, lengthSec: headLen }),
+        cutClip(run, filePath, tailWav, { startSec: tailStart, lengthSec: tailLen }),
+      ]);
+      if (headCut.code !== 0 || tailCut.code !== 0) return EMPTY_RESULT;
 
-    const vocalsWav = path.join(tmpRoot, DEMUCS_MODEL, 'tail', 'vocals.wav');
+      const concat = await spawnCapture(run, 'ffmpeg', [
+        '-hide_banner', '-loglevel', 'error',
+        '-i', headWav, '-i', tailWav,
+        '-filter_complex', '[0:a][1:a]concat=n=2:v=0:a=1',
+        combinedWav,
+      ]);
+      if (concat.code !== 0) return EMPTY_RESULT;
+      tailSegmentStartSec = headLen;
+    }
+
+    const vocalsWav = await runDemucsVocals(run, tmpRoot, combinedWav);
+    if (!vocalsWav) return EMPTY_RESULT;
+
     const [vocalEnv, mixEnv] = await Promise.all([
       rmsEnvelope(run, vocalsWav),
-      rmsEnvelope(run, tailWav),
+      rmsEnvelope(run, combinedWav),
     ]);
-    if (!vocalEnv.ok || vocalEnv.levels.length === 0) return empty;
+    if (!vocalEnv.ok || vocalEnv.levels.length === 0) return EMPTY_RESULT;
 
-    return classifyVocalEnvelope({
-      vocalLevels: vocalEnv.levels,
-      mixLevels: mixEnv.levels,
+    if (overlap) {
+      const tailResult = classifyVocalEnvelope({
+        vocalLevels: vocalEnv.levels,
+        mixLevels: mixEnv.levels,
+        tailStartSec: 0,
+      });
+      const headResult = classifyFirstVocalStart({
+        vocalLevels: vocalEnv.levels,
+        mixLevels: mixEnv.levels,
+        headStartSec: 0,
+      });
+      return { ...tailResult, ...headResult };
+    }
+
+    const splitIndex = Math.round(tailSegmentStartSec / VOCAL_FRAME_SEC);
+    const tailResult = classifyVocalEnvelope({
+      vocalLevels: vocalEnv.levels.slice(splitIndex),
+      mixLevels: mixEnv.levels.slice(splitIndex),
       tailStartSec: tailStart,
     });
+    const headResult = classifyFirstVocalStart({
+      vocalLevels: vocalEnv.levels.slice(0, splitIndex),
+      mixLevels: mixEnv.levels.slice(0, splitIndex),
+      headStartSec: headStart,
+    });
+    return { ...tailResult, ...headResult };
   } catch {
-    return empty;
+    return EMPTY_RESULT;
   } finally {
     await rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
   }

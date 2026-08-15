@@ -255,7 +255,7 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - `MIXER_ENABLED` フラグと Idle 駆動の旧再生経路を削除し、PCM ミキサーを常時経路にした
 - `stop()` 後は MixStream を作り直し、ウォッチドッグは `state.playbackDuration` の増加と `dropCurrent()` で復旧する
 
-### Phase 6 — 曲ごとの DJ つなぎ 🚧
+### Phase 6 — 曲ごとの DJ つなぎ ✅ 完了（PR #27, #30）
 
 詳細は [`docs/mix-transition-phase6.md`](mix-transition-phase6.md)。
 
@@ -265,6 +265,15 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - 解析は直列キュー。arm はキャッシュのみ（Demucs 待ちでクロスフェードを止めない）
 - essentia.js キーはベストエフォート
 - Guild 単位の `/fade` でクロスフェード / tail-fade を切れる（既定はオン。無効時はギャップレス）
+
+### Phase 7 — Beatmatch / Phrase Mix（Auto DJ 化） 🚧
+
+詳細は [`docs/mix-transition-phase7.md`](mix-transition-phase7.md)。
+
+- BPM の単一値だけでなく beat grid / downbeat / phrase boundary を解析し、tempo sync を伴う `beatmix` を追加する
+- Session tempo 方式（現在の playback BPM に incoming を合わせる）を採用。tempo は spawn 時に確定させ、promotion 後に戻さない
+- tempo matching は ffmpeg 内蔵の `rubberband` フィルタを使う（新規バイナリ依存なし）
+- 7A（analysis foundation）→ 7B（tempo sync）→ 7C（beatmix planner）→ 7D（mix execution）→ 7E（ordering / calibration）の順で実装する
 
 ---
 
@@ -319,4 +328,5 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 3 | ✅ | PR #22。ordering + Gemini refine + `/mix order` |
 | 4 | ✅ | PR #25。`/mix create` + Web 生成 |
 | 5 法務・常時ミキサー | ✅ | privacy / CLAUDE / AGENTS / README。`MIXER_ENABLED` と旧 Idle 経路を削除 |
-| 6 | 🚧 | `docs/mix-transition-phase6.md`。Demucs 末尾ボーカル + tail-fade |
+| 6 | ✅ | PR #27, #30。`docs/mix-transition-phase6.md`。Demucs 末尾ボーカル + tail-fade |
+| 7A | 🚧 | `docs/mix-transition-phase7.md`。analysis v3（beat grid / downbeat / phrase / head vocal） |
