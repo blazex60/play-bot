@@ -501,6 +501,12 @@ export class GuildPlayer {
   }
 
   #resetSessionTempoFor(track) {
+    // Fast path only: #analysisCache is rarely populated synchronously by
+    // the time a track becomes current (analysis is normally scheduled/
+    // fetched afterward — see #scheduleAnalysis / #maybeStartCrossfade).
+    // #maybeApplyAnalysisDuration backfills nativeBpm below once analysis
+    // actually arrives for this track, however it arrives (persisted
+    // lookup, in-memory cache hit, or a freshly completed #runAnalysis).
     const nativeBpm = track?.videoId ? (this.#analysisCache.get(track.videoId)?.bpm ?? null) : null;
     this.#sessionTempo = resetSessionTempo(nativeBpm);
   }
@@ -807,10 +813,18 @@ export class GuildPlayer {
   }
 
   #maybeApplyAnalysisDuration(track, analysis) {
-    if (!analysis?.durationSec) return;
     if (this.#queue.current !== track) return;
-    if (this.#mixStream?.remainingSec == null) {
+    if (analysis?.durationSec && this.#mixStream?.remainingSec == null) {
       this.#mixStream.setDurationSec(analysis.durationSec);
+    }
+    // Phase 7 §8.4: the fast-path #analysisCache read in #resetSessionTempoFor
+    // usually misses (analysis isn't scheduled/fetched until after a track
+    // becomes current) — this is the shared arrival point for all three ways
+    // analysis reaches the current track (persisted lookup, in-memory cache
+    // hit, freshly completed #runAnalysis), so it is where nativeBpm actually
+    // gets backfilled once known.
+    if (analysis?.bpm != null && this.#sessionTempo.nativeBpm == null) {
+      this.#sessionTempo = resetSessionTempo(analysis.bpm);
     }
   }
 

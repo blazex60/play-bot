@@ -80,6 +80,22 @@ test('canTempoMatch rejects unrelated tempos', () => {
   assert.equal(result.ratio, null);
 });
 
+test('canTempoMatch treats the exact soft-limit boundary as normal, not marginal (float rounding)', () => {
+  // 104/100 computes to 1.0400000000000000355... in IEEE 754 — a naive
+  // `deviation > softLimit` comparison pushes the exact 4% boundary into
+  // the marginal tier even though §8.3 means it inclusive ("4%以内").
+  const result = canTempoMatch(100, 104);
+  assert.equal(result.tier, 'normal');
+});
+
+test('canTempoMatch treats the exact hard-limit boundary as still matchable (float rounding)', () => {
+  // 106/100 computes to 1.0600000000000000533... — same rounding issue at
+  // the hard limit ("6%超" = over 6%, so exactly 6% must still be ok).
+  const result = canTempoMatch(100, 106);
+  assert.equal(result.ok, true);
+  assert.equal(result.tier, 'marginal');
+});
+
 test('SOFT_LIMIT_RATIO and HARD_LIMIT_RATIO match Phase 7 §8.3 provisional values', () => {
   assert.equal(SOFT_LIMIT_RATIO, 0.04);
   assert.equal(HARD_LIMIT_RATIO, 0.06);
@@ -105,12 +121,24 @@ test('buildTempoFilter refuses rubberband beyond the hard limit', () => {
   assert.equal(result.backend, null);
 });
 
+test('buildTempoFilter accepts the exact rubberband hard-limit boundary (float rounding)', () => {
+  const result = buildTempoFilter({ nativeBpm: 100, targetBpm: 106, backend: 'rubberband' }); // exactly 6%
+  assert.ok(result.filter);
+  assert.equal(result.backend, 'rubberband');
+});
+
 test('buildTempoFilter restricts atempo to the soft limit (pitch also shifts)', () => {
   const withinSoft = buildTempoFilter({ nativeBpm: 100, targetBpm: 103, backend: 'atempo' }); // 3%
   assert.match(withinSoft.filter, /^atempo=1\.0300$/);
 
   const beyondSoft = buildTempoFilter({ nativeBpm: 100, targetBpm: 105, backend: 'atempo' }); // 5%
   assert.equal(beyondSoft.filter, null);
+});
+
+test('buildTempoFilter accepts the exact atempo soft-limit boundary (float rounding)', () => {
+  const result = buildTempoFilter({ nativeBpm: 100, targetBpm: 104, backend: 'atempo' }); // exactly 4%
+  assert.ok(result.filter);
+  assert.equal(result.backend, 'atempo');
 });
 
 test('buildTempoFilter returns null for an unknown/absent backend', () => {
@@ -163,6 +191,36 @@ test('probeTempoBackend returns null when neither filter nor the command is avai
   resetTempoBackendProbeCache();
   const backend = await probeTempoBackend({ spawnFn: fakeSpawn('', 1) });
   assert.equal(backend, null);
+});
+
+function fakeSpawnError(err) {
+  return () => {
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.kill = () => {};
+    queueMicrotask(() => proc.emit('error', err));
+    return proc;
+  };
+}
+
+test('probeTempoBackend resolves to null (not a rejection) when the ffmpeg spawn itself fails', async () => {
+  resetTempoBackendProbeCache();
+  const backend = await probeTempoBackend({ spawnFn: fakeSpawnError(new Error('ENOENT')) });
+  assert.equal(backend, null);
+});
+
+test('probeTempoBackend does not permanently cache a spawn failure — a later call can still detect the backend', async () => {
+  resetTempoBackendProbeCache();
+  const failed = await probeTempoBackend({ spawnFn: fakeSpawnError(new Error('spawn EAGAIN')) });
+  assert.equal(failed, null);
+
+  // A transient spawn error (unlike a genuine "no rubberband filter" build)
+  // must not disable tempo matching for the rest of the process's life.
+  const recovered = await probeTempoBackend({
+    spawnFn: fakeSpawn(' T.. rubberband      A->A       ...\n'),
+  });
+  assert.equal(recovered, 'rubberband');
 });
 
 test('probeTempoBackend memoizes the result across calls', async () => {

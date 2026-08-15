@@ -3,6 +3,11 @@ import { spawnCapture } from './spawnCapture.js';
 // Phase 7 §8.3 (tempo range, provisional pending real-track calibration in 7E).
 export const SOFT_LIMIT_RATIO = 0.04;
 export const HARD_LIMIT_RATIO = 0.06;
+// Limits are meant to be inclusive ("6%超: beatmix不可" = *over* 6% is
+// rejected). Comparing a float ratio's deviation straight against a limit
+// rejects the exact boundary itself (e.g. 100->106 computes to
+// 0.06000000000000005, not 0.06) due to binary floating-point error.
+const RATIO_EPSILON = 1e-9;
 
 /**
  * Half/double detection (bpmDelta in src/mix/ordering.js) treats an octave
@@ -49,8 +54,8 @@ export function canTempoMatch(nativeBpm, targetBpm, { softLimit = SOFT_LIMIT_RAT
   const ratio = tempoRatio(nativeBpm, targetBpm);
   if (ratio == null) return { ok: false, ratio: null, tier: null };
   const deviation = Math.abs(ratio - 1);
-  if (deviation > hardLimit) return { ok: false, ratio, tier: 'exceeds-hard' };
-  if (deviation > softLimit) return { ok: true, ratio, tier: 'marginal' };
+  if (deviation > hardLimit + RATIO_EPSILON) return { ok: false, ratio, tier: 'exceeds-hard' };
+  if (deviation > softLimit + RATIO_EPSILON) return { ok: true, ratio, tier: 'marginal' };
   return { ok: true, ratio, tier: 'normal' };
 }
 
@@ -67,11 +72,11 @@ export function buildTempoFilter({ nativeBpm, targetBpm, backend = 'rubberband' 
   const deviation = Math.abs(ratio - 1);
 
   if (backend === 'rubberband') {
-    if (deviation > HARD_LIMIT_RATIO) return { filter: null, ratio, backend: null };
+    if (deviation > HARD_LIMIT_RATIO + RATIO_EPSILON) return { filter: null, ratio, backend: null };
     return { filter: `rubberband=tempo=${ratio.toFixed(4)}`, ratio, backend: 'rubberband' };
   }
   if (backend === 'atempo') {
-    if (deviation > SOFT_LIMIT_RATIO) return { filter: null, ratio, backend: null };
+    if (deviation > SOFT_LIMIT_RATIO + RATIO_EPSILON) return { filter: null, ratio, backend: null };
     return { filter: `atempo=${ratio.toFixed(4)}`, ratio, backend: 'atempo' };
   }
   return { filter: null, ratio, backend: null };
@@ -87,14 +92,26 @@ let cachedBackendPromise = null;
  */
 export async function probeTempoBackend({ spawnFn } = {}) {
   if (cachedBackendPromise) return cachedBackendPromise;
-  cachedBackendPromise = (async () => {
-    const { stdout, code } = await spawnCapture(spawnFn, 'ffmpeg', ['-hide_banner', '-filters']);
-    if (code !== 0) return null;
-    if (/\brubberband\b/.test(stdout)) return 'rubberband';
-    if (/\batempo\b/.test(stdout)) return 'atempo';
-    return null;
+  const probe = (async () => {
+    try {
+      const { stdout, code } = await spawnCapture(spawnFn, 'ffmpeg', ['-hide_banner', '-filters']);
+      if (code !== 0) return null;
+      if (/\brubberband\b/.test(stdout)) return 'rubberband';
+      if (/\batempo\b/.test(stdout)) return 'atempo';
+      return null;
+    } catch {
+      // spawnCapture rejects on a spawn error or timeout — that is a
+      // transient condition, not a stable property of the ffmpeg binary
+      // (unlike "no rubberband/atempo filter listed"), so unlike a real
+      // unavailable-backend result it must not be memoized: caching it
+      // would disable tempo matching for the rest of the process's life.
+      return null;
+    }
   })();
-  return cachedBackendPromise;
+  cachedBackendPromise = probe;
+  const result = await probe;
+  if (result == null) cachedBackendPromise = null;
+  return result;
 }
 
 /** Test-only: force the next probeTempoBackend() call to re-probe. */

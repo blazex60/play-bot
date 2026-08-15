@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { AudioPlayerStatus, StreamType } from '@discordjs/voice'
 import { createTrack } from './queue.js'
 import { triggerTrackEnd } from './player/playbackDrive.js'
-import { makePlayer } from './player/test-helpers.js'
+import { makePlayer, nextTurn } from './player/test-helpers.js'
+import { ANALYSIS_VERSION } from './audio/trackAnalysis.js'
 
 // --- Phase 7B §8.4: session tempo bookkeeping (no stretch wired yet) ------
 
@@ -23,15 +24,55 @@ test('GuildPlayer.sessionTempo resets to a fresh native state for each new curre
   const { player, queue } = makePlayer({ track: trackA })
 
   await player.playNext()
+  await nextTurn()
   const afterA = player.sessionTempo
   assert.deepEqual(afterA, { nativeBpm: null, playbackBpm: null, tempoRatio: 1 })
 
   await player.stop()
   queue.add(trackB)
   await player.playNext()
+  await nextTurn()
   const afterB = player.sessionTempo
   assert.deepEqual(afterB, { nativeBpm: null, playbackBpm: null, tempoRatio: 1 })
   assert.notEqual(afterA, afterB, 'each new current track gets a freshly reset session tempo object')
+
+  await player.stop()
+})
+
+test('GuildPlayer.sessionTempo backfills nativeBpm/playbackBpm from cached analysis, read independently per track', async () => {
+  // No duration on the track itself: #resolvePlaybackDurationSec then has
+  // nothing to fall back to, so mixStream.remainingSec stays null and the
+  // crossfade arm timer's `if (remaining == null) await
+  // this.#getCachedAnalysis(current)` branch actually runs — that call is
+  // what reaches #maybeApplyAnalysisDuration and backfills nativeBpm.
+  const trackA = createTrack({
+    title: 'Track A', webpageUrl: 'https://example.com/a', videoId: 'vid-a',
+  })
+  const trackB = createTrack({
+    title: 'Track B', webpageUrl: 'https://example.com/b', videoId: 'vid-b',
+  })
+  const analysisByVideoId = {
+    'vid-a': { version: ANALYSIS_VERSION, durationSec: 60, bpm: 120 },
+    'vid-b': { version: ANALYSIS_VERSION, durationSec: 60, bpm: 95 },
+  }
+  const { player, queue } = makePlayer({
+    track: trackA,
+    // Long enough that the 2-frame default source doesn't end (and advance
+    // the queue) before the crossfade arm timer has a chance to fire.
+    framesPerTrack: 300,
+    getTrackAnalysisFn: async (videoId) => analysisByVideoId[videoId] ?? null,
+  })
+
+  // CROSSFADE_ARM_INTERVAL_MS is 200ms; wait past it.
+  await player.playNext()
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  assert.deepEqual(player.sessionTempo, { nativeBpm: 120, playbackBpm: 120, tempoRatio: 1 })
+
+  await player.stop()
+  queue.add(trackB)
+  await player.playNext()
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  assert.deepEqual(player.sessionTempo, { nativeBpm: 95, playbackBpm: 95, tempoRatio: 1 })
 
   await player.stop()
 })
