@@ -5,6 +5,37 @@ import { createTrack } from './queue.js'
 import { triggerTrackEnd } from './player/playbackDrive.js'
 import { makePlayer } from './player/test-helpers.js'
 
+// --- Phase 7B §8.4: session tempo bookkeeping (no stretch wired yet) ------
+
+test('GuildPlayer.sessionTempo starts unstretched with no known BPM', () => {
+  const { player } = makePlayer()
+
+  assert.deepEqual(player.sessionTempo, { nativeBpm: null, playbackBpm: null, tempoRatio: 1 })
+})
+
+test('GuildPlayer.sessionTempo resets to a fresh native state for each new current track', async () => {
+  const trackA = createTrack({
+    title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a',
+  })
+  const trackB = createTrack({
+    title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b',
+  })
+  const { player, queue } = makePlayer({ track: trackA })
+
+  await player.playNext()
+  const afterA = player.sessionTempo
+  assert.deepEqual(afterA, { nativeBpm: null, playbackBpm: null, tempoRatio: 1 })
+
+  await player.stop()
+  queue.add(trackB)
+  await player.playNext()
+  const afterB = player.sessionTempo
+  assert.deepEqual(afterB, { nativeBpm: null, playbackBpm: null, tempoRatio: 1 })
+  assert.notEqual(afterA, afterB, 'each new current track gets a freshly reset session tempo object')
+
+  await player.stop()
+})
+
 test('GuildPlayer.status reflects the audio player state', () => {
   const { player, audioPlayer } = makePlayer()
 
