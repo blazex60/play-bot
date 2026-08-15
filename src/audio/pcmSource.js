@@ -167,11 +167,15 @@ export class PcmSource extends EventEmitter {
     return source;
   }
 
-  static createFileSource(filePath, { measured, startSec = 0 } = {}) {
+  static createFileSource(filePath, { measured, startSec = 0, tempoFilter = null, spawnFn = spawn } = {}) {
     const source = new PcmSource();
-    const filter = measured
+    const baseFilter = measured
       ? `loudnorm=${LOUDNORM_TARGET}:measured_I=${measured.measured_I}:measured_TP=${measured.measured_TP}:measured_LRA=${measured.measured_LRA}:measured_thresh=${measured.measured_thresh}:offset=${measured.offset}:linear=true`
       : 'anull';
+    // Phase 7 §8.2: append to the existing single -af chain rather than a
+    // second decode pass — tempoFilter is a pre-built fragment (see
+    // buildTempoFilter() in tempo.js), e.g. "rubberband=tempo=1.0167".
+    const filter = tempoFilter ? `${baseFilter},${tempoFilter}` : baseFilter;
 
     const args = [
       '-hide_banner',
@@ -189,7 +193,7 @@ export class PcmSource extends EventEmitter {
       'pipe:1',
     );
 
-    const proc = spawn('ffmpeg', args, {
+    const proc = spawnFn('ffmpeg', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

@@ -17,6 +17,7 @@ import { createStreamSource, createFileSource } from './audio/pcmSource.js';
 import { analyzeTrackFile, ANALYSIS_VERSION } from './audio/trackAnalysis.js';
 import { planTransition, DEFAULT_OVERLAP_SEC } from './audio/transition.js';
 import { probeDurationSec } from './audio/duration.js';
+import { createSessionTempoState, resetSessionTempo } from './audio/tempo.js';
 import { LoopMode } from './queue.js';
 import { getAnalysisQueue } from './audio/analysisQueue.js';
 
@@ -78,6 +79,13 @@ export class GuildPlayer {
   #mixStream = null;
   #mixerResource = null;
   #mixerStarted = false;
+  /**
+   * Phase 7 §8.4: held for the lifetime of the current track. 7B does not
+   * yet stretch anything (no beatmix planner exists to pick a targetBpm) —
+   * this only tracks the native-BPM reset baseline every new current track
+   * starts from, so 7C can call applySessionTempo() from a known-good state.
+   */
+  #sessionTempo = createSessionTempoState();
   #createPcmSourceFn;
   #incomingTempFile = null;
   #analysisCache = new Map();
@@ -234,6 +242,7 @@ export class GuildPlayer {
     if (!this.#mixStream.setCurrent(source, { durationSec })) {
       return;
     }
+    this.#resetSessionTempoFor(track);
     if (!this.#mixerStarted) {
       this.#ensureMixerPlaying();
     }
@@ -355,6 +364,7 @@ export class GuildPlayer {
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
     this.#playbackCount += 1;
+    this.#resetSessionTempoFor(next);
     this.#startCrossfadeArm();
     this.#prefetchUpcoming();
     this.#ensureIncomingPrepForUpcoming();
@@ -462,6 +472,10 @@ export class GuildPlayer {
     this.#playbackCount += 1;
     this.#crossfadeStarted = false;
     this.#mixStream?.setDurationSec(this.#resolvePlaybackDurationSec(nextTrack));
+    // §8.4: promotion without a beatmix transition resets to the new
+    // track's native BPM — 7C's planner is what would carry a stretch
+    // across promotion instead of resetting it.
+    this.#resetSessionTempoFor(nextTrack);
     this.#ensureMixerPlaying();
     this.#startCrossfadeArm();
     this.#prefetchUpcoming();
@@ -480,6 +494,21 @@ export class GuildPlayer {
 
   get positionSec() {
     return this.#mixStream?.positionSec ?? 0;
+  }
+
+  get sessionTempo() {
+    return this.#sessionTempo;
+  }
+
+  #resetSessionTempoFor(track) {
+    // Fast path only: #analysisCache is rarely populated synchronously by
+    // the time a track becomes current (analysis is normally scheduled/
+    // fetched afterward — see #scheduleAnalysis / #maybeStartCrossfade).
+    // #maybeApplyAnalysisDuration backfills nativeBpm below once analysis
+    // actually arrives for this track, however it arrives (persisted
+    // lookup, in-memory cache hit, or a freshly completed #runAnalysis).
+    const nativeBpm = track?.videoId ? (this.#analysisCache.get(track.videoId)?.bpm ?? null) : null;
+    this.#sessionTempo = resetSessionTempo(nativeBpm);
   }
 
   #recordPlay(track) {
@@ -784,10 +813,18 @@ export class GuildPlayer {
   }
 
   #maybeApplyAnalysisDuration(track, analysis) {
-    if (!analysis?.durationSec) return;
     if (this.#queue.current !== track) return;
-    if (this.#mixStream?.remainingSec == null) {
+    if (analysis?.durationSec && this.#mixStream?.remainingSec == null) {
       this.#mixStream.setDurationSec(analysis.durationSec);
+    }
+    // Phase 7 §8.4: the fast-path #analysisCache read in #resetSessionTempoFor
+    // usually misses (analysis isn't scheduled/fetched until after a track
+    // becomes current) — this is the shared arrival point for all three ways
+    // analysis reaches the current track (persisted lookup, in-memory cache
+    // hit, freshly completed #runAnalysis), so it is where nativeBpm actually
+    // gets backfilled once known.
+    if (analysis?.bpm != null && this.#sessionTempo.nativeBpm == null) {
+      this.#sessionTempo = resetSessionTempo(analysis.bpm);
     }
   }
 

@@ -329,4 +329,5 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 4 | ✅ | PR #25。`/mix create` + Web 生成 |
 | 5 法務・常時ミキサー | ✅ | privacy / CLAUDE / AGENTS / README。`MIXER_ENABLED` と旧 Idle 経路を削除 |
 | 6 | ✅ | PR #27, #30。`docs/mix-transition-phase6.md`。Demucs 末尾ボーカル + tail-fade |
-| 7A | 🚧 | `docs/mix-transition-phase7.md`。analysis v3（beat grid / downbeat / phrase / head vocal） |
+| 7A | ✅ | PR #31。`docs/mix-transition-phase7.md`。analysis v3（beat grid / downbeat / phrase / head vocal） |
+| 7B | ✅ | tempo sync 基盤。`src/audio/tempo.js`（tempoRatio/canTempoMatch/buildTempoFilter + rubberband probe）、`PcmSource.createFileSource` の `tempoFilter` オプション、session tempo state。**まだ beatmix planner（7C）へは未接続** — 実際に stretch を適用する呼び出し元はまだ無い |
