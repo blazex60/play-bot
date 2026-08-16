@@ -407,6 +407,77 @@ test('planBeatmixTransition stretches the incoming entry against its head BPM, n
   assert.equal(plan.incoming.tempoRatio, 1); // headBpm already matches targetBpm exactly
 });
 
+test('planBeatmixTransition targets the outgoing tail\'s actual current tempo, not the head BPM it was originally matched to', () => {
+  // Simulates a chained beatmix: the outgoing track was itself spawned as
+  // an incoming track earlier, stretched to match its own head (120) to a
+  // 120 BPM session — so outgoingPlaybackBpm=120, tempoRatio=1 at spawn.
+  // Its native tail is 125, and since that spawn-time ratio (1) carries
+  // through unchanged for its whole remaining playback, the tail is
+  // actually playing at 125 right now, not the 120 it was originally
+  // matched against.
+  const outgoing = makeAnalysis({
+    bpm: 125, // aggregate prefers tailBpm
+    headBpm: 120,
+    tailBpm: 125,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 184, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 125,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: 15,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, { outgoingPlaybackBpm: 120 });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.targetBpm, 125); // the tail's real current tempo, not the stale 120
+});
+
+test('planBeatmixTransition normalizes the outgoing tempo ratio through octaves, not a plain division', () => {
+  // outgoingBpm is a doubled misdetection (240 instead of the real ~120);
+  // outgoingPlaybackBpm=120 reflects this track already having been
+  // correctly session-matched at spawn time. A plain 120/240 division
+  // would treat the source as playing at half its real remaining-time
+  // rate and could schedule an overlap the source can't actually sustain.
+  const outgoing = makeAnalysis({
+    bpm: 240,
+    headBpm: 240,
+    tailBpm: 240,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    // 5s of native room after the exit — at the correct ratio (~1) this
+    // comfortably covers a 4-bar (8s @ 120 BPM) overlap's worth of real
+    // time is NOT actually available, so this alone would still gate the
+    // bar count; the point of this test is only that the ratio used to
+    // convert that room is ~1, not 0.5.
+    phrasesTail: [{ sec: 195, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 122,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: 15,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, {
+    outgoingPlaybackBpm: 120,
+    minOverlapBars: 2,
+  });
+  assert.equal(plan.eligible, true);
+  // 5s of native room / ratio~1 => ~5s playback room => only 2 bars (4s @
+  // 120 BPM) fit, not 4 bars (8s). A naive 120/240=0.5 ratio would have
+  // computed 10s of playback room and wrongly allowed 4 bars.
+  assert.equal(plan.sync.bars, 2);
+});
+
 test('planBeatmixTransition rejects when an entry candidate has almost no forward vocal-free room, even though the entry point itself is safe', () => {
   const outgoing = makeAnalysis({
     bpm: 120,

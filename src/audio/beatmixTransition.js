@@ -1,4 +1,4 @@
-import { canTempoMatch, buildTempoFilter, HARD_LIMIT_RATIO } from './tempo.js';
+import { canTempoMatch, buildTempoFilter, tempoRatio, HARD_LIMIT_RATIO } from './tempo.js';
 import { camelotDistance } from '../mix/camelot.js';
 import { planTransition } from './transition.js';
 
@@ -76,6 +76,28 @@ function entryForwardSafeSec(incoming, entrySec) {
   const gaps = Array.isArray(incoming?.headVocalGaps) ? incoming.headVocalGaps : [];
   const gap = gaps.find((g) => entrySec >= g.startSec - 1e-6 && entrySec <= g.endSec + 1e-6);
   return gap ? gap.endSec - entrySec : 0; // defensive: findEntryCandidates should never offer an unsafe entry
+}
+
+/**
+ * §2.3/§8.4: tempo is fixed once at spawn time and holds for a source's
+ * entire remaining playback. `outgoingPlaybackBpm` reflects the stretch the
+ * outgoing track was spawned with — calibrated against its own HEAD BPM at
+ * whatever earlier transition promoted it to current (see
+ * planBeatmixTransition's incoming.headBpm handling below, which is exactly
+ * that calibration on the other side of a transition). If outgoing's native
+ * head and tail BPM drift apart, that same fixed ratio still carries through
+ * unchanged to the tail — so `outgoingPlaybackBpm` is what the head matched,
+ * not what the tail (where the exit point lives) is actually playing right
+ * now. Reconstructs the tail's real current tempo: nativeTailBpm *
+ * (outgoingPlaybackBpm / nativeHeadBpm). Falls back to `outgoingPlaybackBpm`
+ * unchanged when head/tail BPM isn't available to compute the drift.
+ */
+function outgoingActualTargetBpm(outgoing, outgoingPlaybackBpm) {
+  if (outgoingPlaybackBpm == null) return null;
+  const nativeHead = outgoing?.headBpm;
+  const nativeTail = outgoing?.tailBpm ?? outgoing?.bpm;
+  if (!(nativeHead > 0) || !(nativeTail > 0)) return outgoingPlaybackBpm;
+  return nativeTail * (outgoingPlaybackBpm / nativeHead);
 }
 
 /**
@@ -269,7 +291,7 @@ export function planBeatmixTransition(outgoing, incoming, {
   }
   const beatsPerBar = outgoingMeter ?? incomingMeter ?? 4;
 
-  const targetBpm = outgoingPlaybackBpm ?? outgoingBpm;
+  const targetBpm = outgoingActualTargetBpm(outgoing, outgoingPlaybackBpm) ?? outgoingBpm;
   const match = canTempoMatch(incomingBpm, targetBpm);
   if (!match.ok) return rejected([`tempo-ratio-${match.tier ?? 'unrelated'}`]);
 
@@ -305,8 +327,15 @@ export function planBeatmixTransition(outgoing, incoming, {
   // (a chained beatmix) relative to its native BPM, and incoming stretches
   // by `match.ratio`. Comparing fadeSec against unconverted native seconds
   // would accept an overlap the source doesn't actually have enough
-  // playback time left to cover.
-  const outgoingRatio = targetBpm / outgoingBpm;
+  // playback time left to cover. Uses tempoRatio()'s octave normalization
+  // (not a plain division) for the same reason canTempoMatch() needs it for
+  // incoming: a half/double BPM misdetection between outgoingBpm and
+  // targetBpm would otherwise produce a ratio nowhere near the real stretch
+  // (e.g. detected 240 vs a 120 target naively divides to 0.5, when the
+  // physical stretch is really ~1). Falls back to 1 (assume unstretched) if
+  // the two aren't octave-related at all — a conservative default, not a
+  // silent wrong answer, since native room is what pre-Phase-7C code always used.
+  const outgoingRatio = tempoRatio(outgoingBpm, targetBpm) ?? 1;
 
   let best = null;
   for (const exit of exitCandidates) {
