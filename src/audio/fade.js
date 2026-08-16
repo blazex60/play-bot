@@ -57,23 +57,27 @@ export function blendFrame(dry, wet, mix) {
 }
 
 /**
- * Soft-clip samples in-place on an Int16 interleaved stereo frame. Unity
- * (no change) below the ceiling — only samples that would otherwise exceed
- * it get the cubic soft-clip curve. The curve itself is not unity-gain
- * everywhere (e.g. ~0.8dB down at half scale), so applying it unconditionally
- * would attenuate and add harmonic distortion to audio nowhere near clipping.
+ * Soft-knee limiter on an Int16 interleaved stereo frame, in-place. Unity
+ * (no change) below `ceiling`; above it, the excess is compressed through
+ * tanh() so the transfer function stays continuous (value and slope) right
+ * at the threshold — a hard switch from unity to a curve (as in an earlier
+ * version of this function) creates a large discontinuity exactly at the
+ * boundary, which is audible as a click/crackle whenever a waveform hovers
+ * near the ceiling. tanh asymptotically approaches ceiling + headroom (< 1)
+ * as excess grows, so output never reaches full scale.
  */
 export function softLimitFrame(frame, ceiling = 0.95) {
   const view = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2);
-  const max = 32767 * ceiling;
+  const threshold = ceiling;
+  const headroom = 1 - threshold;
   for (let i = 0; i < view.length; i++) {
-    const sample = view[i];
-    if (sample <= max && sample >= -max) continue;
-    const x = sample / 32768;
-    // cubic soft clip
-    const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
-    const scaled = y * 32768;
-    view[i] = scaled > max ? max : scaled < -max ? -max : scaled;
+    const x = view[i] / 32768;
+    const abs = x < 0 ? -x : x;
+    if (abs <= threshold) continue;
+    const excess = abs - threshold;
+    const compressed = headroom * Math.tanh(excess / headroom);
+    const y = (threshold + compressed) * (x < 0 ? -1 : 1);
+    view[i] = Math.round(y * 32768);
   }
   return frame;
 }

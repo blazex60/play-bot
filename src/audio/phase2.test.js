@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { gainForPosition, mixFrames, FRAME_BYTES, OVERLAP_GAIN, blendFrame } from './fade.js';
+import { gainForPosition, mixFrames, FRAME_BYTES, OVERLAP_GAIN, blendFrame, softLimitFrame } from './fade.js';
 import { planTransition, snapStartToBar } from './transition.js';
 import { recommendOverlapSec } from './trackAnalysis.js';
 import { designHighpass, createBiquadProcessor } from './eq.js';
@@ -562,7 +562,7 @@ test('MixStream non-beatmix crossfade applies base-swap EQ fully on the very fir
   mix.endMixer();
 });
 
-test('MixStream tail-fade soft-limits near-full-scale input instead of a hard clamp', async () => {
+test('MixStream tail-fade soft-limits near-full-scale input with a gentle knee (not a hard clamp)', async () => {
   const mix = new MixStream();
   const loud = Buffer.alloc(FRAME_BYTES);
   const loudView = new Int16Array(loud.buffer);
@@ -571,13 +571,36 @@ test('MixStream tail-fade soft-limits near-full-scale input instead of a hard cl
   const incoming = PcmSource.fromBuffers(Array.from({ length: 5 }, () => Buffer.from(loud)));
 
   assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  // Prime: a Readable queues one frame from _read() before any source is
+  // attached (an all-zero silence frame) — without draining it first, the
+  // very next read() returns that stale silence instead of a real tail-fade
+  // frame, and a peak-only-upper-bound assertion would pass on it vacuously.
+  assert.ok(await readFramePaused(mix));
   assert.equal(mix.startCrossfade(incoming, { fadeSec: 5, curve: 'equal-power', mode: 'tail-fade' }), true);
 
   const frame = await readFramePaused(mix);
   const view = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2);
   const peak = Math.max(...Array.from(view, Math.abs));
-  // outGain ~1 at the very start of the fade: scaleFrame() alone would leave
-  // this near 32000; the cubic soft-clip curve pulls it down well below that.
-  assert.ok(peak < 25000, `expected the cubic soft-clip curve to engage, got peak ${peak}`);
+  // outGain ~1 at the very start of the fade: 32000 sits above the ~31130
+  // (0.95 ceiling) threshold, so the soft-knee limiter engages — but only
+  // gently (tanh saturation), not the old aggressive whole-range cubic curve.
+  assert.ok(peak < 32000, `expected the limiter to engage at all, got peak ${peak}`);
+  assert.ok(peak > 31000, `expected a gentle knee near the ceiling, not heavy compression, got peak ${peak}`);
   mix.endMixer();
+});
+
+test('softLimitFrame is continuous across the ceiling threshold (no discontinuity)', () => {
+  // Round-2 regression: an earlier version switched abruptly from unity to
+  // the cubic curve exactly at the ceiling, so a sample of 31129 stayed
+  // unchanged while 31130 jumped to ~21764 — audible as a click whenever a
+  // waveform hovers near the threshold.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const view = new Int16Array(frame.buffer);
+  view[0] = 31129;
+  view[1] = 31130;
+  softLimitFrame(frame, 0.95);
+  assert.ok(
+    Math.abs(view[0] - view[1]) <= 2,
+    `expected adjacent inputs straddling the threshold to stay adjacent after limiting, got ${view[0]} vs ${view[1]}`,
+  );
 });

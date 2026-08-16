@@ -223,6 +223,26 @@ test('probeTempoBackend does not permanently cache a spawn failure — a later c
   assert.equal(recovered, 'rubberband');
 });
 
+test('probeTempoBackend memoizes a conclusive "neither filter" result (exit 0, clean run)', async () => {
+  // Round-2 regression: unlike a nonzero exit or thrown spawn error (both
+  // transient, correctly uncached above), a clean run that simply lists
+  // neither filter is a stable fact about this ffmpeg binary — player.js
+  // polls this once per 200ms arm tick whenever a candidate pair has BPM
+  // data, so failing to cache this specific null re-spawns `ffmpeg -filters`
+  // every tick for as long as that candidate is considered.
+  resetTempoBackendProbeCache();
+  let calls = 0;
+  const spawnFn = (...args) => {
+    calls += 1;
+    return fakeSpawn(' T.. volume           A->A       Change input volume.\n')(...args);
+  };
+  const first = await probeTempoBackend({ spawnFn });
+  const second = await probeTempoBackend({ spawnFn });
+  assert.equal(first, null);
+  assert.equal(second, null);
+  assert.equal(calls, 1, 'ffmpeg -filters should only be spawned once for a conclusive null');
+});
+
 test('probeTempoBackend memoizes the result across calls', async () => {
   resetTempoBackendProbeCache();
   let calls = 0;

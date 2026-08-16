@@ -18,6 +18,7 @@ import { analyzeTrackFile, ANALYSIS_VERSION } from './audio/trackAnalysis.js';
 import { planBeatSyncedTransition } from './audio/beatmixTransition.js';
 import { probeDurationSec } from './audio/duration.js';
 import { createSessionTempoState, resetSessionTempo, probeTempoBackend, compensateDurationSec } from './audio/tempo.js';
+import { TAIL_WINDOW_SEC } from './audio/vocalActivity.js';
 import { LoopMode } from './queue.js';
 import { getAnalysisQueue } from './audio/analysisQueue.js';
 
@@ -28,11 +29,17 @@ const CROSSFADE_PREP_LEAD_SEC = 15;
 const MAX_CROSSFADE_SEC = 6;
 /**
  * Phase 7D: covers the arm loop's early-return gate for both legacy
- * crossfade (MAX_CROSSFADE_SEC) and beatmix, whose overlap (up to
- * BEATMIX_OVERLAP_BARS bars) can exceed 6s at slower tempos — 20s covers 4
- * bars down to 48 BPM. Real-track calibration is Phase 7E's job.
+ * crossfade (MAX_CROSSFADE_SEC) and beatmix/phrase-crossfade. Exit
+ * candidates come from findExitCandidates()'s search over the tail analysis
+ * window (TAIL_WINDOW_SEC, e.g. 45s before EOF, §5) — the gate must open
+ * before `remaining` drops below the earliest possible candidate position,
+ * or planning (and therefore #ensureIncomingPrep) never runs early enough:
+ * by the time the gate finally opened, positionSec could already be PAST a
+ * candidate exitStartSec near the far edge of that window, forcing an
+ * immediate/late fade instead of the planned downbeat-aligned one (Codex
+ * round-2). A fixed overlap-length guess (e.g. 20s) undercounts this.
  */
-const MAX_TRANSITION_LEAD_SEC = 20;
+const MAX_TRANSITION_LEAD_SEC = TAIL_WINDOW_SEC;
 const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
@@ -190,6 +197,14 @@ export class GuildPlayer {
   #probeTempoBackendFn;
   #createPcmSourceFn;
   #incomingTempFile = null;
+  /**
+   * Loudnorm measurement for #incomingTempFile, cached alongside it so a
+   * re-prep for the SAME track with different startSec/tempoFilter (a
+   * beatmix plan replacing the eager default prep) can respawn just the
+   * ffmpeg decoder on the already-downloaded file instead of re-running the
+   * full yt-dlp fetch + loudnorm measurement pass (Codex round-2).
+   */
+  #incomingMeasured = null;
   #analysisCache = new Map();
   #analysisMissAt = new Map();
   #probedDurationCache = new Map();
@@ -461,12 +476,18 @@ export class GuildPlayer {
     // crossfade itself never armed in time — a natural end-of-stream raced
     // it. Adopting the source without carrying that stretch forward would
     // desync session tempo bookkeeping from what is actually playing.
-    const promotedTempo = this.#preparedIncoming.prep?.sessionTempo ?? null;
+    // Same tempoHonored check as #maybeStartCrossfade (Codex round-2): if
+    // prep fell back to createStreamSource, the prep record still describes
+    // the ORIGINALLY-REQUESTED startSec/tempoFilter, not what the source
+    // actually does — trusting it here would corrupt duration/tempo
+    // bookkeeping the same way an unchecked stash would in the crossfade path.
+    const sourceHonorsPlan = source.tempoHonored !== false;
+    const promotedTempo = sourceHonorsPlan ? (this.#preparedIncoming.prep?.sessionTempo ?? null) : null;
     const tempoRatio = promotedTempo?.tempoRatio ?? 1;
     // Same native-seek-offset subtraction as #onCrossfadePromoted (Codex
     // round-1 P1) — this source may have been spawned with startSec baked
     // in even though it's being adopted outside a crossfade.
-    const entrySec = this.#preparedIncoming.prep?.startSec ?? 0;
+    const entrySec = sourceHonorsPlan ? (this.#preparedIncoming.prep?.startSec ?? 0) : 0;
     const nativeDurationSec = this.#resolvePlaybackDurationSec(next);
     const remainingNativeDurationSec = nativeDurationSec != null
       ? Math.max(0, nativeDurationSec - entrySec)
@@ -483,6 +504,7 @@ export class GuildPlayer {
     const outgoingTemp = this.#currentTempFile;
     this.#currentTempFile = this.#incomingTempFile;
     this.#incomingTempFile = null;
+    this.#incomingMeasured = null;
 
     if (this.#queue.loopMode !== LoopMode.TRACK && this.#queue.current !== next) {
       this.#queue.next({ forceAdvance: true });
@@ -599,6 +621,7 @@ export class GuildPlayer {
     const outgoingTemp = this.#currentTempFile;
     this.#currentTempFile = this.#incomingTempFile;
     this.#incomingTempFile = null;
+    this.#incomingMeasured = null;
 
     const nextTrack = this.#queue.current;
     if (!nextTrack) {
@@ -877,6 +900,7 @@ export class GuildPlayer {
           throw cancelErr;
         }
         this.#incomingTempFile = prefetched.filePath;
+        this.#incomingMeasured = prefetched.measured;
       } else {
         this.#currentTempFile = prefetched.filePath;
       }
@@ -1004,6 +1028,18 @@ export class GuildPlayer {
     }
   }
 
+  /** Destroys a prepared entry's source, resolved or still in flight. */
+  #destroyPreparedSource(entry) {
+    if (!entry) return;
+    if (entry.source) {
+      entry.source.destroy?.();
+    } else if (entry.promise) {
+      entry.promise.then((resolved) => {
+        resolved?.destroy?.();
+      }).catch(() => {});
+    }
+  }
+
   #clearPreparedIncoming() {
     // Invalidate in-flight createPcmSource so it won't assign #incomingTempFile
     // after cancel (stop / skip / replace prep / playNextMixer).
@@ -1011,16 +1047,10 @@ export class GuildPlayer {
     if (!this.#preparedIncoming) return;
     const pending = this.#preparedIncoming;
     this.#preparedIncoming = null;
-    const source = pending.source;
-    if (source) {
-      source.destroy?.();
-    } else {
-      pending.promise.then((resolved) => {
-        resolved?.destroy?.();
-      }).catch(() => {});
-    }
+    this.#destroyPreparedSource(pending);
     const filePath = this.#incomingTempFile;
     this.#incomingTempFile = null;
+    this.#incomingMeasured = null;
     if (filePath) {
       cleanupTempFile(filePath).catch((err) => {
         console.error('[GuildPlayer] prepared incoming temp cleanup error:', err);
@@ -1042,9 +1072,35 @@ export class GuildPlayer {
       && this.#preparedIncoming.prep?.startSec === startSec
       && this.#preparedIncoming.prep?.tempoFilter === tempoFilter
     ) return;
+
+    const entry = { track: next, source: null, promise: null, prep: { startSec, tempoFilter, sessionTempo } };
+
+    // Reuse the already-downloaded/normalized file for the SAME track when
+    // only startSec/tempoFilter changed (e.g. a beatmix plan replacing the
+    // eager default prep) — #clearPreparedIncoming() below would otherwise
+    // delete #incomingTempFile, and #getPrefetchedOrFetch() consumes (and
+    // deletes) its prefetch map entry on first use, so a full #createPcmSource
+    // re-run would re-download + re-normalize a file already on disk.
+    if (
+      this.#preparedIncoming?.track === next
+      && this.#incomingTempFile != null
+      && this.#incomingMeasured != null
+    ) {
+      this.#destroyPreparedSource(this.#preparedIncoming);
+      const source = createFileSource(this.#incomingTempFile, {
+        measured: this.#incomingMeasured,
+        startSec,
+        tempoFilter,
+      });
+      source.tempoHonored = true;
+      entry.source = source;
+      entry.promise = Promise.resolve(source);
+      this.#preparedIncoming = entry;
+      return;
+    }
+
     this.#clearPreparedIncoming();
     const prepId = this.#incomingPrepId;
-    const entry = { track: next, source: null, promise: null, prep: { startSec, tempoFilter, sessionTempo } };
     entry.promise = this.#createPcmSource(next, { forIncoming: true, prepId, startSec, tempoFilter })
       .then((resolved) => {
         if (this.#preparedIncoming === entry) {
@@ -1073,6 +1129,7 @@ export class GuildPlayer {
       if (forPlayback && this.#incomingTempFile) {
         this.#currentTempFile = this.#incomingTempFile;
         this.#incomingTempFile = null;
+        this.#incomingMeasured = null;
       }
       return source;
     }
@@ -1230,6 +1287,16 @@ export class GuildPlayer {
       const sourceHonorsPlan = source.tempoHonored !== false;
       const pendingSessionTempo = sourceHonorsPlan ? norm.sessionTempo : null;
       const pendingEntrySec = sourceHonorsPlan ? norm.entrySec : 0;
+      // A beatmix plan's bar-envelope EQ (targetBpm/sync/eq.swapBar) assumes
+      // the incoming audio actually IS the seeked/tempo-matched stream it
+      // was computed for — running that bar-timed EQ ramp against unseeked,
+      // native-tempo audio would swap bass at a point with no relation to
+      // its real downbeats. Downgrade to a plain crossfade (no bar envelope,
+      // instant EQ like the legacy path) rather than executing a "beatmix"
+      // that isn't actually beat-synced.
+      const mixPlan = (!sourceHonorsPlan && norm.mixPlan.mode === 'beatmix')
+        ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null }
+        : norm.mixPlan;
 
       // Set promotion state BEFORE calling startCrossfade(): if the outgoing
       // source is already at EOF, startCrossfade()'s synchronous
@@ -1242,7 +1309,7 @@ export class GuildPlayer {
       this.#crossfadeTargetTrack = next;
       this.#crossfadeStarted = true;
 
-      const started = this.#mixStream.startCrossfade(source, norm.mixPlan);
+      const started = this.#mixStream.startCrossfade(source, mixPlan);
       if (!started) {
         this.#pendingSessionTempo = null;
         this.#pendingIncomingEntrySec = 0;
@@ -1260,6 +1327,7 @@ export class GuildPlayer {
   async #cleanupIncomingTempFile() {
     const filePath = this.#incomingTempFile;
     this.#incomingTempFile = null;
+    this.#incomingMeasured = null;
     if (filePath) {
       await cleanupTempFile(filePath);
     }

@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { AudioPlayerStatus } from '@discordjs/voice';
-import { LoopMode, createTrack } from './queue.js';
+import { LoopMode, createTrack, GuildQueue } from './queue.js';
 import { isShortTrack, shouldReconnectRetry } from './player/playbackPolicy.js';
 import { triggerTrackEnd } from './player/playbackDrive.js';
-import { makePlayer, nextTurn } from './player/test-helpers.js';
+import { makePlayer, makeAudioPlayer, nextTurn } from './player/test-helpers.js';
+import { GuildPlayer } from './player.js';
 import { FRAME_BYTES } from './audio/fade.js';
 import { PcmSource } from './audio/pcmSource.js';
 import { ANALYSIS_VERSION } from './audio/trackAnalysis.js';
@@ -713,6 +715,121 @@ test('acceptance (mixer): an unavailable tempo backend rejects beatmix instead o
   await player.stop();
 });
 
+function spawnBuffered(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d; });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0) reject(new Error(stderr.trim() || `${cmd} exited ${code}`));
+      else resolve({ stderr });
+    });
+  });
+}
+
+test('acceptance (mixer): re-prepping the same incoming track for a beatmix plan reuses the already-downloaded file', async () => {
+  // Codex round-2: #ensureIncomingPrep's mismatch-triggered re-prep must not
+  // delete and re-fetch a file the eager default prep already downloaded —
+  // exercises the REAL #createPcmSource normalize pipeline (no
+  // createPcmSourceFn override), so prefetchTrackFn/createFileSource really
+  // run against an on-disk file.
+  const dir = await mkdtemp(join(tmpdir(), 'music-bot-reuse-test-'));
+  const filePath = join(dir, 'track-b.wav');
+  try {
+    await spawnBuffered('ffmpeg', [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=8',
+      filePath,
+    ]);
+
+    let prefetchCalls = 0;
+    let startedPlan = null;
+    const outgoingAnalysis = {
+      version: ANALYSIS_VERSION,
+      durationSec: 8,
+      lastVocalEndSec: 1.0,
+      vocalConfidence: 0.85,
+      confidence: 0.8,
+      bpm: 120,
+      beatConfidence: 0.7,
+      downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+      phrases: { tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], head: [] },
+      analysisSource: 'demucs',
+    };
+    const incomingAnalysis = {
+      version: ANALYSIS_VERSION,
+      durationSec: 8,
+      firstVocalStartSec: 5.0,
+      headVocalGaps: [],
+      vocalConfidence: 0.85,
+      confidence: 0.8,
+      bpm: 120,
+      headBpm: 120,
+      beatConfidence: 0.7,
+      downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+      phrases: { head: [{ sec: 0.2, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }], tail: [] },
+      analysisSource: 'demucs',
+    };
+
+    // Constructed directly (not via makePlayer()) because makePlayer always
+    // supplies a default createPcmSourceFn mock when none is given, which
+    // short-circuits #createPcmSource before it ever reaches the real
+    // normalize/prefetch pipeline this test needs to exercise.
+    const audioPlayer = makeAudioPlayer();
+    const queue = new GuildQueue();
+    queue.add(createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }));
+    const player = new GuildPlayer({
+      guildId: 'guild-1',
+      queue,
+      audioPlayer,
+      getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+      analyzeTrackFileFn: null,
+      probeTempoBackendFn: async () => 'rubberband',
+      prefetchTrackFn: async (track) => {
+        if (track.videoId === 'vid-b') prefetchCalls += 1;
+        return {
+          filePath,
+          measured: { measured_I: -16, measured_TP: -1.5, measured_LRA: 11, measured_thresh: -30, offset: 0 },
+        };
+      },
+      connection: { subscribe() {} },
+      onDisconnect: async () => {},
+      resolveAudioStreamFn(url) { return { url }; },
+      createAudioResourceFn(stream, options) { return { stream, options, playStream: { destroy() {} } }; },
+    });
+    queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+    player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+    await player.playNext();
+    // Let the eager default prep (#ensureIncomingPrepForUpcoming, startSec=0)
+    // for Track B finish downloading/normalizing first. Real ffmpeg spawn +
+    // decode, unlike the mocked PcmSource used elsewhere, needs actual
+    // wall-clock time.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(prefetchCalls, 1, 'expected the eager default prep to fetch Track B once');
+
+    // remaining (8s) is already inside the beatmix plan's prepWindow from the
+    // very first arm tick (fadeSec + CROSSFADE_PREP_LEAD_SEC = 19s), so the
+    // re-prep decision — reuse vs re-fetch — happens on the first tick after
+    // playNext, well before positionSec would ever reach the plan's
+    // exitStartSec. No need to drive frames through a full crossfade to
+    // observe it; just give the 200ms arm timer a couple of ticks.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    assert.equal(
+      prefetchCalls,
+      1,
+      'expected the beatmix re-prep to reuse the already-downloaded file, not re-fetch it',
+    );
+
+    await player.stop();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('acceptance (mixer): /fade off skips crossfade and stays gapless', async () => {
   const previousSettingsPath = getSettingsPathForTest();
   const dir = await mkdtemp(join(tmpdir(), 'music-bot-fade-player-test-'));
@@ -788,10 +905,14 @@ test('acceptance (mixer): disabling fade during arm prevents a late startCrossfa
 });
 
 test('acceptance (mixer): crossfade timer defers analysis until the transition window', async () => {
+  // Phase 7D round-2: the arm loop's early-return gate now covers
+  // CROSSFADE_PREP_LEAD_SEC + MAX_TRANSITION_LEAD_SEC (TAIL_WINDOW_SEC =
+  // 45s), so remaining must exceed 60s for the gate to still be closed at
+  // the start — a 60s track sits exactly ON that boundary.
   const frame = Buffer.alloc(FRAME_BYTES);
   let analysisRequests = 0;
   const { player, queue } = makePlayer({
-    trackDuration: 60,
+    trackDuration: 90,
     getTrackAnalysisFn: async () => {
       analysisRequests += 1;
       return null;
@@ -802,7 +923,7 @@ test('acceptance (mixer): crossfade timer defers analysis until the transition w
   queue.add(createTrack({
     title: 'Track B',
     webpageUrl: 'https://example.com/b',
-    duration: 60,
+    duration: 90,
     videoId: 'vid-b',
   }));
 
