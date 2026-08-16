@@ -425,26 +425,22 @@ export class MixStream extends Readable {
       return null;
     }
 
-    let processedOut = Buffer.from(outFrame);
-    let processedIn = Buffer.from(inFrame);
     // The biquad filters are stateful IIR processors — always run them every
     // frame so their history stays continuous, then blend the dry/wet result
-    // by the ramp mix. eqRampSec == null (non-beatmix) resolves mix to 1,
-    // reproducing the prior "always fully filtered" behavior exactly.
-    if (this.#outEq) {
-      const wet = this.#outEq(Buffer.from(outFrame));
-      const mix = this.#crossfade.eqRampSec != null
-        ? clamp01(this.#fadeElapsedSec / this.#crossfade.eqRampSec)
-        : 1;
-      processedOut = blendFrame(processedOut, wet, mix);
-    }
-    if (this.#inEq) {
-      const wet = this.#inEq(Buffer.from(inFrame));
-      const mix = this.#crossfade.eqRampSec != null
-        ? clamp01(this.#fadeElapsedSec / this.#crossfade.eqRampSec)
-        : 1;
-      processedIn = blendFrame(processedIn, wet, mix);
-    }
+    // by the ramp mix (shared by both sides — the ramp is one crossfade-wide
+    // envelope, not per-channel). eqRampSec == null (non-beatmix) resolves
+    // mix to 1, reproducing the prior "always fully filtered" behavior
+    // exactly. mixFrames() below only reads outFrame/processedOut (never
+    // mutates), so skip the defensive copy when there is no filter to blend.
+    const eqMix = this.#crossfade.eqRampSec != null
+      ? clamp01(this.#fadeElapsedSec / this.#crossfade.eqRampSec)
+      : 1;
+    const processedOut = this.#outEq
+      ? blendFrame(outFrame, this.#outEq(Buffer.from(outFrame)), eqMix)
+      : outFrame;
+    const processedIn = this.#inEq
+      ? blendFrame(inFrame, this.#inEq(Buffer.from(inFrame)), eqMix)
+      : inFrame;
 
     const outGain = gainForPosition({
       positionSec: this.#fadeElapsedSec,
@@ -491,13 +487,12 @@ export class MixStream extends Readable {
     this.#incomingSkipSec = 0;
     this.#incomingSkippedSec = 0;
 
-    // Emit trackend for the outgoing track; GuildPlayer advances queue metadata
-    // without calling setCurrent again when already crossfading.
-    this.emit('trackend', { promoted: true });
-
     if (!next) {
       this.#current = null;
       this.#betweenTracks = true;
+      // Emit trackend for the outgoing track; GuildPlayer advances queue
+      // metadata without calling setCurrent again when already crossfading.
+      this.emit('trackend', { promoted: true });
       return;
     }
 
@@ -514,6 +509,12 @@ export class MixStream extends Readable {
     next.on('error', (err) => {
       this.emit('sourceerror', err);
     });
+
+    // Emit only after #current/#durationSec are already switched to the
+    // promoted source: a listener's setDurationSec() call (GuildPlayer's
+    // #onCrossfadePromoted, which runs synchronously inside this emit) must
+    // not be immediately overwritten by the #durationSec = null reset above.
+    this.emit('trackend', { promoted: true });
   }
 
   #clearIncoming() {

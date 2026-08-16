@@ -634,6 +634,82 @@ test('acceptance (mixer): beatmix transition spawns a tempo-matched, seeked inco
     'expected the promoted session tempo to carry the beatmix plan\'s incoming tempo state, not reset to a fresh lookup',
   );
 
+  // Codex round-1 P1: the incoming source was spawned seeked to entrySec
+  // (0.2s), so Track B's remaining playback is (8 - 0.2) = 7.8s native, not
+  // the full 8s — tempoRatio is 1 here so playback-domain is the same.
+  // The 220-read loop above consumes the 4s (200-frame) overlap plus 20
+  // more frames (0.4s) of Track B as sole "current" afterward, so
+  // positionSec sits at ~4.4s post-promotion: remainingSec ~= 7.8 - 4.4 =
+  // 3.4s. Before the fix this would read ~3.8s (entrySec never subtracted
+  // from the native duration fed to setDurationSec).
+  assert.ok(
+    Math.abs(player.mixStream.remainingSec - 3.4) < 0.05,
+    `expected remainingSec to subtract the 0.2s entry seek from Track B's duration, got ${player.mixStream.remainingSec}`,
+  );
+
+  await player.stop();
+});
+
+test('acceptance (mixer): an unavailable tempo backend rejects beatmix instead of spawning an unsupported filter', async () => {
+  // Same shape as the beatmix acceptance fixture above, but with a BPM gap
+  // that actually requires a stretch (122 vs 120, ~1.7% — well within
+  // range) and a tempo backend probe that resolves null (genuinely no
+  // rubberband/atempo support) rather than being mocked to 'rubberband'.
+  // Before the fix, `tempoBackend ?? 'rubberband'` would substitute
+  // 'rubberband' here and let planBeatmixTransition emit a filter ffmpeg
+  // cannot actually apply.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  let startedPlan = null;
+
+  const outgoingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    lastVocalEndSec: 1.0,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], head: [] },
+    analysisSource: 'demucs',
+  };
+  const incomingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    firstVocalStartSec: 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 122,
+    headBpm: 122,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { head: [{ sec: 0.2, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }], tail: [] },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  for (let i = 0; i < 60; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  assert.ok(startedPlan, 'expected a transition to still start via the fallback ladder');
+  assert.notEqual(startedPlan.mode, 'beatmix', 'a null tempo backend must reject beatmix, not fall back to a bogus rubberband filter');
+
   await player.stop();
 });
 

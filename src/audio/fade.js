@@ -56,12 +56,20 @@ export function blendFrame(dry, wet, mix) {
   return out;
 }
 
-/** Soft-clip samples in-place on an Int16 interleaved stereo frame. */
+/**
+ * Soft-clip samples in-place on an Int16 interleaved stereo frame. Unity
+ * (no change) below the ceiling — only samples that would otherwise exceed
+ * it get the cubic soft-clip curve. The curve itself is not unity-gain
+ * everywhere (e.g. ~0.8dB down at half scale), so applying it unconditionally
+ * would attenuate and add harmonic distortion to audio nowhere near clipping.
+ */
 export function softLimitFrame(frame, ceiling = 0.95) {
   const view = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2);
   const max = 32767 * ceiling;
   for (let i = 0; i < view.length; i++) {
-    const x = view[i] / 32768;
+    const sample = view[i];
+    if (sample <= max && sample >= -max) continue;
+    const x = sample / 32768;
     // cubic soft clip
     const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
     const scaled = y * 32768;

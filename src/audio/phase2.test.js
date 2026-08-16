@@ -530,27 +530,40 @@ test('MixStream beatmix mode ramps the bass-swap EQ in over swapBar instead of a
   mix.endMixer();
 });
 
-test('MixStream non-beatmix crossfade EQ mix resolves to fully-wet from the first frame (no bar-envelope ramp)', async () => {
+test('MixStream non-beatmix crossfade applies base-swap EQ fully on the very first frame (no bar-envelope ramp)', async () => {
   // computeEqRampSec() returns null for any plan.mode other than 'beatmix',
-  // and #readCrossfadeFrame's blend mix resolves eqRampSec == null to 1
-  // (blendFrame(dry, wet, 1) === wet, per the blendFrame unit test above) —
-  // i.e. the legacy crossfade/phrase-crossfade path is mathematically
-  // unchanged: the filter always fully applies from frame one, exactly as
-  // before this refactor. Confirmed end-to-end (not just this component
-  // proof) by 'MixStream startCrossfade mixes then promotes' above, which
-  // exercises baseSwap:true with no beatmix fields and still passes.
+  // so #readCrossfadeFrame's blend mix resolves eqRampSec == null to 1
+  // immediately — legacy crossfade/phrase-crossfade should be bit-identical
+  // to running the highpass directly, with no dry/wet ramp-in at all.
+  // Verified against an independent instance of the same filter (both start
+  // from the same zero IIR state on this, the very first frame) rather than
+  // a magnitude threshold — the filter's own step-response transient makes
+  // "how loud is frame 1" alone an unreliable, ramp-vs-no-ramp signal.
   const mix = new MixStream();
-  const outgoing = PcmSource.fromBuffers([Buffer.alloc(FRAME_BYTES)]);
-  const incoming = PcmSource.fromBuffers([Buffer.alloc(FRAME_BYTES)]);
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const silent = Buffer.alloc(FRAME_BYTES);
+  const outgoing = PcmSource.fromBuffers([Buffer.from(loud)]);
+  const incoming = PcmSource.fromBuffers([Buffer.from(silent)]);
+
   assert.equal(mix.setCurrent(outgoing, { durationSec: 60 }), true);
   assert.ok(await readFramePaused(mix));
-  assert.equal(mix.startCrossfade(incoming, { fadeSec: 5, curve: 'equal-power', baseSwap: true }), true);
+  assert.equal(mix.startCrossfade(incoming, { fadeSec: 5, curve: 'equal-power', baseSwap: true, highpassHz: 120 }), true);
+
+  const frame = await readFramePaused(mix);
+  assert.ok(frame);
+
+  const expectedWet = createBiquadProcessor(designHighpass(48000, 120))(Buffer.from(loud));
+  const outGain = gainForPosition({ positionSec: 0, fadeSec: 5, curve: 'equal-power', role: 'out' });
+  const inGain = gainForPosition({ positionSec: 0, fadeSec: 5, curve: 'equal-power', role: 'in' });
+  const expected = mixFrames(expectedWet, silent, outGain, inGain);
+
+  assert.deepEqual(frame, expected);
   mix.endMixer();
 });
 
 test('MixStream tail-fade soft-limits near-full-scale input instead of a hard clamp', async () => {
   const mix = new MixStream();
-  const samples = FRAME_BYTES / 2;
   const loud = Buffer.alloc(FRAME_BYTES);
   const loudView = new Int16Array(loud.buffer);
   loudView.fill(32000);
@@ -566,6 +579,5 @@ test('MixStream tail-fade soft-limits near-full-scale input instead of a hard cl
   // outGain ~1 at the very start of the fade: scaleFrame() alone would leave
   // this near 32000; the cubic soft-clip curve pulls it down well below that.
   assert.ok(peak < 25000, `expected the cubic soft-clip curve to engage, got peak ${peak}`);
-  assert.equal(samples > 0, true);
   mix.endMixer();
 });
