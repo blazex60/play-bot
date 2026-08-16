@@ -331,3 +331,4 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 6 | ✅ | PR #27, #30。`docs/mix-transition-phase6.md`。Demucs 末尾ボーカル + tail-fade |
 | 7A | ✅ | PR #31。`docs/mix-transition-phase7.md`。analysis v3（beat grid / downbeat / phrase / head vocal） |
 | 7B | ✅ | tempo sync 基盤。`src/audio/tempo.js`（tempoRatio/canTempoMatch/buildTempoFilter + rubberband probe）、`PcmSource.createFileSource` の `tempoFilter` オプション、session tempo state。**まだ beatmix planner（7C）へは未接続** — 実際に stretch を適用する呼び出し元はまだ無い |
+| 7C | ✅ | beatmix planner。`src/audio/beatmixTransition.js`（entry/exit candidate 検索、pair scoring、`planBeatmixTransition()`/`planPhraseCrossfade()`、§16 fallback ladder を実装する `planBeatSyncedTransition()`）。**まだ実際の再生には未接続** — `player.js` は引き続き既存の `planTransition()` を呼ぶ。`transition.js`/`MixStream`/`player.js` は無変更（bar envelope 実行は 7D） |
