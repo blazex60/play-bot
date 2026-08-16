@@ -154,3 +154,66 @@ test('transitionCost\'s beatmix term is absent when the outgoing side has no usa
   const withoutUsableExit = transitionCost(from, to);
   assert.notEqual(withBeatmixData, withoutUsableExit);
 });
+
+test('transitionCost\'s beatmix term requires the planner\'s own bar-derived overlap room, not a flat 2s floor', () => {
+  // Codex round-1 on PR #35: a fixed 2s floor admitted candidates
+  // planBeatmixTransition() would reject with no-exit-candidate (needs
+  // MIN_OVERLAP_BARS * barSec = 2 bars @ 120 BPM/4-beat = 4s). This exit
+  // candidate has 3.5s of room — enough for the old flat floor, not enough
+  // for the real bar-derived one.
+  const tightRoom = richOutgoing({
+    durationSec: 163.5,
+    phrases: { tail: [{ sec: 160, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] },
+  });
+  const to = richIncoming();
+  // bpm/key/lastRms are identical between richOutgoing()/richIncoming() by
+  // default, so a correctly-skipped beatmix term leaves cost at exactly 0.
+  assert.equal(transitionCost(tightRoom, to), 0);
+});
+
+test('transitionCost\'s beatmix term rejects meter-mismatched pairs, matching planBeatmixTransition()', () => {
+  // Codex round-1 on PR #35: scoreTransitionPair() itself doesn't inspect
+  // meter, so a 3/4 vs 4/4 pair could still score well here even though
+  // planBeatmixTransition() hard-rejects it (bar alignment can't stay
+  // synchronized). bpm/key/lastRms stay identical to the defaults so any
+  // nonzero cost can only come from the beatmix term itself.
+  const matchedMeter = [
+    richOutgoing({ downbeatGrid: { confidence: 0.8, meter: 4 } }),
+    richIncoming({ downbeatGrid: { confidence: 0.8, meter: 4 } }),
+  ];
+  const mismatchedMeter = [
+    richOutgoing({ downbeatGrid: { confidence: 0.8, meter: 4 } }),
+    richIncoming({ downbeatGrid: { confidence: 0.8, meter: 3 } }),
+  ];
+  assert.equal(transitionCost(...mismatchedMeter), 0, 'expected the beatmix term to be fully skipped for a meter mismatch');
+  assert.notEqual(
+    transitionCost(...matchedMeter),
+    0,
+    'expected the beatmix term to actually be active when meters agree (sanity check)',
+  );
+});
+
+test('transitionCost\'s beatmix term scores the best exit/entry combination, not just the top-ranked candidate on each side', () => {
+  // Codex round-1 on PR #35: findExitCandidates()/findEntryCandidates() sort
+  // by phrase score first, but the highest-scoring candidate on each side
+  // can sit right at a vocal boundary (poor vocalSafety) while a
+  // lower-scored pair together has much better vocal safety margin.
+  // planBeatmixTransition() searches every combination and keeps the best
+  // pair; this term must too.
+  const exitNearBoundary = { sec: 150.5, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }; // margin 0.5
+  const exitSafe = { sec: 155, barIndex: 1, score: 0.85, reasons: ['bar-multiple'] }; // margin 5
+  const entryNearBoundary = { sec: 19, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }; // margin 1
+  const entrySafe = { sec: 4, barIndex: 1, score: 0.8, reasons: ['bar-multiple'] }; // margin 16
+
+  const fromBothCandidates = richOutgoing({ phrases: { tail: [exitNearBoundary, exitSafe] } });
+  const toBothCandidates = richIncoming({ phrases: { head: [entryNearBoundary, entrySafe] } });
+  // Only the top-ranked (by score) candidate on each side — [0]-only logic
+  // would reduce the "both candidates" case to exactly this pairing.
+  const fromTopOnly = richOutgoing({ phrases: { tail: [exitNearBoundary] } });
+  const toTopOnly = richIncoming({ phrases: { head: [entryNearBoundary] } });
+
+  assert.ok(
+    transitionCost(fromBothCandidates, toBothCandidates) < transitionCost(fromTopOnly, toTopOnly),
+    'expected considering the lower-ranked-but-vocal-safer pair to score better (cost less) than being forced onto the top-ranked pair alone',
+  );
+});

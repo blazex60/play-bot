@@ -4,6 +4,7 @@ import {
   findEntryCandidates,
   scoreTransitionPair,
   HARMONIC_CONFIDENCE_MIN,
+  MIN_OVERLAP_BARS,
 } from '../audio/beatmixTransition.js';
 import { canTempoMatch } from '../audio/tempo.js';
 
@@ -22,10 +23,12 @@ const DEFAULT_ENERGY_WEIGHT = 0.3;
  */
 const DEFAULT_BEATMIX_WEIGHT = 1.5;
 /**
- * A cheap floor just to exclude exit candidates with essentially no overlap
- * room at all — ordering only needs "is a beatmix plausible here," not the
- * planner's own MIN_OVERLAP_BARS-derived minimum (which needs a resolved
- * target BPM/bar length ordering doesn't have yet).
+ * Fallback floor only for the (rare) case neither side reports a usable
+ * target BPM at all — otherwise minOverlapSecFor() below derives the real
+ * MIN_OVERLAP_BARS-based minimum from targetBpm/meter, the same as
+ * planBeatmixTransition() does, so ordering doesn't score an edge highly
+ * that the live planner would reject outright with no-exit-candidate
+ * (Codex round-1 on PR #35).
  */
 const MIN_OVERLAP_SEC_FOR_ORDERING = 2;
 const MISSING_ANALYSIS_PENALTY = 0.35;
@@ -62,6 +65,25 @@ export function bpmDelta(a, b) {
 }
 
 /**
+ * Same targetBpm-derived bar length planBeatmixTransition() uses for its own
+ * exit-candidate minimum, so ordering doesn't admit a candidate the live
+ * planner would reject with no-exit-candidate for having too little room
+ * (Codex round-1 on PR #35). Falls back to the cheap fixed floor only when
+ * targetBpm itself is unusable (no bar length can be derived at all).
+ * @param {number | null} targetBpm
+ * @param {object | null | undefined} fromAnalysis
+ * @param {object | null | undefined} toAnalysis
+ * @returns {number}
+ */
+function minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis) {
+  if (!(targetBpm > 0)) return MIN_OVERLAP_SEC_FOR_ORDERING;
+  const beatsPerBar = fromAnalysis?.downbeatGrid?.meter ?? toAnalysis?.downbeatGrid?.meter ?? 4;
+  const barSec = (60 / targetBpm) * beatsPerBar;
+  if (!(barSec > 0)) return MIN_OVERLAP_SEC_FOR_ORDERING;
+  return Math.max(MIN_OVERLAP_SEC_FOR_ORDERING, barSec * MIN_OVERLAP_BARS);
+}
+
+/**
  * Phase 7E: an additional, opt-in cost term layered on top of the base bpm/
  * key/energy terms below, built by reusing Phase 7C's beatmix planner
  * building blocks (findExitCandidates/findEntryCandidates/
@@ -72,19 +94,21 @@ export function bpmDelta(a, b) {
  * cached-metadata-only 0..1 quality score.
  *
  * Returns null (not zero) when either side lacks phrase/vocal analysis
- * (pre-v3 cached analysis, or a track whose vocal separation failed) —
- * treated the same as the harmonic term's confidence gate below: an
- * unavailable *richer* signal is skipped rather than penalized, since the
- * base bpm/key/energy terms already cover that pair on their own.
+ * (pre-v3 cached analysis, or a track whose vocal separation failed), or
+ * when outgoing/incoming report incompatible meters (e.g. 3/4 vs 4/4 — bar
+ * alignment can never stay synchronized, the same hard-reject
+ * planBeatmixTransition() applies) — treated the same as the harmonic
+ * term's confidence gate below: an unavailable/inapplicable *richer* signal
+ * is skipped rather than penalized, since the base bpm/key/energy terms
+ * already cover that pair on their own (Codex round-1 on PR #35).
  * @param {object | null | undefined} fromAnalysis
  * @param {object | null | undefined} toAnalysis
  * @returns {number | null} 0 (great fit) .. 1 (poor fit), or null if unusable
  */
 function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
-  const exitCandidates = findExitCandidates(fromAnalysis, { minOverlapSec: MIN_OVERLAP_SEC_FOR_ORDERING });
-  if (exitCandidates.length === 0) return null;
-  const entryCandidates = findEntryCandidates(toAnalysis);
-  if (entryCandidates.length === 0) return null;
+  const fromMeter = fromAnalysis?.downbeatGrid?.meter ?? null;
+  const toMeter = toAnalysis?.downbeatGrid?.meter ?? null;
+  if (fromMeter != null && toMeter != null && fromMeter !== toMeter) return null;
 
   // Ordering has no resolved session tempo (that only exists once a
   // transition is actually armed) — targetBpm/incomingBpm mirror the same
@@ -92,19 +116,50 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
   // (which tempoRatio() itself is built on) applies the same octave
   // normalization bpmDelta() below already relies on, so the two terms
   // never disagree about a half/double pair being "close" (§12 note).
+  //
+  // This does NOT account for a chained beatmix having already stretched
+  // `fromAnalysis`'s track away from its native tail BPM by the time it
+  // would actually play as "outgoing" — ordering has no notion of session
+  // tempo propagating through a multi-track path (the DP/greedy loops below
+  // only ever look up each track's own native analysis, never a
+  // path-dependent stretched tempo). This is a pre-existing property of the
+  // whole transitionCost() design (the bpmDelta-based term above has the
+  // identical limitation, unchanged since before this term existed) rather
+  // than something new here; modeling it correctly needs the DP state
+  // itself to carry a running session BPM, a larger change than this
+  // opt-in term warrants on its own (Codex round-1 on PR #35).
   const targetBpm = fromAnalysis?.tailBpm ?? fromAnalysis?.bpm ?? null;
   const incomingBpm = toAnalysis?.headBpm ?? toAnalysis?.bpm ?? null;
   const match = canTempoMatch(incomingBpm, targetBpm);
 
-  const score = scoreTransitionPair({
-    outgoing: fromAnalysis,
-    incoming: toAnalysis,
-    exit: exitCandidates[0],
-    entry: entryCandidates[0],
-    targetBpm,
-    match,
+  const exitCandidates = findExitCandidates(fromAnalysis, {
+    minOverlapSec: minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis),
   });
-  return 1 - score;
+  if (exitCandidates.length === 0) return null;
+  const entryCandidates = findEntryCandidates(toAnalysis);
+  if (entryCandidates.length === 0) return null;
+
+  // Best-scoring exit×entry combination, matching how
+  // planBeatmixTransition()/planPhraseCrossfade() themselves search pairs —
+  // the single top-ranked phrase candidate on each side isn't necessarily
+  // the best-scoring PAIR together (Codex round-1 on PR #35). Candidate
+  // pools are small (bounded by phrase analysis output), so this stays
+  // cheap even inside optimizeTrackOrder()'s O(n·2^n) exact search.
+  let bestScore = 0;
+  for (const exit of exitCandidates) {
+    for (const entry of entryCandidates) {
+      const score = scoreTransitionPair({
+        outgoing: fromAnalysis,
+        incoming: toAnalysis,
+        exit,
+        entry,
+        targetBpm,
+        match,
+      });
+      if (score > bestScore) bestScore = score;
+    }
+  }
+  return 1 - bestScore;
 }
 
 /**
