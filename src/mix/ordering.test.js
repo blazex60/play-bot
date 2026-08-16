@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { bpmDelta, transitionCost, optimizeTrackOrder, isValidPermutation } from './ordering.js';
 import { camelotDistance, parseCamelot } from './camelot.js';
-import { BEAT_CONFIDENCE_MIN } from '../audio/beatmixTransition.js';
+import { BEAT_CONFIDENCE_MIN, DOWNBEAT_CONFIDENCE_MIN } from '../audio/beatmixTransition.js';
 
 test('parseCamelot accepts Camelot codes and key names', () => {
   assert.deepEqual(parseCamelot('8B'), { code: '8B', number: 8, mode: 'B' });
@@ -164,14 +164,22 @@ test('transitionCost\'s beatmix term requires the planner\'s own bar-derived ove
   // MIN_OVERLAP_BARS * barSec = 2 bars @ 120 BPM/4-beat = 4s). This exit
   // candidate has 3.5s of room — enough for the old flat floor, not enough
   // for the real bar-derived one.
+  //
+  // Codex round-3 on PR #35: an empty exitCandidates result here means every
+  // candidate was conclusively filtered for lacking room — since both sides
+  // already carry real v3 phrase/vocal data (checked before this), that's a
+  // positively identified no-fit, not missing analysis, so it must be
+  // penalized (BEATMIX_INFEASIBLE_COST) rather than silently skipped.
   const tightRoom = richOutgoing({
     durationSec: 163.5,
     phrases: { tail: [{ sec: 160, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] },
   });
   const to = richIncoming();
-  // bpm/key/lastRms are identical between richOutgoing()/richIncoming() by
-  // default, so a correctly-skipped beatmix term leaves cost at exactly 0.
-  assert.equal(transitionCost(tightRoom, to), 0);
+  const wellFittingRoom = richOutgoing();
+  assert.ok(
+    transitionCost(tightRoom, to) > transitionCost(wellFittingRoom, to),
+    'expected an exit candidate without enough bar-derived room to be penalized versus one with plenty of room',
+  );
 });
 
 test('transitionCost\'s beatmix term penalizes meter-mismatched pairs, matching planBeatmixTransition()', () => {
@@ -258,6 +266,66 @@ test('transitionCost\'s beatmix term penalizes sub-threshold beat-grid confidenc
   );
 });
 
+test('transitionCost\'s beatmix term penalizes sub-threshold downbeat-grid confidence, matching planBeatmixTransition()\'s downbeat-confidence-low rejection', () => {
+  // Codex round-3 on PR #35: scoreTransitionPair() folds downbeatGrid
+  // confidence into only one of five weighted sub-signals, so a shaky
+  // downbeat grid could still contribute to a decent overall score even
+  // though planBeatmixTransition() hard-rejects the same pair with
+  // 'downbeat-confidence-low'. Below DOWNBEAT_CONFIDENCE_MIN on either side
+  // must be a confirmed infeasibility (full penalty), same treatment as the
+  // beatConfidence gate above.
+  const solid = richOutgoing();
+  const shakyOutgoing = richOutgoing({ downbeatGrid: { confidence: DOWNBEAT_CONFIDENCE_MIN - 0.1 } });
+  const solidIncoming = richIncoming();
+  const shakyIncoming = richIncoming({ downbeatGrid: { confidence: DOWNBEAT_CONFIDENCE_MIN - 0.1 } });
+
+  assert.ok(
+    transitionCost(solid, shakyIncoming) > transitionCost(solid, solidIncoming),
+    'expected a sub-threshold incoming downbeat grid to be penalized, not scored as solid',
+  );
+  assert.ok(
+    transitionCost(shakyOutgoing, solidIncoming) > transitionCost(solid, solidIncoming),
+    'expected a sub-threshold outgoing downbeat grid to be penalized, not scored as solid',
+  );
+});
+
+test('transitionCost\'s beatmix term rejects a tempo ratio beyond the hard limit, matching planBeatmixTransition()\'s tempo-ratio-exceeds-hard rejection', () => {
+  // CodeRabbit round-2 (major) on PR #35: canTempoMatch() can return
+  // { ok: false, ratio: <number>, tier: 'exceeds-hard' } — a REAL, computed
+  // ratio that was positively rejected, not missing/unrelated BPM data
+  // (that case has ratio: null and stays unpenalized, same as before).
+  // scoreTransitionPair() only folds tempo into ONE of five weighted
+  // sub-signals, so without gating on match.ok a tempo-infeasible pair
+  // could still score decently on vocal safety/phrase/downbeat/energy
+  // alone, even though planBeatmixTransition() would hard-reject the same
+  // pair outright with 'tempo-ratio-exceeds-hard'.
+  const from = richOutgoing(); // tailBpm 120
+  const withinHardLimit = richIncoming({ bpm: 124, headBpm: 124 }); // ~3.2% dev, inside HARD_LIMIT_RATIO (6%)
+  const exceedsHardLimit = richIncoming({ bpm: 130, headBpm: 130 }); // ~7.7% dev, exceeds it
+  assert.ok(
+    transitionCost(from, exceedsHardLimit) > transitionCost(from, withinHardLimit),
+    'expected a tempo ratio beyond the hard limit to be penalized like other confirmed infeasibilities, not partially scored on the remaining sub-signals',
+  );
+});
+
+test('transitionCost\'s beatmix term rejects an octave-related tempo whose real bar length still mismatches, matching planBeatmixTransition()\'s octave-bar-mismatch rejection', () => {
+  // Codex round-3 on PR #35: canTempoMatch()/tempoRatio() octave-normalize
+  // incomingBpm before taking a ratio, so a genuine half-tempo incoming
+  // track (60 BPM against a 120 BPM target) reads as a perfect match.ratio
+  // (1.0, tier 'normal') here — but the incoming track's REAL downbeat grid
+  // has bar lengths built on its own native 60 BPM, so its actual
+  // downbeats only land on every other computed bar boundary.
+  // planBeatmixTransition() separately hard-rejects this with
+  // 'octave-bar-mismatch' even when match.ok is true, via isHalfDouble().
+  const from = richOutgoing(); // tailBpm 120
+  const genuinelyClose = richIncoming({ bpm: 122, headBpm: 122 }); // ~1.6% dev, not octave-related
+  const octaveMismatch = richIncoming({ bpm: 60, headBpm: 60 }); // half tempo — a deceptively "perfect" normalized ratio
+  assert.ok(
+    transitionCost(from, octaveMismatch) > transitionCost(from, genuinelyClose),
+    'expected an octave-related-but-bar-mismatched tempo to be penalized despite its deceptively perfect normalized ratio',
+  );
+});
+
 test('transitionCost\'s beatmix term rejects an entry whose start is vocal-safe but leaves no forward overlap room', () => {
   // Codex round-2 on PR #35 (follow-up to the round-1 exit-side fix):
   // findEntryCandidates() only checks that entry.sec ITSELF is vocal-safe
@@ -281,6 +349,33 @@ test('transitionCost\'s beatmix term rejects an entry whose start is vocal-safe 
   assert.ok(
     transitionCost(from, tightEntry) > transitionCost(from, roomyEntry),
     'expected an entry without enough forward overlap room to be penalized versus one with enough room',
+  );
+});
+
+test('transitionCost\'s beatmix term measures incoming overlap room in playback seconds, not native seconds', () => {
+  // Codex round-3 on PR #35: when the incoming track is sped up
+  // (match.ratio > 1), native vocal-free seconds convert to FEWER playback
+  // seconds — comparing native room directly against minOverlapSec (itself
+  // a playback-domain, targetBpm-derived duration) can admit a candidate
+  // the live planner rejects with no-overlap-fit. 114 -> 120 BPM stretches
+  // by ~1.053x, so 4.1 native seconds of room leave only ~3.9 playback
+  // seconds — enough for the old native-only check (needs 4s), not enough
+  // once divided by match.ratio the way planBeatmixTransition() does.
+  const from = richOutgoing(); // tailBpm 120
+  const fourPointOneSecRoom = { sec: 15.9, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] };
+  const stretchedIncoming = richIncoming({
+    bpm: 114,
+    headBpm: 114, // ratio ~1.0526 once matched against the 120 target
+    firstVocalStartSec: 20,
+    phrases: { head: [fourPointOneSecRoom] },
+  });
+  const unstretchedIncoming = richIncoming({
+    firstVocalStartSec: 20,
+    phrases: { head: [fourPointOneSecRoom] }, // same 4.1s native room, but ratio ~1 (no conversion needed)
+  });
+  assert.ok(
+    transitionCost(from, stretchedIncoming) > transitionCost(from, unstretchedIncoming),
+    'expected the same native room to be penalized once stretched into insufficient playback-domain room',
   );
 });
 
@@ -317,13 +412,19 @@ test('optimizeTrackOrder caches per-edge beatmix scoring so the exact search sta
   const tracks = Array.from({ length: n }, (_, i) => ({ title: `T${i}` }));
   const analyses = tracks.map((_, i) => bigAnalysis(i));
 
+  // Fixed at 500ms locally sits comfortably between the ~35ms cached and
+  // ~3000ms uncached measurements, but shared/noisy CI runners can be
+  // meaningfully slower than that — override via ORDERING_PERF_BUDGET_MS
+  // rather than let a slow runner fail this test with no real regression
+  // (CodeRabbit round-2 on PR #35).
+  const budgetMs = Number(process.env.ORDERING_PERF_BUDGET_MS ?? 1500);
   const start = Date.now();
   const order = optimizeTrackOrder({ tracks, analyses, maxExact: n });
   const elapsedMs = Date.now() - start;
 
   assert.equal(isValidPermutation(order, n), true);
   assert.ok(
-    elapsedMs < 500,
-    `expected edge-cost caching to keep a ${n}-track exact search well under 500ms even with 20x15 phrase candidates per edge (took ${elapsedMs}ms)`,
+    elapsedMs < budgetMs,
+    `expected edge-cost caching to keep a ${n}-track exact search well under ${budgetMs}ms even with 20x15 phrase candidates per edge (took ${elapsedMs}ms)`,
   );
 });

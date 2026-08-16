@@ -4,11 +4,14 @@ import {
   findEntryCandidates,
   scoreTransitionPair,
   entryForwardSafeSec,
+  hasVocalAnalysis,
   HARMONIC_CONFIDENCE_MIN,
   BEAT_CONFIDENCE_MIN,
+  DOWNBEAT_CONFIDENCE_MIN,
   MIN_OVERLAP_BARS,
 } from '../audio/beatmixTransition.js';
 import { canTempoMatch } from '../audio/tempo.js';
+import { isHalfDouble } from '../audio/trackAnalysis.js';
 
 const DEFAULT_BPM_WEIGHT = 1;
 const DEFAULT_KEY_WEIGHT = 1.2;
@@ -101,28 +104,46 @@ const BEATMIX_INFEASIBLE_COST = 1;
  * Returns null (not zero, not penalized — the term is simply skipped, same
  * treatment as the harmonic term's confidence gate below) only when either
  * side lacks phrase/vocal analysis entirely (pre-v3 cached analysis, or a
- * track whose vocal separation failed) — there the base bpm/key/energy
- * terms already cover the pair on their own and we have no basis to say
- * anything more.
+ * track whose vocal separation failed) — checked via hasVocalAnalysis()
+ * FIRST, before any other gate below runs, so a track with e.g. a leftover
+ * downbeatGrid.meter but analysisSource:'none' (vocal separation failed)
+ * can't get flagged as a "confirmed" infeasibility it was never actually
+ * evaluated for (Codex round-3 on PR #35).
  *
- * Once both sides carry real v3 data, a *positively identified*
- * incompatibility — incompatible meters (3/4 vs 4/4, bar alignment can
- * never stay synchronized), sub-threshold beat-grid confidence, or no
- * exit/entry pair with enough forward room — gets the maximum penalty
+ * Once both sides are confirmed to carry real v3 data, every *positively
+ * identified* incompatibility below — incompatible meters, sub-threshold
+ * beat/downbeat-grid confidence, a tempo ratio beyond the hard stretch
+ * limit, an octave-related-but-bar-mismatched tempo, or no exit/entry pair
+ * with enough forward room — gets the maximum penalty
  * (BEATMIX_INFEASIBLE_COST) rather than null. Returning null there would
  * make a confirmed-bad pair cost exactly the same as "no data" and cheaper
  * than a genuinely good but imperfectly-scored pair, since transitionCost()
  * averages only the terms that fire — the optimizer must never prefer a
  * transition planBeatmixTransition() would hard-reject over one it would
- * actually accept (Codex round-2 on PR #35).
+ * actually accept (Codex round-2/round-3, CodeRabbit round-2 on PR #35).
  * @param {object | null | undefined} fromAnalysis
  * @param {object | null | undefined} toAnalysis
  * @returns {number | null} 0 (great fit) .. 1 (poor fit), or null if unusable
  */
 function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
-  const fromMeter = fromAnalysis?.downbeatGrid?.meter ?? null;
-  const toMeter = toAnalysis?.downbeatGrid?.meter ?? null;
+  if (!hasVocalAnalysis(fromAnalysis) || !hasVocalAnalysis(toAnalysis)) return null;
+
+  const fromMeter = fromAnalysis.downbeatGrid?.meter ?? null;
+  const toMeter = toAnalysis.downbeatGrid?.meter ?? null;
   if (fromMeter != null && toMeter != null && fromMeter !== toMeter) {
+    return BEATMIX_INFEASIBLE_COST;
+  }
+
+  if (
+    (fromAnalysis.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN
+    || (toAnalysis.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN
+  ) {
+    return BEATMIX_INFEASIBLE_COST;
+  }
+  if (
+    (fromAnalysis.downbeatGrid?.confidence ?? 0) < DOWNBEAT_CONFIDENCE_MIN
+    || (toAnalysis.downbeatGrid?.confidence ?? 0) < DOWNBEAT_CONFIDENCE_MIN
+  ) {
     return BEATMIX_INFEASIBLE_COST;
   }
 
@@ -144,25 +165,43 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
   // than something new here; modeling it correctly needs the DP state
   // itself to carry a running session BPM, a larger change than this
   // opt-in term warrants on its own (Codex round-1 on PR #35).
-  const targetBpm = fromAnalysis?.tailBpm ?? fromAnalysis?.bpm ?? null;
-  const incomingBpm = toAnalysis?.headBpm ?? toAnalysis?.bpm ?? null;
+  const targetBpm = fromAnalysis.tailBpm ?? fromAnalysis.bpm ?? null;
+  const incomingBpm = toAnalysis.headBpm ?? toAnalysis.bpm ?? null;
   const match = canTempoMatch(incomingBpm, targetBpm);
+
+  // match.ratio != null but match.ok === false means canTempoMatch() found a
+  // real ratio and positively rejected it (tier: 'exceeds-hard') —
+  // planBeatmixTransition() hard-rejects the same pair with
+  // 'tempo-ratio-exceeds-hard' before ever scoring it. scoreTransitionPair()
+  // itself only folds tempo into ONE of five weighted sub-signals
+  // (tempoCompatibility), so vocal safety/phrase/downbeat/energy can still
+  // add up to a deceptively decent score for a pair that can never actually
+  // beatmix. A null ratio (missing/unrelated BPM data) stays unpenalized —
+  // canTempoMatch() itself already applies the octave normalization that
+  // makes a half/double pair look "related" in the first place, so a null
+  // ratio here means genuinely unrelated tempos (CodeRabbit round-2 on
+  // PR #35).
+  if (match.ratio != null && !match.ok) return BEATMIX_INFEASIBLE_COST;
+
+  // canTempoMatch()/tempoRatio() normalize incomingBpm into targetBpm's
+  // octave band before taking a ratio, so a genuine half/double pair (e.g.
+  // 60 vs 120) reads as an excellent match.ratio here — but the incoming
+  // track's REAL downbeat grid has a bar length built on its own (unhalved/
+  // undoubled) native BPM, so its actual downbeats only land on every other
+  // (or every 2nd-of-half) computed bar boundary. planBeatmixTransition()
+  // separately hard-rejects this with 'octave-bar-mismatch' even when
+  // match.ok is true (Codex round-3 on PR #35).
+  if (isHalfDouble(incomingBpm, targetBpm)) return BEATMIX_INFEASIBLE_COST;
 
   const minOverlapSec = minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis);
   const exitCandidates = findExitCandidates(fromAnalysis, { minOverlapSec });
-  if (exitCandidates.length === 0) return null;
   const entryCandidates = findEntryCandidates(toAnalysis);
-  if (entryCandidates.length === 0) return null;
-
-  // Both sides now confirmed to carry real v3 data — a sub-threshold beat
-  // grid means planBeatmixTransition() would hard-reject with
-  // 'beat-confidence-low' regardless of how well phrases/vocals line up, so
-  // this is a positive infeasibility signal, not missing data (Codex
-  // round-2 on PR #35).
-  if (
-    (fromAnalysis.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN
-    || (toAnalysis.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN
-  ) {
+  // Both sides are already confirmed to carry real v3 data (the
+  // hasVocalAnalysis() check at the top) — an empty result here means every
+  // candidate was conclusively filtered out (too close to vocals, not
+  // enough room), a positively identified no-fit, not missing analysis
+  // (Codex round-3 on PR #35).
+  if (exitCandidates.length === 0 || entryCandidates.length === 0) {
     return BEATMIX_INFEASIBLE_COST;
   }
 
@@ -180,13 +219,27 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
   // that entry.sec itself is vocal-safe, not that enough vocal-free room
   // follows it for a real overlap — planBeatmixTransition() applies this
   // exact check (forwardSafePlayback) before ever scoring a pair (Codex
-  // round-2 on PR #35). A candidate that fails this filter on every exit
-  // partner naturally leaves bestScore at 0, i.e. the same
-  // BEATMIX_INFEASIBLE_COST as any other confirmed no-fit case.
+  // round-2 on PR #35). Both this and the incoming-duration room below are
+  // divided by match.ratio to convert native seconds into playback-domain
+  // seconds (the incoming source is being stretched by that ratio) before
+  // comparing against minOverlapSec, which is itself already a
+  // playback-domain (target-BPM-derived) duration — planBeatmixTransition()
+  // applies the identical conversion (Codex round-3 on PR #35). A candidate
+  // that fails either filter on every exit partner naturally leaves
+  // bestScore at 0, i.e. the same BEATMIX_INFEASIBLE_COST as any other
+  // confirmed no-fit case.
+  const incomingDurationSec = Number.isFinite(toAnalysis.durationSec) ? toAnalysis.durationSec : Infinity;
   let bestScore = 0;
   for (const exit of exitCandidates) {
     for (const entry of entryCandidates) {
-      if (entryForwardSafeSec(toAnalysis, entry.sec) + 1e-6 < minOverlapSec) continue;
+      const forwardSafePlayback = match.ratio != null
+        ? entryForwardSafeSec(toAnalysis, entry.sec) / match.ratio
+        : entryForwardSafeSec(toAnalysis, entry.sec);
+      if (forwardSafePlayback + 1e-6 < minOverlapSec) continue;
+      const roomInIncomingPlayback = match.ratio != null
+        ? (incomingDurationSec - entry.sec) / match.ratio
+        : (incomingDurationSec - entry.sec);
+      if (roomInIncomingPlayback + 1e-6 < minOverlapSec) continue;
       const score = scoreTransitionPair({
         outgoing: fromAnalysis,
         incoming: toAnalysis,

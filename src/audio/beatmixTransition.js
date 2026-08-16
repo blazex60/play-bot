@@ -129,7 +129,7 @@ function energyContinuity(exit, entry) {
  * at all", which the two candidate-search functions below must never
  * conflate — a failed analysis has zero evidence of being vocal-safe.
  */
-function hasVocalAnalysis(analysis) {
+export function hasVocalAnalysis(analysis) {
   return Boolean(analysis?.analysisSource) && analysis.analysisSource !== 'none';
 }
 
