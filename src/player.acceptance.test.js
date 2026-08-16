@@ -715,6 +715,205 @@ test('acceptance (mixer): an unavailable tempo backend rejects beatmix instead o
   await player.stop();
 });
 
+test('acceptance (mixer): a chained beatmix transition subtracts the current source\'s own entry offset from the next exit timestamp', async () => {
+  // Codex round-3 P1: once A->B promotes B with a nonzero entrySec baked
+  // into its spawn (createFileSource's startSec seek), MixStream.positionSec
+  // for B is relative to THAT seek point, not native 0 — but B's own
+  // analysis.exitStartSec (the timestamp #maybeStartCrossfade compares
+  // positionSec against for the B->C transition) remains an ABSOLUTE
+  // position in B's native file. Without subtracting B's own entry offset
+  // first, the computed threshold sits (B's entrySec) seconds later than
+  // positionSec can ever reach relative to its actual start point.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const firedPlans = [];
+  const incomingSpawnArgsByTrack = new Map();
+
+  const BS_ENTRY_SEC = 5.0; // B's own entry offset, baked in by A->B.
+  const BC_EXIT_SEC = 20.0; // absolute, native position in B's file.
+  const FIXED_THRESHOLD = BC_EXIT_SEC - BS_ENTRY_SEC; // 15.0
+  const BUGGY_THRESHOLD = BC_EXIT_SEC; // 20.0 (pre-fix, unsubtracted)
+
+  const analysisA = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    lastVocalEndSec: 1.0,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], head: [] },
+    analysisSource: 'demucs',
+  };
+  const analysisB = {
+    version: ANALYSIS_VERSION,
+    durationSec: 30,
+    lastVocalEndSec: BC_EXIT_SEC,
+    // Must be strictly after BS_ENTRY_SEC — findEntryCandidates() only
+    // offers entry points before firstVocalStartSec (or inside a
+    // headVocalGaps window) as vocal-safe.
+    firstVocalStartSec: BS_ENTRY_SEC + 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    // head candidate: B's OWN entry offset when promoted from A.
+    // tail candidate: the exit point B->C must arm against.
+    phrases: {
+      head: [{ sec: BS_ENTRY_SEC, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+      tail: [{ sec: BC_EXIT_SEC, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }],
+    },
+    analysisSource: 'demucs',
+  };
+  const analysisC = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    firstVocalStartSec: 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { head: [{ sec: 0.5, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }], tail: [] },
+    analysisSource: 'demucs',
+  };
+  const analysisByVideoId = { 'vid-a': analysisA, 'vid-b': analysisB, 'vid-c': analysisC };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => analysisByVideoId[videoId] ?? null,
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async (track, opts) => {
+      if (!incomingSpawnArgsByTrack.has(track.videoId)) incomingSpawnArgsByTrack.set(track.videoId, []);
+      incomingSpawnArgsByTrack.get(track.videoId).push(opts);
+      return PcmSource.fromBuffers(Array.from({ length: 2500 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 30, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 8, videoId: 'vid-c' }));
+
+  player.mixStream.on('crossfadestart', (plan) => { firedPlans.push(plan); });
+
+  await player.playNext();
+  for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+  assert.equal(firedPlans.length, 1, 'expected the A->B beatmix transition to arm');
+
+  for (let i = 0; i < 220; i += 1) player.mixStream.read(FRAME_BYTES);
+  assert.equal(queue.current.videoId, 'vid-b', 'expected A->B to promote Track B');
+  assert.ok(
+    (incomingSpawnArgsByTrack.get('vid-b') ?? []).some((opts) => Math.abs((opts.startSec ?? 0) - BS_ENTRY_SEC) < 1e-6),
+    'expected Track B to have been spawned seeked to its own entrySec',
+  );
+
+  // positionSec is now relative to B's own (seeked) start. Drive to a
+  // checkpoint clearly short of the FIXED threshold first — this must not
+  // arm the B->C transition under either the fixed or buggy math.
+  const baseline = player.mixStream.positionSec;
+  const toCheckpoint1 = Math.max(0, Math.ceil(((FIXED_THRESHOLD - 2) - baseline) / 0.02));
+  for (let i = 0; i < toCheckpoint1; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+  assert.equal(firedPlans.length, 1, 'expected no B->C transition yet, well short of the fixed threshold');
+
+  // Drive past the FIXED threshold (exitStartSec - B's own entrySec) while
+  // staying clear of the BUGGY (unsubtracted) one — only entry-offset-
+  // subtracted math can have armed by here.
+  const afterCheckpoint1 = player.mixStream.positionSec;
+  const toCheckpoint2 = Math.max(0, Math.ceil(((FIXED_THRESHOLD + 2) - afterCheckpoint1) / 0.02));
+  for (let i = 0; i < toCheckpoint2; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+
+  assert.ok(
+    player.mixStream.positionSec < BUGGY_THRESHOLD,
+    `test invariant broken: positionSec (${player.mixStream.positionSec}) reached the buggy threshold — widen the margin`,
+  );
+  assert.equal(
+    firedPlans.length,
+    2,
+    'expected the B->C transition to arm once positionSec passed (exitStartSec - B\'s own entrySec), not the unsubtracted exitStartSec',
+  );
+  assert.ok(
+    (incomingSpawnArgsByTrack.get('vid-c') ?? []).length >= 1,
+    'expected Track C\'s incoming source to actually be spawned',
+  );
+
+  await player.stop();
+});
+
+test('acceptance (mixer): incoming prep for a beatmix plan starts relative to the selected exit point, not just time-to-EOF', async () => {
+  // Codex round-3 P2: the prep gate must fire based on distance to the
+  // SELECTED exit point (startSec), not distance to EOF. Track A's exit
+  // candidate sits far before EOF (12s into a 40s track) — under the old
+  // EOF-relative gate (remaining <= fadeSec + CROSSFADE_PREP_LEAD_SEC),
+  // prep wouldn't fire until `remaining` shrinks near 19s (position ~21s+),
+  // long after the 12s exit point was already reached. The fixed gate opens
+  // as soon as positionSec is within CROSSFADE_PREP_LEAD_SEC of startSec.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const incomingSpawnArgs = [];
+
+  const outgoingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 40,
+    lastVocalEndSec: 12.0,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { tail: [{ sec: 12.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], head: [] },
+    analysisSource: 'demucs',
+  };
+  const incomingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    firstVocalStartSec: 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { head: [{ sec: 0.2, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }], tail: [] },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 40,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 40, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async (track, opts) => {
+      if (track.videoId === 'vid-b') incomingSpawnArgs.push(opts);
+      return PcmSource.fromBuffers(Array.from({ length: 2500 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  await player.playNext();
+  // No frames read at all — positionSec is still 0. Give the arm timer a
+  // single 200ms tick.
+  await waitMs(300);
+
+  assert.ok(
+    incomingSpawnArgs.some((opts) => Math.abs((opts.startSec ?? 0) - 0.2) < 1e-6),
+    'expected the beatmix-specific incoming prep (seeked to entrySec) to have already been requested, ' +
+    'even though remaining time-to-EOF (40s) is nowhere close to fadeSec + CROSSFADE_PREP_LEAD_SEC',
+  );
+
+  await player.stop();
+});
+
 function spawnBuffered(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -728,12 +927,28 @@ function spawnBuffered(cmd, args) {
   });
 }
 
-test('acceptance (mixer): re-prepping the same incoming track for a beatmix plan reuses the already-downloaded file', async () => {
+async function pollUntil(predicate, { timeoutMs = 3000, intervalMs = 50 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await waitMs(intervalMs);
+  }
+  return predicate();
+}
+
+test('acceptance (mixer): re-prepping the same incoming track for a beatmix plan reuses the already-downloaded file', async (t) => {
   // Codex round-2: #ensureIncomingPrep's mismatch-triggered re-prep must not
   // delete and re-fetch a file the eager default prep already downloaded —
   // exercises the REAL #createPcmSource normalize pipeline (no
   // createPcmSourceFn override), so prefetchTrackFn/createFileSource really
-  // run against an on-disk file.
+  // run against an on-disk file. Skips when ffmpeg itself is unavailable,
+  // unlike the rest of this suite which mocks the PCM source and has no
+  // ffmpeg dependency.
+  const hasFfmpeg = await spawnBuffered('ffmpeg', ['-hide_banner', '-version']).then(() => true, () => false);
+  if (!hasFfmpeg) {
+    t.skip('ffmpeg is not available in this environment');
+    return;
+  }
   const dir = await mkdtemp(join(tmpdir(), 'music-bot-reuse-test-'));
   const filePath = join(dir, 'track-b.wav');
   try {
@@ -806,17 +1021,21 @@ test('acceptance (mixer): re-prepping the same incoming track for a beatmix plan
     // Let the eager default prep (#ensureIncomingPrepForUpcoming, startSec=0)
     // for Track B finish downloading/normalizing first. Real ffmpeg spawn +
     // decode, unlike the mocked PcmSource used elsewhere, needs actual
-    // wall-clock time.
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    // wall-clock time — poll with a generous deadline instead of a fixed
+    // sleep so a slow/loaded machine doesn't fail for an unrelated reason.
+    await pollUntil(() => prefetchCalls >= 1, { timeoutMs: 5000 });
     assert.equal(prefetchCalls, 1, 'expected the eager default prep to fetch Track B once');
 
     // remaining (8s) is already inside the beatmix plan's prepWindow from the
-    // very first arm tick (fadeSec + CROSSFADE_PREP_LEAD_SEC = 19s), so the
-    // re-prep decision — reuse vs re-fetch — happens on the first tick after
-    // playNext, well before positionSec would ever reach the plan's
-    // exitStartSec. No need to drive frames through a full crossfade to
-    // observe it; just give the 200ms arm timer a couple of ticks.
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    // very first arm tick (positionSec 0 is within CROSSFADE_PREP_LEAD_SEC of
+    // startSec ~1.0s), so the re-prep decision — reuse vs re-fetch — happens
+    // on the first tick after playNext, well before positionSec would ever
+    // reach the plan's exitStartSec. No need to drive frames through a full
+    // crossfade to observe it; just give the 200ms arm timer a few ticks to
+    // land the mismatch-triggered re-prep, then confirm no SECOND fetch
+    // followed it (an absence check, so this still needs a bounded wait
+    // rather than a poll-until-true condition).
+    await waitMs(800);
 
     assert.equal(
       prefetchCalls,

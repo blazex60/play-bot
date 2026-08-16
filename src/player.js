@@ -194,6 +194,18 @@ export class GuildPlayer {
    * how much of the source is actually left to play (Codex round-1 P1).
    */
   #pendingIncomingEntrySec = 0;
+  /**
+   * Native seconds the CURRENTLY playing source was seeked forward by at
+   * spawn (0 for a fresh/legacy start). analysis-derived exit timestamps
+   * (norm.exitStartSec) are absolute positions in the native file, while
+   * MixStream.positionSec is relative to wherever this source's decoder
+   * actually started — comparing them directly without subtracting this
+   * offset makes the arm loop think the exit point is #currentEntrySec
+   * seconds later than it really is relative to positionSec, delaying (or
+   * for a short remaining source, entirely missing) the next chained
+   * transition (Codex round-3 P1).
+   */
+  #currentEntrySec = 0;
   #probeTempoBackendFn;
   #createPcmSourceFn;
   #incomingTempFile = null;
@@ -238,6 +250,16 @@ export class GuildPlayer {
     audioPlayer = createAudioPlayer(),
     createAudioResourceFn = createAudioResource,
     resolveAudioStreamFn = resolveAudioStream,
+    /**
+     * Test-only override for the real normalize/prefetch pcm source
+     * pipeline. §9.3/§2.3/§8.4: the player treats a returned source's
+     * `tempoHonored !== false` as "startSec/tempoFilter were actually
+     * applied" and stashes beatmix/phrase promotion bookkeeping (session
+     * tempo, entry-offset subtraction) accordingly — a custom factory that
+     * ignores startSec/tempoFilter must set `source.tempoHonored = false`,
+     * or the player will wrongly believe a plain/native-tempo source was
+     * seeked and stretched as requested.
+     */
     createPcmSourceFn = null,
     getTrackAnalysisFn = null,
     putTrackAnalysisFn = null,
@@ -373,6 +395,7 @@ export class GuildPlayer {
     // above already establishes this track's own baseline.
     this.#pendingSessionTempo = null;
     this.#pendingIncomingEntrySec = 0;
+    this.#currentEntrySec = 0;
     this.#startCrossfadeArm();
     this.#prefetchUpcoming();
     this.#ensureIncomingPrepForUpcoming();
@@ -518,6 +541,7 @@ export class GuildPlayer {
     // a later #onCrossfadePromoted call.
     this.#pendingSessionTempo = null;
     this.#pendingIncomingEntrySec = 0;
+    this.#currentEntrySec = entrySec;
     this.#clearCrossfadeArm();
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
@@ -644,6 +668,10 @@ export class GuildPlayer {
     const promotedEntrySec = this.#pendingIncomingEntrySec;
     this.#pendingSessionTempo = null;
     this.#pendingIncomingEntrySec = 0;
+    // This source is now #current — later arm-loop ticks must subtract this
+    // from any exit timestamp they compare against positionSec (see
+    // #currentEntrySec's own comment).
+    this.#currentEntrySec = promotedEntrySec;
     if (promotedTempo) {
       this.#sessionTempo = promotedTempo;
     } else {
@@ -1228,25 +1256,42 @@ export class GuildPlayer {
       if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
       const norm = normalizeTransitionPlan(rawPlan);
 
-      // outAnalysis.durationSec / plan exit timestamps are native-timeline —
-      // MixStream.positionSec is playback-domain (post-stretch) when the
-      // OUTGOING track is itself already running at a stretched session
-      // tempo from an earlier beatmix promotion (§2.3/§8.4). Convert before
-      // comparing against positionSec, or arming drifts by the stretch
-      // amount for a chained beatmix.
+      // outAnalysis.durationSec / plan exit timestamps are absolute,
+      // native-timeline positions in the outgoing file. MixStream.positionSec
+      // is playback-domain (post-stretch) AND relative to wherever #current's
+      // decoder actually started — which is native offset #currentEntrySec,
+      // not 0, when #current was itself promoted from a seeked beatmix/phrase
+      // source. Both the tempo stretch (§2.3/§8.4) and this seek offset must
+      // be accounted for before comparing against positionSec, or the
+      // computed startSec sits too late (by the stretch amount, and/or by
+      // #currentEntrySec seconds) for positionSec to ever catch up to in
+      // time, arming the next chained transition late or missing it entirely
+      // (Codex round-3 P1).
       const outgoingTempoRatio = this.#sessionTempo.tempoRatio ?? 1;
+      const currentEntrySec = this.#currentEntrySec ?? 0;
       const nativeDurationSec = outAnalysis.durationSec
         ?? this.#resolvePlaybackDurationSec(current)
         ?? current.duration;
-      const durationSec = compensateDurationSec(nativeDurationSec, outgoingTempoRatio);
+      const remainingNativeDurationSec = nativeDurationSec != null
+        ? Math.max(0, nativeDurationSec - currentEntrySec)
+        : null;
+      const durationSec = compensateDurationSec(remainingNativeDurationSec, outgoingTempoRatio);
       const positionSec = this.#mixStream?.positionSec ?? 0;
       const startSec = norm.exitStartSec != null && durationSec != null
-        ? compensateDurationSec(norm.exitStartSec, outgoingTempoRatio)
+        ? compensateDurationSec(Math.max(0, norm.exitStartSec - currentEntrySec), outgoingTempoRatio)
         : (durationSec != null ? Math.max(0, durationSec - norm.mixPlan.fadeSec) : null);
 
       const fadeWindow = norm.mixPlan.fadeSec;
-      const prepWindow = norm.mixPlan.fadeSec + CROSSFADE_PREP_LEAD_SEC;
-      if (remaining <= prepWindow) {
+      // Gate on distance to the SELECTED exit point (startSec), not to EOF.
+      // A beatmix/phrase exit can sit up to TAIL_WINDOW_SEC before EOF —
+      // gating on `remaining` (time to EOF) alone means prep wouldn't fire
+      // until we're already much closer to (or past) that exit than
+      // CROSSFADE_PREP_LEAD_SEC, missing the selected downbeat by however
+      // long preparation itself takes (Codex round-3 P2).
+      const prepDue = startSec != null
+        ? positionSec >= startSec - CROSSFADE_PREP_LEAD_SEC
+        : remaining <= fadeWindow + CROSSFADE_PREP_LEAD_SEC;
+      if (prepDue) {
         this.#ensureIncomingPrep(next, {
           startSec: norm.entrySec,
           tempoFilter: norm.tempoFilter,

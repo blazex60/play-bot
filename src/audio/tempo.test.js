@@ -241,6 +241,7 @@ test('probeTempoBackend memoizes a conclusive "neither filter" result (exit 0, c
   assert.equal(first, null);
   assert.equal(second, null);
   assert.equal(calls, 1, 'ffmpeg -filters should only be spawned once for a conclusive null');
+  resetTempoBackendProbeCache();
 });
 
 test('probeTempoBackend memoizes the result across calls', async () => {

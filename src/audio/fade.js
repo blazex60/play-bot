@@ -98,7 +98,10 @@ export function mixFrames(outFrame, inFrame, outGain, inGain) {
   const max = 32767 * ceiling;
   for (let i = 0; i < dest.length; i++) {
     const x = (a[i] * gOut + b[i] * gIn) / 32768;
-    // cubic soft clip (same transfer as softLimitFrame)
+    // cubic soft clip over the whole overlap mix (unlike softLimitFrame,
+    // which is unity below its ceiling and only curves above it — this one
+    // runs across the full range since summing two sources can push the mix
+    // anywhere in it, not just near clipping).
     const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
     const scaled = y * 32768;
     dest[i] = scaled > max ? max : scaled < -max ? -max : scaled;
