@@ -173,6 +173,12 @@ export class MixStream extends Readable {
       baseSwap: plan.baseSwap === true && mode !== 'tail-fade',
       mode,
       eqRampSec: computeEqRampSec(plan),
+      // plan.mode itself collapses to 'crossfade' in #crossfade.mode above
+      // (MixStream doesn't otherwise distinguish beatmix from a plain
+      // crossfade) — remembered separately so a later stall-cancel decision
+      // (Codex round-6) still knows this attempt was originally beat-synced
+      // even after eqRampSec has already been neutralized by an earlier stall.
+      isBeatmix: plan.mode === 'beatmix',
     };
     this.#fadeElapsedSec = 0;
     this.#incomingSkipSec = mode === 'tail-fade' ? 0 : Math.max(0, plan.incomingOffsetSec ?? 0);
@@ -413,14 +419,25 @@ export class MixStream extends Readable {
       }
       // Incoming not ready yet — keep playing/consuming outgoing outro
       // instead of inserting underrun silence that freezes the current track.
-      // A beatmix's bar-envelope EQ ramp (eqRampSec) assumes both sides
-      // advance in lockstep from crossfade start — once the outgoing side
-      // has consumed a frame the incoming couldn't keep pace with, that
-      // lockstep is already broken for the rest of this transition (the
-      // outgoing beat grid keeps advancing here while the incoming's stays
-      // pinned at its entry point). Fall back to an instant, non-bar-timed
-      // EQ swap rather than keep ramping against audio now offset by
-      // however long this stall lasts (Codex round-5).
+      // A beatmix's whole premise is that outgoing's downbeat and incoming's
+      // (seeked) downbeat land together once mixing starts — outgoing keeps
+      // advancing through this stall while incoming stays pinned at its
+      // entry point, so that alignment is broken by however long the stall
+      // lasts. If NO dual-mixed frame has played yet (fadeElapsedSec still
+      // 0), nothing beat-synced has actually been heard — cancel this
+      // attempt outright (same recovery path as an incoming decode error)
+      // rather than start an overlap already desynced from its plan, and
+      // let GuildPlayer retry once a freshly-spawned decoder has had time to
+      // buffer. Once fadeElapsedSec has advanced past 0, real beat-matched
+      // audio already played; discarding it on top of an alignment glitch
+      // would be worse, so only the bar-timed EQ ramp downgrades there,
+      // falling back to an instant swap for the rest of the transition
+      // (Codex round-5 and round-6).
+      if (this.#fadeElapsedSec === 0 && this.#crossfade.isBeatmix) {
+        this.emit('incomingerror', new Error('incoming stalled before beatmix could start'));
+        this.#clearIncoming();
+        return outFrame;
+      }
       if (this.#crossfade.eqRampSec != null) {
         this.#crossfade.eqRampSec = null;
       }

@@ -805,7 +805,7 @@ test('acceptance (mixer): a chained beatmix transition subtracts the current sou
 
   await player.playNext();
   for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
-  await waitMs(300);
+  await pollUntil(() => firedPlans.length >= 1);
   assert.equal(firedPlans.length, 1, 'expected the A->B beatmix transition to arm');
 
   for (let i = 0; i < 220; i += 1) player.mixStream.read(FRAME_BYTES);
@@ -830,7 +830,7 @@ test('acceptance (mixer): a chained beatmix transition subtracts the current sou
   const afterCheckpoint1 = player.mixStream.positionSec;
   const toCheckpoint2 = Math.max(0, Math.ceil(((FIXED_THRESHOLD + 2) - afterCheckpoint1) / 0.02));
   for (let i = 0; i < toCheckpoint2; i += 1) player.mixStream.read(FRAME_BYTES);
-  await waitMs(300);
+  await pollUntil(() => firedPlans.length >= 2);
 
   assert.ok(
     player.mixStream.positionSec < BUGGY_THRESHOLD,
@@ -1023,6 +1023,21 @@ test('acceptance (mixer): an unhonored beatmix with a zero entry offset still do
     analysisSource: 'demucs',
   };
 
+  // Pin the fixture: it must actually produce a zero-sec entry candidate
+  // paired with a nonzero tempo filter, or this stops exercising the
+  // regression this test targets.
+  const rawPlan = planBeatSyncedTransition(outgoingAnalysis, incomingAnalysis, {
+    outgoingPlaybackBpm: 120,
+    tempoBackend: 'rubberband',
+    maxOverlapSec: 6,
+  });
+  assert.equal(rawPlan.mode, 'beatmix', 'test invariant: expected the planner to pick beatmix for this fixture');
+  assert.equal(rawPlan.incoming?.entrySec, 0, 'test invariant: expected a zero-sec entry candidate');
+  assert.ok(
+    typeof rawPlan.incoming?.tempoFilter === 'string' && rawPlan.incoming.tempoFilter.length > 0,
+    'test invariant: expected the fixture\'s BPM mismatch to require a tempo filter',
+  );
+
   const { player, queue } = makePlayer({
     trackDuration: 8,
     track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
@@ -1160,6 +1175,10 @@ test('acceptance (mixer): TRACK loop mode restarts from the beginning, not the b
   for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
   await waitMs(300);
 
+  assert.ok(
+    incomingSpawnArgs.length >= 2,
+    `expected the TRACK loop to actually spawn the same track again, got ${incomingSpawnArgs.length} spawn(s)`,
+  );
   const nonzeroSpawns = incomingSpawnArgs.filter((opts) => (opts.startSec ?? 0) !== 0);
   assert.equal(
     nonzeroSpawns.length,

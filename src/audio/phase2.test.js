@@ -530,23 +530,21 @@ test('MixStream beatmix mode ramps the bass-swap EQ in over swapBar instead of a
   mix.endMixer();
 });
 
-test('MixStream drops the beatmix EQ ramp once the incoming leg stalls before producing PCM', async () => {
-  // Codex round-5: eqRampSec's bar-envelope schedule assumes both sides
-  // advance in lockstep from crossfade start. If the incoming decoder has
-  // no PCM ready yet (a late ffmpeg/yt-dlp startup, or a mid-overlap
-  // underrun), #readCrossfadeFrame keeps playing/consuming outgoing frames
-  // alone rather than freezing — but fadeElapsedSec (and hence the ramp)
-  // stays pinned at 0 while that happens, so once incoming data finally
-  // arrives the outgoing side has already played further into its beat
-  // grid than the ramp schedule accounts for. Continuing to ramp the EQ in
-  // on that now-wrong schedule would swap bass at a point unrelated to the
-  // (now offset) real downbeats — the fix drops eqRampSec on any stall, so
-  // the EQ applies fully/instantly from the first successfully-mixed frame
-  // on, like the legacy (non-beatmix) path already does.
+test('MixStream cancels a beatmix outright if incoming PCM never buffers before the overlap starts', async () => {
+  // Codex round-6 (follow-up on round-5): a beatmix's whole premise is that
+  // outgoing's downbeat and incoming's (seeked) downbeat land together once
+  // mixing starts. If incoming has produced NO PCM at all by the time the
+  // very first crossfade frame is read (fadeElapsedSec still 0 — nothing
+  // beat-synced has actually played yet), simply dropping the EQ ramp
+  // (round-5's fix) isn't enough: outgoing would still start advancing
+  // through its own beat grid alone while incoming sits frozen at its entry
+  // point, so whenever incoming data finally arrives the two beat grids are
+  // already offset by the stall length. Cancel the attempt outright instead
+  // — same recovery path as an incoming decode error — so GuildPlayer can
+  // retry once a freshly-spawned decoder has had time to buffer.
   const mix = new MixStream();
   const loud = Buffer.alloc(FRAME_BYTES);
   new Int16Array(loud.buffer).fill(8000);
-  const silent = Buffer.alloc(FRAME_BYTES);
   const outgoing = PcmSource.fromBuffers(Array.from({ length: 20 }, () => Buffer.from(loud)));
   const incoming = createPendingSource();
 
@@ -562,21 +560,98 @@ test('MixStream drops the beatmix EQ ramp once the incoming leg stalls before pr
     sync: { bars: 40, beatsPerBar: 4 },
     eq: { type: 'bass-swap', swapBar: 1, highpassHz: 120 },
   }), true);
+  assert.equal(mix.isCrossfading, true);
 
-  for (let i = 0; i < 5; i++) {
-    assert.ok(await readFramePaused(mix), 'outgoing must keep playing during the stall');
+  let incomingErrorMsg = null;
+  mix.on('incomingerror', (err) => { incomingErrorMsg = err.message; });
+
+  const frame = await readFramePaused(mix);
+  assert.ok(frame, 'outgoing must keep playing through the cancel');
+  assert.equal(
+    mix.isCrossfading,
+    false,
+    'expected the beatmix to be canceled outright once incoming never buffered before the overlap started',
+  );
+  assert.ok(incomingErrorMsg, 'expected an incomingerror so GuildPlayer resets arm state and can retry');
+
+  assert.ok(await readFramePaused(mix), 'outgoing must keep playing solo after the canceled beatmix');
+  mix.endMixer();
+});
+
+function createStallingSource(initialChunks) {
+  const source = new EventEmitter();
+  source.ended = false;
+  source.error = null;
+  const queue = [...initialChunks];
+  source.read = (bytes) => {
+    if (queue.length === 0) return null;
+    return queue.shift().subarray(0, bytes);
+  };
+  source.destroy = () => {
+    source.removeAllListeners();
+    source.ended = true;
+  };
+  source.supply = (chunks) => {
+    queue.push(...chunks);
+    source.emit('data');
+  };
+  return source;
+}
+
+test('MixStream drops the beatmix EQ ramp (without canceling) on a stall mid-overlap', async () => {
+  // Codex round-5: once real beat-matched audio has already played
+  // (fadeElapsedSec > 0), a later stall shouldn't discard it — round-6's
+  // outright cancellation is reserved for a stall before ANY dual-mixed
+  // frame has played. Here the EQ ramp still needs to stop ramping on the
+  // now-wrong bar schedule, falling back to an instant swap for the rest of
+  // the transition, exactly like the "never buffered at all" case used to.
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const silent = Buffer.alloc(FRAME_BYTES);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 20 }, () => Buffer.from(loud)));
+  const incoming = createStallingSource([Buffer.from(silent), Buffer.from(silent), Buffer.from(silent)]);
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    mode: 'beatmix',
+    fadeSec: 80,
+    curve: 'equal-power',
+    baseSwap: true,
+    highpassHz: 120,
+    targetBpm: 120,
+    sync: { bars: 40, beatsPerBar: 4 },
+    eq: { type: 'bass-swap', swapBar: 1, highpassHz: 120 },
+  }), true);
+
+  // Consume the 3 pre-loaded incoming frames — genuine dual-mixed audio,
+  // advancing fadeElapsedSec past 0.
+  for (let i = 0; i < 3; i++) {
+    assert.ok(await readFramePaused(mix), 'expected real dual-mixed frames before the stall');
   }
+  assert.ok(await readFramePaused(mix), 'outgoing must keep playing through the mid-overlap stall');
+  assert.equal(mix.isCrossfading, true, 'a mid-overlap stall must not cancel the transition');
 
-  const pending = Array.from({ length: 20 }, () => Buffer.from(silent));
-  incoming.read = (bytes) => (pending.length === 0 ? null : pending.shift().subarray(0, bytes));
-  incoming.emit('data');
+  incoming.supply([Buffer.from(silent), Buffer.from(silent)]);
 
   const frame = await readFramePaused(mix);
   assert.ok(frame);
 
-  const expectedWet = createBiquadProcessor(designHighpass(48000, 120))(Buffer.from(loud));
-  const outGain = gainForPosition({ positionSec: 0, fadeSec: 80, curve: 'equal-power', role: 'out' });
-  const inGain = gainForPosition({ positionSec: 0, fadeSec: 80, curve: 'equal-power', role: 'in' });
+  // The real outEq filter is a stateful IIR processor that ran continuously
+  // across the 3 genuine pre-stall frames (always invoked every frame to
+  // keep its history continuous, regardless of the dry/wet blend mix at the
+  // time) — prime an independent instance the same way before capturing the
+  // comparison frame, or its zero-initial-state transient won't match.
+  const independentOutEq = createBiquadProcessor(designHighpass(48000, 120));
+  independentOutEq(Buffer.from(loud));
+  independentOutEq(Buffer.from(loud));
+  independentOutEq(Buffer.from(loud));
+  const expectedWet = independentOutEq(Buffer.from(loud));
+  // 3 real dual-mixed frames at 20ms each preceded the stall.
+  const positionSec = 3 * 0.02;
+  const outGain = gainForPosition({ positionSec, fadeSec: 80, curve: 'equal-power', role: 'out' });
+  const inGain = gainForPosition({ positionSec, fadeSec: 80, curve: 'equal-power', role: 'in' });
   const expected = mixFrames(expectedWet, silent, outGain, inGain);
 
   assert.deepEqual(
