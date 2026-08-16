@@ -6,6 +6,8 @@ import {
   gainForPosition,
   mixFrames,
   scaleFrame,
+  softLimitFrame,
+  blendFrame,
 } from './fade.js';
 import {
   createOutgoingBaseSwapProcessor,
@@ -14,6 +16,30 @@ import {
 import { MAX_UNDERRUN_MS } from './config.js';
 
 const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
+
+function clamp01(n) {
+  return n < 0 ? 0 : n > 1 ? 1 : n;
+}
+
+/**
+ * Phase 7 §11.1: for a `mode: 'beatmix'` plan, the bass-swap EQ ramps in over
+ * `eq.swapBar` bars instead of applying instantly for the whole crossfade
+ * (the doc's diagram — A/B LOW% cross over gradually, not switched at bar 1).
+ * `sync.beatsPerBar` and `targetBpm` (the session tempo both sides play the
+ * overlap at) give the real bar length; any other mode (plain crossfade,
+ * phrase-crossfade) keeps the existing instant on/off EQ, so this returns
+ * null for them.
+ * @returns {number|null} ramp duration in seconds, or null for "apply fully".
+ */
+function computeEqRampSec(plan) {
+  if (plan.mode !== 'beatmix') return null;
+  const targetBpm = plan.targetBpm;
+  const beatsPerBar = plan.sync?.beatsPerBar;
+  const swapBar = plan.eq?.swapBar;
+  if (!(targetBpm > 0) || !(beatsPerBar > 0) || !(swapBar > 0)) return null;
+  const barSec = (60 / targetBpm) * beatsPerBar;
+  return barSec > 0 ? barSec * swapBar : null;
+}
 
 export class MixStream extends Readable {
   #current = null;
@@ -146,6 +172,13 @@ export class MixStream extends Readable {
       curve: plan.curve ?? 'equal-power',
       baseSwap: plan.baseSwap === true && mode !== 'tail-fade',
       mode,
+      eqRampSec: computeEqRampSec(plan),
+      // plan.mode itself collapses to 'crossfade' in #crossfade.mode above
+      // (MixStream doesn't otherwise distinguish beatmix from a plain
+      // crossfade) — remembered separately so a later stall-cancel decision
+      // (Codex round-6) still knows this attempt was originally beat-synced
+      // even after eqRampSec has already been neutralized by an earlier stall.
+      isBeatmix: plan.mode === 'beatmix',
     };
     this.#fadeElapsedSec = 0;
     this.#incomingSkipSec = mode === 'tail-fade' ? 0 : Math.max(0, plan.incomingOffsetSec ?? 0);
@@ -332,7 +365,10 @@ export class MixStream extends Readable {
       curve: this.#crossfade.curve,
       role: 'out',
     });
-    const faded = scaleFrame(outFrame, outGain);
+    // §11.2: unlike the crossfade path (mixFrames() already soft-limits),
+    // tail-fade only ever scales a single frame — no other source is
+    // summed in — but scaleFrame() alone has no headroom/clip protection.
+    const faded = softLimitFrame(scaleFrame(outFrame, outGain));
     this.#consumedBytes += FRAME_BYTES;
     this.#fadeElapsedSec += FRAME_MS / 1000;
 
@@ -383,6 +419,28 @@ export class MixStream extends Readable {
       }
       // Incoming not ready yet — keep playing/consuming outgoing outro
       // instead of inserting underrun silence that freezes the current track.
+      // A beatmix's whole premise is that outgoing's downbeat and incoming's
+      // (seeked) downbeat land together once mixing starts — outgoing keeps
+      // advancing through this stall while incoming stays pinned at its
+      // entry point, so that alignment is broken by however long the stall
+      // lasts. If NO dual-mixed frame has played yet (fadeElapsedSec still
+      // 0), nothing beat-synced has actually been heard — cancel this
+      // attempt outright (same recovery path as an incoming decode error)
+      // rather than start an overlap already desynced from its plan, and
+      // let GuildPlayer retry once a freshly-spawned decoder has had time to
+      // buffer. Once fadeElapsedSec has advanced past 0, real beat-matched
+      // audio already played; discarding it on top of an alignment glitch
+      // would be worse, so only the bar-timed EQ ramp downgrades there,
+      // falling back to an instant swap for the rest of the transition
+      // (Codex round-5 and round-6).
+      if (this.#fadeElapsedSec === 0 && this.#crossfade.isBeatmix) {
+        this.emit('incomingerror', new Error('incoming stalled before beatmix could start'));
+        this.#clearIncoming();
+        return outFrame;
+      }
+      if (this.#crossfade.eqRampSec != null) {
+        this.#crossfade.eqRampSec = null;
+      }
       if (outFrame) {
         this.#consumedBytes += FRAME_BYTES;
         return outFrame;
@@ -395,10 +453,22 @@ export class MixStream extends Readable {
       return null;
     }
 
-    let processedOut = Buffer.from(outFrame);
-    let processedIn = Buffer.from(inFrame);
-    if (this.#outEq) processedOut = this.#outEq(processedOut);
-    if (this.#inEq) processedIn = this.#inEq(processedIn);
+    // The biquad filters are stateful IIR processors — always run them every
+    // frame so their history stays continuous, then blend the dry/wet result
+    // by the ramp mix (shared by both sides — the ramp is one crossfade-wide
+    // envelope, not per-channel). eqRampSec == null (non-beatmix) resolves
+    // mix to 1, reproducing the prior "always fully filtered" behavior
+    // exactly. mixFrames() below only reads outFrame/processedOut (never
+    // mutates), so skip the defensive copy when there is no filter to blend.
+    const eqMix = this.#crossfade.eqRampSec != null
+      ? clamp01(this.#fadeElapsedSec / this.#crossfade.eqRampSec)
+      : 1;
+    const processedOut = this.#outEq
+      ? blendFrame(outFrame, this.#outEq(Buffer.from(outFrame)), eqMix)
+      : outFrame;
+    const processedIn = this.#inEq
+      ? blendFrame(inFrame, this.#inEq(Buffer.from(inFrame)), eqMix)
+      : inFrame;
 
     const outGain = gainForPosition({
       positionSec: this.#fadeElapsedSec,
@@ -445,13 +515,12 @@ export class MixStream extends Readable {
     this.#incomingSkipSec = 0;
     this.#incomingSkippedSec = 0;
 
-    // Emit trackend for the outgoing track; GuildPlayer advances queue metadata
-    // without calling setCurrent again when already crossfading.
-    this.emit('trackend', { promoted: true });
-
     if (!next) {
       this.#current = null;
       this.#betweenTracks = true;
+      // Emit trackend for the outgoing track; GuildPlayer advances queue
+      // metadata without calling setCurrent again when already crossfading.
+      this.emit('trackend', { promoted: true });
       return;
     }
 
@@ -468,6 +537,12 @@ export class MixStream extends Readable {
     next.on('error', (err) => {
       this.emit('sourceerror', err);
     });
+
+    // Emit only after #current/#durationSec are already switched to the
+    // promoted source: a listener's setDurationSec() call (GuildPlayer's
+    // #onCrossfadePromoted, which runs synchronously inside this emit) must
+    // not be immediately overwritten by the #durationSec = null reset above.
+    this.emit('trackend', { promoted: true });
   }
 
   #clearIncoming() {

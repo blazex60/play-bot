@@ -89,28 +89,35 @@ let cachedBackendPromise = null;
  * Debian bookworm's ffmpeg, no new package needed), falling back to atempo,
  * then null (beatmix unavailable). Result is memoized process-wide — the
  * ffmpeg binary does not change at runtime.
+ *
+ * A clean run (exit 0) that simply lists neither filter is just as stable a
+ * fact about this binary as finding one — it gets memoized the same way. A
+ * nonzero exit or thrown spawn error is different: transient (a momentary
+ * resource issue, not a property of the binary), so that must NOT be
+ * memoized, or a later real detection would never be retried. Phase 7D's
+ * player.js polls this once per 200ms crossfade-arm tick whenever a
+ * candidate pair has usable BPM data, so an unmemoized "genuinely no
+ * backend" result means re-spawning `ffmpeg -filters` every tick for as
+ * long as that candidate is under consideration (Codex round-2).
  */
 export async function probeTempoBackend({ spawnFn } = {}) {
   if (cachedBackendPromise) return cachedBackendPromise;
+  let conclusive = false;
   const probe = (async () => {
     try {
       const { stdout, code } = await spawnCapture(spawnFn, 'ffmpeg', ['-hide_banner', '-filters']);
       if (code !== 0) return null;
+      conclusive = true;
       if (/\brubberband\b/.test(stdout)) return 'rubberband';
       if (/\batempo\b/.test(stdout)) return 'atempo';
       return null;
     } catch {
-      // spawnCapture rejects on a spawn error or timeout — that is a
-      // transient condition, not a stable property of the ffmpeg binary
-      // (unlike "no rubberband/atempo filter listed"), so unlike a real
-      // unavailable-backend result it must not be memoized: caching it
-      // would disable tempo matching for the rest of the process's life.
       return null;
     }
   })();
   cachedBackendPromise = probe;
   const result = await probe;
-  if (result == null) cachedBackendPromise = null;
+  if (result == null && !conclusive) cachedBackendPromise = null;
   return result;
 }
 

@@ -35,16 +35,49 @@ export function scaleFrame(frame, gain) {
   return out;
 }
 
-/** Soft-clip samples in-place on an Int16 interleaved stereo frame. */
+/**
+ * Linear-interpolate two same-length s16le frames sample-by-sample.
+ * mix=0 -> dry, mix=1 -> wet. Used to ramp an EQ effect in/out gradually
+ * (Phase 7 §11.1 bar-envelope bass swap) instead of switching it on/off
+ * instantly for the whole crossfade.
+ * @returns {Buffer}
+ */
+export function blendFrame(dry, wet, mix) {
+  if (!(mix > 0)) return dry;
+  if (mix >= 1) return wet;
+  const out = Buffer.allocUnsafe(FRAME_BYTES);
+  const a = new Int16Array(dry.buffer, dry.byteOffset, FRAME_BYTES / 2);
+  const b = new Int16Array(wet.buffer, wet.byteOffset, FRAME_BYTES / 2);
+  const dest = new Int16Array(out.buffer, out.byteOffset, FRAME_BYTES / 2);
+  for (let i = 0; i < dest.length; i++) {
+    const v = a[i] * (1 - mix) + b[i] * mix;
+    dest[i] = v > 32767 ? 32767 : v < -32768 ? -32768 : Math.round(v);
+  }
+  return out;
+}
+
+/**
+ * Soft-knee limiter on an Int16 interleaved stereo frame, in-place. Unity
+ * (no change) below `ceiling`; above it, the excess is compressed through
+ * tanh() so the transfer function stays continuous (value and slope) right
+ * at the threshold — a hard switch from unity to a curve (as in an earlier
+ * version of this function) creates a large discontinuity exactly at the
+ * boundary, which is audible as a click/crackle whenever a waveform hovers
+ * near the ceiling. tanh asymptotically approaches ceiling + headroom (< 1)
+ * as excess grows, so output never reaches full scale.
+ */
 export function softLimitFrame(frame, ceiling = 0.95) {
   const view = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2);
-  const max = 32767 * ceiling;
+  const threshold = ceiling;
+  const headroom = 1 - threshold;
   for (let i = 0; i < view.length; i++) {
     const x = view[i] / 32768;
-    // cubic soft clip
-    const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
-    const scaled = y * 32768;
-    view[i] = scaled > max ? max : scaled < -max ? -max : scaled;
+    const abs = x < 0 ? -x : x;
+    if (abs <= threshold) continue;
+    const excess = abs - threshold;
+    const compressed = headroom * Math.tanh(excess / headroom);
+    const y = (threshold + compressed) * (x < 0 ? -1 : 1);
+    view[i] = Math.round(y * 32768);
   }
   return frame;
 }
@@ -65,7 +98,10 @@ export function mixFrames(outFrame, inFrame, outGain, inGain) {
   const max = 32767 * ceiling;
   for (let i = 0; i < dest.length; i++) {
     const x = (a[i] * gOut + b[i] * gIn) / 32768;
-    // cubic soft clip (same transfer as softLimitFrame)
+    // cubic soft clip over the whole overlap mix (unlike softLimitFrame,
+    // which is unity below its ceiling and only curves above it — this one
+    // runs across the full range since summing two sources can push the mix
+    // anywhere in it, not just near clipping).
     const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
     const scaled = y * 32768;
     dest[i] = scaled > max ? max : scaled < -max ? -max : scaled;

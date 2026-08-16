@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { gainForPosition, mixFrames, FRAME_BYTES, OVERLAP_GAIN } from './fade.js';
+import { gainForPosition, mixFrames, FRAME_BYTES, OVERLAP_GAIN, blendFrame, softLimitFrame } from './fade.js';
 import { planTransition, snapStartToBar } from './transition.js';
 import { recommendOverlapSec } from './trackAnalysis.js';
 import { designHighpass, createBiquadProcessor } from './eq.js';
@@ -471,4 +471,268 @@ test('MixStream promoted source errors emit sourceerror', async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(sourceError, true);
   mix.endMixer();
+});
+
+test('blendFrame interpolates linearly and returns the endpoints unchanged', () => {
+  const dry = Buffer.alloc(FRAME_BYTES);
+  const wet = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(dry.buffer).fill(10000);
+  new Int16Array(wet.buffer).fill(-10000);
+
+  assert.equal(blendFrame(dry, wet, 0), dry);
+  assert.equal(blendFrame(dry, wet, 1), wet);
+
+  const half = blendFrame(dry, wet, 0.5);
+  const view = new Int16Array(half.buffer, half.byteOffset, half.byteLength / 2);
+  assert.equal(view[0], 0);
+});
+
+test('MixStream beatmix mode ramps the bass-swap EQ in over swapBar instead of applying it instantly', async () => {
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const silent = Buffer.alloc(FRAME_BYTES);
+  // Long fadeSec relative to swapSec (1 bar @120BPM = 2s) keeps the overall
+  // equal-power crossfade gain ~flat across the sampled frames, isolating
+  // the EQ ramp's effect from the (separate, unchanged) gain envelope.
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 200 }, () => Buffer.from(loud)));
+  const incoming = PcmSource.fromBuffers(Array.from({ length: 200 }, () => Buffer.from(silent)));
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 200 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    mode: 'beatmix',
+    fadeSec: 80,
+    curve: 'equal-power',
+    baseSwap: true,
+    highpassHz: 120,
+    targetBpm: 120,
+    sync: { bars: 40, beatsPerBar: 4 },
+    eq: { type: 'bass-swap', swapBar: 1, highpassHz: 120 },
+  }), true);
+
+  const first = await readFramePaused(mix);
+  const firstView = new Int16Array(first.buffer, first.byteOffset, first.byteLength / 2);
+  const firstAbs = Math.max(...Array.from(firstView, Math.abs));
+
+  // 1 bar @120BPM = 2s = 100 frames; sample well past that.
+  let later;
+  for (let i = 0; i < 125; i++) {
+    later = await readFramePaused(mix);
+  }
+  const laterView = new Int16Array(later.buffer, later.byteOffset, later.byteLength / 2);
+  const laterAbs = Math.max(...Array.from(laterView, Math.abs));
+
+  assert.ok(
+    firstAbs > laterAbs * 3,
+    `expected the bass swap to ramp in (first=${firstAbs}, later=${laterAbs})`,
+  );
+  mix.endMixer();
+});
+
+test('MixStream cancels a beatmix outright if incoming PCM never buffers before the overlap starts', async () => {
+  // Codex round-6 (follow-up on round-5): a beatmix's whole premise is that
+  // outgoing's downbeat and incoming's (seeked) downbeat land together once
+  // mixing starts. If incoming has produced NO PCM at all by the time the
+  // very first crossfade frame is read (fadeElapsedSec still 0 — nothing
+  // beat-synced has actually played yet), simply dropping the EQ ramp
+  // (round-5's fix) isn't enough: outgoing would still start advancing
+  // through its own beat grid alone while incoming sits frozen at its entry
+  // point, so whenever incoming data finally arrives the two beat grids are
+  // already offset by the stall length. Cancel the attempt outright instead
+  // — same recovery path as an incoming decode error — so GuildPlayer can
+  // retry once a freshly-spawned decoder has had time to buffer.
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 20 }, () => Buffer.from(loud)));
+  const incoming = createPendingSource();
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    mode: 'beatmix',
+    fadeSec: 80,
+    curve: 'equal-power',
+    baseSwap: true,
+    highpassHz: 120,
+    targetBpm: 120,
+    sync: { bars: 40, beatsPerBar: 4 },
+    eq: { type: 'bass-swap', swapBar: 1, highpassHz: 120 },
+  }), true);
+  assert.equal(mix.isCrossfading, true);
+
+  let incomingErrorMsg = null;
+  mix.on('incomingerror', (err) => { incomingErrorMsg = err.message; });
+
+  const frame = await readFramePaused(mix);
+  assert.ok(frame, 'outgoing must keep playing through the cancel');
+  assert.equal(
+    mix.isCrossfading,
+    false,
+    'expected the beatmix to be canceled outright once incoming never buffered before the overlap started',
+  );
+  assert.ok(incomingErrorMsg, 'expected an incomingerror so GuildPlayer resets arm state and can retry');
+
+  assert.ok(await readFramePaused(mix), 'outgoing must keep playing solo after the canceled beatmix');
+  mix.endMixer();
+});
+
+function createStallingSource(initialChunks) {
+  const source = new EventEmitter();
+  source.ended = false;
+  source.error = null;
+  const queue = [...initialChunks];
+  source.read = (bytes) => {
+    if (queue.length === 0) return null;
+    return queue.shift().subarray(0, bytes);
+  };
+  source.destroy = () => {
+    source.removeAllListeners();
+    source.ended = true;
+  };
+  source.supply = (chunks) => {
+    queue.push(...chunks);
+    source.emit('data');
+  };
+  return source;
+}
+
+test('MixStream drops the beatmix EQ ramp (without canceling) on a stall mid-overlap', async () => {
+  // Codex round-5: once real beat-matched audio has already played
+  // (fadeElapsedSec > 0), a later stall shouldn't discard it — round-6's
+  // outright cancellation is reserved for a stall before ANY dual-mixed
+  // frame has played. Here the EQ ramp still needs to stop ramping on the
+  // now-wrong bar schedule, falling back to an instant swap for the rest of
+  // the transition, exactly like the "never buffered at all" case used to.
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const silent = Buffer.alloc(FRAME_BYTES);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 20 }, () => Buffer.from(loud)));
+  const incoming = createStallingSource([Buffer.from(silent), Buffer.from(silent), Buffer.from(silent)]);
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    mode: 'beatmix',
+    fadeSec: 80,
+    curve: 'equal-power',
+    baseSwap: true,
+    highpassHz: 120,
+    targetBpm: 120,
+    sync: { bars: 40, beatsPerBar: 4 },
+    eq: { type: 'bass-swap', swapBar: 1, highpassHz: 120 },
+  }), true);
+
+  // Consume the 3 pre-loaded incoming frames — genuine dual-mixed audio,
+  // advancing fadeElapsedSec past 0.
+  for (let i = 0; i < 3; i++) {
+    assert.ok(await readFramePaused(mix), 'expected real dual-mixed frames before the stall');
+  }
+  assert.ok(await readFramePaused(mix), 'outgoing must keep playing through the mid-overlap stall');
+  assert.equal(mix.isCrossfading, true, 'a mid-overlap stall must not cancel the transition');
+
+  incoming.supply([Buffer.from(silent), Buffer.from(silent)]);
+
+  const frame = await readFramePaused(mix);
+  assert.ok(frame);
+
+  // The real outEq filter is a stateful IIR processor that ran continuously
+  // across the 3 genuine pre-stall frames (always invoked every frame to
+  // keep its history continuous, regardless of the dry/wet blend mix at the
+  // time) — prime an independent instance the same way before capturing the
+  // comparison frame, or its zero-initial-state transient won't match.
+  const independentOutEq = createBiquadProcessor(designHighpass(48000, 120));
+  independentOutEq(Buffer.from(loud));
+  independentOutEq(Buffer.from(loud));
+  independentOutEq(Buffer.from(loud));
+  const expectedWet = independentOutEq(Buffer.from(loud));
+  // 3 real dual-mixed frames at 20ms each preceded the stall.
+  const positionSec = 3 * 0.02;
+  const outGain = gainForPosition({ positionSec, fadeSec: 80, curve: 'equal-power', role: 'out' });
+  const inGain = gainForPosition({ positionSec, fadeSec: 80, curve: 'equal-power', role: 'in' });
+  const expected = mixFrames(expectedWet, silent, outGain, inGain);
+
+  assert.deepEqual(
+    frame,
+    expected,
+    'expected the EQ to apply fully/instantly on the first post-stall frame, not still be ramping in from swapBar',
+  );
+  mix.endMixer();
+});
+
+test('MixStream non-beatmix crossfade applies base-swap EQ fully on the very first frame (no bar-envelope ramp)', async () => {
+  // computeEqRampSec() returns null for any plan.mode other than 'beatmix',
+  // so #readCrossfadeFrame's blend mix resolves eqRampSec == null to 1
+  // immediately — legacy crossfade/phrase-crossfade should be bit-identical
+  // to running the highpass directly, with no dry/wet ramp-in at all.
+  // Verified against an independent instance of the same filter (both start
+  // from the same zero IIR state on this, the very first frame) rather than
+  // a magnitude threshold — the filter's own step-response transient makes
+  // "how loud is frame 1" alone an unreliable, ramp-vs-no-ramp signal.
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const silent = Buffer.alloc(FRAME_BYTES);
+  const outgoing = PcmSource.fromBuffers([Buffer.from(loud)]);
+  const incoming = PcmSource.fromBuffers([Buffer.from(silent)]);
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 60 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, { fadeSec: 5, curve: 'equal-power', baseSwap: true, highpassHz: 120 }), true);
+
+  const frame = await readFramePaused(mix);
+  assert.ok(frame);
+
+  const expectedWet = createBiquadProcessor(designHighpass(48000, 120))(Buffer.from(loud));
+  const outGain = gainForPosition({ positionSec: 0, fadeSec: 5, curve: 'equal-power', role: 'out' });
+  const inGain = gainForPosition({ positionSec: 0, fadeSec: 5, curve: 'equal-power', role: 'in' });
+  const expected = mixFrames(expectedWet, silent, outGain, inGain);
+
+  assert.deepEqual(frame, expected);
+  mix.endMixer();
+});
+
+test('MixStream tail-fade soft-limits near-full-scale input with a gentle knee (not a hard clamp)', async () => {
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  const loudView = new Int16Array(loud.buffer);
+  loudView.fill(32000);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 5 }, () => Buffer.from(loud)));
+  const incoming = PcmSource.fromBuffers(Array.from({ length: 5 }, () => Buffer.from(loud)));
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  // Prime: a Readable queues one frame from _read() before any source is
+  // attached (an all-zero silence frame) — without draining it first, the
+  // very next read() returns that stale silence instead of a real tail-fade
+  // frame, and a peak-only-upper-bound assertion would pass on it vacuously.
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, { fadeSec: 5, curve: 'equal-power', mode: 'tail-fade' }), true);
+
+  const frame = await readFramePaused(mix);
+  const view = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2);
+  const peak = Math.max(...Array.from(view, Math.abs));
+  // outGain ~1 at the very start of the fade: 32000 sits above the ~31130
+  // (0.95 ceiling) threshold, so the soft-knee limiter engages — but only
+  // gently (tanh saturation), not the old aggressive whole-range cubic curve.
+  assert.ok(peak < 32000, `expected the limiter to engage at all, got peak ${peak}`);
+  assert.ok(peak > 31000, `expected a gentle knee near the ceiling, not heavy compression, got peak ${peak}`);
+  mix.endMixer();
+});
+
+test('softLimitFrame is continuous across the ceiling threshold (no discontinuity)', () => {
+  // Round-2 regression: an earlier version switched abruptly from unity to
+  // the cubic curve exactly at the ceiling, so a sample of 31129 stayed
+  // unchanged while 31130 jumped to ~21764 — audible as a click whenever a
+  // waveform hovers near the threshold.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const view = new Int16Array(frame.buffer);
+  view[0] = 31129;
+  view[1] = 31130;
+  softLimitFrame(frame, 0.95);
+  assert.ok(
+    Math.abs(view[0] - view[1]) <= 2,
+    `expected adjacent inputs straddling the threshold to stay adjacent after limiting, got ${view[0]} vs ${view[1]}`,
+  );
 });
