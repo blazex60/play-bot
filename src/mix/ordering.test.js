@@ -292,8 +292,10 @@ test('transitionCost\'s beatmix term penalizes sub-threshold downbeat-grid confi
 test('transitionCost\'s beatmix term rejects a tempo ratio beyond the hard limit, matching planBeatmixTransition()\'s tempo-ratio-exceeds-hard rejection', () => {
   // CodeRabbit round-2 (major) on PR #35: canTempoMatch() can return
   // { ok: false, ratio: <number>, tier: 'exceeds-hard' } — a REAL, computed
-  // ratio that was positively rejected, not missing/unrelated BPM data
-  // (that case has ratio: null and stays unpenalized, same as before).
+  // ratio that was positively rejected, not missing BPM data (that case has
+  // ratio: null AND at least one of targetBpm/incomingBpm null, and stays
+  // unpenalized — see the separate "no octave relation" test below for the
+  // ratio: null-but-both-BPMs-present case, which is also penalized).
   // scoreTransitionPair() only folds tempo into ONE of five weighted
   // sub-signals, so without gating on match.ok a tempo-infeasible pair
   // could still score decently on vocal safety/phrase/downbeat/energy
@@ -305,6 +307,57 @@ test('transitionCost\'s beatmix term rejects a tempo ratio beyond the hard limit
   assert.ok(
     transitionCost(from, exceedsHardLimit) > transitionCost(from, withinHardLimit),
     'expected a tempo ratio beyond the hard limit to be penalized like other confirmed infeasibilities, not partially scored on the remaining sub-signals',
+  );
+});
+
+test('transitionCost\'s beatmix term rejects tempo pairs with no octave relation at all, matching planBeatmixTransition()\'s outright !match.ok rejection', () => {
+  // Codex round-5 on PR #35: canTempoMatch() returns the identical
+  // { ok: false, ratio: null } shape both when a BPM is genuinely missing
+  // AND when both BPMs are present but share no octave relation at all
+  // (e.g. 30 vs 120 — no candidate among [x, x*2, x/2] falls in the
+  // target's 0.6x-1.4x band). Only the latter is a positively identified
+  // infeasibility the live planner rejects outright via its own
+  // `if (!match.ok)` check; the round-3 fix only handled the
+  // ratio-non-null "exceeds-hard" variant of !match.ok.
+  //
+  // A relative comparison against a well-matched pair isn't enough here —
+  // tempoCompatibility alone already degrades to 0 for a ratio: null pair
+  // even without the gate (scoreTransitionPair() handles that internally),
+  // which was already enough to make this an inequality hold even with the
+  // gate reverted (caught via this session's revert-and-confirm check, same
+  // trap as the round-4 marginal-tempo test). Asserting the exact expected
+  // cost when the gate fires avoids that trap.
+  const from = richOutgoing(); // tailBpm 120
+  const noOctaveRelation = richIncoming({ bpm: 30, headBpm: 30 }); // canTempoMatch(30, 120) -> ratio: null
+  const expectedBpmCost = 1 * Math.min(2, bpmDelta(120, 30) / 20);
+  const expectedGatedCost = (expectedBpmCost + 1.5 * 1) / 4; // beatmixWeight 1.5 * BEATMIX_INFEASIBLE_COST 1
+  assert.ok(
+    Math.abs(transitionCost(from, noOctaveRelation) - expectedGatedCost) < 1e-9,
+    `expected the no-octave-relation gate to force the full infeasibility penalty (got ${transitionCost(from, noOctaveRelation)}, expected ${expectedGatedCost})`,
+  );
+});
+
+test('transitionCost\'s beatmix term is skipped for v2-cached analysis (real vocal analysis, no v3 fields), not penalized', () => {
+  // Codex round-5 on PR #35: hasVocalAnalysis() (analysisSource !== 'none')
+  // predates v3 (Phase 6) — a v2-cached row has a valid analysisSource from
+  // its own vocal-activity pass but none of v3's beatConfidence/
+  // downbeatGrid/phrases fields. Gating only on hasVocalAnalysis()
+  // mis-classified v2 rows as "real v3 data with an unreadable beat grid,"
+  // giving every one of their edges the full infeasibility penalty instead
+  // of skipping the term entirely, same as any other pre-v3 analysis.
+  const v2Outgoing = {
+    analysisSource: 'demucs', bpm: 120, tailKey: '8B', harmonicConfidence: 0.8,
+    lastVocalEndSec: 150, durationSec: 200, lastRms: -14,
+  };
+  const v2Incoming = {
+    analysisSource: 'demucs', bpm: 130, headKey: '9B', harmonicConfidence: 0.8, lastRms: -20,
+  };
+  const legacyOutgoing = { bpm: 120, tailKey: '8B', harmonicConfidence: 0.8, lastRms: -14 };
+  const legacyIncoming = { bpm: 130, headKey: '9B', harmonicConfidence: 0.8, lastRms: -20 };
+  assert.equal(
+    transitionCost(v2Outgoing, v2Incoming),
+    transitionCost(legacyOutgoing, legacyIncoming),
+    'expected v2-cached analysis (real analysisSource, no v3 fields) to cost exactly the same as no analysisSource at all',
   );
 });
 

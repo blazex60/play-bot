@@ -93,6 +93,24 @@ function minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis) {
 const BEATMIX_INFEASIBLE_COST = 1;
 
 /**
+ * hasVocalAnalysis() alone only proves vocal separation succeeded — that
+ * field predates v3 (Phase 6), so a v2-cached row has
+ * `analysisSource: 'demucs'` too, despite having none of v3's
+ * beatConfidence/downbeatGrid/phrases fields at all. Requiring a finite
+ * beatConfidence (v3-only, set unconditionally whenever v3 analysis ran)
+ * distinguishes "real v3 data" from "just has a valid vocal-analysis
+ * result," so a v2 row correctly falls through to null (skipped) below
+ * instead of every one of its edges getting the full infeasibility penalty
+ * for fields it was never actually evaluated against (Codex round-5 on
+ * PR #35).
+ * @param {object | null | undefined} analysis
+ * @returns {boolean}
+ */
+function hasBeatmixAnalysis(analysis) {
+  return hasVocalAnalysis(analysis) && Number.isFinite(analysis?.beatConfidence);
+}
+
+/**
  * Phase 7E: an additional, opt-in cost term layered on top of the base bpm/
  * key/energy terms below, built by reusing Phase 7C's beatmix planner
  * building blocks (findExitCandidates/findEntryCandidates/
@@ -104,30 +122,32 @@ const BEATMIX_INFEASIBLE_COST = 1;
  *
  * Returns null (not zero, not penalized — the term is simply skipped, same
  * treatment as the harmonic term's confidence gate below) only when either
- * side lacks phrase/vocal analysis entirely (pre-v3 cached analysis, or a
- * track whose vocal separation failed) — checked via hasVocalAnalysis()
- * FIRST, before any other gate below runs, so a track with e.g. a leftover
- * downbeatGrid.meter but analysisSource:'none' (vocal separation failed)
- * can't get flagged as a "confirmed" infeasibility it was never actually
- * evaluated for (Codex round-3 on PR #35).
+ * side lacks real v3 beatmix analysis entirely (pre-v3/v2 cached analysis,
+ * or a track whose vocal separation failed) — checked via
+ * hasBeatmixAnalysis() FIRST, before any other gate below runs, so a track
+ * with e.g. a leftover downbeatGrid.meter but analysisSource:'none' (vocal
+ * separation failed), or a v2 row with no v3 fields at all, can't get
+ * flagged as a "confirmed" infeasibility it was never actually evaluated
+ * for (Codex round-3/round-5 on PR #35).
  *
  * Once both sides are confirmed to carry real v3 data, every *positively
  * identified* incompatibility below — incompatible meters, sub-threshold
  * beat/downbeat-grid confidence, a tempo ratio beyond the hard stretch
- * limit, an octave-related-but-bar-mismatched tempo, or no exit/entry pair
- * with enough forward room — gets the maximum penalty
- * (BEATMIX_INFEASIBLE_COST) rather than null. Returning null there would
- * make a confirmed-bad pair cost exactly the same as "no data" and cheaper
- * than a genuinely good but imperfectly-scored pair, since transitionCost()
- * averages only the terms that fire — the optimizer must never prefer a
- * transition planBeatmixTransition() would hard-reject over one it would
- * actually accept (Codex round-2/round-3, CodeRabbit round-2 on PR #35).
+ * limit or genuinely unrelated to the target's octave, an octave-related-
+ * but-bar-mismatched tempo, or no exit/entry pair with enough forward room
+ * — gets the maximum penalty (BEATMIX_INFEASIBLE_COST) rather than null.
+ * Returning null there would make a confirmed-bad pair cost exactly the
+ * same as "no data" and cheaper than a genuinely good but imperfectly-
+ * scored pair, since transitionCost() averages only the terms that fire —
+ * the optimizer must never prefer a transition planBeatmixTransition()
+ * would hard-reject over one it would actually accept (Codex round-2/
+ * round-3/round-5, CodeRabbit round-2 on PR #35).
  * @param {object | null | undefined} fromAnalysis
  * @param {object | null | undefined} toAnalysis
  * @returns {number | null} 0 (great fit) .. 1 (poor fit), or null if unusable
  */
 function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
-  if (!hasVocalAnalysis(fromAnalysis) || !hasVocalAnalysis(toAnalysis)) return null;
+  if (!hasBeatmixAnalysis(fromAnalysis) || !hasBeatmixAnalysis(toAnalysis)) return null;
 
   const fromMeter = fromAnalysis.downbeatGrid?.meter ?? null;
   const toMeter = toAnalysis.downbeatGrid?.meter ?? null;
@@ -170,19 +190,26 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
   const incomingBpm = toAnalysis.headBpm ?? toAnalysis.bpm ?? null;
   const match = canTempoMatch(incomingBpm, targetBpm);
 
-  // match.ratio != null but match.ok === false means canTempoMatch() found a
-  // real ratio and positively rejected it (tier: 'exceeds-hard') —
-  // planBeatmixTransition() hard-rejects the same pair with
-  // 'tempo-ratio-exceeds-hard' before ever scoring it. scoreTransitionPair()
-  // itself only folds tempo into ONE of five weighted sub-signals
-  // (tempoCompatibility), so vocal safety/phrase/downbeat/energy can still
-  // add up to a deceptively decent score for a pair that can never actually
-  // beatmix. A null ratio (missing/unrelated BPM data) stays unpenalized —
-  // canTempoMatch() itself already applies the octave normalization that
-  // makes a half/double pair look "related" in the first place, so a null
-  // ratio here means genuinely unrelated tempos (CodeRabbit round-2 on
-  // PR #35).
-  if (match.ratio != null && !match.ok) return BEATMIX_INFEASIBLE_COST;
+  // !match.ok covers two distinct cases planBeatmixTransition() rejects
+  // identically via its own `if (!match.ok)` check: a real ratio beyond the
+  // hard stretch limit (tier: 'exceeds-hard', match.ratio non-null), and a
+  // target/incoming pair with NO octave relation at all (canTempoMatch()
+  // itself applies the octave normalization that makes a half/double pair
+  // look "related" in the first place, so failing to find any candidate in
+  // range means genuinely unrelated tempos, tier: null, match.ratio null).
+  // scoreTransitionPair() only folds tempo into ONE of five weighted
+  // sub-signals (tempoCompatibility), so vocal safety/phrase/downbeat/
+  // energy can still add up to a deceptively decent score for a pair that
+  // can never actually beatmix in either case.
+  //
+  // The targetBpm/incomingBpm != null guard is what keeps this from
+  // over-penalizing: canTempoMatch() returns the identical
+  // { ok: false, ratio: null } shape whether the BPMs are genuinely
+  // unrelated OR one side's BPM is simply missing (a "no data" case the
+  // base bpm/key/energy terms already cover, not a positively identified
+  // incompatibility) — only having both real BPM values in hand lets us
+  // tell those two apart (CodeRabbit round-2, Codex round-5 on PR #35).
+  if (!match.ok && targetBpm != null && incomingBpm != null) return BEATMIX_INFEASIBLE_COST;
 
   // canTempoMatch()/tempoRatio() normalize incomingBpm into targetBpm's
   // octave band before taking a ratio, so a genuine half/double pair (e.g.
