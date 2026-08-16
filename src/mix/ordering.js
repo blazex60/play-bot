@@ -11,7 +11,7 @@ import {
   MARGINAL_TEMPO_MIN_SCORE,
   MIN_OVERLAP_BARS,
 } from '../audio/beatmixTransition.js';
-import { canTempoMatch } from '../audio/tempo.js';
+import { canTempoMatch, buildTempoFilter } from '../audio/tempo.js';
 import { isHalfDouble } from '../audio/trackAnalysis.js';
 
 const DEFAULT_BPM_WEIGHT = 1;
@@ -134,19 +134,29 @@ function hasBeatmixAnalysis(analysis) {
  * identified* incompatibility below — incompatible meters, sub-threshold
  * beat/downbeat-grid confidence, a tempo ratio beyond the hard stretch
  * limit or genuinely unrelated to the target's octave, an octave-related-
- * but-bar-mismatched tempo, or no exit/entry pair with enough forward room
- * — gets the maximum penalty (BEATMIX_INFEASIBLE_COST) rather than null.
+ * but-bar-mismatched tempo, a stretch the given tempoBackend can't actually
+ * build a filter for, or no exit/entry pair with enough forward room —
+ * gets the maximum penalty (BEATMIX_INFEASIBLE_COST) rather than null.
  * Returning null there would make a confirmed-bad pair cost exactly the
  * same as "no data" and cheaper than a genuinely good but imperfectly-
  * scored pair, since transitionCost() averages only the terms that fire —
  * the optimizer must never prefer a transition planBeatmixTransition()
  * would hard-reject over one it would actually accept (Codex round-2/
- * round-3/round-5, CodeRabbit round-2 on PR #35).
+ * round-3/round-5/round-6, CodeRabbit round-2 on PR #35).
  * @param {object | null | undefined} fromAnalysis
  * @param {object | null | undefined} toAnalysis
+ * @param {string | null} [tempoBackend] Result of tempo.js's
+ *   probeTempoBackend() ('rubberband'|'atempo'|null) — the tempo-filter
+ *   gate below only runs when this is explicitly passed (including an
+ *   explicit `null` meaning "probed, nothing usable found"); when the
+ *   caller hasn't done the probe at all (undefined, the default), the
+ *   backend is genuinely unknown rather than positively identified as
+ *   unavailable, so the gate is skipped — consistent with every other gate
+ *   here only penalizing confirmed infeasibilities, never mere unknowns
+ *   (Codex round-6 on PR #35).
  * @returns {number | null} 0 (great fit) .. 1 (poor fit), or null if unusable
  */
-function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
+function beatmixCompatibilityCost(fromAnalysis, toAnalysis, tempoBackend) {
   if (!hasBeatmixAnalysis(fromAnalysis) || !hasBeatmixAnalysis(toAnalysis)) return null;
 
   const fromMeter = fromAnalysis.downbeatGrid?.meter ?? null;
@@ -220,6 +230,22 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
   // separately hard-rejects this with 'octave-bar-mismatch' even when
   // match.ok is true (Codex round-3 on PR #35).
   if (isHalfDouble(incomingBpm, targetBpm)) return BEATMIX_INFEASIBLE_COST;
+
+  // planBeatmixTransition() rejects with 'tempo-filter-unavailable' when a
+  // non-identity stretch is needed but buildTempoFilter() can't produce a
+  // filter for the ACTUAL runtime backend — rubberband covers the full
+  // hard-limit range, atempo only the narrower soft-limit (marginal-tier
+  // stretches fail), and no backend at all rejects any stretch outright.
+  // scoreTransitionPair() has no notion of backend, so without this a
+  // marginal-tempo pair could still score decently and get prioritized in
+  // an environment where the only available backend can't actually build
+  // its filter (Codex round-6 on PR #35).
+  if (tempoBackend !== undefined) {
+    const built = buildTempoFilter({ nativeBpm: incomingBpm, targetBpm, backend: tempoBackend });
+    if (built.filter == null && Math.abs((match.ratio ?? 1) - 1) > 1e-9) {
+      return BEATMIX_INFEASIBLE_COST;
+    }
+  }
 
   const minOverlapSec = minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis);
   const exitCandidates = findExitCandidates(fromAnalysis, { minOverlapSec });
@@ -298,7 +324,12 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
 /**
  * @param {object | null | undefined} fromAnalysis
  * @param {object | null | undefined} toAnalysis
- * @param {{ bpmWeight?: number, keyWeight?: number, energyWeight?: number, beatmixWeight?: number }} [weights]
+ * @param {{
+ *   bpmWeight?: number, keyWeight?: number, energyWeight?: number, beatmixWeight?: number,
+ *   tempoBackend?: string | null,
+ * }} [weights] `tempoBackend` is tempo.js's probeTempoBackend() result — see
+ *   beatmixCompatibilityCost()'s docstring for why leaving it unset differs
+ *   from explicitly passing `null`.
  * @returns {number}
  */
 export function transitionCost(fromAnalysis, toAnalysis, weights = {}) {
@@ -341,7 +372,7 @@ export function transitionCost(fromAnalysis, toAnalysis, weights = {}) {
     parts += 1;
   }
 
-  const beatmixCost = beatmixCompatibilityCost(fromAnalysis, toAnalysis);
+  const beatmixCost = beatmixCompatibilityCost(fromAnalysis, toAnalysis, weights.tempoBackend);
   if (beatmixCost != null) {
     cost += beatmixWeight * beatmixCost;
     parts += 1;
@@ -374,7 +405,11 @@ export function isValidPermutation(order, length) {
  *   analyses?: (object | null)[],
  *   maxExact?: number,
  *   maxTracks?: number,
- * }} args
+ *   tempoBackend?: string | null,
+ * }} args `tempoBackend` should be the caller's own tempo.js probeTempoBackend()
+ *   result (probed once, before calling this — see transitionCost()'s
+ *   docstring); omit it to leave the beatmix term's tempo-filter
+ *   availability gate unapplied.
  * @returns {number[]} permutation of track indices (0..n-1)
  */
 export function optimizeTrackOrder({
@@ -383,6 +418,7 @@ export function optimizeTrackOrder({
   analyses = [],
   maxExact = 10,
   maxTracks = MAX_OPTIMIZE_TRACKS,
+  tempoBackend,
 }) {
   const n = tracks.length;
   if (n <= 1) return [...Array(n).keys()];
@@ -394,6 +430,7 @@ export function optimizeTrackOrder({
       analyses: analyses.slice(0, maxTracks),
       maxExact,
       maxTracks,
+      tempoBackend,
     });
     const tail = Array.from({ length: n - maxTracks }, (_, i) => i + maxTracks);
     return [...headOrder, ...tail];
@@ -420,7 +457,7 @@ export function optimizeTrackOrder({
       const key = `${lastIdx}:${next}`;
       if (edgeCostCache.has(key)) return edgeCostCache.get(key);
       const from = lastIdx === -1 ? anchorAnalysis : analysisAt(lastIdx);
-      const cost = transitionCost(from, analysisAt(next));
+      const cost = transitionCost(from, analysisAt(next), { tempoBackend });
       edgeCostCache.set(key, cost);
       return cost;
     }
@@ -471,7 +508,7 @@ export function optimizeTrackOrder({
     let bestIdx = null;
     let bestCost = Infinity;
     for (const idx of remaining) {
-      const cost = transitionCost(lastAnalysis, analysisAt(idx));
+      const cost = transitionCost(lastAnalysis, analysisAt(idx), { tempoBackend });
       if (cost < bestCost) {
         bestCost = cost;
         bestIdx = idx;

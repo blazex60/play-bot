@@ -36,6 +36,32 @@ test('optimizeTrackOrder prefers closer BPM neighbors', () => {
   assert.equal(order[0], 0, '130 BPM track should follow 128 BPM anchor before 90 BPM outlier');
 });
 
+test('optimizeTrackOrder threads tempoBackend through to transitionCost, flipping the winning candidate', () => {
+  // Codex round-6 on PR #35: optimizeTrackOrder() must actually pass its
+  // tempoBackend option all the way down through both the exact-search
+  // edgeCost() cache and the greedy fallback loop's direct transitionCost()
+  // calls, not just accept the parameter. A marginal-tempo candidate
+  // (~4.3% dev, buildable under rubberband, not atempo) is pitted against a
+  // plain candidate with no beatmix data at all but a closer base BPM
+  // delta — which one wins depends entirely on which backend is passed.
+  const anchor = richOutgoing(); // tailBpm 120
+  const marginalCandidate = richIncoming({ bpm: 125.4, headBpm: 125.4 });
+  const plainCandidate = { bpm: 110, headKey: '8B', harmonicConfidence: 0.8, lastRms: -14 };
+  const tracks = [{ title: 'marginal' }, { title: 'plain' }];
+  const analyses = [marginalCandidate, plainCandidate];
+
+  const withRubberband = optimizeTrackOrder({
+    anchorAnalysis: anchor, tracks, analyses, tempoBackend: 'rubberband',
+  });
+  const withAtempo = optimizeTrackOrder({
+    anchorAnalysis: anchor, tracks, analyses, tempoBackend: 'atempo',
+  });
+  assert.equal(isValidPermutation(withRubberband, 2), true);
+  assert.equal(isValidPermutation(withAtempo, 2), true);
+  assert.deepEqual(withRubberband, [0, 1], 'rubberband can build the marginal stretch, so it should win');
+  assert.deepEqual(withAtempo, [1, 0], 'atempo cannot build the marginal stretch, so the plain candidate should win');
+});
+
 test('isValidPermutation rejects duplicates and out-of-range indices', () => {
   assert.equal(isValidPermutation([0, 1, 2], 3), true);
   assert.equal(isValidPermutation([0, 0, 2], 3), false);
@@ -358,6 +384,48 @@ test('transitionCost\'s beatmix term is skipped for v2-cached analysis (real voc
     transitionCost(v2Outgoing, v2Incoming),
     transitionCost(legacyOutgoing, legacyIncoming),
     'expected v2-cached analysis (real analysisSource, no v3 fields) to cost exactly the same as no analysisSource at all',
+  );
+});
+
+test('transitionCost\'s beatmix term rejects any non-identity stretch when the probed tempo backend is null (no backend available)', () => {
+  // Codex round-6 on PR #35: buildTempoFilter() with a null/unsupported
+  // backend always returns filter: null, matching planBeatmixTransition()'s
+  // own 'tempo-filter-unavailable' rejection for a real environment where
+  // neither rubberband nor atempo could be found on the ffmpeg build.
+  // Passing tempoBackend explicitly (even null) is what activates this gate
+  // — leaving it unset means "caller never probed," a genuinely unknown
+  // (not positively identified) case that stays unpenalized, same as
+  // before this round.
+  const from = richOutgoing(); // tailBpm 120
+  const closeMatch = richIncoming({ bpm: 124, headBpm: 124 }); // ~3.2% dev, well within the hard limit
+  assert.ok(
+    transitionCost(from, closeMatch, { tempoBackend: null })
+      > transitionCost(from, closeMatch, { tempoBackend: 'rubberband' }),
+    'expected a null tempo backend to penalize a stretch that a real backend would happily build',
+  );
+  assert.equal(
+    transitionCost(from, closeMatch),
+    transitionCost(from, closeMatch, { tempoBackend: 'rubberband' }),
+    'expected leaving tempoBackend unset to behave like a fully-capable backend, not like null',
+  );
+});
+
+test('transitionCost\'s beatmix term rejects marginal-tier stretches under atempo but allows them under rubberband, matching buildTempoFilter()\'s per-backend range', () => {
+  // Codex round-6 on PR #35: buildTempoFilter()'s atempo branch only covers
+  // SOFT_LIMIT_RATIO (4%), while rubberband covers the full HARD_LIMIT_RATIO
+  // (6%) — a 4-6% "marginal" stretch that scoreTransitionPair() would
+  // otherwise score decently is only actually buildable under rubberband.
+  const from = richOutgoing(); // tailBpm 120
+  const marginal = richIncoming({ bpm: 125.4, headBpm: 125.4 }); // ~4.3% dev: inside rubberband's range, outside atempo's
+  assert.ok(
+    transitionCost(from, marginal, { tempoBackend: 'atempo' })
+      > transitionCost(from, marginal, { tempoBackend: 'rubberband' }),
+    'expected atempo to be penalized for a stretch it cannot build while rubberband is not',
+  );
+  assert.equal(
+    transitionCost(from, marginal),
+    transitionCost(from, marginal, { tempoBackend: 'rubberband' }),
+    'expected leaving tempoBackend unset to behave like rubberband (the widest range), not like atempo',
   );
 });
 

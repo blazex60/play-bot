@@ -1,4 +1,5 @@
 import { optimizeTrackOrder } from './ordering.js';
+import { probeTempoBackend } from '../audio/tempo.js';
 
 export const DEFAULT_TARGET_COUNT = 10;
 export const MIN_TARGET_COUNT = 3;
@@ -86,6 +87,7 @@ export async function resolveGeneratedTracks({
  *   resolveYoutubeTrackFn: Function,
  *   optimizeTrackOrderFn?: typeof optimizeTrackOrder,
  *   loadAnalysisFn?: (videoId: string | null) => Promise<object | null> | object | null,
+ *   probeTempoBackendFn?: typeof probeTempoBackend,
  *   requestedBy: string,
  *   requestedById?: string | null,
  * }} args
@@ -98,6 +100,7 @@ export async function generatePlaylistFromPrompt({
   resolveYoutubeTrackFn,
   optimizeTrackOrderFn = optimizeTrackOrder,
   loadAnalysisFn = async () => null,
+  probeTempoBackendFn = probeTempoBackend,
   requestedBy,
   requestedById = null,
 }) {
@@ -152,7 +155,12 @@ export async function generatePlaylistFromPrompt({
   const analyses = await Promise.all(
     resolved.map((track) => loadAnalysisFn(track.videoId ?? null)),
   );
-  const order = optimizeTrackOrderFn({ tracks: resolved, analyses });
+  // Probed once per generation call (memoized process-wide after the first
+  // real probe, per tempo.js), so ordering's beatmix term can gate on
+  // whether a marginal-tier or non-identity stretch is actually buildable
+  // in THIS environment (Codex round-6 on PR #35).
+  const tempoBackend = await probeTempoBackendFn();
+  const order = optimizeTrackOrderFn({ tracks: resolved, analyses, tempoBackend });
   const ordered = order.map((idx) => resolved[idx]);
 
   return {

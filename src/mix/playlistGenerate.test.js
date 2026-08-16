@@ -112,6 +112,7 @@ test('generatePlaylistFromPrompt retries when too few tracks resolve', async () 
       track: { title: entry.id, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
     }),
     optimizeTrackOrderFn: ({ tracks }) => tracks.map((_, i) => i),
+    probeTempoBackendFn: async () => null,
     requestedBy: 'tester',
   });
 
@@ -146,6 +147,7 @@ test('generatePlaylistFromPrompt keeps first-attempt hits and retries below full
       track: { title: entry.id, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
     }),
     optimizeTrackOrderFn: ({ tracks }) => tracks.map((_, i) => i),
+    probeTempoBackendFn: async () => null,
     requestedBy: 'tester',
   });
 
@@ -174,9 +176,45 @@ test('generatePlaylistFromPrompt retries even when the 50% floor is already met'
       track: { title: entry.id, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
     }),
     optimizeTrackOrderFn: ({ tracks }) => tracks.map((_, i) => i),
+    probeTempoBackendFn: async () => null,
     requestedBy: 'tester',
   });
 
   assert.equal(calls, 2);
   assert.equal(result.tracks.length, 4);
+});
+
+test('generatePlaylistFromPrompt probes the tempo backend once and passes it to optimizeTrackOrderFn', async () => {
+  // Codex round-6 on PR #35: ordering's beatmix term can only gate on
+  // tempo-filter availability if callers actually probe and pass it
+  // through — this verifies generatePlaylistFromPrompt does its part.
+  let probeCalls = 0;
+  let receivedTempoBackend;
+  const result = await generatePlaylistFromPrompt({
+    prompt: 'probe check',
+    targetCount: 3,
+    gemini: {
+      async generateTrackList() {
+        return { tracks: [{ title: 'x' }, { title: 'y' }, { title: 'z' }] };
+      },
+    },
+    searchYoutubeFn: async (query) => [{ id: query }],
+    resolveYoutubeTrackFn: (entry) => ({
+      status: 'matched',
+      track: { title: entry.id, videoId: entry.id, webpageUrl: `https://youtu.be/${entry.id}` },
+    }),
+    optimizeTrackOrderFn: ({ tracks, tempoBackend }) => {
+      receivedTempoBackend = tempoBackend;
+      return tracks.map((_, i) => i);
+    },
+    probeTempoBackendFn: async () => {
+      probeCalls += 1;
+      return 'atempo';
+    },
+    requestedBy: 'tester',
+  });
+
+  assert.ok(result);
+  assert.equal(probeCalls, 1, 'expected the tempo backend to be probed exactly once per generation call');
+  assert.equal(receivedTempoBackend, 'atempo', 'expected the probed backend to reach optimizeTrackOrderFn');
 });

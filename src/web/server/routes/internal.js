@@ -1,6 +1,7 @@
 import { bindRouteError, nowUnix, recordOperationLog } from './route-utils.js'
 import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js'
 import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
+import { probeTempoBackend } from '../../../audio/tempo.js'
 import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
 import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
@@ -60,6 +61,7 @@ export async function internalRoutes(app, {
   refineLimiter = createRefineRateLimiter(),
   generateLimiter = createGenerateRateLimiter(),
   searchYoutube = defaultSearchYoutube,
+  probeTempoBackendFn = probeTempoBackend,
 } = {}) {
   app.addHook('onRequest', async (request, reply) => {
     if (!token || getBearerToken(request) !== token) {
@@ -234,8 +236,14 @@ export async function internalRoutes(app, {
       return loadAnalysis(track?.videoId)
     });
     const anchorAnalysis = anchorVideoId ? loadAnalysis(anchorVideoId) : null
+    // Probed once per request (memoized process-wide after the first real
+    // probe, per tempo.js), so ordering's beatmix term can gate on whether a
+    // marginal-tier or non-identity stretch is actually buildable in THIS
+    // environment rather than assuming rubberband is always available
+    // (Codex round-6 on PR #35).
+    const tempoBackend = await probeTempoBackendFn()
 
-    let order = optimizeTrackOrder({ anchorAnalysis, tracks, analyses })
+    let order = optimizeTrackOrder({ anchorAnalysis, tracks, analyses, tempoBackend })
     let source = 'algorithm'
 
     // Gemini refine is optional and must stay under the bot's ~5s webClient abort.
