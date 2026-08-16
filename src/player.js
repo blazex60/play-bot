@@ -1332,15 +1332,19 @@ export class GuildPlayer {
       const sourceHonorsPlan = source.tempoHonored !== false;
       const pendingSessionTempo = sourceHonorsPlan ? norm.sessionTempo : null;
       const pendingEntrySec = sourceHonorsPlan ? norm.entrySec : 0;
-      // A beatmix plan's bar-envelope EQ (targetBpm/sync/eq.swapBar) assumes
-      // the incoming audio actually IS the seeked/tempo-matched stream it
-      // was computed for — running that bar-timed EQ ramp against unseeked,
-      // native-tempo audio would swap bass at a point with no relation to
-      // its real downbeats. Downgrade to a plain crossfade (no bar envelope,
-      // instant EQ like the legacy path) rather than executing a "beatmix"
-      // that isn't actually beat-synced.
-      const mixPlan = (!sourceHonorsPlan && norm.mixPlan.mode === 'beatmix')
-        ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null }
+      // Any plan with a nonzero entrySec (beatmix OR phrase-crossfade)
+      // assumes the incoming audio actually starts at that seeked,
+      // downbeat-aligned/vocal-safe position. normalizeTransitionPlan()
+      // already flattens phrase-crossfade into mixPlan.mode: 'crossfade',
+      // so gating this downgrade on mode === 'beatmix' alone let an
+      // unhonored phrase-crossfade through unchanged: its baseSwap EQ
+      // decision was made assuming the selected phrase boundary, which this
+      // source never actually reached (native position 0 instead). Gate on
+      // entrySec instead — nonzero for exactly beatmix/phrase-crossfade,
+      // zero for anything else — and strip baseSwap along with beatmix's
+      // bar-envelope fields (Codex round-4).
+      const mixPlan = (!sourceHonorsPlan && norm.entrySec > 0)
+        ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false }
         : norm.mixPlan;
 
       // Set promotion state BEFORE calling startCrossfade(): if the outgoing

@@ -914,6 +914,74 @@ test('acceptance (mixer): incoming prep for a beatmix plan starts relative to th
   await player.stop();
 });
 
+test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgrades baseSwap, not just beatmix mode', async () => {
+  // Codex round-4: the downgrade-when-unhonored guard only checked
+  // `norm.mixPlan.mode === 'beatmix'` — but normalizeTransitionPlan() already
+  // flattens phrase-crossfade into mixPlan.mode: 'crossfade', so an unhonored
+  // phrase-crossfade (source fell back to createStreamSource, native
+  // position 0) sailed through unchanged, still carrying baseSwap: true from
+  // a plan that assumed the incoming audio started at its selected
+  // vocal-safe phrase boundary. No BPM data on either side forces
+  // planBeatSyncedTransition to reject beatmix (bpm-unavailable) and fall
+  // through to phrase-crossfade, which doesn't require BPM at all.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  let startedPlan = null;
+
+  const outgoingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    lastVocalEndSec: 1.0,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    phrases: { tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], head: [] },
+    analysisSource: 'demucs',
+  };
+  const incomingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    firstVocalStartSec: 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    phrases: { head: [{ sec: 0.2, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }], tail: [] },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async (track, opts) => {
+      const source = PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+      // Simulate a normalize-ineligible/failed Track B: createStreamSource's
+      // real fallback ignores startSec/tempoFilter and marks the source
+      // accordingly.
+      if (track.videoId === 'vid-b') source.tempoHonored = false;
+      return source;
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+
+  assert.ok(startedPlan, 'expected a phrase-crossfade transition to arm');
+  assert.equal(startedPlan.mode, 'crossfade');
+  assert.equal(
+    startedPlan.baseSwap,
+    false,
+    'expected baseSwap to be stripped once the incoming source could not honor the plan\'s selected entry point',
+  );
+
+  await player.stop();
+});
+
 function spawnBuffered(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
