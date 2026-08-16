@@ -30,9 +30,60 @@ const PHRASE_ALIGNMENT_WEIGHT = 1;
 const TEMPO_COMPATIBILITY_WEIGHT = 1;
 const DOWNBEAT_CONFIDENCE_WEIGHT = 0.8;
 const HARMONIC_WEIGHT = 0.6;
+const ENERGY_CONTINUITY_WEIGHT = 0.4;
+/** §16 tier 1 requires "high confidence" specifically for the 4-6% marginal tempo tier (§8.3). */
+const MARGINAL_TEMPO_MIN_SCORE = 0.7;
 
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));
+}
+
+/**
+ * Vocal-safety margin (seconds) for an entry candidate. findEntryCandidates()
+ * already guarantees `entrySec` is either before firstVocalStartSec or
+ * inside a headVocalGaps window — for the gap case, `firstVocalStartSec -
+ * entrySec` is negative (the gap sits after singing already started), which
+ * would wrongly zero out the credit for a genuinely safe gap entry. Measure
+ * from the containing gap's edges instead when that's where entrySec is.
+ */
+function entryVocalMargin(incoming, entrySec) {
+  const firstVocal = incoming?.firstVocalStartSec;
+  if (!Number.isFinite(firstVocal) || entrySec <= firstVocal - 1e-6) {
+    return Number.isFinite(firstVocal) ? firstVocal - entrySec : VOCAL_MARGIN_FULL_CREDIT_SEC;
+  }
+  const gaps = Array.isArray(incoming?.headVocalGaps) ? incoming.headVocalGaps : [];
+  const gap = gaps.find((g) => entrySec >= g.startSec - 1e-6 && entrySec <= g.endSec + 1e-6);
+  if (!gap) return 0; // defensive: findEntryCandidates should never offer an unsafe entry
+  return Math.min(entrySec - gap.startSec, gap.endSec - entrySec);
+}
+
+/**
+ * §10's energy term, at the resolution the v3 analysis payload actually
+ * offers: phrase candidates carry a 'near-silence' reason tag (a boolean
+ * threshold on RMS at that point — see phraseAnalysis.js), not a raw energy
+ * value. This is a coarse proxy, not true RMS continuity — full credit when
+ * both candidates agree on being near-silence or not, partial credit on a
+ * potential level mismatch when only one side is.
+ */
+function energyContinuity(exit, entry) {
+  const exitSilent = (exit?.reasons ?? []).includes('near-silence');
+  const entrySilent = (entry?.reasons ?? []).includes('near-silence');
+  return exitSilent === entrySilent ? 1 : 0.5;
+}
+
+/**
+ * `analyzeVocalActivity()` runs one Demucs pass covering both the head and
+ * tail windows; on total failure (ffmpeg/Demucs pipeline error) it returns
+ * `lastVocalEndSec: null, firstVocalStartSec: null, vocalConfidence: 0,
+ * source: 'none'` for BOTH — the same null a genuinely fully-instrumental
+ * head window (a real, trustworthy analysis result) can also produce for
+ * `firstVocalStartSec`. `analysisSource !== 'none'` disambiguates "no
+ * vocals were verifiably found" from "vocal safety could not be verified
+ * at all", which the two candidate-search functions below must never
+ * conflate — a failed analysis has zero evidence of being vocal-safe.
+ */
+function hasVocalAnalysis(analysis) {
+  return Boolean(analysis?.analysisSource) && analysis.analysisSource !== 'none';
 }
 
 /**
@@ -41,12 +92,15 @@ function clamp01(n) {
  * vocal-free window with enough room left for `minOverlapSec`. Degrades to
  * plain downbeats (score 0) when phrase candidates are unavailable, rather
  * than rejecting outright — a downbeat-only exit point is still usable.
+ * Returns nothing when vocal analysis failed outright (see
+ * hasVocalAnalysis()) — there is no verifiably vocal-safe window to offer.
  * @returns {{ sec: number, barIndex: number, score: number, reasons: string[] }[]} sorted best-first
  */
 export function findExitCandidates(outgoing, { minOverlapSec = 2 } = {}) {
   if (!outgoing) return [];
   const durationSec = outgoing.durationSec;
   if (!(durationSec > 0)) return [];
+  if (!hasVocalAnalysis(outgoing)) return [];
   const vocalFloor = Number.isFinite(outgoing.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0;
   const phrasePool = Array.isArray(outgoing.phrases?.tail) ? outgoing.phrases.tail : [];
   const pool = phrasePool.length > 0
@@ -64,12 +118,15 @@ export function findExitCandidates(outgoing, { minOverlapSec = 2 } = {}) {
  * Incoming head candidates: phrase boundaries filtered to vocal-safe
  * positions (before firstVocalStartSec, or inside a headVocalGaps window).
  * A null firstVocalStartSec means no singing was detected in the head
- * window at all — every candidate is safe. Degrades to plain downbeats the
- * same way findExitCandidates() does.
+ * window at all — every candidate is safe, but only once hasVocalAnalysis()
+ * confirms that null came from a real result and not a failed analysis (see
+ * findExitCandidates()'s docstring). Degrades to plain downbeats the same
+ * way findExitCandidates() does.
  * @returns {{ sec: number, barIndex: number, score: number, reasons: string[] }[]} sorted best-first
  */
 export function findEntryCandidates(incoming) {
   if (!incoming) return [];
+  if (!hasVocalAnalysis(incoming)) return [];
   const phrasePool = Array.isArray(incoming.phrases?.head) ? incoming.phrases.head : [];
   const pool = phrasePool.length > 0
     ? phrasePool
@@ -97,9 +154,7 @@ export function findEntryCandidates(incoming) {
  */
 export function scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match = null }) {
   const exitMargin = exit.sec - (Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0);
-  const entryMargin = Number.isFinite(incoming?.firstVocalStartSec)
-    ? incoming.firstVocalStartSec - entry.sec
-    : VOCAL_MARGIN_FULL_CREDIT_SEC;
+  const entryMargin = entryVocalMargin(incoming, entry.sec);
   const vocalSafety = Math.min(
     clamp01(exitMargin / VOCAL_MARGIN_FULL_CREDIT_SEC),
     clamp01(entryMargin / VOCAL_MARGIN_FULL_CREDIT_SEC),
@@ -116,11 +171,15 @@ export function scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm
     (outgoing?.downbeatGrid?.confidence ?? 0) + (incoming?.downbeatGrid?.confidence ?? 0)
   ) / 2);
 
+  const energy = energyContinuity(exit, entry);
+
   let total = vocalSafety * VOCAL_SAFETY_WEIGHT
     + phraseAlignment * PHRASE_ALIGNMENT_WEIGHT
     + tempoCompatibility * TEMPO_COMPATIBILITY_WEIGHT
-    + downbeatConfidence * DOWNBEAT_CONFIDENCE_WEIGHT;
-  let totalWeight = VOCAL_SAFETY_WEIGHT + PHRASE_ALIGNMENT_WEIGHT + TEMPO_COMPATIBILITY_WEIGHT + DOWNBEAT_CONFIDENCE_WEIGHT;
+    + downbeatConfidence * DOWNBEAT_CONFIDENCE_WEIGHT
+    + energy * ENERGY_CONTINUITY_WEIGHT;
+  let totalWeight = VOCAL_SAFETY_WEIGHT + PHRASE_ALIGNMENT_WEIGHT + TEMPO_COMPATIBILITY_WEIGHT
+    + DOWNBEAT_CONFIDENCE_WEIGHT + ENERGY_CONTINUITY_WEIGHT;
 
   const harmonicOk = (outgoing?.harmonicConfidence ?? 0) >= HARMONIC_CONFIDENCE_MIN
     && (incoming?.harmonicConfidence ?? 0) >= HARMONIC_CONFIDENCE_MIN;
@@ -171,11 +230,36 @@ export function planBeatmixTransition(outgoing, incoming, {
     return rejected(['downbeat-confidence-low']);
   }
 
+  // Both readings must agree once both sides are confident enough to
+  // report one — bar boundaries land every `meter` beats, so a 4/4 outgoing
+  // paired with a 3/4 incoming would put sync.bars/the bass-swap bar on the
+  // wrong beat for the incoming track from the second bar onward.
+  const outgoingMeter = outgoing.downbeatGrid?.meter ?? null;
+  const incomingMeter = incoming.downbeatGrid?.meter ?? null;
+  if (outgoingMeter != null && incomingMeter != null && outgoingMeter !== incomingMeter) {
+    return rejected(['meter-mismatch']);
+  }
+  const beatsPerBar = outgoingMeter ?? incomingMeter ?? 4;
+
   const targetBpm = outgoingPlaybackBpm ?? outgoingBpm;
   const match = canTempoMatch(incomingBpm, targetBpm);
   if (!match.ok) return rejected([`tempo-ratio-${match.tier ?? 'unrelated'}`]);
 
-  const beatsPerBar = outgoing.downbeatGrid?.meter ?? incoming.downbeatGrid?.meter ?? 4;
+  // §8.3: the 4-6% marginal tier is only meant to be taken "when confidence/
+  // transition conditions are high" — gated below once a candidate pair's
+  // full score (vocal safety + phrase + downbeat + harmonic) is known,
+  // rather than on the raw BPM-confidence minimums alone.
+  const isMarginalTempo = match.tier === 'marginal';
+
+  const built = buildTempoFilter({ nativeBpm: incomingBpm, targetBpm, backend: tempoBackend });
+  // A non-1 ratio with no filter (backend unavailable, or atempo's soft-only
+  // range exceeded) cannot actually be played back stretched — reject
+  // rather than silently emit a plan whose incoming.playbackBpm lies about
+  // what will really play.
+  if (built.filter == null && Math.abs(match.ratio - 1) > 1e-9) {
+    return rejected(['tempo-filter-unavailable']);
+  }
+
   const barSec = (60 / targetBpm) * beatsPerBar;
   if (!(barSec > 0)) return rejected(['invalid-bar-length']);
 
@@ -187,15 +271,23 @@ export function planBeatmixTransition(outgoing, incoming, {
 
   const durationSec = outgoing.durationSec;
   const incomingDurationSec = Number.isFinite(incoming.durationSec) ? incoming.durationSec : Infinity;
+  // fadeSec is a playback-domain (post-stretch) duration. Native seconds of
+  // remaining source content convert to playback seconds by dividing by
+  // that side's own tempo ratio — outgoing may itself already be stretched
+  // (a chained beatmix) relative to its native BPM, and incoming stretches
+  // by `match.ratio`. Comparing fadeSec against unconverted native seconds
+  // would accept an overlap the source doesn't actually have enough
+  // playback time left to cover.
+  const outgoingRatio = targetBpm / outgoingBpm;
 
   let best = null;
   for (const exit of exitCandidates) {
-    const roomAfterExit = durationSec - exit.sec;
+    const roomAfterExitPlayback = (durationSec - exit.sec) / outgoingRatio;
     for (const entry of entryCandidates) {
-      const roomInIncoming = incomingDurationSec - entry.sec;
+      const roomInIncomingPlayback = (incomingDurationSec - entry.sec) / match.ratio;
       for (let bars = overlapBars; bars >= minOverlapBars; bars -= 1) {
         const fadeSec = barSec * bars;
-        if (fadeSec > roomAfterExit + 1e-6 || fadeSec > roomInIncoming + 1e-6) continue;
+        if (fadeSec > roomAfterExitPlayback + 1e-6 || fadeSec > roomInIncomingPlayback + 1e-6) continue;
         const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match });
         if (!best || pairScore > best.pairScore) best = { exit, entry, bars, fadeSec, pairScore };
         break; // widest bar count that fits this pair is the one worth scoring
@@ -203,8 +295,9 @@ export function planBeatmixTransition(outgoing, incoming, {
     }
   }
   if (!best) return rejected(['no-overlap-fit']);
-
-  const built = buildTempoFilter({ nativeBpm: incomingBpm, targetBpm, backend: tempoBackend });
+  if (isMarginalTempo && best.pairScore < MARGINAL_TEMPO_MIN_SCORE) {
+    return rejected(['marginal-tempo-low-confidence']);
+  }
 
   return {
     mode: 'beatmix',
@@ -243,6 +336,14 @@ export function planBeatmixTransition(outgoing, incoming, {
  */
 export function planPhraseCrossfade(outgoing, incoming, { minOverlapSec = 1, maxOverlapSec = 6 } = {}) {
   if (!outgoing || !incoming) return rejected(['missing-analysis']);
+
+  // Tier 2 is specifically "phrase + vocal-safe" (§16) — unlike tier 1, it
+  // must not silently accept findExitCandidates()/findEntryCandidates()'s
+  // bare-downbeat degrade, or it stops being distinguishable from a plain
+  // downbeat-snapped crossfade when phrase analysis simply never ran.
+  const hasTailPhrases = Array.isArray(outgoing.phrases?.tail) && outgoing.phrases.tail.length > 0;
+  const hasHeadPhrases = Array.isArray(incoming.phrases?.head) && incoming.phrases.head.length > 0;
+  if (!hasTailPhrases || !hasHeadPhrases) return rejected(['no-phrase-data']);
 
   const exitCandidates = findExitCandidates(outgoing, { minOverlapSec });
   if (exitCandidates.length === 0) return rejected(['no-exit-candidate']);

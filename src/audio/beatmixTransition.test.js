@@ -26,6 +26,7 @@ function makeAnalysis({
   tailKey = null,
   headKey = null,
   harmonicConfidence = 0,
+  analysisSource = 'demucs', // real (possibly null-vocal) analysis by default; pass 'none' to simulate a failed pass
 } = {}) {
   return {
     bpm,
@@ -45,6 +46,7 @@ function makeAnalysis({
     tailKey,
     headKey,
     harmonicConfidence,
+    analysisSource,
   };
 }
 
@@ -81,6 +83,28 @@ test('findExitCandidates returns nothing without a usable duration', () => {
   assert.deepEqual(findExitCandidates(makeAnalysis({ durationSec: null })), []);
 });
 
+test('findExitCandidates returns nothing when vocal analysis failed outright, even with a null lastVocalEndSec that would otherwise default to a permissive floor', () => {
+  // analyzeVocalActivity()'s emptyResult() on a total ffmpeg/Demucs failure
+  // returns lastVocalEndSec: null AND source: 'none' together — treating
+  // that null as "vocal-free from time 0" would offer an unverified window.
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: null,
+    phrasesTail: [{ sec: 190, barIndex: 0, score: 0.5, reasons: [] }],
+    analysisSource: 'none',
+  });
+  assert.deepEqual(findExitCandidates(outgoing), []);
+});
+
+test('findEntryCandidates returns nothing when vocal analysis failed outright, even with a null firstVocalStartSec that would otherwise mean fully safe', () => {
+  const incoming = makeAnalysis({
+    firstVocalStartSec: null,
+    phrasesHead: [{ sec: 5, barIndex: 0, score: 0.5, reasons: [] }],
+    analysisSource: 'none',
+  });
+  assert.deepEqual(findEntryCandidates(incoming), []);
+});
+
 // --- findEntryCandidates -----------------------------------------------------
 
 test('findEntryCandidates keeps candidates before firstVocalStartSec and inside headVocalGaps', () => {
@@ -115,6 +139,27 @@ test('scoreTransitionPair rewards a closer tempo match', () => {
   const close = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm: 121 });
   const far = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm: 127 });
   assert.ok(close > far);
+});
+
+test('scoreTransitionPair credits a gap-safe entry from the gap boundaries, not a negative firstVocalStartSec delta', () => {
+  const outgoing = makeAnalysis({ downbeatConfidence: 0.7, lastVocalEndSec: 0 });
+  // Entry at 22s sits inside the [20,24] gap, after firstVocalStartSec (15) —
+  // the naive `firstVocalStartSec - entrySec` would be -7 (zero credit).
+  // The true margin is min(22-20, 24-22) = 2s, i.e. full credit.
+  const incomingWithGap = makeAnalysis({
+    downbeatConfidence: 0.7,
+    firstVocalStartSec: 15,
+    headVocalGaps: [{ startSec: 20, endSec: 24 }],
+  });
+  const exit = { sec: 190, score: 0.5 };
+  const gapEntry = { sec: 22, score: 0.5 };
+  const scoreAtGapEntry = scoreTransitionPair({ outgoing, incoming: incomingWithGap, exit, entry: gapEntry, targetBpm: 120 });
+
+  // A same-shaped pair whose entry is comfortably before firstVocalStartSec
+  // should score identically — the gap entry is just as safe.
+  const beforeOnsetEntry = { sec: 13, score: 0.5 };
+  const scoreBeforeOnset = scoreTransitionPair({ outgoing, incoming: incomingWithGap, exit, entry: beforeOnsetEntry, targetBpm: 120 });
+  assert.equal(scoreAtGapEntry, scoreBeforeOnset);
 });
 
 test('scoreTransitionPair adds a harmonic bonus only when both sides clear the confidence threshold', () => {
@@ -249,6 +294,91 @@ test('planBeatmixTransition rejects when no overlap length fits on the incoming 
   assert.deepEqual(plan.reasons, ['no-overlap-fit']);
 });
 
+test('planBeatmixTransition rejects an incompatible meter instead of silently picking one side', () => {
+  const { outgoing, incoming } = happyPathTracks();
+  const plan = planBeatmixTransition(outgoing, { ...incoming, downbeatGrid: { ...incoming.downbeatGrid, meter: 3 } });
+  assert.deepEqual(plan.reasons, ['meter-mismatch']);
+});
+
+test('planBeatmixTransition rejects when the tempo filter cannot be built for a non-unity ratio', () => {
+  const { outgoing, incoming } = happyPathTracks();
+  // ~4.76% deviation: within canTempoMatch()'s marginal tier (ok: true),
+  // but beyond atempo's soft-limit-only range — buildTempoFilter() returns
+  // filter: null even though match.ok is true.
+  const plan = planBeatmixTransition(outgoing, { ...incoming, bpm: 126 }, { tempoBackend: 'atempo' });
+  assert.deepEqual(plan.reasons, ['tempo-filter-unavailable']);
+});
+
+test('planBeatmixTransition gates the 4-6% marginal tempo tier on transition quality, not just the BPM-confidence minimums', () => {
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.55, // just above BEAT_CONFIDENCE_MIN
+    downbeatConfidence: 0.45, // just above DOWNBEAT_CONFIDENCE_MIN
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 184, barIndex: 0, score: 0.1, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 126, // ~4.76% off 120 — marginal tier
+    beatConfidence: 0.55,
+    downbeatConfidence: 0.45,
+    durationSec: 200,
+    firstVocalStartSec: 15,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.1, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming); // rubberband: filter builds fine, this only tests the quality gate
+  assert.deepEqual(plan.reasons, ['marginal-tempo-low-confidence']);
+});
+
+test('planBeatmixTransition allows a marginal tempo match when transition quality is high', () => {
+  // Same ~4.76% marginal deviation as the low-confidence case above, but
+  // with near-maximal downbeat confidence and phrase alignment — high
+  // enough overall quality to clear MARGINAL_TEMPO_MIN_SCORE.
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.95,
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 184, barIndex: 0, score: 0.95, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 126,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.95,
+    durationSec: 200,
+    firstVocalStartSec: 15,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.95, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.equal(plan.eligible, true);
+  assert.ok(Math.abs(plan.incoming.tempoRatio - 120 / 126) < 1e-9);
+});
+
+test('planBeatmixTransition converts overlap room to the stretched incoming timeline before choosing bar count', () => {
+  const outgoing = makeAnalysis({
+    bpm: 124,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 184, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 11.8, // 7.8s of *native* room after the entry candidate
+    firstVocalStartSec: 15,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.equal(plan.eligible, true);
+  // 4 bars (~7.74s) fits the native 7.8s room but not the ~7.55s of actual
+  // playback time left once incoming plays back sped up by ~3.3%.
+  assert.equal(plan.sync.bars, 3);
+});
+
 // --- planPhraseCrossfade -----------------------------------------------------
 
 test('planPhraseCrossfade aligns to phrase boundaries without requiring tempo compatibility', () => {
@@ -270,9 +400,22 @@ test('planPhraseCrossfade aligns to phrase boundaries without requiring tempo co
   assert.ok(plan.confidence > 0);
 });
 
-test('planPhraseCrossfade rejects without a phrase candidate on either side', () => {
+test('planPhraseCrossfade rejects when neither side has real phrase data (does not fall back to bare downbeats)', () => {
   const outgoing = makeAnalysis({ durationSec: 200, lastVocalEndSec: 180 });
   const incoming = makeAnalysis({ firstVocalStartSec: 10 });
+  assert.deepEqual(planPhraseCrossfade(outgoing, incoming).reasons, ['no-phrase-data']);
+});
+
+test('planPhraseCrossfade rejects on no-exit-candidate when phrase data exists but nothing clears the vocal-safe/overlap filter', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 10,
+    lastVocalEndSec: 9.5, // leaves no room for even minOverlapSec
+    phrasesTail: [{ sec: 9.6, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    firstVocalStartSec: 10,
+    phrasesHead: [{ sec: 3, barIndex: 0, score: 0.5, reasons: [] }],
+  });
   assert.deepEqual(planPhraseCrossfade(outgoing, incoming).reasons, ['no-exit-candidate']);
 });
 
@@ -321,5 +464,5 @@ test('planBeatSyncedTransition falls back to the existing planTransition() cross
   assert.equal(plan.mode, 'crossfade');
   assert.equal(plan.baseSwap, true);
   assert.ok(plan.startSec >= 195);
-  assert.deepEqual(plan.fallbackFrom, ['beat-confidence-low', 'no-exit-candidate']);
+  assert.deepEqual(plan.fallbackFrom, ['beat-confidence-low', 'no-phrase-data']);
 });
