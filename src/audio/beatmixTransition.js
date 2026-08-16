@@ -34,7 +34,7 @@ const DOWNBEAT_CONFIDENCE_WEIGHT = 0.8;
 const HARMONIC_WEIGHT = 0.6;
 const ENERGY_CONTINUITY_WEIGHT = 0.4;
 /** §16 tier 1 requires "high confidence" specifically for the 4-6% marginal tempo tier (§8.3). */
-const MARGINAL_TEMPO_MIN_SCORE = 0.7;
+export const MARGINAL_TEMPO_MIN_SCORE = 0.7;
 
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));

@@ -326,6 +326,42 @@ test('transitionCost\'s beatmix term rejects an octave-related tempo whose real 
   );
 });
 
+test('transitionCost\'s beatmix term rejects a low-scoring marginal-tempo pair, matching planBeatmixTransition()\'s marginal-tempo-low-confidence rejection', () => {
+  // Codex round-4 on PR #35: planBeatmixTransition() only takes the 4-6%
+  // "marginal" tempo tier "when confidence/transition conditions are high"
+  // (§8.3) — it rejects the best pair outright if its score falls below
+  // MARGINAL_TEMPO_MIN_SCORE (0.7), no matter how the pair got there. This
+  // term must apply the same gate rather than giving a marginal-tier,
+  // mediocre-quality pair partial credit via 1 - bestScore.
+  const from = richOutgoing();
+  const weakOutgoing = richOutgoing({ phrases: { tail: [{ sec: 160, barIndex: 0, score: 0, reasons: [] }] } });
+  // 125.4 BPM against a 120 BPM target: ~4.3% deviation, inside the 4-6%
+  // marginal band (SOFT_LIMIT_RATIO..HARD_LIMIT_RATIO). Zeroing the phrase
+  // scores on both sides drags the pair's raw score below 0.7 without
+  // touching bpm/key/energy (which stay identical to the defaults), so the
+  // ONLY way transitionCost() can land on exactly the value computed below
+  // is if the gate forces the full BEATMIX_INFEASIBLE_COST — the naturally
+  // computed (ungated) 1 - bestScore for this exact fixture lands on a
+  // measurably different, lower number (verified by reverting the gate).
+  const weakMarginal = richIncoming({
+    bpm: 125.4,
+    headBpm: 125.4,
+    phrases: { head: [{ sec: 15.9, barIndex: 0, score: 0, reasons: [] }] },
+  });
+  const strongMarginal = richIncoming({ bpm: 125.4, headBpm: 125.4 });
+
+  const expectedBpmCost = 1 * Math.min(2, bpmDelta(120, 125.4) / 20);
+  const expectedGatedCost = (expectedBpmCost + 1.5 * 1) / 4; // beatmixWeight 1.5 * BEATMIX_INFEASIBLE_COST 1
+  assert.ok(
+    Math.abs(transitionCost(weakOutgoing, weakMarginal) - expectedGatedCost) < 1e-9,
+    `expected the marginal-tempo gate to force the full infeasibility penalty (got ${transitionCost(weakOutgoing, weakMarginal)}, expected ${expectedGatedCost})`,
+  );
+  assert.ok(
+    transitionCost(from, strongMarginal) < expectedGatedCost,
+    'expected a well-scoring pair at the same marginal tempo tier to score better than the full-penalty value, i.e. not be forced through the gate',
+  );
+});
+
 test('transitionCost\'s beatmix term rejects an entry whose start is vocal-safe but leaves no forward overlap room', () => {
   // Codex round-2 on PR #35 (follow-up to the round-1 exit-side fix):
   // findEntryCandidates() only checks that entry.sec ITSELF is vocal-safe

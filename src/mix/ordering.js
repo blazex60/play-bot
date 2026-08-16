@@ -8,6 +8,7 @@ import {
   HARMONIC_CONFIDENCE_MIN,
   BEAT_CONFIDENCE_MIN,
   DOWNBEAT_CONFIDENCE_MIN,
+  MARGINAL_TEMPO_MIN_SCORE,
   MIN_OVERLAP_BARS,
 } from '../audio/beatmixTransition.js';
 import { canTempoMatch } from '../audio/tempo.js';
@@ -251,6 +252,19 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
       if (score > bestScore) bestScore = score;
     }
   }
+
+  // §8.3: planBeatmixTransition() only takes the 4-6% "marginal" tempo tier
+  // "when confidence/transition conditions are high" — it rejects the best
+  // pair outright (marginal-tempo-low-confidence) if its score falls below
+  // MARGINAL_TEMPO_MIN_SCORE, regardless of how good the other sub-signals
+  // are. Without this gate a marginal-tempo pair with a mediocre overall
+  // score would still get partial credit here instead of the full
+  // infeasibility penalty the live planner would apply (Codex round-4 on
+  // PR #35).
+  if (match.tier === 'marginal' && bestScore < MARGINAL_TEMPO_MIN_SCORE) {
+    return BEATMIX_INFEASIBLE_COST;
+  }
+
   return 1 - bestScore;
 }
 
