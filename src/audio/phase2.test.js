@@ -530,6 +530,63 @@ test('MixStream beatmix mode ramps the bass-swap EQ in over swapBar instead of a
   mix.endMixer();
 });
 
+test('MixStream drops the beatmix EQ ramp once the incoming leg stalls before producing PCM', async () => {
+  // Codex round-5: eqRampSec's bar-envelope schedule assumes both sides
+  // advance in lockstep from crossfade start. If the incoming decoder has
+  // no PCM ready yet (a late ffmpeg/yt-dlp startup, or a mid-overlap
+  // underrun), #readCrossfadeFrame keeps playing/consuming outgoing frames
+  // alone rather than freezing — but fadeElapsedSec (and hence the ramp)
+  // stays pinned at 0 while that happens, so once incoming data finally
+  // arrives the outgoing side has already played further into its beat
+  // grid than the ramp schedule accounts for. Continuing to ramp the EQ in
+  // on that now-wrong schedule would swap bass at a point unrelated to the
+  // (now offset) real downbeats — the fix drops eqRampSec on any stall, so
+  // the EQ applies fully/instantly from the first successfully-mixed frame
+  // on, like the legacy (non-beatmix) path already does.
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const silent = Buffer.alloc(FRAME_BYTES);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 20 }, () => Buffer.from(loud)));
+  const incoming = createPendingSource();
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 1 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    mode: 'beatmix',
+    fadeSec: 80,
+    curve: 'equal-power',
+    baseSwap: true,
+    highpassHz: 120,
+    targetBpm: 120,
+    sync: { bars: 40, beatsPerBar: 4 },
+    eq: { type: 'bass-swap', swapBar: 1, highpassHz: 120 },
+  }), true);
+
+  for (let i = 0; i < 5; i++) {
+    assert.ok(await readFramePaused(mix), 'outgoing must keep playing during the stall');
+  }
+
+  const pending = Array.from({ length: 20 }, () => Buffer.from(silent));
+  incoming.read = (bytes) => (pending.length === 0 ? null : pending.shift().subarray(0, bytes));
+  incoming.emit('data');
+
+  const frame = await readFramePaused(mix);
+  assert.ok(frame);
+
+  const expectedWet = createBiquadProcessor(designHighpass(48000, 120))(Buffer.from(loud));
+  const outGain = gainForPosition({ positionSec: 0, fadeSec: 80, curve: 'equal-power', role: 'out' });
+  const inGain = gainForPosition({ positionSec: 0, fadeSec: 80, curve: 'equal-power', role: 'in' });
+  const expected = mixFrames(expectedWet, silent, outGain, inGain);
+
+  assert.deepEqual(
+    frame,
+    expected,
+    'expected the EQ to apply fully/instantly on the first post-stall frame, not still be ramping in from swapBar',
+  );
+  mix.endMixer();
+});
+
 test('MixStream non-beatmix crossfade applies base-swap EQ fully on the very first frame (no bar-envelope ramp)', async () => {
   // computeEqRampSec() returns null for any plan.mode other than 'beatmix',
   // so #readCrossfadeFrame's blend mix resolves eqRampSec == null to 1

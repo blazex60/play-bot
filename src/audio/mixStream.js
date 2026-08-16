@@ -413,6 +413,17 @@ export class MixStream extends Readable {
       }
       // Incoming not ready yet — keep playing/consuming outgoing outro
       // instead of inserting underrun silence that freezes the current track.
+      // A beatmix's bar-envelope EQ ramp (eqRampSec) assumes both sides
+      // advance in lockstep from crossfade start — once the outgoing side
+      // has consumed a frame the incoming couldn't keep pace with, that
+      // lockstep is already broken for the rest of this transition (the
+      // outgoing beat grid keeps advancing here while the incoming's stays
+      // pinned at its entry point). Fall back to an instant, non-bar-timed
+      // EQ swap rather than keep ramping against audio now offset by
+      // however long this stall lasts (Codex round-5).
+      if (this.#crossfade.eqRampSec != null) {
+        this.#crossfade.eqRampSec = null;
+      }
       if (outFrame) {
         this.#consumedBytes += FRAME_BYTES;
         return outFrame;

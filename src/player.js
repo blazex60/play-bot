@@ -719,7 +719,13 @@ export class GuildPlayer {
     // #maybeApplyAnalysisDuration backfills nativeBpm below once analysis
     // actually arrives for this track, however it arrives (persisted
     // lookup, in-memory cache hit, or a freshly completed #runAnalysis).
-    const nativeBpm = track?.videoId ? (this.#analysisCache.get(track.videoId)?.bpm ?? null) : null;
+    // headBpm (not the tail-biased aggregate `bpm`) — outgoingActualTargetBpm()
+    // scales the tail BPM by (sessionTempo.playbackBpm / analysis.headBpm),
+    // so for a ratio-1 (unstretched) session this must equal headBpm itself
+    // or that formula stops being an identity and reports a tail tempo the
+    // audio isn't actually playing at (Codex round-5 P1).
+    const cached = track?.videoId ? this.#analysisCache.get(track.videoId) : null;
+    const nativeBpm = cached ? (cached.headBpm ?? cached.bpm ?? null) : null;
     this.#sessionTempo = resetSessionTempo(nativeBpm);
   }
 
@@ -1052,7 +1058,8 @@ export class GuildPlayer {
     // hit, freshly completed #runAnalysis), so it is where nativeBpm actually
     // gets backfilled once known.
     if (analysis?.bpm != null && this.#sessionTempo.nativeBpm == null) {
-      this.#sessionTempo = resetSessionTempo(analysis.bpm);
+      // Same headBpm preference as #resetSessionTempoFor, for the same reason.
+      this.#sessionTempo = resetSessionTempo(analysis.headBpm ?? analysis.bpm);
     }
   }
 
@@ -1256,6 +1263,25 @@ export class GuildPlayer {
       if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
       const norm = normalizeTransitionPlan(rawPlan);
 
+      // §2.3/§8.4: TRACK loop mode repeats the SAME track (`next === current`
+      // above) — planBeatSyncedTransition still picks a head-window entry
+      // candidate for it as if it were a different, upcoming song. Seeking
+      // there on spawn would permanently omit everything before that
+      // candidate after the very first loop, since every subsequent repeat
+      // re-arms with the same nonzero entrySec (Codex round-5). The outgoing
+      // exit point is still meaningful (fade the ending into the beginning),
+      // so only the entry side is forced back to a true restart; downgrade
+      // out of beatmix since its bar envelope assumed the original,
+      // downbeat-aligned candidate rather than the file's real start.
+      if (next === current) {
+        norm.entrySec = 0;
+        norm.tempoFilter = null;
+        norm.sessionTempo = null;
+        if (norm.mixPlan.mode === 'beatmix') {
+          norm.mixPlan = { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false };
+        }
+      }
+
       // outAnalysis.durationSec / plan exit timestamps are absolute,
       // native-timeline positions in the outgoing file. MixStream.positionSec
       // is playback-domain (post-stretch) AND relative to wherever #current's
@@ -1340,10 +1366,14 @@ export class GuildPlayer {
       // unhonored phrase-crossfade through unchanged: its baseSwap EQ
       // decision was made assuming the selected phrase boundary, which this
       // source never actually reached (native position 0 instead). Gate on
-      // entrySec instead — nonzero for exactly beatmix/phrase-crossfade,
-      // zero for anything else — and strip baseSwap along with beatmix's
-      // bar-envelope fields (Codex round-4).
-      const mixPlan = (!sourceHonorsPlan && norm.entrySec > 0)
+      // entrySec (Codex round-4) OR tempoFilter (round-5): a beatmix whose
+      // selected entry candidate happens to sit at entrySec === 0 can still
+      // require a nonzero tempo stretch — entrySec alone missed that case,
+      // leaving mode: 'beatmix' (bar-envelope EQ) running against audio that
+      // fell back to native, unstretched tempo. Either field being set means
+      // the plan required a transform this source didn't actually apply.
+      const requiresUnhonoredTransform = norm.entrySec > 0 || norm.tempoFilter != null;
+      const mixPlan = (!sourceHonorsPlan && requiresUnhonoredTransform)
         ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false }
         : norm.mixPlan;
 

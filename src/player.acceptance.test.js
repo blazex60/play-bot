@@ -13,6 +13,7 @@ import { GuildPlayer } from './player.js';
 import { FRAME_BYTES } from './audio/fade.js';
 import { PcmSource } from './audio/pcmSource.js';
 import { ANALYSIS_VERSION } from './audio/trackAnalysis.js';
+import { planBeatSyncedTransition } from './audio/beatmixTransition.js';
 import {
   configureSettingsPathForTest,
   getSettingsPathForTest,
@@ -977,6 +978,193 @@ test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgr
     startedPlan.baseSwap,
     false,
     'expected baseSwap to be stripped once the incoming source could not honor the plan\'s selected entry point',
+  );
+
+  await player.stop();
+});
+
+test('acceptance (mixer): an unhonored beatmix with a zero entry offset still downgrades (tempo-only mismatch)', async () => {
+  // Codex round-5: round-4's guard broadened from mode==='beatmix' to
+  // norm.entrySec > 0, but a beatmix's selected entry candidate can land
+  // at entrySec === 0 while still requiring a nonzero tempo filter (a BPM
+  // mismatch within stretch range). entrySec alone missed that case,
+  // leaving mode: 'beatmix' (bar-envelope EQ) running against audio that
+  // fell back to native, unstretched tempo instead of the planned stretch.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  let startedPlan = null;
+
+  const outgoingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    lastVocalEndSec: 1.0,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], head: [] },
+    analysisSource: 'demucs',
+  };
+  const incomingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    // Zero-sec head candidate: entrySec will be 0, but headBpm still
+    // differs from the outgoing target enough to require a tempo filter.
+    firstVocalStartSec: 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 122,
+    headBpm: 122,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { head: [{ sec: 0, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }], tail: [] },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async (track, opts) => {
+      const source = PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+      if (track.videoId === 'vid-b') source.tempoHonored = false;
+      return source;
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+
+  assert.ok(startedPlan, 'expected a transition to arm');
+  assert.equal(
+    startedPlan.mode,
+    'crossfade',
+    'expected the zero-entry beatmix to still downgrade out of bar-envelope mode once its tempo filter went unhonored',
+  );
+
+  await player.stop();
+});
+
+test('acceptance (mixer): fresh session tempo baselines from head BPM, not the tail-biased aggregate', async () => {
+  // Codex round-5 P1: #resetSessionTempoFor seeded sessionTempo.playbackBpm
+  // from analysis.bpm (tail-biased per trackAnalysis.js). outgoingActualTargetBpm()
+  // then scales the tail BPM by (playbackBpm / analysis.headBpm) — for a
+  // ratio-1 (unstretched) session that formula is only an identity when
+  // playbackBpm equals headBpm. Seeding from the tail-biased value instead
+  // reports a distorted "actual tail tempo" for any track whose head/tail
+  // BPM differ, corrupting the beatmix planner's tempo match.
+  const outgoingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 30,
+    headBpm: 120,
+    bpm: 125,
+    beatConfidence: 0.7,
+    confidence: 0.8,
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 30,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 30, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : null),
+    analyzeTrackFileFn: null,
+  });
+  // A second queued track gives the crossfade-arm loop a `next` to plan
+  // against, which is what actually fetches (and backfills nativeBpm from)
+  // the current track's analysis — #resetSessionTempoFor's own fast-path
+  // read misses on a fresh track (analysis isn't fetched until afterward),
+  // and with no `next` at all the arm loop returns before ever calling
+  // #getCachedAnalysis(current) since `track.duration` already satisfies
+  // mixStream.remainingSec on its own.
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 30, videoId: 'vid-b' }));
+
+  await player.playNext();
+  await pollUntil(() => player.sessionTempo.playbackBpm != null);
+
+  assert.equal(
+    player.sessionTempo.playbackBpm,
+    120,
+    'expected a fresh session\'s playbackBpm to baseline from headBpm (120), not the tail-biased aggregate bpm (125)',
+  );
+
+  await player.stop();
+});
+
+test('acceptance (mixer): TRACK loop mode restarts from the beginning, not the beatmix entry candidate', async () => {
+  // Codex round-5: LoopMode.TRACK re-arms with next === current, but
+  // planBeatSyncedTransition still picks a head-window entry candidate for
+  // `next` as if it were a different, upcoming song. Without forcing the
+  // entry back to 0, a high-scoring head-phrase candidate deep into the
+  // file would seek there on every repeat — after the very first loop, the
+  // track permanently loses its intro instead of replaying the whole song.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const incomingSpawnArgs = [];
+
+  // Same track's analysis serves as both outgoing (tail exit) and incoming
+  // (head entry) — a real head-phrase candidate sits well into the file.
+  const analysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    lastVocalEndSec: 1.0,
+    firstVocalStartSec: 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: {
+      tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }],
+      head: [{ sec: 3.0, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+    },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async (track, opts) => {
+      incomingSpawnArgs.push(opts);
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.loopMode = LoopMode.TRACK;
+
+  // Confirm the fixture actually exercises the bug: absent the TRACK-loop
+  // guard, this same analysis pair (used as both outgoing and incoming)
+  // really does make the planner pick the nonzero head candidate as entrySec.
+  const rawPlan = planBeatSyncedTransition(analysis, analysis, {
+    outgoingPlaybackBpm: 120,
+    tempoBackend: 'rubberband',
+    maxOverlapSec: 6,
+  });
+  const wouldBeEntrySec = rawPlan.mode === 'beatmix' ? rawPlan.incoming?.entrySec : rawPlan.entrySec;
+  assert.ok(
+    wouldBeEntrySec > 0,
+    `test invariant: expected the planner to pick a nonzero entry candidate for this fixture, got ${wouldBeEntrySec}`,
+  );
+
+  await player.playNext();
+  for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+
+  const nonzeroSpawns = incomingSpawnArgs.filter((opts) => (opts.startSec ?? 0) !== 0);
+  assert.equal(
+    nonzeroSpawns.length,
+    0,
+    `expected every TRACK-loop repeat spawn to start at 0 (full replay), got nonzero startSec in: ${JSON.stringify(nonzeroSpawns)}`,
   );
 
   await player.stop();
