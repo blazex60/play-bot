@@ -84,6 +84,18 @@ export function buildTempoFilter({ nativeBpm, targetBpm, backend = 'rubberband' 
 
 let cachedBackendPromise = null;
 
+function delay(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+// Codex round-7 on PR #35: a nonzero exit or thrown spawn error (e.g. a
+// momentary `spawn EAGAIN`) is indistinguishable, to a caller, from a clean
+// run that conclusively found neither filter — both come back as `null`.
+// But ordering.js now gates a real infeasibility *penalty* on that `null`,
+// so a one-off transient hiccup must not be handed to it as if it were a
+// verified "no backend" fact. Retry a couple of times before giving up.
+const PROBE_RETRY_DELAYS_MS = [50, 150];
+
 /**
  * Probes the local ffmpeg build for the rubberband filter (§8.2: bundled in
  * Debian bookworm's ffmpeg, no new package needed), falling back to atempo,
@@ -104,15 +116,27 @@ export async function probeTempoBackend({ spawnFn } = {}) {
   if (cachedBackendPromise) return cachedBackendPromise;
   let conclusive = false;
   const probe = (async () => {
-    try {
-      const { stdout, code } = await spawnCapture(spawnFn, 'ffmpeg', ['-hide_banner', '-filters']);
-      if (code !== 0) return null;
-      conclusive = true;
-      if (/\brubberband\b/.test(stdout)) return 'rubberband';
-      if (/\batempo\b/.test(stdout)) return 'atempo';
-      return null;
-    } catch {
-      return null;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const { stdout, code } = await spawnCapture(spawnFn, 'ffmpeg', ['-hide_banner', '-filters']);
+        if (code !== 0) {
+          if (attempt < PROBE_RETRY_DELAYS_MS.length) {
+            await delay(PROBE_RETRY_DELAYS_MS[attempt]);
+            continue;
+          }
+          return null;
+        }
+        conclusive = true;
+        if (/\brubberband\b/.test(stdout)) return 'rubberband';
+        if (/\batempo\b/.test(stdout)) return 'atempo';
+        return null;
+      } catch {
+        if (attempt < PROBE_RETRY_DELAYS_MS.length) {
+          await delay(PROBE_RETRY_DELAYS_MS[attempt]);
+          continue;
+        }
+        return null;
+      }
     }
   })();
   cachedBackendPromise = probe;

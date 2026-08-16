@@ -1,6 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bpmDelta, transitionCost, optimizeTrackOrder, isValidPermutation } from './ordering.js';
+import {
+  bpmDelta,
+  transitionCost,
+  optimizeTrackOrder,
+  isValidPermutation,
+  DEFAULT_BPM_WEIGHT,
+  DEFAULT_BEATMIX_WEIGHT,
+  BEATMIX_INFEASIBLE_COST,
+} from './ordering.js';
 import { camelotDistance, parseCamelot } from './camelot.js';
 import { BEAT_CONFIDENCE_MIN, DOWNBEAT_CONFIDENCE_MIN } from '../audio/beatmixTransition.js';
 
@@ -60,6 +68,15 @@ test('optimizeTrackOrder threads tempoBackend through to transitionCost, flippin
   assert.equal(isValidPermutation(withAtempo, 2), true);
   assert.deepEqual(withRubberband, [0, 1], 'rubberband can build the marginal stretch, so it should win');
   assert.deepEqual(withAtempo, [1, 0], 'atempo cannot build the marginal stretch, so the plain candidate should win');
+
+  // CodeRabbit round-7 on PR #35: the assertions above only exercise the
+  // exact-search edgeCost() cache (n=2 <= default maxExact=10). Force the
+  // greedy fallback loop (n > maxExact) to confirm its own direct
+  // transitionCost(..., { tempoBackend }) call also threads the option.
+  const withAtempoGreedy = optimizeTrackOrder({
+    anchorAnalysis: anchor, tracks, analyses, maxExact: 1, tempoBackend: 'atempo',
+  });
+  assert.deepEqual(withAtempoGreedy, [1, 0], 'greedy fallback must thread tempoBackend too');
 });
 
 test('isValidPermutation rejects duplicates and out-of-range indices', () => {
@@ -355,11 +372,46 @@ test('transitionCost\'s beatmix term rejects tempo pairs with no octave relation
   // cost when the gate fires avoids that trap.
   const from = richOutgoing(); // tailBpm 120
   const noOctaveRelation = richIncoming({ bpm: 30, headBpm: 30 }); // canTempoMatch(30, 120) -> ratio: null
-  const expectedBpmCost = 1 * Math.min(2, bpmDelta(120, 30) / 20);
-  const expectedGatedCost = (expectedBpmCost + 1.5 * 1) / 4; // beatmixWeight 1.5 * BEATMIX_INFEASIBLE_COST 1
+  // Codex round-7 on PR #35: a confirmed infeasibility is added on top of
+  // the other terms' own average (bpm/key/energy — key and energy both
+  // land on 0 here since tailKey/headKey and lastRms are identical), not
+  // blended into a shared cost/parts denominator, so it can never net
+  // *lower* the cost relative to leaving beatmix out entirely.
+  const expectedBpmCost = DEFAULT_BPM_WEIGHT * Math.min(2, bpmDelta(120, 30) / 20);
+  const expectedGatedCost = expectedBpmCost / 3 + DEFAULT_BEATMIX_WEIGHT * BEATMIX_INFEASIBLE_COST;
   assert.ok(
     Math.abs(transitionCost(from, noOctaveRelation) - expectedGatedCost) < 1e-9,
     `expected the no-octave-relation gate to force the full infeasibility penalty (got ${transitionCost(from, noOctaveRelation)}, expected ${expectedGatedCost})`,
+  );
+});
+
+test('transitionCost never lets a confirmed beatmix infeasibility LOWER the cost versus the same edge scored without beatmix data', () => {
+  // Codex round-7 on PR #35: bpm/key/energy sub-scores cap at 2, 2, and 1
+  // respectively (before weighting), while beatmixCost caps at only 1. If
+  // the confirmed-infeasibility penalty were blended into the same
+  // cost/parts average as the other terms (as it was before this round's
+  // fix), an edge whose bpm/key/energy terms are ALL already near their own
+  // ceiling would come out CHEAPER once a maxed-but-lower-ceiling beatmix
+  // penalty got folded in and diluted the average — i.e. proving a
+  // transition infeasible could make ordering rank it BETTER. This pins the
+  // additive fix: the same bpm/key/energy inputs, with vs. without beatmix
+  // data at all, must never let "with" score lower than "without".
+  const from = richOutgoing(); // bpm 120, tailKey '8B', lastRms -14
+  // 120 vs 160 has no usable octave relation within the 0.6x-1.4x band
+  // (canTempoMatch -> tier 'exceeds-hard'), a confirmed infeasibility; '8B'
+  // vs '2B' and -14 vs -2 dBFS push key and energy to their own caps too.
+  const confirmedInfeasible = richIncoming({ bpm: 160, headBpm: 160, headKey: '2B', lastRms: -2 });
+  const plainOutgoing = { bpm: 120, tailKey: '8B', harmonicConfidence: 0.8, lastRms: -14 };
+  const plainIncoming = { bpm: 160, headKey: '2B', harmonicConfidence: 0.8, lastRms: -2 };
+  // Sanity check the fixture actually caps all three non-beatmix terms
+  // (bpm 2, key 2.4, energy 0.3 -> 4.7/3) before relying on it below.
+  assert.ok(
+    Math.abs(transitionCost(plainOutgoing, plainIncoming) - 4.7 / 3) < 1e-9,
+    `expected the no-beatmix-data baseline to be exactly 4.7/3 (got ${transitionCost(plainOutgoing, plainIncoming)})`,
+  );
+  assert.ok(
+    transitionCost(from, confirmedInfeasible) > transitionCost(plainOutgoing, plainIncoming),
+    `expected a confirmed infeasibility to strictly increase cost relative to no beatmix data at all (got ${transitionCost(from, confirmedInfeasible)} vs ${transitionCost(plainOutgoing, plainIncoming)})`,
   );
 });
 
@@ -471,8 +523,11 @@ test('transitionCost\'s beatmix term rejects a low-scoring marginal-tempo pair, 
   });
   const strongMarginal = richIncoming({ bpm: 125.4, headBpm: 125.4 });
 
-  const expectedBpmCost = 1 * Math.min(2, bpmDelta(120, 125.4) / 20);
-  const expectedGatedCost = (expectedBpmCost + 1.5 * 1) / 4; // beatmixWeight 1.5 * BEATMIX_INFEASIBLE_COST 1
+  // Same additive-not-blended formula as the no-octave-relation test above
+  // (Codex round-7) — key and energy both land on 0 here too (identical
+  // key/lastRms on both sides).
+  const expectedBpmCost = DEFAULT_BPM_WEIGHT * Math.min(2, bpmDelta(120, 125.4) / 20);
+  const expectedGatedCost = expectedBpmCost / 3 + DEFAULT_BEATMIX_WEIGHT * BEATMIX_INFEASIBLE_COST;
   assert.ok(
     Math.abs(transitionCost(weakOutgoing, weakMarginal) - expectedGatedCost) < 1e-9,
     `expected the marginal-tempo gate to force the full infeasibility penalty (got ${transitionCost(weakOutgoing, weakMarginal)}, expected ${expectedGatedCost})`,
@@ -569,7 +624,7 @@ test('optimizeTrackOrder caches per-edge beatmix scoring so the exact search sta
   const tracks = Array.from({ length: n }, (_, i) => ({ title: `T${i}` }));
   const analyses = tracks.map((_, i) => bigAnalysis(i));
 
-  // Fixed at 500ms locally sits comfortably between the ~35ms cached and
+  // Fixed at 1500ms locally sits comfortably between the ~35ms cached and
   // ~3000ms uncached measurements, but shared/noisy CI runners can be
   // meaningfully slower than that — override via ORDERING_PERF_BUDGET_MS
   // rather than let a slow runner fail this test with no real regression

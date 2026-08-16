@@ -14,7 +14,7 @@ import {
 import { canTempoMatch, buildTempoFilter } from '../audio/tempo.js';
 import { isHalfDouble } from '../audio/trackAnalysis.js';
 
-const DEFAULT_BPM_WEIGHT = 1;
+export const DEFAULT_BPM_WEIGHT = 1;
 const DEFAULT_KEY_WEIGHT = 1.2;
 const DEFAULT_ENERGY_WEIGHT = 0.3;
 /**
@@ -27,7 +27,7 @@ const DEFAULT_ENERGY_WEIGHT = 0.3;
  * HARD_LIMIT_RATIO in tempo.js and BEAT_CONFIDENCE_MIN/
  * DOWNBEAT_CONFIDENCE_MIN in beatmixTransition.js).
  */
-const DEFAULT_BEATMIX_WEIGHT = 1.5;
+export const DEFAULT_BEATMIX_WEIGHT = 1.5;
 /**
  * Fallback floor only for the (rare) case neither side reports a usable
  * target BPM at all — otherwise minOverlapSecFor() below derives the real
@@ -90,7 +90,7 @@ function minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis) {
 }
 
 /** Full penalty for a positively-identified beatmix infeasibility (see below). */
-const BEATMIX_INFEASIBLE_COST = 1;
+export const BEATMIX_INFEASIBLE_COST = 1;
 
 /**
  * hasVocalAnalysis() alone only proves vocal separation succeeded — that
@@ -374,6 +374,20 @@ export function transitionCost(fromAnalysis, toAnalysis, weights = {}) {
 
   const beatmixCost = beatmixCompatibilityCost(fromAnalysis, toAnalysis, weights.tempoBackend);
   if (beatmixCost != null) {
+    if (beatmixCost === BEATMIX_INFEASIBLE_COST) {
+      // Codex round-7 on PR #35: bpm/key/energy sub-scores cap at 2, 2, and 1
+      // respectively (before weighting), while beatmixCost caps at 1 — so
+      // blending a maxed-out beatmix term into the same cost/parts average
+      // as already-near-capped bpm/key terms can *lower* the average versus
+      // leaving beatmix out entirely (a maxed lower-ceiling term dilutes an
+      // already-maxed higher-ceiling set). A positively identified
+      // infeasibility must never make an edge look better than the same
+      // edge scored without beatmix data, so add its penalty on top of the
+      // other terms' own average instead of folding it into a shared
+      // denominator.
+      const baseCost = parts > 0 ? cost / parts : 1;
+      return baseCost + beatmixWeight * BEATMIX_INFEASIBLE_COST;
+    }
     cost += beatmixWeight * beatmixCost;
     parts += 1;
   }
