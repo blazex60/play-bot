@@ -6,6 +6,8 @@ import {
   gainForPosition,
   mixFrames,
   scaleFrame,
+  softLimitFrame,
+  blendFrame,
 } from './fade.js';
 import {
   createOutgoingBaseSwapProcessor,
@@ -14,6 +16,30 @@ import {
 import { MAX_UNDERRUN_MS } from './config.js';
 
 const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
+
+function clamp01(n) {
+  return n < 0 ? 0 : n > 1 ? 1 : n;
+}
+
+/**
+ * Phase 7 §11.1: for a `mode: 'beatmix'` plan, the bass-swap EQ ramps in over
+ * `eq.swapBar` bars instead of applying instantly for the whole crossfade
+ * (the doc's diagram — A/B LOW% cross over gradually, not switched at bar 1).
+ * `sync.beatsPerBar` and `targetBpm` (the session tempo both sides play the
+ * overlap at) give the real bar length; any other mode (plain crossfade,
+ * phrase-crossfade) keeps the existing instant on/off EQ, so this returns
+ * null for them.
+ * @returns {number|null} ramp duration in seconds, or null for "apply fully".
+ */
+function computeEqRampSec(plan) {
+  if (plan.mode !== 'beatmix') return null;
+  const targetBpm = plan.targetBpm;
+  const beatsPerBar = plan.sync?.beatsPerBar;
+  const swapBar = plan.eq?.swapBar;
+  if (!(targetBpm > 0) || !(beatsPerBar > 0) || !(swapBar > 0)) return null;
+  const barSec = (60 / targetBpm) * beatsPerBar;
+  return barSec > 0 ? barSec * swapBar : null;
+}
 
 export class MixStream extends Readable {
   #current = null;
@@ -146,6 +172,7 @@ export class MixStream extends Readable {
       curve: plan.curve ?? 'equal-power',
       baseSwap: plan.baseSwap === true && mode !== 'tail-fade',
       mode,
+      eqRampSec: computeEqRampSec(plan),
     };
     this.#fadeElapsedSec = 0;
     this.#incomingSkipSec = mode === 'tail-fade' ? 0 : Math.max(0, plan.incomingOffsetSec ?? 0);
@@ -332,7 +359,10 @@ export class MixStream extends Readable {
       curve: this.#crossfade.curve,
       role: 'out',
     });
-    const faded = scaleFrame(outFrame, outGain);
+    // §11.2: unlike the crossfade path (mixFrames() already soft-limits),
+    // tail-fade only ever scales a single frame — no other source is
+    // summed in — but scaleFrame() alone has no headroom/clip protection.
+    const faded = softLimitFrame(scaleFrame(outFrame, outGain));
     this.#consumedBytes += FRAME_BYTES;
     this.#fadeElapsedSec += FRAME_MS / 1000;
 
@@ -397,8 +427,24 @@ export class MixStream extends Readable {
 
     let processedOut = Buffer.from(outFrame);
     let processedIn = Buffer.from(inFrame);
-    if (this.#outEq) processedOut = this.#outEq(processedOut);
-    if (this.#inEq) processedIn = this.#inEq(processedIn);
+    // The biquad filters are stateful IIR processors — always run them every
+    // frame so their history stays continuous, then blend the dry/wet result
+    // by the ramp mix. eqRampSec == null (non-beatmix) resolves mix to 1,
+    // reproducing the prior "always fully filtered" behavior exactly.
+    if (this.#outEq) {
+      const wet = this.#outEq(Buffer.from(outFrame));
+      const mix = this.#crossfade.eqRampSec != null
+        ? clamp01(this.#fadeElapsedSec / this.#crossfade.eqRampSec)
+        : 1;
+      processedOut = blendFrame(processedOut, wet, mix);
+    }
+    if (this.#inEq) {
+      const wet = this.#inEq(Buffer.from(inFrame));
+      const mix = this.#crossfade.eqRampSec != null
+        ? clamp01(this.#fadeElapsedSec / this.#crossfade.eqRampSec)
+        : 1;
+      processedIn = blendFrame(processedIn, wet, mix);
+    }
 
     const outGain = gainForPosition({
       positionSec: this.#fadeElapsedSec,

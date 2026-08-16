@@ -545,6 +545,98 @@ test('acceptance (mixer): cached lastVocalEnd starts a vocal-free crossfade', as
   await player.stop();
 });
 
+test('acceptance (mixer): beatmix transition spawns a tempo-matched, seeked incoming source and carries session tempo across promotion', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  let startedPlan = null;
+  const incomingSpawnArgs = [];
+
+  // §9.2/§16 tier 1: bpm/beatConfidence/downbeatGrid.confidence/meter on
+  // both sides, a vocal-safe phrase-boundary exit (outgoing) and entry
+  // (incoming) with >= 2 bars (4s @ 120BPM) of forward-safe room. Same BPM
+  // on both sides keeps tempoRatio exactly 1, so the only thing under test
+  // is the wiring (spawn options, plan shape, promotion) — not the planner
+  // math itself, which beatmixTransition.test.js already covers in depth.
+  const outgoingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    lastVocalEndSec: 1.0,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], head: [] },
+    analysisSource: 'demucs',
+  };
+  const incomingAnalysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    firstVocalStartSec: 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { head: [{ sec: 0.2, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }], tail: [] },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async (track, opts) => {
+      if (track.videoId === 'vid-b') incomingSpawnArgs.push(opts);
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  // 20ms frames: 60 reads = 1.2s, past the 1.0s exitStartSec.
+  for (let i = 0; i < 60; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  assert.ok(startedPlan, 'expected a beatmix transition to arm and start');
+  assert.equal(startedPlan.mode, 'beatmix');
+  assert.equal(startedPlan.targetBpm, 120);
+  assert.ok(startedPlan.startSec >= 1.0 - 1e-6);
+
+  assert.ok(incomingSpawnArgs.length >= 1, 'expected the incoming source to actually be (re-)spawned');
+  const spawned = incomingSpawnArgs[incomingSpawnArgs.length - 1];
+  assert.ok(
+    Math.abs(spawned.startSec - 0.2) < 1e-6,
+    `expected the incoming spawn to seek to the plan's entrySec, got ${spawned.startSec}`,
+  );
+  assert.ok(
+    typeof spawned.tempoFilter === 'string' && spawned.tempoFilter.startsWith('rubberband=tempo='),
+    `expected a tempo filter on the incoming spawn, got ${spawned.tempoFilter}`,
+  );
+
+  // Drive well past the 4s (2-bar) overlap so the crossfade promotes Track B.
+  for (let i = 0; i < 220; i += 1) {
+    player.mixStream.read(FRAME_BYTES);
+  }
+
+  assert.equal(queue.current.videoId, 'vid-b', 'expected the beatmix crossfade to promote track B');
+  assert.deepEqual(
+    player.sessionTempo,
+    { nativeBpm: 120, playbackBpm: 120, tempoRatio: 1 },
+    'expected the promoted session tempo to carry the beatmix plan\'s incoming tempo state, not reset to a fresh lookup',
+  );
+
+  await player.stop();
+});
+
 test('acceptance (mixer): /fade off skips crossfade and stays gapless', async () => {
   const previousSettingsPath = getSettingsPathForTest();
   const dir = await mkdtemp(join(tmpdir(), 'music-bot-fade-player-test-'));

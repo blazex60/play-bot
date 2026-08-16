@@ -6,7 +6,11 @@ import { triggerTrackEnd } from './player/playbackDrive.js'
 import { makePlayer, nextTurn } from './player/test-helpers.js'
 import { ANALYSIS_VERSION } from './audio/trackAnalysis.js'
 
-// --- Phase 7B §8.4: session tempo bookkeeping (no stretch wired yet) ------
+// --- Phase 7B §8.4: session tempo bookkeeping. Phase 7D wires an actual
+// stretch (beatmix promotion) into it — see player.acceptance.test.js's
+// "beatmix transition..." test for the full crossfade-driven version; the
+// test below only exercises the reset-to-native path these tests already
+// cover, unchanged. ------------------------------------------------------
 
 test('GuildPlayer.sessionTempo starts unstretched with no known BPM', () => {
   const { player } = makePlayer()

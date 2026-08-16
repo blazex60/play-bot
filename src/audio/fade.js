@@ -35,6 +35,27 @@ export function scaleFrame(frame, gain) {
   return out;
 }
 
+/**
+ * Linear-interpolate two same-length s16le frames sample-by-sample.
+ * mix=0 -> dry, mix=1 -> wet. Used to ramp an EQ effect in/out gradually
+ * (Phase 7 §11.1 bar-envelope bass swap) instead of switching it on/off
+ * instantly for the whole crossfade.
+ * @returns {Buffer}
+ */
+export function blendFrame(dry, wet, mix) {
+  if (!(mix > 0)) return dry;
+  if (mix >= 1) return wet;
+  const out = Buffer.allocUnsafe(FRAME_BYTES);
+  const a = new Int16Array(dry.buffer, dry.byteOffset, FRAME_BYTES / 2);
+  const b = new Int16Array(wet.buffer, wet.byteOffset, FRAME_BYTES / 2);
+  const dest = new Int16Array(out.buffer, out.byteOffset, FRAME_BYTES / 2);
+  for (let i = 0; i < dest.length; i++) {
+    const v = a[i] * (1 - mix) + b[i] * mix;
+    dest[i] = v > 32767 ? 32767 : v < -32768 ? -32768 : Math.round(v);
+  }
+  return out;
+}
+
 /** Soft-clip samples in-place on an Int16 interleaved stereo frame. */
 export function softLimitFrame(frame, ceiling = 0.95) {
   const view = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2);
