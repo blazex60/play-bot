@@ -73,7 +73,7 @@ function entryVocalMargin(incoming, entrySec) {
  * nothing about what happens after that window ends, so the room is capped
  * there rather than treated as unbounded.
  */
-function entryForwardSafeSec(incoming, entrySec) {
+export function entryForwardSafeSec(incoming, entrySec) {
   const firstVocal = incoming?.firstVocalStartSec;
   if (!Number.isFinite(firstVocal)) return Math.max(0, HEAD_WINDOW_SEC - entrySec);
   if (entrySec <= firstVocal - 1e-6) return firstVocal - entrySec;

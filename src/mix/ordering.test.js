@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { bpmDelta, transitionCost, optimizeTrackOrder, isValidPermutation } from './ordering.js';
 import { camelotDistance, parseCamelot } from './camelot.js';
+import { BEAT_CONFIDENCE_MIN } from '../audio/beatmixTransition.js';
 
 test('parseCamelot accepts Camelot codes and key names', () => {
   assert.deepEqual(parseCamelot('8B'), { code: '8B', number: 8, mode: 'B' });
@@ -83,6 +84,7 @@ function richOutgoing(overrides = {}) {
     harmonicConfidence: 0.8,
     tailKey: '8B',
     downbeatGrid: { confidence: 0.8 },
+    beatConfidence: 0.8,
     phrases: { tail: [{ sec: 160, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] },
     lastRms: -14,
     ...overrides,
@@ -99,6 +101,7 @@ function richIncoming(overrides = {}) {
     harmonicConfidence: 0.8,
     headKey: '8B',
     downbeatGrid: { confidence: 0.8 },
+    beatConfidence: 0.8,
     phrases: { head: [{ sec: 4, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] },
     lastRms: -14,
     ...overrides,
@@ -171,12 +174,20 @@ test('transitionCost\'s beatmix term requires the planner\'s own bar-derived ove
   assert.equal(transitionCost(tightRoom, to), 0);
 });
 
-test('transitionCost\'s beatmix term rejects meter-mismatched pairs, matching planBeatmixTransition()', () => {
+test('transitionCost\'s beatmix term penalizes meter-mismatched pairs, matching planBeatmixTransition()', () => {
   // Codex round-1 on PR #35: scoreTransitionPair() itself doesn't inspect
   // meter, so a 3/4 vs 4/4 pair could still score well here even though
   // planBeatmixTransition() hard-rejects it (bar alignment can't stay
   // synchronized). bpm/key/lastRms stay identical to the defaults so any
-  // nonzero cost can only come from the beatmix term itself.
+  // cost difference can only come from the beatmix term itself.
+  //
+  // Codex round-2 on PR #35: the original round-1 fix returned null
+  // (skipped) for a meter mismatch, same as "no data available" — but a
+  // confirmed mismatch is a *positive* infeasibility signal, not missing
+  // data, and skipping it let two meter-mismatched (unfixably bad) tracks
+  // cost LESS than two well-matched (genuinely good) ones, since
+  // transitionCost() only averages the terms that actually fire. A
+  // confirmed mismatch must cost more than a real, scored match.
   const matchedMeter = [
     richOutgoing({ downbeatGrid: { confidence: 0.8, meter: 4 } }),
     richIncoming({ downbeatGrid: { confidence: 0.8, meter: 4 } }),
@@ -185,11 +196,17 @@ test('transitionCost\'s beatmix term rejects meter-mismatched pairs, matching pl
     richOutgoing({ downbeatGrid: { confidence: 0.8, meter: 4 } }),
     richIncoming({ downbeatGrid: { confidence: 0.8, meter: 3 } }),
   ];
-  assert.equal(transitionCost(...mismatchedMeter), 0, 'expected the beatmix term to be fully skipped for a meter mismatch');
-  assert.notEqual(
-    transitionCost(...matchedMeter),
-    0,
-    'expected the beatmix term to actually be active when meters agree (sanity check)',
+  const noBeatmixData = transitionCost(
+    { bpm: 120, tailKey: '8B', harmonicConfidence: 0.8, lastRms: -14 },
+    { bpm: 120, headKey: '8B', harmonicConfidence: 0.8, lastRms: -14 },
+  );
+  assert.ok(
+    transitionCost(...mismatchedMeter) > transitionCost(...matchedMeter),
+    'expected a confirmed meter mismatch to cost more than a genuinely well-matched beatmix pair',
+  );
+  assert.ok(
+    transitionCost(...mismatchedMeter) > noBeatmixData,
+    'expected a confirmed meter mismatch to cost more than simply having no beatmix data at all',
   );
 });
 
@@ -215,5 +232,98 @@ test('transitionCost\'s beatmix term scores the best exit/entry combination, not
   assert.ok(
     transitionCost(fromBothCandidates, toBothCandidates) < transitionCost(fromTopOnly, toTopOnly),
     'expected considering the lower-ranked-but-vocal-safer pair to score better (cost less) than being forced onto the top-ranked pair alone',
+  );
+});
+
+test('transitionCost\'s beatmix term penalizes sub-threshold beat-grid confidence, matching planBeatmixTransition()\'s beat-confidence-low rejection', () => {
+  // Codex round-2 on PR #35: scoreTransitionPair() never inspects
+  // beatConfidence at all — only downbeatGrid.confidence factors into its
+  // score — so a shaky beat grid could still get a near-perfect beatmix
+  // score here even though planBeatmixTransition() hard-rejects the same
+  // pair with 'beat-confidence-low'. Below BEAT_CONFIDENCE_MIN on either
+  // side must be treated as a confirmed infeasibility (full penalty), not
+  // scored as if the grid were solid.
+  const solidBeat = richOutgoing();
+  const shakyBeatOutgoing = richOutgoing({ beatConfidence: BEAT_CONFIDENCE_MIN - 0.1 });
+  const solidIncoming = richIncoming();
+  const shakyBeatIncoming = richIncoming({ beatConfidence: BEAT_CONFIDENCE_MIN - 0.1 });
+
+  assert.ok(
+    transitionCost(solidBeat, shakyBeatIncoming) > transitionCost(solidBeat, solidIncoming),
+    'expected a sub-threshold incoming beat grid to be penalized, not scored as solid',
+  );
+  assert.ok(
+    transitionCost(shakyBeatOutgoing, solidIncoming) > transitionCost(solidBeat, solidIncoming),
+    'expected a sub-threshold outgoing beat grid to be penalized, not scored as solid',
+  );
+});
+
+test('transitionCost\'s beatmix term rejects an entry whose start is vocal-safe but leaves no forward overlap room', () => {
+  // Codex round-2 on PR #35 (follow-up to the round-1 exit-side fix):
+  // findEntryCandidates() only checks that entry.sec ITSELF is vocal-safe
+  // (before firstVocalStartSec) — it says nothing about whether the room
+  // that follows is enough for even the shortest real overlap.
+  // planBeatmixTransition() additionally requires forwardSafePlayback to
+  // cover the fadeSec it picks (entryForwardSafeSec()); this term must
+  // apply the same floor derived by minOverlapSecFor() (2 bars @ 120 BPM/
+  // 4-beat = 4s here). Single exit/entry candidate on each side so there's
+  // no candidate-selection ambiguity — this isolates the forward-room
+  // filter itself from the "best pair" search covered above.
+  const from = richOutgoing();
+  const tightEntry = richIncoming({
+    firstVocalStartSec: 20,
+    phrases: { head: [{ sec: 16.5, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] }, // 3.5s room, needs 4s
+  });
+  const roomyEntry = richIncoming({
+    firstVocalStartSec: 20,
+    phrases: { head: [{ sec: 15, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] }, // 5s room
+  });
+  assert.ok(
+    transitionCost(from, tightEntry) > transitionCost(from, roomyEntry),
+    'expected an entry without enough forward overlap room to be penalized versus one with enough room',
+  );
+});
+
+test('optimizeTrackOrder caches per-edge beatmix scoring so the exact search stays fast with realistic candidate pools', () => {
+  // Codex round-2 on PR #35 (P1): transitionCost(from, next) only depends
+  // on the (from, next) pair, but the exact-search DP previously
+  // recomputed it once per (mask, lastIdx, next) STATE — O(2^n * n) calls
+  // instead of the O(n^2) distinct edges that actually exist. Each call now
+  // runs an exitCandidates x entryCandidates search
+  // (beatmixCompatibilityCost()), so with real v3 payloads (~20-25 tail x
+  // ~15-20 head candidates) this measured at ~3s for a single n=10 exact
+  // search on this machine without the edgeCost() cache added in this
+  // round, comfortably enough to blow past the bot's 5s
+  // /internal/optimize-order timeout on slower hardware — versus ~35ms with
+  // it. The threshold below sits an order of magnitude above the cached
+  // time and well below the uncached time, so a regression back to
+  // per-state recomputation fails this test rather than silently
+  // reintroducing the event-loop-blocking bug.
+  function bigAnalysis(i) {
+    const bpm = 118 + (i % 5);
+    const tailPhrases = Array.from({ length: 20 }, (_, k) => (
+      { sec: 150 + k * 2, barIndex: k, score: 0.5 + (k % 5) / 10, reasons: ['bar-multiple'] }
+    ));
+    const headPhrases = Array.from({ length: 15 }, (_, k) => (
+      { sec: 4 + k * 1.2, barIndex: k, score: 0.5 + (k % 5) / 10, reasons: ['bar-multiple'] }
+    ));
+    return {
+      ...richOutgoing({ bpm, tailBpm: bpm }),
+      ...richIncoming({ bpm, headBpm: bpm }),
+      phrases: { tail: tailPhrases, head: headPhrases },
+    };
+  }
+  const n = 10; // optimizeTrackOrder()'s default maxExact — the exact case Codex flagged
+  const tracks = Array.from({ length: n }, (_, i) => ({ title: `T${i}` }));
+  const analyses = tracks.map((_, i) => bigAnalysis(i));
+
+  const start = Date.now();
+  const order = optimizeTrackOrder({ tracks, analyses, maxExact: n });
+  const elapsedMs = Date.now() - start;
+
+  assert.equal(isValidPermutation(order, n), true);
+  assert.ok(
+    elapsedMs < 500,
+    `expected edge-cost caching to keep a ${n}-track exact search well under 500ms even with 20x15 phrase candidates per edge (took ${elapsedMs}ms)`,
   );
 });

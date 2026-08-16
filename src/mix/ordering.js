@@ -3,7 +3,9 @@ import {
   findExitCandidates,
   findEntryCandidates,
   scoreTransitionPair,
+  entryForwardSafeSec,
   HARMONIC_CONFIDENCE_MIN,
+  BEAT_CONFIDENCE_MIN,
   MIN_OVERLAP_BARS,
 } from '../audio/beatmixTransition.js';
 import { canTempoMatch } from '../audio/tempo.js';
@@ -83,6 +85,9 @@ function minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis) {
   return Math.max(MIN_OVERLAP_SEC_FOR_ORDERING, barSec * MIN_OVERLAP_BARS);
 }
 
+/** Full penalty for a positively-identified beatmix infeasibility (see below). */
+const BEATMIX_INFEASIBLE_COST = 1;
+
 /**
  * Phase 7E: an additional, opt-in cost term layered on top of the base bpm/
  * key/energy terms below, built by reusing Phase 7C's beatmix planner
@@ -93,14 +98,23 @@ function minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis) {
  * signals (plus harmonic distance and energy continuity) into one pure,
  * cached-metadata-only 0..1 quality score.
  *
- * Returns null (not zero) when either side lacks phrase/vocal analysis
- * (pre-v3 cached analysis, or a track whose vocal separation failed), or
- * when outgoing/incoming report incompatible meters (e.g. 3/4 vs 4/4 — bar
- * alignment can never stay synchronized, the same hard-reject
- * planBeatmixTransition() applies) — treated the same as the harmonic
- * term's confidence gate below: an unavailable/inapplicable *richer* signal
- * is skipped rather than penalized, since the base bpm/key/energy terms
- * already cover that pair on their own (Codex round-1 on PR #35).
+ * Returns null (not zero, not penalized — the term is simply skipped, same
+ * treatment as the harmonic term's confidence gate below) only when either
+ * side lacks phrase/vocal analysis entirely (pre-v3 cached analysis, or a
+ * track whose vocal separation failed) — there the base bpm/key/energy
+ * terms already cover the pair on their own and we have no basis to say
+ * anything more.
+ *
+ * Once both sides carry real v3 data, a *positively identified*
+ * incompatibility — incompatible meters (3/4 vs 4/4, bar alignment can
+ * never stay synchronized), sub-threshold beat-grid confidence, or no
+ * exit/entry pair with enough forward room — gets the maximum penalty
+ * (BEATMIX_INFEASIBLE_COST) rather than null. Returning null there would
+ * make a confirmed-bad pair cost exactly the same as "no data" and cheaper
+ * than a genuinely good but imperfectly-scored pair, since transitionCost()
+ * averages only the terms that fire — the optimizer must never prefer a
+ * transition planBeatmixTransition() would hard-reject over one it would
+ * actually accept (Codex round-2 on PR #35).
  * @param {object | null | undefined} fromAnalysis
  * @param {object | null | undefined} toAnalysis
  * @returns {number | null} 0 (great fit) .. 1 (poor fit), or null if unusable
@@ -108,7 +122,9 @@ function minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis) {
 function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
   const fromMeter = fromAnalysis?.downbeatGrid?.meter ?? null;
   const toMeter = toAnalysis?.downbeatGrid?.meter ?? null;
-  if (fromMeter != null && toMeter != null && fromMeter !== toMeter) return null;
+  if (fromMeter != null && toMeter != null && fromMeter !== toMeter) {
+    return BEATMIX_INFEASIBLE_COST;
+  }
 
   // Ordering has no resolved session tempo (that only exists once a
   // transition is actually armed) — targetBpm/incomingBpm mirror the same
@@ -132,22 +148,45 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis) {
   const incomingBpm = toAnalysis?.headBpm ?? toAnalysis?.bpm ?? null;
   const match = canTempoMatch(incomingBpm, targetBpm);
 
-  const exitCandidates = findExitCandidates(fromAnalysis, {
-    minOverlapSec: minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis),
-  });
+  const minOverlapSec = minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis);
+  const exitCandidates = findExitCandidates(fromAnalysis, { minOverlapSec });
   if (exitCandidates.length === 0) return null;
   const entryCandidates = findEntryCandidates(toAnalysis);
   if (entryCandidates.length === 0) return null;
+
+  // Both sides now confirmed to carry real v3 data — a sub-threshold beat
+  // grid means planBeatmixTransition() would hard-reject with
+  // 'beat-confidence-low' regardless of how well phrases/vocals line up, so
+  // this is a positive infeasibility signal, not missing data (Codex
+  // round-2 on PR #35).
+  if (
+    (fromAnalysis.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN
+    || (toAnalysis.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN
+  ) {
+    return BEATMIX_INFEASIBLE_COST;
+  }
 
   // Best-scoring exit×entry combination, matching how
   // planBeatmixTransition()/planPhraseCrossfade() themselves search pairs —
   // the single top-ranked phrase candidate on each side isn't necessarily
   // the best-scoring PAIR together (Codex round-1 on PR #35). Candidate
   // pools are small (bounded by phrase analysis output), so this stays
-  // cheap even inside optimizeTrackOrder()'s O(n·2^n) exact search.
+  // cheap even inside optimizeTrackOrder()'s O(n·2^n) exact search (edge
+  // costs are themselves cached per (from, to) pair there — see
+  // optimizeTrackOrder()'s edgeCost()).
+  //
+  // entryForwardSafeSec() mirrors findExitCandidates()'s own minOverlapSec
+  // filter but for the incoming side: findEntryCandidates() only checks
+  // that entry.sec itself is vocal-safe, not that enough vocal-free room
+  // follows it for a real overlap — planBeatmixTransition() applies this
+  // exact check (forwardSafePlayback) before ever scoring a pair (Codex
+  // round-2 on PR #35). A candidate that fails this filter on every exit
+  // partner naturally leaves bestScore at 0, i.e. the same
+  // BEATMIX_INFEASIBLE_COST as any other confirmed no-fit case.
   let bestScore = 0;
   for (const exit of exitCandidates) {
     for (const entry of entryCandidates) {
+      if (entryForwardSafeSec(toAnalysis, entry.sec) + 1e-6 < minOverlapSec) continue;
       const score = scoreTransitionPair({
         outgoing: fromAnalysis,
         incoming: toAnalysis,
@@ -270,6 +309,27 @@ export function optimizeTrackOrder({
 
   if (n <= maxExact) {
     const memo = new Map();
+    // transitionCost(from, next) only depends on the (lastIdx, next) pair,
+    // never on `mask` — but dpCost()/reconstruct() are called once per DP
+    // state, so without this cache the same edge (and, since Phase 7E, its
+    // O(exitCandidates * entryCandidates) beatmix pair search) gets
+    // recomputed once per state that reaches it: O(2^n * n) edge
+    // evaluations instead of the O(n^2) distinct directed edges that
+    // actually exist. At n=maxExact=10 that's ~10x more DP states alone,
+    // each potentially re-running a beatmix search over real-world
+    // candidate pools (~20-25 tail x ~15-20 head), which was measured to
+    // block the event loop past the /internal/optimize-order route's 5s
+    // timeout (Codex round-2 on PR #35).
+    const edgeCostCache = new Map();
+    /** @param {number} lastIdx @param {number} next @returns {number} */
+    function edgeCost(lastIdx, next) {
+      const key = `${lastIdx}:${next}`;
+      if (edgeCostCache.has(key)) return edgeCostCache.get(key);
+      const from = lastIdx === -1 ? anchorAnalysis : analysisAt(lastIdx);
+      const cost = transitionCost(from, analysisAt(next));
+      edgeCostCache.set(key, cost);
+      return cost;
+    }
 
     /** @param {number} mask @param {number} lastIdx @returns {number} */
     function dpCost(mask, lastIdx) {
@@ -280,8 +340,7 @@ export function optimizeTrackOrder({
       let best = Infinity;
       for (let next = 0; next < n; next += 1) {
         if (mask & (1 << next)) continue;
-        const from = lastIdx === -1 ? anchorAnalysis : analysisAt(lastIdx);
-        const edge = transitionCost(from, analysisAt(next));
+        const edge = edgeCost(lastIdx, next);
         const rest = dpCost(mask | (1 << next), next);
         best = Math.min(best, edge + rest);
       }
@@ -296,8 +355,7 @@ export function optimizeTrackOrder({
       let bestCost = Infinity;
       for (let next = 0; next < n; next += 1) {
         if (mask & (1 << next)) continue;
-        const from = lastIdx === -1 ? anchorAnalysis : analysisAt(lastIdx);
-        const edge = transitionCost(from, analysisAt(next));
+        const edge = edgeCost(lastIdx, next);
         const rest = dpCost(mask | (1 << next), next);
         const total = edge + rest;
         if (total < bestCost) {
