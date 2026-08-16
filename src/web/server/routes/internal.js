@@ -1,6 +1,7 @@
 import { bindRouteError, nowUnix, recordOperationLog } from './route-utils.js'
 import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js'
 import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
+import { probeTempoBackend } from '../../../audio/tempo.js'
 import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
 import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
@@ -60,6 +61,7 @@ export async function internalRoutes(app, {
   refineLimiter = createRefineRateLimiter(),
   generateLimiter = createGenerateRateLimiter(),
   searchYoutube = defaultSearchYoutube,
+  probeTempoBackendFn = probeTempoBackend,
 } = {}) {
   app.addHook('onRequest', async (request, reply) => {
     if (!token || getBearerToken(request) !== token) {
@@ -223,46 +225,56 @@ export async function internalRoutes(app, {
   }
 
   app.post('/internal/optimize-order', async (request, reply) => {
-    if (!db) throw new Error('db is required for internal routes')
-    const { guildId = null, anchorVideoId = null, tracks } = request.body ?? {}
-    if (!Array.isArray(tracks) || tracks.length === 0) {
-      return reply.code(400).send({ error: 'missing_fields' })
-    }
+    try {
+      if (!db) throw new Error('db is required for internal routes')
+      const { guildId = null, anchorVideoId = null, tracks } = request.body ?? {}
+      if (!Array.isArray(tracks) || tracks.length === 0) {
+        return reply.code(400).send({ error: 'missing_fields' })
+      }
 
-    const analyses = tracks.map((track) => {
-      if (track?.analysis && typeof track.analysis === 'object') return track.analysis
-      return loadAnalysis(track?.videoId)
-    });
-    const anchorAnalysis = anchorVideoId ? loadAnalysis(anchorVideoId) : null
+      const analyses = tracks.map((track) => {
+        if (track?.analysis && typeof track.analysis === 'object') return track.analysis
+        return loadAnalysis(track?.videoId)
+      });
+      const anchorAnalysis = anchorVideoId ? loadAnalysis(anchorVideoId) : null
+      // Probed once per request (memoized process-wide after the first real
+      // probe, per tempo.js), so ordering's beatmix term can gate on whether a
+      // marginal-tier or non-identity stretch is actually buildable in THIS
+      // environment rather than assuming rubberband is always available
+      // (Codex round-6 on PR #35).
+      const tempoBackend = await probeTempoBackendFn()
 
-    let order = optimizeTrackOrder({ anchorAnalysis, tracks, analyses })
-    let source = 'algorithm'
+      let order = optimizeTrackOrder({ anchorAnalysis, tracks, analyses, tempoBackend })
+      let source = 'algorithm'
 
-    // Gemini refine is optional and must stay under the bot's ~5s webClient abort.
-    // Rate-limit paid calls; on limit/timeout/failure keep the algorithm order.
-    if (gemini && tracks.length >= 2) {
-      const limitKey = guildId || 'global'
-      if (refineLimiter.tryBegin(limitKey)) {
-        try {
-          const refined = await Promise.race([
-            gemini.refineOrder({
-              tracks,
-              algorithmOrder: order,
-              timeoutMs: REFINE_TIMEOUT_MS,
-            }),
-            delay(REFINE_TIMEOUT_MS).then(() => null),
-          ])
-          if (refined && isValidPermutation(refined, tracks.length)) {
-            order = refined
-            source = 'gemini'
+      // Gemini refine is optional and must stay under the bot's ~5s webClient abort.
+      // Rate-limit paid calls; on limit/timeout/failure keep the algorithm order.
+      if (gemini && tracks.length >= 2) {
+        const limitKey = guildId || 'global'
+        if (refineLimiter.tryBegin(limitKey)) {
+          try {
+            const refined = await Promise.race([
+              gemini.refineOrder({
+                tracks,
+                algorithmOrder: order,
+                timeoutMs: REFINE_TIMEOUT_MS,
+              }),
+              delay(REFINE_TIMEOUT_MS).then(() => null),
+            ])
+            if (refined && isValidPermutation(refined, tracks.length)) {
+              order = refined
+              source = 'gemini'
+            }
+          } finally {
+            refineLimiter.end(limitKey)
           }
-        } finally {
-          refineLimiter.end(limitKey)
         }
       }
-    }
 
-    return reply.send({ order, source })
+      return reply.send({ order, source })
+    } catch (error) {
+      return bindRouteError(reply, error)
+    }
   })
 
   app.post('/internal/generate-playlist', async (request, reply) => {

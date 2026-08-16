@@ -223,6 +223,27 @@ test('probeTempoBackend does not permanently cache a spawn failure — a later c
   assert.equal(recovered, 'rubberband');
 });
 
+test('probeTempoBackend retries a transient failure within the same call instead of surfacing null on the first hiccup', async () => {
+  // Codex round-7 on PR #35: ordering.js now gates a real infeasibility
+  // *penalty* on tempoBackend === null. Before this retry, a single
+  // momentary spawn hiccup (nonzero exit or thrown spawn error) was
+  // indistinguishable, to that ONE caller, from a conclusive "no backend
+  // installed" — even though tempo.js's own memoization already knew not
+  // to treat it as a stable fact for the NEXT call. Verify a failure that
+  // clears up on retry resolves to the real backend, not null, within the
+  // same probeTempoBackend() call.
+  resetTempoBackendProbeCache();
+  let calls = 0;
+  const spawnFn = (...args) => {
+    calls += 1;
+    if (calls < 3) return fakeSpawnError(new Error('spawn EAGAIN'))(...args);
+    return fakeSpawn(' T.. rubberband      A->A       ...\n')(...args);
+  };
+  const backend = await probeTempoBackend({ spawnFn });
+  assert.equal(backend, 'rubberband');
+  assert.equal(calls, 3, 'expected two transient failures to be retried before the third, successful attempt');
+});
+
 test('probeTempoBackend memoizes a conclusive "neither filter" result (exit 0, clean run)', async () => {
   // Round-2 regression: unlike a nonzero exit or thrown spawn error (both
   // transient, correctly uncached above), a clean run that simply lists

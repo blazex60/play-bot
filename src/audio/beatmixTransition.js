@@ -34,7 +34,7 @@ const DOWNBEAT_CONFIDENCE_WEIGHT = 0.8;
 const HARMONIC_WEIGHT = 0.6;
 const ENERGY_CONTINUITY_WEIGHT = 0.4;
 /** §16 tier 1 requires "high confidence" specifically for the 4-6% marginal tempo tier (§8.3). */
-const MARGINAL_TEMPO_MIN_SCORE = 0.7;
+export const MARGINAL_TEMPO_MIN_SCORE = 0.7;
 
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));
@@ -73,7 +73,7 @@ function entryVocalMargin(incoming, entrySec) {
  * nothing about what happens after that window ends, so the room is capped
  * there rather than treated as unbounded.
  */
-function entryForwardSafeSec(incoming, entrySec) {
+export function entryForwardSafeSec(incoming, entrySec) {
   const firstVocal = incoming?.firstVocalStartSec;
   if (!Number.isFinite(firstVocal)) return Math.max(0, HEAD_WINDOW_SEC - entrySec);
   if (entrySec <= firstVocal - 1e-6) return firstVocal - entrySec;
@@ -129,7 +129,7 @@ function energyContinuity(exit, entry) {
  * at all", which the two candidate-search functions below must never
  * conflate — a failed analysis has zero evidence of being vocal-safe.
  */
-function hasVocalAnalysis(analysis) {
+export function hasVocalAnalysis(analysis) {
   return Boolean(analysis?.analysisSource) && analysis.analysisSource !== 'none';
 }
 

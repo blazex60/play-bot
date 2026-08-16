@@ -399,6 +399,78 @@ test('POST /internal/optimize-order skips Gemini when rate-limited', async (t) =
   assert.equal(refineCalls, 0)
 })
 
+test('POST /internal/optimize-order probes the tempo backend once and threads it through to ordering', async (t) => {
+  // Codex round-6 on PR #35: the route must actually probe the tempo
+  // backend and pass it to optimizeTrackOrder(), not just accept an
+  // injectable probeTempoBackendFn. Reuses the same marginal-vs-plain
+  // candidate design verified directly against optimizeTrackOrder() in
+  // src/mix/ordering.test.js — which one wins flips with the backend.
+  const db = createMemoryDb()
+  t.after(() => db.close())
+  const config = createTestConfig()
+  const anchor = {
+    analysisSource: 'demucs', durationSec: 200, lastVocalEndSec: 150,
+    bpm: 120, tailBpm: 120, harmonicConfidence: 0.8, tailKey: '8B',
+    downbeatGrid: { confidence: 0.8 }, beatConfidence: 0.8,
+    phrases: { tail: [{ sec: 160, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] },
+    lastRms: -14,
+  }
+  const marginalCandidate = {
+    analysisSource: 'demucs', firstVocalStartSec: 20, headVocalGaps: [],
+    bpm: 125.4, headBpm: 125.4, harmonicConfidence: 0.8, headKey: '8B',
+    downbeatGrid: { confidence: 0.8 }, beatConfidence: 0.8,
+    phrases: { head: [{ sec: 4, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] },
+    lastRms: -14,
+  }
+  const plainCandidate = { bpm: 110, headKey: '8B', harmonicConfidence: 0.8, lastRms: -14 }
+
+  // loadAnalysis() reads the anchor from the DB (anchorVideoId doesn't
+  // accept an inline analysis like tracks[].analysis does), and requires
+  // version >= ANALYSIS_VERSION — without this row the anchor resolves to
+  // null and the beatmix term never fires for either candidate (both edges
+  // fall back to the identical missing-analysis bpm penalty), which would
+  // make this test pass for the wrong reason regardless of backend.
+  db.prepare(`
+    INSERT INTO track_analysis (video_id, version, payload_json, analyzed_at)
+    VALUES (?, ?, ?, ?)
+  `).run('anchor', 3, JSON.stringify({ version: 3, ...anchor }), Math.floor(Date.now() / 1000))
+
+  const Fastify = (await import('fastify')).default
+  const { internalRoutes } = await import('./internal.js')
+
+  async function orderWithBackend(backend) {
+    let probeCalls = 0
+    const dedicated = Fastify({ logger: false })
+    await dedicated.register(internalRoutes, {
+      db,
+      token: config.botApi.token,
+      probeTempoBackendFn: async () => { probeCalls += 1; return backend },
+    })
+    t.after(() => dedicated.close())
+    const response = await dedicated.inject({
+      method: 'POST',
+      url: '/internal/optimize-order',
+      headers: authHeaders(config),
+      payload: {
+        anchorVideoId: 'anchor',
+        tracks: [
+          { videoId: 'marginal', title: 'Marginal', duration: 200, analysis: marginalCandidate },
+          { videoId: 'plain', title: 'Plain', duration: 200, analysis: plainCandidate },
+        ],
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    assert.equal(probeCalls, 1, 'expected the tempo backend to be probed exactly once per request')
+    return response.json().order
+  }
+
+  const withRubberband = await orderWithBackend('rubberband')
+  const withAtempo = await orderWithBackend('atempo')
+  assert.deepEqual([...withRubberband].sort(), [0, 1])
+  assert.deepEqual([...withAtempo].sort(), [0, 1])
+  assert.notDeepEqual(withRubberband, withAtempo, 'expected the winning candidate to flip between backends')
+})
+
 test('PUT /internal/track-analysis normalizes analyzedAt milliseconds to seconds', async (t) => {
   const { app, config, db } = await setup(t)
   const ms = Date.UTC(2026, 0, 15, 12, 0, 0)
