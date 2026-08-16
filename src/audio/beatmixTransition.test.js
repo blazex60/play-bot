@@ -478,6 +478,68 @@ test('planBeatmixTransition normalizes the outgoing tempo ratio through octaves,
   assert.equal(plan.sync.bars, 2);
 });
 
+test('planBeatmixTransition rejects when incoming matches only via octave normalization (bar lengths would not align)', () => {
+  // 60 BPM (4s bars) vs a 120 BPM target (2s bars): canTempoMatch()
+  // correctly treats these as tempo-compatible (ratio ~1 after octave
+  // normalization), but incoming's real downbeats only land on every
+  // other computed 2s bar boundary.
+  const { outgoing, incoming } = happyPathTracks();
+  const plan = planBeatmixTransition(outgoing, { ...incoming, bpm: 60 });
+  assert.deepEqual(plan.reasons, ['octave-bar-mismatch']);
+});
+
+test('planBeatmixTransition converts the exit prefilter to native-time room for an already-stretched outgoing source', () => {
+  const outgoing = makeAnalysis({
+    bpm: 125, // native; with outgoingPlaybackBpm=120 this yields ratio 0.96
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 190,
+    // 3.9 native seconds of room after the exit — below the *unscaled*
+    // 4.0s (2 bars @ 120 BPM) minimum, but above the correctly *scaled*
+    // 3.84s (4.0 * 0.96) minimum once outgoingRatio is accounted for.
+    phrasesTail: [{ sec: 196.1, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 122,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: 15,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, {
+    outgoingPlaybackBpm: 120,
+    minOverlapBars: 2,
+  });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, 2);
+});
+
+test('planBeatmixTransition bounds an instrumental head\'s safety by the analyzed window, not infinity', () => {
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 184, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 122,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: null, // no vocals found within the analyzed 30s head window
+    // Only 2s of headroom before the analyzed window ends at 30s — not
+    // enough for even MIN_OVERLAP_BARS, even though nothing here proves
+    // vocals don't start right after 30s.
+    phrasesHead: [{ sec: 28, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.deepEqual(plan.reasons, ['no-overlap-fit']);
+});
+
 test('planBeatmixTransition rejects when an entry candidate has almost no forward vocal-free room, even though the entry point itself is safe', () => {
   const outgoing = makeAnalysis({
     bpm: 120,
@@ -582,6 +644,25 @@ test('planPhraseCrossfade skips an infeasible top-scored entry (too close to the
   assert.equal(plan.eligible, true);
   assert.equal(plan.entrySec, 2);
   assert.equal(plan.fadeSec, 6);
+});
+
+test('planPhraseCrossfade converts outgoing room for an already-stretched source', () => {
+  // outgoingBpm=100 with outgoingPlaybackBpm=105 yields ratio 1.05: 6
+  // native seconds of room after the exit is really only ~5.71 playback
+  // seconds, not the naive 6 a native-only calculation would compute.
+  const outgoing = makeAnalysis({
+    bpm: 100,
+    durationSec: 200,
+    lastVocalEndSec: 190,
+    phrasesTail: [{ sec: 194, barIndex: 0, score: 0.7, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    firstVocalStartSec: 20,
+    phrasesHead: [{ sec: 2, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  const plan = planPhraseCrossfade(outgoing, incoming, { outgoingPlaybackBpm: 105 });
+  assert.equal(plan.eligible, true);
+  assert.ok(Math.abs(plan.fadeSec - 6 / 1.05) < 1e-9);
 });
 
 test('planPhraseCrossfade rejects when no candidate pair has enough incoming-source or vocal-free room', () => {

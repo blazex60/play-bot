@@ -1,6 +1,8 @@
 import { canTempoMatch, buildTempoFilter, tempoRatio, HARD_LIMIT_RATIO } from './tempo.js';
 import { camelotDistance } from '../mix/camelot.js';
 import { planTransition } from './transition.js';
+import { isHalfDouble } from './trackAnalysis.js';
+import { HEAD_WINDOW_SEC } from './vocalActivity.js';
 
 /**
  * Phase 7C (docs/mix-transition-phase7.md §9-10, §16): the beatmix planner.
@@ -66,12 +68,14 @@ function entryVocalMargin(incoming, entrySec) {
  * 0.1s before the end of a gap, is technically a "safe" candidate but has
  * almost no forward room; a multi-second fadeSec from there would spend
  * most of the overlap under vocals despite the plan being labeled
- * vocal-safe. Infinity when no vocals were detected in the head window at
- * all (hasVocalAnalysis() must already be true for entrySec to exist).
+ * vocal-safe. A null firstVocalStartSec only proves the analyzed head
+ * window (HEAD_WINDOW_SEC, e.g. the first 30s) came back clear — it says
+ * nothing about what happens after that window ends, so the room is capped
+ * there rather than treated as unbounded.
  */
 function entryForwardSafeSec(incoming, entrySec) {
   const firstVocal = incoming?.firstVocalStartSec;
-  if (!Number.isFinite(firstVocal)) return Infinity;
+  if (!Number.isFinite(firstVocal)) return Math.max(0, HEAD_WINDOW_SEC - entrySec);
   if (entrySec <= firstVocal - 1e-6) return firstVocal - entrySec;
   const gaps = Array.isArray(incoming?.headVocalGaps) ? incoming.headVocalGaps : [];
   const gap = gaps.find((g) => entrySec >= g.startSec - 1e-6 && entrySec <= g.endSec + 1e-6);
@@ -295,6 +299,19 @@ export function planBeatmixTransition(outgoing, incoming, {
   const match = canTempoMatch(incomingBpm, targetBpm);
   if (!match.ok) return rejected([`tempo-ratio-${match.tier ?? 'unrelated'}`]);
 
+  // canTempoMatch()/tempoRatio() octave-normalize incomingBpm before taking
+  // a ratio (§8.1 half/double handling) — correct for "is this tempo close
+  // enough to stretch," but `barSec` below is derived from targetBpm alone
+  // and assumes incoming's OWN downbeat grid also has that same bar length.
+  // When incomingBpm only matched via a 2x/0.5x octave correction (e.g. a
+  // 60 BPM grid — 4s bars — matched against a 120 BPM target's 2s bars),
+  // the incoming track's real downbeats land on only every other computed
+  // bar boundary: sync.bars/the bass-swap bar would be built against a bar
+  // length the incoming track doesn't actually have.
+  if (isHalfDouble(incomingBpm, targetBpm)) {
+    return rejected(['octave-bar-mismatch']);
+  }
+
   // §8.3: the 4-6% marginal tier is only meant to be taken "when confidence/
   // transition conditions are high" — gated below once a candidate pair's
   // full score (vocal safety + phrase + downbeat + harmonic) is known,
@@ -313,7 +330,31 @@ export function planBeatmixTransition(outgoing, incoming, {
   const barSec = (60 / targetBpm) * beatsPerBar;
   if (!(barSec > 0)) return rejected(['invalid-bar-length']);
 
-  const exitCandidates = findExitCandidates(outgoing, { minOverlapSec: Math.max(minOverlapSec, barSec * minOverlapBars) });
+  // fadeSec (and the minimum overlap requirement below) are playback-domain
+  // (post-stretch) durations. Native seconds of remaining source content
+  // convert to playback seconds by dividing by that side's own tempo ratio
+  // — outgoing may itself already be stretched (a chained beatmix) relative
+  // to its native BPM, and incoming stretches by `match.ratio`. Comparing
+  // playback-domain durations against unconverted native seconds would
+  // accept an overlap the source doesn't actually have enough playback time
+  // left to cover. Uses tempoRatio()'s octave normalization (not a plain
+  // division) for the same reason canTempoMatch() needs it for incoming: a
+  // half/double BPM misdetection between outgoingBpm and targetBpm would
+  // otherwise produce a ratio nowhere near the real stretch (e.g. detected
+  // 240 vs a 120 target naively divides to 0.5, when the physical stretch
+  // is really ~1). Falls back to 1 (assume unstretched) if the two aren't
+  // octave-related at all — a conservative default, not a silent wrong
+  // answer, since native room is what pre-Phase-7C code always used.
+  const outgoingRatio = tempoRatio(outgoingBpm, targetBpm) ?? 1;
+
+  // Coarse prefilter — findExitCandidates() compares against native
+  // durationSec, so the playback-domain minimum overlap must be converted
+  // back to native seconds here, or a candidate with enough real playback
+  // room (once outgoingRatio stretches/compresses it) gets excluded before
+  // the precise, per-pair room check below ever sees it.
+  const exitCandidates = findExitCandidates(outgoing, {
+    minOverlapSec: Math.max(minOverlapSec, barSec * minOverlapBars * outgoingRatio),
+  });
   if (exitCandidates.length === 0) return rejected(['no-exit-candidate']);
 
   const entryCandidates = findEntryCandidates(incoming);
@@ -321,21 +362,6 @@ export function planBeatmixTransition(outgoing, incoming, {
 
   const durationSec = outgoing.durationSec;
   const incomingDurationSec = Number.isFinite(incoming.durationSec) ? incoming.durationSec : Infinity;
-  // fadeSec is a playback-domain (post-stretch) duration. Native seconds of
-  // remaining source content convert to playback seconds by dividing by
-  // that side's own tempo ratio — outgoing may itself already be stretched
-  // (a chained beatmix) relative to its native BPM, and incoming stretches
-  // by `match.ratio`. Comparing fadeSec against unconverted native seconds
-  // would accept an overlap the source doesn't actually have enough
-  // playback time left to cover. Uses tempoRatio()'s octave normalization
-  // (not a plain division) for the same reason canTempoMatch() needs it for
-  // incoming: a half/double BPM misdetection between outgoingBpm and
-  // targetBpm would otherwise produce a ratio nowhere near the real stretch
-  // (e.g. detected 240 vs a 120 target naively divides to 0.5, when the
-  // physical stretch is really ~1). Falls back to 1 (assume unstretched) if
-  // the two aren't octave-related at all — a conservative default, not a
-  // silent wrong answer, since native room is what pre-Phase-7C code always used.
-  const outgoingRatio = tempoRatio(outgoingBpm, targetBpm) ?? 1;
 
   let best = null;
   for (const exit of exitCandidates) {
@@ -400,7 +426,11 @@ export function planBeatmixTransition(outgoing, incoming, {
  * this is meant to still work for tracks with a shaky beat grid as long as
  * phrase boundaries and vocal safety are known.
  */
-export function planPhraseCrossfade(outgoing, incoming, { minOverlapSec = 1, maxOverlapSec = 6 } = {}) {
+export function planPhraseCrossfade(outgoing, incoming, {
+  minOverlapSec = 1,
+  maxOverlapSec = 6,
+  outgoingPlaybackBpm = null,
+} = {}) {
   if (!outgoing || !incoming) return rejected(['missing-analysis']);
 
   // Tier 2 is specifically "phrase + vocal-safe" (§16) — unlike tier 1, it
@@ -411,7 +441,15 @@ export function planPhraseCrossfade(outgoing, incoming, { minOverlapSec = 1, max
   const hasHeadPhrases = Array.isArray(incoming.phrases?.head) && incoming.phrases.head.length > 0;
   if (!hasTailPhrases || !hasHeadPhrases) return rejected(['no-phrase-data']);
 
-  const exitCandidates = findExitCandidates(outgoing, { minOverlapSec });
+  // Tier 2 applies no NEW tempo stretch, but the outgoing source may already
+  // be running at a non-native rate from an earlier (chained) beatmix —
+  // fadeSec is a wall-clock/playback duration, so native-timeline room on
+  // the outgoing side still needs the same conversion tier 1 uses.
+  const outgoingBpm = outgoing.bpm;
+  const outgoingTargetBpm = outgoingActualTargetBpm(outgoing, outgoingPlaybackBpm) ?? outgoingBpm;
+  const outgoingRatio = outgoingBpm > 0 ? (tempoRatio(outgoingBpm, outgoingTargetBpm) ?? 1) : 1;
+
+  const exitCandidates = findExitCandidates(outgoing, { minOverlapSec: minOverlapSec * outgoingRatio });
   if (exitCandidates.length === 0) return rejected(['no-exit-candidate']);
   const entryCandidates = findEntryCandidates(incoming);
   if (entryCandidates.length === 0) return rejected(['no-entry-candidate']);
@@ -424,11 +462,12 @@ export function planPhraseCrossfade(outgoing, incoming, { minOverlapSec = 1, max
   // gap's end) with almost no forward room, or close to the incoming
   // source's own end. Search pairs instead of taking [0]/[0] blindly, and
   // cap fadeSec by whichever constraint (outgoing room, incoming source
-  // duration, forward vocal-free room) is tightest, unlike beatmix there is
-  // no tempo stretch here, so all of these stay in native seconds.
+  // duration, forward vocal-free room) is tightest. Incoming stays in
+  // native seconds (tier 2 never stretches it); outgoing room is converted
+  // like tier 1's.
   let best = null;
   for (const exit of exitCandidates) {
-    const roomAfterExit = durationSec - exit.sec;
+    const roomAfterExit = (durationSec - exit.sec) / outgoingRatio;
     for (const entry of entryCandidates) {
       const roomInIncoming = incomingDurationSec - entry.sec;
       const forwardSafe = entryForwardSafeSec(incoming, entry.sec);
