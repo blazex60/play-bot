@@ -58,6 +58,27 @@ function entryVocalMargin(incoming, entrySec) {
 }
 
 /**
+ * How many native seconds of vocal-free room follow `entrySec` before the
+ * next vocal boundary. findEntryCandidates() only checks that `entrySec`
+ * itself is safe (before firstVocalStartSec, or inside a headVocalGaps
+ * window) — it says nothing about whether the *rest* of an overlap
+ * starting there stays clear. An entry 0.1s before firstVocalStartSec, or
+ * 0.1s before the end of a gap, is technically a "safe" candidate but has
+ * almost no forward room; a multi-second fadeSec from there would spend
+ * most of the overlap under vocals despite the plan being labeled
+ * vocal-safe. Infinity when no vocals were detected in the head window at
+ * all (hasVocalAnalysis() must already be true for entrySec to exist).
+ */
+function entryForwardSafeSec(incoming, entrySec) {
+  const firstVocal = incoming?.firstVocalStartSec;
+  if (!Number.isFinite(firstVocal)) return Infinity;
+  if (entrySec <= firstVocal - 1e-6) return firstVocal - entrySec;
+  const gaps = Array.isArray(incoming?.headVocalGaps) ? incoming.headVocalGaps : [];
+  const gap = gaps.find((g) => entrySec >= g.startSec - 1e-6 && entrySec <= g.endSec + 1e-6);
+  return gap ? gap.endSec - entrySec : 0; // defensive: findEntryCandidates should never offer an unsafe entry
+}
+
+/**
  * §10's energy term, at the resolution the v3 analysis payload actually
  * offers: phrase candidates carry a 'near-silence' reason tag (a boolean
  * threshold on RMS at that point — see phraseAnalysis.js), not a raw energy
@@ -216,8 +237,15 @@ export function planBeatmixTransition(outgoing, incoming, {
 } = {}) {
   if (!outgoing || !incoming) return rejected(['missing-analysis']);
 
+  // trackAnalysis.js's aggregate `bpm` field prefers tailBpm (falling back
+  // to headBpm only when the tail window failed) — a reasonable default for
+  // the outgoing side, whose exit point lives in its own tail, but backwards
+  // for incoming: its entry point lives in its HEAD window, so a head/tail
+  // tempo difference (e.g. a slower intro) must stretch against headBpm, not
+  // the tail-biased aggregate, or the entry will be spawned at the wrong
+  // native tempo and drift out of sync from the first beat.
   const outgoingBpm = outgoing.bpm;
-  const incomingBpm = incoming.bpm;
+  const incomingBpm = incoming.headBpm ?? incoming.bpm;
   if (!(outgoingBpm > 0) || !(incomingBpm > 0)) return rejected(['bpm-unavailable']);
 
   if ((outgoing.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN || (incoming.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN) {
@@ -285,9 +313,18 @@ export function planBeatmixTransition(outgoing, incoming, {
     const roomAfterExitPlayback = (durationSec - exit.sec) / outgoingRatio;
     for (const entry of entryCandidates) {
       const roomInIncomingPlayback = (incomingDurationSec - entry.sec) / match.ratio;
+      // entry.sec itself being vocal-safe (findEntryCandidates()) says
+      // nothing about whether the overlap that FOLLOWS it stays clear — an
+      // entry 0.1s before firstVocalStartSec, or 0.1s before a gap ends,
+      // would otherwise let a multi-bar overlap run straight into vocals.
+      const forwardSafePlayback = entryForwardSafeSec(incoming, entry.sec) / match.ratio;
       for (let bars = overlapBars; bars >= minOverlapBars; bars -= 1) {
         const fadeSec = barSec * bars;
-        if (fadeSec > roomAfterExitPlayback + 1e-6 || fadeSec > roomInIncomingPlayback + 1e-6) continue;
+        if (
+          fadeSec > roomAfterExitPlayback + 1e-6
+          || fadeSec > roomInIncomingPlayback + 1e-6
+          || fadeSec > forwardSafePlayback + 1e-6
+        ) continue;
         const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match });
         if (!best || pairScore > best.pairScore) best = { exit, entry, bars, fadeSec, pairScore };
         break; // widest bar count that fits this pair is the one worth scoring
@@ -350,25 +387,43 @@ export function planPhraseCrossfade(outgoing, incoming, { minOverlapSec = 1, max
   const entryCandidates = findEntryCandidates(incoming);
   if (entryCandidates.length === 0) return rejected(['no-entry-candidate']);
 
-  const exit = exitCandidates[0];
-  const entry = entryCandidates[0];
   const durationSec = outgoing.durationSec ?? 60;
-  const fadeSec = Math.max(minOverlapSec, Math.min(maxOverlapSec, durationSec - exit.sec));
-  const phraseAlignment = clamp01(((exit.score ?? 0) + (entry.score ?? 0)) / 2);
+  const incomingDurationSec = Number.isFinite(incoming.durationSec) ? incoming.durationSec : Infinity;
+
+  // The top-scored exit/entry are not necessarily a *feasible* pair — the
+  // highest-scoring entry might sit right before firstVocalStartSec (or a
+  // gap's end) with almost no forward room, or close to the incoming
+  // source's own end. Search pairs instead of taking [0]/[0] blindly, and
+  // cap fadeSec by whichever constraint (outgoing room, incoming source
+  // duration, forward vocal-free room) is tightest, unlike beatmix there is
+  // no tempo stretch here, so all of these stay in native seconds.
+  let best = null;
+  for (const exit of exitCandidates) {
+    const roomAfterExit = durationSec - exit.sec;
+    for (const entry of entryCandidates) {
+      const roomInIncoming = incomingDurationSec - entry.sec;
+      const forwardSafe = entryForwardSafeSec(incoming, entry.sec);
+      const fadeSec = Math.min(maxOverlapSec, roomAfterExit, roomInIncoming, forwardSafe);
+      if (fadeSec < minOverlapSec) continue;
+      const phraseAlignment = clamp01(((exit.score ?? 0) + (entry.score ?? 0)) / 2);
+      if (!best || phraseAlignment > best.phraseAlignment) best = { exit, entry, fadeSec, phraseAlignment };
+    }
+  }
+  if (!best) return rejected(['no-overlap-fit']);
 
   return {
     mode: 'phrase-crossfade',
     eligible: true,
-    confidence: Number(phraseAlignment.toFixed(3)),
-    fadeSec,
-    startSec: exit.sec,
+    confidence: Number(best.phraseAlignment.toFixed(3)),
+    fadeSec: best.fadeSec,
+    startSec: best.exit.sec,
     curve: 'equal-power',
     baseSwap: true,
     highpassHz: 120,
     lowshelfGainDb: 2,
-    entrySec: entry.sec,
-    exitBarIndex: exit.barIndex,
-    entryBarIndex: entry.barIndex,
+    entrySec: best.entry.sec,
+    exitBarIndex: best.exit.barIndex,
+    entryBarIndex: best.entry.barIndex,
     incomingOffsetSec: 0,
     reason: ['phrase-aligned', 'vocal-safe'],
     outgoingBpm: outgoing.bpm ?? null,

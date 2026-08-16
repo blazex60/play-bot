@@ -11,6 +11,8 @@ import {
 
 function makeAnalysis({
   bpm = 120,
+  headBpm = null,
+  tailBpm = null,
   beatConfidence = 0.7,
   downbeatMeter = 4,
   downbeatConfidence = 0.6,
@@ -30,6 +32,8 @@ function makeAnalysis({
 } = {}) {
   return {
     bpm,
+    headBpm,
+    tailBpm,
     beatConfidence,
     durationSec,
     downbeatGrid: {
@@ -379,6 +383,76 @@ test('planBeatmixTransition converts overlap room to the stretched incoming time
   assert.equal(plan.sync.bars, 3);
 });
 
+test('planBeatmixTransition stretches the incoming entry against its head BPM, not the tail-biased aggregate', () => {
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 184, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 125, // trackAnalysis.js's aggregate prefers tailBpm — a faster back half
+    headBpm: 120, // the actual intro tempo, where the entry point lives
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: 15,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.incoming.nativeBpm, 120);
+  assert.equal(plan.incoming.tempoRatio, 1); // headBpm already matches targetBpm exactly
+});
+
+test('planBeatmixTransition rejects when an entry candidate has almost no forward vocal-free room, even though the entry point itself is safe', () => {
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 184, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 122,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: 15,
+    // Only 2s of forward room before singing starts — not enough for even
+    // MIN_OVERLAP_BARS (2 bars = 4s at 120 BPM), despite 13s itself passing
+    // the point-only "is entrySec before firstVocalStartSec" check.
+    phrasesHead: [{ sec: 13, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.deepEqual(plan.reasons, ['no-overlap-fit']);
+});
+
+test('planBeatmixTransition rejects when an entry candidate sits too close to the end of a vocal gap', () => {
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 184, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 122,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: 5,
+    headVocalGaps: [{ startSec: 20, endSec: 22 }],
+    phrasesHead: [{ sec: 21.8, barIndex: 0, score: 0.9, reasons: [] }], // 0.2s before the gap closes
+  });
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.deepEqual(plan.reasons, ['no-overlap-fit']);
+});
+
 // --- planPhraseCrossfade -----------------------------------------------------
 
 test('planPhraseCrossfade aligns to phrase boundaries without requiring tempo compatibility', () => {
@@ -417,6 +491,40 @@ test('planPhraseCrossfade rejects on no-exit-candidate when phrase data exists b
     phrasesHead: [{ sec: 3, barIndex: 0, score: 0.5, reasons: [] }],
   });
   assert.deepEqual(planPhraseCrossfade(outgoing, incoming).reasons, ['no-exit-candidate']);
+});
+
+test('planPhraseCrossfade skips an infeasible top-scored entry (too close to the incoming source end) and picks a feasible one instead', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 185, barIndex: 0, score: 0.7, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    durationSec: 10, // short incoming source
+    firstVocalStartSec: 8,
+    phrasesHead: [
+      { sec: 7.5, barIndex: 0, score: 0.9, reasons: [] }, // highest score, but only 0.5s before vocals start
+      { sec: 2, barIndex: 1, score: 0.4, reasons: [] }, // lower score, but 6s of clean forward room
+    ],
+  });
+  const plan = planPhraseCrossfade(outgoing, incoming);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.entrySec, 2);
+  assert.equal(plan.fadeSec, 6);
+});
+
+test('planPhraseCrossfade rejects when no candidate pair has enough incoming-source or vocal-free room', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: 180,
+    phrasesTail: [{ sec: 185, barIndex: 0, score: 0.7, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    durationSec: 10,
+    firstVocalStartSec: 8,
+    phrasesHead: [{ sec: 7.5, barIndex: 0, score: 0.9, reasons: [] }], // only 0.5s of forward room, and the only candidate
+  });
+  assert.deepEqual(planPhraseCrossfade(outgoing, incoming).reasons, ['no-overlap-fit']);
 });
 
 // --- planBeatSyncedTransition (§16 fallback ladder) ---------------------------
