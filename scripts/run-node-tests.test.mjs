@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+import { assertSupportedNodeVersion } from './bun-cli.mjs'
 import {
-  assertSupportedNodeVersion,
+  assertSupportedBunVersion,
   buildNodeTestArguments,
   discoverServerTests,
 } from './run-node-tests.mjs'
@@ -78,4 +79,9 @@ test('buildNodeTestArguments rejects unsorted input before invoking node test', 
 test('assertSupportedNodeVersion rejects Node versions below 20', () => {
   assert.throws(() => assertSupportedNodeVersion('19.9.0'), /Node.js 20 or newer/)
   assert.doesNotThrow(() => assertSupportedNodeVersion('20.0.0'))
+})
+
+test('assertSupportedBunVersion rejects a missing Bun version', () => {
+  assert.throws(() => assertSupportedBunVersion(''), /Bun is required/)
+  assert.doesNotThrow(() => assertSupportedBunVersion('1.2.0'))
 })

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import Database from 'better-sqlite3'
+import Database from './sqlite.js'
 import { runMigrations } from './migrate.js'
 
 test('runMigrations applies 007 vocal columns', () => {

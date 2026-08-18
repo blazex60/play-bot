@@ -4,12 +4,14 @@ import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { nodeExecutable } from './bun-cli.mjs'
+
 const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const artifactRoot = mkdtempSync(resolve(tmpdir(), 'music-bot-playwright-'))
 try {
   const playwright = resolve(projectRoot, 'node_modules/@playwright/test/cli.js')
   const result = spawnSync(
-    process.execPath,
+    nodeExecutable(),
     [playwright, 'test', '--config', 'test/browser/playwright.config.mjs', ...process.argv.slice(2)],
     {
       cwd: projectRoot,

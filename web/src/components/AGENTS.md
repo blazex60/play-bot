@@ -30,6 +30,6 @@
 - props が多くなりがちなコンポーネント（`PlaylistBuilder.jsx` 等）は個別 prop を並べるのではなく `{ state, actions }` のようにグループ化することを検討する
 
 ### Testing Requirements
-- `PlaylistPanel.test.jsx`, `PlaylistBuilder.test.jsx`, `PermissionMatrix.test.jsx` が既存のテスト例。vitest + @testing-library/react
+- `PlaylistPanel.test.jsx`, `PlaylistBuilder.test.jsx`, `PermissionMatrix.test.jsx` が既存のテスト例。bun:test + @testing-library/react
 
 <!-- MANUAL: -->

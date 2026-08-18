@@ -10,7 +10,7 @@ Artifacts: `tmp/mix-spike/`（gitignore。runner 再実行は `tmp/mix-spike/rep
 - YouTube は bot 判定で `yt-dlp` ダウンロード不可（この Cloud 環境）
 - 代わりに **Archive.org / Incompetech / Wikimedia** の公開 CC・ロイヤリティフリー音源 + 合成コントロールを使用
 - `aubio-tools`（`aubiotrack`）は apt で導入可能。Python `aubio` ラッパは NumPy 2 と非互換のため不使用
-- `essentia.js` は `npm install` で動作確認（本スパイクでは `--no-save`。本番採用時に `package.json` へ追加）
+- `essentia.js` は `bun install` で動作確認（本スパイクでは `--no-save`。本番採用時に `package.json` へ追加）
 
 ## サンプル
 

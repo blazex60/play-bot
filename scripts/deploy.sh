@@ -22,7 +22,7 @@ echo "[deploy] $OLD_SHA -> $NEW_SHA"
 echo "[deploy] changed files:"
 echo "$CHANGED" | sed 's/^/[deploy]   /'
 
-if echo "$CHANGED" | grep -Eq '^(Dockerfile|docker-compose\.yml|package\.json|package-lock\.json)$'; then
+if echo "$CHANGED" | grep -Eq '^(Dockerfile|docker-compose\.yml|package\.json|bun\.lock)$'; then
   echo "[deploy] Dockerfile/compose/package manifest changed -> full rebuild (music-bot, music-web, cloudflared)"
   docker compose up --build -d
   exit 0

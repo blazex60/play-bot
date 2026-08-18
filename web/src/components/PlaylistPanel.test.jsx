@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, mock } from 'bun:test'
 
 import { PlaylistPanel } from './PlaylistPanel.jsx'
 
@@ -11,19 +11,19 @@ function baseProps(overrides = {}) {
     selectedService: 'youtube',
     selectedPlaylistId: undefined,
     busy: false,
-    onSelectService: vi.fn(),
-    onLoadPlaylists: vi.fn(),
-    onSelectPlaylist: vi.fn(),
-    onImport: vi.fn(),
-    onRelink: vi.fn(),
-    onDisconnect: vi.fn(),
+    onSelectService: mock(),
+    onLoadPlaylists: mock(),
+    onSelectPlaylist: mock(),
+    onImport: mock(),
+    onRelink: mock(),
+    onDisconnect: mock(),
     ...overrides,
   }
 }
 
 describe('PlaylistPanel link state', () => {
   it('prompts to link and disables playlist actions when unlinked', async () => {
-    const onRelink = vi.fn()
+    const onRelink = mock()
     render(
       <PlaylistPanel
         {...baseProps({
@@ -56,7 +56,7 @@ describe('PlaylistPanel link state', () => {
   })
 
   it('calls disconnect for an active linked service', async () => {
-    const onDisconnect = vi.fn()
+    const onDisconnect = mock()
     render(
       <PlaylistPanel
         {...baseProps({

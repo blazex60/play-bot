@@ -1,5 +1,5 @@
 import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'bun:test'
 
 import { P0Smoke } from './p0-smoke.jsx'
 

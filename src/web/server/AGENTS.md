@@ -37,7 +37,7 @@
 
 ### Testing Requirements
 - 各モジュールに対応する `*.test.js` がある。`testSupport.js` の `createMemoryDb()` でインメモリ SQLite を使い、`process.env.MUSICBOT_TOKEN_ENC_KEY` をテスト用鍵に設定してから実行する
-- `npm run test:server` で実行される
+- `bun run test:server` で実行される
 
 ### Common Patterns
 - route ハンドラは `try { ... } catch (error) { return bindRouteError(reply, error) }` の形に統一（`routes/route-utils.js`）

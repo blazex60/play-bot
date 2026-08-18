@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, mock } from 'bun:test'
 
 import { PlaylistBuilder } from './PlaylistBuilder.jsx'
 
@@ -22,23 +22,23 @@ function baseProps(overrides = {}) {
     busy: false,
   }
   const actions = {
-    onNewPlaylistNameChange: vi.fn(),
-    onCreate: vi.fn(),
-    onSelect: vi.fn(),
-    onRenameValueChange: vi.fn(),
-    onRename: vi.fn(),
-    onDelete: vi.fn(),
-    onTrackUrlChange: vi.fn(),
-    onAddByUrl: vi.fn(),
-    onTrackSearchQueryChange: vi.fn(),
-    onSearchTracks: vi.fn(),
-    onGeneratePromptChange: vi.fn(),
-    onGenerateCountChange: vi.fn(),
-    onGenerateFromPrompt: vi.fn(),
-    onAddFromSearchResult: vi.fn(),
-    onMoveTrack: vi.fn(),
-    onRemoveTrack: vi.fn(),
-    onQueueToGuild: vi.fn(),
+    onNewPlaylistNameChange: mock(),
+    onCreate: mock(),
+    onSelect: mock(),
+    onRenameValueChange: mock(),
+    onRename: mock(),
+    onDelete: mock(),
+    onTrackUrlChange: mock(),
+    onAddByUrl: mock(),
+    onTrackSearchQueryChange: mock(),
+    onSearchTracks: mock(),
+    onGeneratePromptChange: mock(),
+    onGenerateCountChange: mock(),
+    onGenerateFromPrompt: mock(),
+    onAddFromSearchResult: mock(),
+    onMoveTrack: mock(),
+    onRemoveTrack: mock(),
+    onQueueToGuild: mock(),
   }
   const stateRecord = /** @type {Record<string, unknown>} */ (state)
   const actionsRecord = /** @type {Record<string, unknown>} */ (actions)
@@ -58,7 +58,7 @@ describe('PlaylistBuilder create flow', () => {
   })
 
   it('calls onCreate with the current name when the create form is submitted', async () => {
-    const onCreate = vi.fn()
+    const onCreate = mock()
     render(<PlaylistBuilder {...baseProps({ newPlaylistName: '作業用BGM', onCreate })} />)
 
     await userEvent.click(screen.getByRole('button', { name: '作成' }))
@@ -66,7 +66,7 @@ describe('PlaylistBuilder create flow', () => {
   })
 
   it('lists saved playlists and selects one on click', async () => {
-    const onSelect = vi.fn()
+    const onSelect = mock()
     const playlist = { id: 1, name: '作業用BGM', trackCount: 3 }
     render(<PlaylistBuilder {...baseProps({ playlists: [playlist], onSelect })} />)
 
@@ -86,8 +86,8 @@ describe('PlaylistBuilder selected playlist detail', () => {
   }
 
   it('renders tracks and calls onMoveTrack/onRemoveTrack', async () => {
-    const onMoveTrack = vi.fn()
-    const onRemoveTrack = vi.fn()
+    const onMoveTrack = mock()
+    const onRemoveTrack = mock()
     render(<PlaylistBuilder {...baseProps({ selectedPlaylist, onMoveTrack, onRemoveTrack })} />)
 
     expect(screen.getByText('Track A')).toBeTruthy()
@@ -112,7 +112,7 @@ describe('PlaylistBuilder selected playlist detail', () => {
   })
 
   it('renders search results and adds one via onAddFromSearchResult', async () => {
-    const onAddFromSearchResult = vi.fn()
+    const onAddFromSearchResult = mock()
     const searchResults = [{ title: 'Track C', webpageUrl: 'https://www.youtube.com/watch?v=ccccccccccc', videoId: 'ccccccccccc' }]
     render(<PlaylistBuilder {...baseProps({ selectedPlaylist, searchResults, onAddFromSearchResult })} />)
 

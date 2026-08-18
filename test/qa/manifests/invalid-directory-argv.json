@@ -11,7 +11,7 @@
       },
       "steps": [{
         "id": "directory-argv",
-        "command": ["node", "--test", "src"],
+        "command": ["bun", "test", "src"],
         "cwd": ".",
         "timeoutMs": 1000,
         "assertions": [{ "kind": "outputIncludes", "value": "never" }],

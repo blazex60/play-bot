@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3'
+import Database from './sqlite.js'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'

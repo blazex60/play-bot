@@ -12,7 +12,7 @@
       "steps": [
         {
           "id": "sqlite-load",
-          "command": ["node", "-e", "const Database=require('better-sqlite3'); const db=new Database(':memory:'); db.prepare('select 1 as ok').get(); db.close(); console.log('P0_SQLITE_OK')"],
+          "command": ["bun", "-e", "import Database from './src/db/sqlite.js'; const db = new Database(':memory:'); db.prepare('select 1 as ok').get(); db.close(); console.log('P0_SQLITE_OK')"],
           "cwd": ".",
           "timeoutMs": 10000,
           "assertions": [{ "kind": "outputIncludes", "value": "P0_SQLITE_OK" }],
@@ -20,7 +20,7 @@
         },
         {
           "id": "server-smoke",
-          "command": ["node", "--test", "test/qa/server-smoke.test.mjs"],
+          "command": ["bun", "test", "test/qa/server-smoke.test.mjs"],
           "cwd": ".",
           "timeoutMs": 10000,
           "assertions": [{ "kind": "outputIncludes", "value": "P0 Fastify and Zod server harness" }],
@@ -28,7 +28,7 @@
         },
         {
           "id": "dom-smoke",
-          "command": ["npm", "run", "test:web"],
+          "command": ["bun", "run", "test:web"],
           "cwd": ".",
           "timeoutMs": 20000,
           "assertions": [{ "kind": "outputIncludes", "value": "P0 React DOM harness" }],
@@ -36,7 +36,7 @@
         },
         {
           "id": "typecheck",
-          "command": ["npm", "run", "typecheck"],
+          "command": ["bun", "run", "typecheck"],
           "cwd": ".",
           "timeoutMs": 20000,
           "assertions": [{ "kind": "outputIncludes", "value": "P0_TYPECHECK_OK" }],
@@ -44,7 +44,7 @@
         },
         {
           "id": "vite-build",
-          "command": ["npm", "run", "build:web"],
+          "command": ["bun", "run", "build:web"],
           "cwd": ".",
           "timeoutMs": 20000,
           "assertions": [{ "kind": "outputIncludes", "value": "P0_VITE_BUILD_OK" }],
@@ -52,7 +52,7 @@
         },
         {
           "id": "chromium-smoke",
-          "command": ["npm", "run", "test:browser"],
+          "command": ["bun", "run", "test:browser"],
           "cwd": ".",
           "timeoutMs": 30000,
           "assertions": [{ "kind": "outputIncludes", "value": "P0_CHROMIUM_RUN_OK" }],

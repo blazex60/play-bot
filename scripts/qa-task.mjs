@@ -9,7 +9,7 @@ import {
   selectCase,
   validateManifestPaths,
 } from './qa-manifest.mjs'
-import { assertSupportedNodeVersion } from './run-node-tests.mjs'
+import { assertSupportedBunVersion } from './bun-cli.mjs'
 import {
   assertNoSymbolicLinks,
   createChildEnvironment,
@@ -37,6 +37,31 @@ async function validatePhysicalPaths(manifest, projectRoot) {
       for (const path of step.cleanup.absentPaths) {
         await assertNoSymbolicLinks(projectRoot, resolve(projectRoot, path), 'Cleanup path')
       }
+    }
+  }
+}
+
+function isBunBinary(command) {
+  const name = String(command).split(/[/\\]/).pop()
+  return name === 'bun' || name === 'bun.exe'
+}
+
+async function assertBunTestFiles(step, cwd) {
+  if (!isBunBinary(step.command[0]) || step.command[1] !== 'test') {
+    return
+  }
+  for (const argument of step.command.slice(2)) {
+    if (argument.startsWith('-')) {
+      continue
+    }
+    const path = resolve(cwd, argument)
+    const linkInfo = await lstat(path)
+    if (linkInfo.isSymbolicLink()) {
+      throw new Error(`Symbolic link argv is forbidden for bun test: ${argument}`)
+    }
+    const info = await stat(path)
+    if (info.isDirectory()) {
+      throw new Error(`Directory argv is forbidden for bun test: ${argument}`)
     }
   }
 }
@@ -136,6 +161,7 @@ export async function runQaCase({ manifest, caseId, projectRoot, evidenceDir }) 
   const steps = []
   for (const step of qaCase.steps) {
     const cwd = resolve(projectRoot, step.cwd)
+    await assertBunTestFiles(step, cwd)
     await assertNodeTestFiles(step, cwd)
     const logPath = resolve(evidenceDir, `${caseId}-${step.id}.log`)
     if (await pathExists(logPath)) {
@@ -173,11 +199,11 @@ export async function runQaCase({ manifest, caseId, projectRoot, evidenceDir }) 
 }
 
 async function main() {
-  assertSupportedNodeVersion()
+  assertSupportedBunVersion()
   const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
   const [task, caseId, manifestArgument] = process.argv.slice(2)
   if (!task || !caseId) {
-    throw new Error('Usage: npm run qa:task -- <task> <case> [manifest]')
+    throw new Error('Usage: bun run qa:task -- <task> <case> [manifest]')
   }
   const manifestPath = resolve(projectRoot, manifestArgument ?? `test/qa/manifests/task-${task}.json`)
   if (dirname(manifestPath) !== resolve(projectRoot, 'test/qa/manifests')) {

@@ -113,14 +113,14 @@ test('runQaCase rejects a cwd that escapes through a symlink', async () => {
   }
 })
 
-test('runQaCase rejects a directory passed to node --test', async () => {
+test('runQaCase rejects a directory passed to bun test', async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), 'music-bot-qa-directory-'))
   const evidenceDir = join(projectRoot, 'evidence')
   try {
     const manifest = parseManifest(
       manifestWith(
         successfulStep({
-          command: [process.execPath, '--test', '.'],
+          command: [process.versions.bun ? process.execPath : 'bun', 'test', '.'],
           assertions: [{ kind: 'outputIncludes', value: 'never' }],
         })
       )
