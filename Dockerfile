@@ -48,7 +48,7 @@ RUN python3 -m venv /opt/demucs-venv \
   && /opt/demucs-venv/bin/python -c "from demucs.pretrained import get_model; get_model('htdemucs')"
 
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile --production
+RUN bun install --frozen-lockfile --omit=dev
 
 COPY src/ ./src/
 COPY --from=web-build /app/web/dist ./web/dist
