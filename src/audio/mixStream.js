@@ -140,7 +140,7 @@ export class MixStream extends Readable {
       this.emit('sourceerror', err);
     });
 
-    this.#scheduleRead();
+    this.#wakeConsumer();
     return true;
   }
 
@@ -198,7 +198,7 @@ export class MixStream extends Readable {
       this.#clearIncoming();
     });
 
-    this.#scheduleRead();
+    this.#wakeConsumer();
     this.emit('crossfadestart', plan);
     return true;
   }
@@ -214,6 +214,7 @@ export class MixStream extends Readable {
     this.#underrunSince = null;
     this.#crossfade = null;
     this.emit('trackend');
+    this.#wakeConsumer();
   }
 
   endMixer() {
@@ -231,6 +232,20 @@ export class MixStream extends Readable {
     this.#tryPushFrame();
   }
 
+  #unpauseIfNeeded() {
+    // createAudioResource(StreamType.Raw) pipelines MixStream into an opus
+    // encoder, which is flowing-mode — not paused reads. pause() here used
+    // to stop that pipeline after one between-tracks silence frame, so the
+    // next setCurrent never delivered PCM (Discord showed speaking from the
+    // leftover packets, but the track itself never played).
+    if (this.isPaused()) this.resume();
+  }
+
+  #wakeConsumer() {
+    this.#unpauseIfNeeded();
+    this.#scheduleRead();
+  }
+
   #scheduleRead() {
     if (this.#pendingRead) {
       this.#tryPushFrame();
@@ -242,6 +257,15 @@ export class MixStream extends Readable {
 
     const frame = this.#readFrame();
     if (frame === null) {
+      // Pipeline from createAudioResource(StreamType.Raw) starts flowing
+      // MixStream immediately, before GuildPlayer.setCurrent / play().
+      // Waiting for the first source is not an underrun — do not push
+      // silence or start the 8s watchdog, or Discord transmits packets
+      // (speaking indicator) while no track is attached, then sourceerror
+      // races the real PCM source and playback never starts.
+      if (!this.#current && !this.#betweenTracks && !this.#incoming) {
+        return;
+      }
       // Between tracks (handoff / prefetch) we MUST keep delivering frames.
       // Starving the AudioPlayer for ~5 packets (~100ms) makes it Idle, and
       // @discordjs/voice then destroy()s this MixStream — killing the mixer
@@ -249,9 +273,19 @@ export class MixStream extends Readable {
       if (this.#betweenTracks) {
         this.push(SILENCE_FRAME);
         this.#pendingRead = false;
-        // Flowing-mode consumers (tests using 'data') would otherwise sync-spin
-        // on endless silence. AudioPlayer uses paused reads, so it is unaffected.
-        if (this.readableFlowing) this.pause();
+        // Yield one tick instead of staying paused: a flowing pipeline
+        // (createAudioResource → opus encoder) must keep receiving 20ms
+        // frames or AudioPlayer goes Idle and destroys MixStream. A
+        // synchronous pause() here never resumed, so Discord kept sending
+        // leftover packets (speaking indicator) while the next track's PCM
+        // never reached the encoder. setImmediate lets tests with 'data'
+        // listeners avoid a tight loop without starving production.
+        if (this.readableFlowing) {
+          this.pause();
+          setImmediate(() => {
+            if (!this.#destroyed && this.isPaused()) this.resume();
+          });
+        }
         return;
       }
       if (!this.#underrunSince) {
@@ -596,9 +630,12 @@ export class MixStream extends Readable {
       this.emit('sourceerror', err);
     });
 
-    // Do not #scheduleRead here: natural-end snap runs inside #readFrame while
+    // Do not #wakeConsumer here: natural-end snap runs inside #readFrame while
     // #pendingRead is still true; scheduling would re-enter #tryPushFrame and
     // double-push. The caller reads the first adopted frame instead (like promote).
+    // Still unpause: createAudioResource's pipeline may have paused us during
+    // the previous between-tracks silence, and the caller only pulls one frame.
+    this.#unpauseIfNeeded();
     return true;
   }
 
