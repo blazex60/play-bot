@@ -61,6 +61,7 @@ export class MixStream extends Readable {
   #heldInFrame = null;
   #incomingSkipSec = 0;
   #incomingSkippedSec = 0;
+  #betweenTrackTimer = null;
 
   constructor() {
     super();
@@ -220,6 +221,8 @@ export class MixStream extends Readable {
   endMixer() {
     if (this.#destroyed) return;
     this.#destroyed = true;
+    if (this.#betweenTrackTimer) clearTimeout(this.#betweenTrackTimer);
+    this.#betweenTrackTimer = null;
     this.#current?.destroy();
     this.#incoming?.destroy();
     this.#current = null;
@@ -233,15 +236,17 @@ export class MixStream extends Readable {
   }
 
   #unpauseIfNeeded() {
-    // createAudioResource(StreamType.Raw) pipelines MixStream into an opus
-    // encoder, which is flowing-mode — not paused reads. pause() here used
-    // to stop that pipeline after one between-tracks silence frame, so the
-    // next setCurrent never delivered PCM (Discord showed speaking from the
-    // leftover packets, but the track itself never played).
     if (this.isPaused()) this.resume();
   }
 
   #wakeConsumer() {
+    // A newly attached/ready source must not wait for the between-track pacing
+    // timer. Resuming here preserves the existing source-ready wake-up; the
+    // pacing callback itself never resumes against downstream backpressure.
+    if (!this.#betweenTracks && this.#betweenTrackTimer) {
+      clearTimeout(this.#betweenTrackTimer);
+      this.#betweenTrackTimer = null;
+    }
     this.#unpauseIfNeeded();
     this.#scheduleRead();
   }
@@ -271,20 +276,26 @@ export class MixStream extends Readable {
       // @discordjs/voice then destroy()s this MixStream — killing the mixer
       // for the rest of the session (2nd track never audible, queue races).
       if (this.#betweenTracks) {
-        this.push(SILENCE_FRAME);
         this.#pendingRead = false;
-        // Yield one tick instead of staying paused: a flowing pipeline
-        // (createAudioResource → opus encoder) must keep receiving 20ms
-        // frames or AudioPlayer goes Idle and destroys MixStream. A
-        // synchronous pause() here never resumed, so Discord kept sending
-        // leftover packets (speaking indicator) while the next track's PCM
-        // never reached the encoder. setImmediate lets tests with 'data'
-        // listeners avoid a tight loop without starving production.
-        if (this.readableFlowing) {
-          this.pause();
-          setImmediate(() => {
-            if (!this.#destroyed && this.#betweenTracks && this.isPaused()) this.resume();
-          });
+        this.push(SILENCE_FRAME);
+        // Silence represents 20 ms of audio, so never produce it faster than
+        // real time.  A read requested during this interval leaves
+        // #pendingRead set; the timer services that demand when the frame is
+        // due.  If pipe() has applied backpressure, _read() is not called and
+        // the timer has nothing to do.  In particular, do not call resume()
+        // here: doing so overrides pipe's pause and grows an encoded-silence
+        // backlog while the next track is being prepared.
+        if (!this.#betweenTrackTimer) {
+          this.#betweenTrackTimer = setTimeout(() => {
+            this.#betweenTrackTimer = null;
+            if (this.#destroyed || !this.#betweenTracks) return;
+            // Flowing consumers represent active demand. pipe() switches this
+            // to false when a destination returns false, so do not manufacture
+            // a read (or resume the stream) while downstream is backpressured.
+            if (this.readableFlowing) this.#pendingRead = true;
+            this.#scheduleRead();
+          }, FRAME_MS);
+          this.#betweenTrackTimer.unref?.();
         }
         return;
       }
@@ -313,6 +324,8 @@ export class MixStream extends Readable {
 
   _destroy(err, callback) {
     this.#destroyed = true;
+    if (this.#betweenTrackTimer) clearTimeout(this.#betweenTrackTimer);
+    this.#betweenTrackTimer = null;
     this.#current?.destroy();
     this.#incoming?.destroy();
     this.#current = null;
@@ -633,9 +646,6 @@ export class MixStream extends Readable {
     // Do not #wakeConsumer here: natural-end snap runs inside #readFrame while
     // #pendingRead is still true; scheduling would re-enter #tryPushFrame and
     // double-push. The caller reads the first adopted frame instead (like promote).
-    // Still unpause: createAudioResource's pipeline may have paused us during
-    // the previous between-tracks silence, and the caller only pulls one frame.
-    this.#unpauseIfNeeded();
     return true;
   }
 

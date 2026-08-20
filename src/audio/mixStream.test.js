@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Writable } from 'node:stream';
 import { FRAME_BYTES } from './fade.js';
 import { MixStream } from './mixStream.js';
 import { PcmSource } from './pcmSource.js';
@@ -107,6 +107,7 @@ test('MixStream dropCurrent emits trackend immediately', async () => {
   mix.setCurrent(source);
   mix.dropCurrent();
   assert.equal(ended, true);
+  mix.endMixer();
 });
 
 test('MixStream pushes silence between tracks so the player is not starved', async () => {
@@ -132,7 +133,7 @@ test('MixStream pushes silence between tracks so the player is not starved', asy
   for (let i = 0; i < 20 && silenceFrames < 3; i++) {
     const chunk = mix.read(FRAME_BYTES);
     if (chunk) silenceFrames += 1;
-    else await new Promise(resolve => setImmediate(resolve));
+    else await new Promise(resolve => setTimeout(resolve, FRAME_MS));
   }
   assert.ok(silenceFrames >= 3, 'expected silence frames during between-tracks handoff');
   mix.endMixer();
@@ -231,6 +232,55 @@ test('MixStream setCurrent after a flowing between-tracks gap delivers the next 
     assert.ok(pcmContains(received, 2222), `expected next-track PCM after the flowing gap, got ${previewFrameSamples(received)}`);
   } finally {
     mix.unpipe(sink);
+    mix.endMixer();
+  }
+});
+
+test('MixStream paces flowing between-track silence in real time', async () => {
+  const mix = new MixStream();
+  const frameTimes = [];
+  mix.on('data', () => frameTimes.push(Date.now()));
+
+  try {
+    mix.dropCurrent();
+    const deadline = Date.now() + 500;
+    while (frameTimes.length < 4 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.equal(frameTimes.length >= 4, true, 'expected four keep-alive frames');
+    assert.ok(frameTimes[3] - frameTimes[0] >= 45,
+      `four 20 ms frames were emitted too quickly: ${frameTimes[3] - frameTimes[0]}ms`);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream does not override downstream backpressure for between-track silence', async () => {
+  const mix = new MixStream();
+  let releaseWrite;
+  const blocked = new Writable({
+    highWaterMark: 1,
+    write(_chunk, _encoding, callback) {
+      releaseWrite = callback;
+    },
+  });
+  mix.pipe(blocked);
+
+  try {
+    mix.dropCurrent();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.ok(blocked.writableLength <= FRAME_BYTES,
+      `backpressured sink buffered ${blocked.writableLength} bytes of silence`);
+    // At most one frame per 20 ms may accumulate while the sink is blocked;
+    // allow one scheduling frame of jitter on top of the five due in 100 ms.
+    assert.ok(mix.readableLength <= FRAME_BYTES * 6,
+      `mixer buffered ${mix.readableLength} bytes of silence`);
+  } finally {
+    mix.unpipe(blocked);
+    releaseWrite?.();
+    blocked.destroy();
     mix.endMixer();
   }
 });
