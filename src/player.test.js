@@ -155,6 +155,48 @@ test('GuildPlayer does not opus-pipeline until the PCM source has data', async (
   await player.stop()
 })
 
+test('GuildPlayer cancels a pending PCM wait when skip supersedes playback', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { PcmSource } = await import('./audio/pcmSource.js')
+  const { FRAME_BYTES } = await import('./audio/fade.js')
+  const started = []
+  let abandonedSource
+  let sourceCount = 0
+  const first = createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', videoId: 'vid-a' })
+  const second = createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', videoId: 'vid-b' })
+  const { player, queue, resources } = makePlayer({
+    track: first,
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => {
+      sourceCount += 1
+      if (sourceCount > 1) return PcmSource.fromBuffers([Buffer.alloc(FRAME_BYTES)])
+      abandonedSource = new EventEmitter()
+      abandonedSource.ended = false
+      abandonedSource.error = null
+      abandonedSource.available = 0
+      abandonedSource.read = () => null
+      abandonedSource.destroy = () => {
+        abandonedSource.removeAllListeners()
+        abandonedSource.ended = true
+      }
+      return abandonedSource
+    },
+  })
+  queue.add(second)
+
+  const abandonedPlay = player.playNext()
+  await nextTurn()
+  await player.skip()
+  await abandonedPlay
+  for (let i = 0; i < 10 && started.length === 0; i += 1) await nextTurn()
+
+  assert.deepEqual(started, ['vid-b'])
+  assert.equal(queue.current, second)
+  assert.equal(resources.length, 1, 'the abandoned track must not start the opus pipeline')
+
+  await player.stop()
+})
+
 test('mixer AudioPlayer pauses without a ready subscriber and survives encoder hiccups', () => {
   assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.noSubscriber, NoSubscriberBehavior.Pause)
   assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.maxMissedFrames, MIXER_MAX_MISSED_FRAMES)

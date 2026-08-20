@@ -184,6 +184,7 @@ export class GuildPlayer {
   #queueExhaustedTimeoutMs;
   #recordPlayFn;
   #onTrackStart;
+  #cancelSourceAudioWait = null;
   #audioPlayer;
   #forceSkip = false;
   #hadError = false;
@@ -345,6 +346,7 @@ export class GuildPlayer {
     this.#audioPlayer.on('error', err => {
       console.error('[GuildPlayer] audioPlayer error:', err);
       this.#hadError = true;
+      this.#cancelSourceAudioWait?.();
       this.#mixStream?.dropCurrent();
     });
 
@@ -420,6 +422,13 @@ export class GuildPlayer {
     }
     this.#resetSessionTempoFor(track);
     await this.#waitForSourceAudio(source);
+    // skip/stop/source failure can supersede this playback while it is
+    // waiting for its first PCM. Never let that abandoned continuation
+    // mutate the replacement track's preparation/crossfade state or report a
+    // play that did not start.
+    if (this.#queue.current !== track || this.#mixStream.currentSource !== source) {
+      return;
+    }
     // Attach the opus pipeline only after PCM has arrived so the encoder's
     // first packet is music, not keep-alive silence.
     this.#ensureMixerPlaying();
@@ -474,6 +483,7 @@ export class GuildPlayer {
     this.#mixStream.on('sourceerror', (err) => {
       console.error('[GuildPlayer] mix source error:', err.message);
       this.#hadError = true;
+      this.#cancelSourceAudioWait?.();
       this.#mixStream.dropCurrent();
     });
     this.#mixStream.on('incomingerror', (err) => {
@@ -615,6 +625,7 @@ export class GuildPlayer {
   }
 
   #waitForSourceAudio(source, timeoutMs = 15_000) {
+    this.#cancelSourceAudioWait?.();
     if (!source || source.error || source.ended || (source.available ?? 0) > 0) {
       return Promise.resolve();
     }
@@ -627,8 +638,12 @@ export class GuildPlayer {
         source.off?.('data', done);
         source.off?.('end', done);
         source.off?.('error', done);
+        if (this.#cancelSourceAudioWait === done) {
+          this.#cancelSourceAudioWait = null;
+        }
         resolve();
       };
+      this.#cancelSourceAudioWait = done;
       const timer = setTimeout(done, timeoutMs);
       timer.unref?.();
       source.on('data', done);
@@ -828,11 +843,13 @@ export class GuildPlayer {
 
   async skip() {
     this.#forceSkip = true;
+    this.#cancelSourceAudioWait?.();
     this.#mixStream?.dropCurrent();
   }
 
   async stop() {
     this.#queue.clear();
+    this.#cancelSourceAudioWait?.();
     this.#clearWatchdog();
     this.#clearCrossfadeArm();
     this.#clearPreparedIncoming();
