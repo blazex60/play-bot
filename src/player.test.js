@@ -119,6 +119,42 @@ test('GuildPlayer pipelines MixStream only after a PCM source is attached', asyn
   await player.stop()
 })
 
+test('GuildPlayer does not opus-pipeline until the PCM source has data', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { FRAME_BYTES } = await import('./audio/fade.js')
+  const frame = Buffer.alloc(FRAME_BYTES)
+  let source
+  const { player, resources } = makePlayer({
+    createPcmSourceFn: async () => {
+      source = new EventEmitter()
+      source.ended = false
+      source.error = null
+      source.available = 0
+      source.read = () => null
+      source.destroy = () => { source.removeAllListeners(); source.ended = true; }
+      return source
+    },
+  })
+
+  const playing = player.playNext()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(resources.length, 0, 'must not pipeline before ffmpeg/yt-dlp produces PCM')
+
+  source.available = FRAME_BYTES
+  source.read = (n) => {
+    const chunk = frame.subarray(0, Math.min(n, frame.length))
+    source.read = () => null
+    return chunk
+  }
+  source.emit('data')
+  await playing
+
+  assert.equal(resources.length, 1)
+  assert.ok(player.mixStream.currentSource)
+
+  await player.stop()
+})
+
 test('mixer AudioPlayer pauses without a ready subscriber and survives encoder hiccups', () => {
   assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.noSubscriber, NoSubscriberBehavior.Pause)
   assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.maxMissedFrames, MIXER_MAX_MISSED_FRAMES)

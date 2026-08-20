@@ -348,6 +348,12 @@ export class GuildPlayer {
       this.#mixStream?.dropCurrent();
     });
 
+    // AutoPaused means playable.length === 0. Re-subscribe so a Ready
+    // connection is visible on the next 20 ms tick and playback resumes.
+    this.#audioPlayer.on(AudioPlayerStatus.AutoPaused, () => {
+      this.#connection?.subscribe?.(this.#audioPlayer);
+    });
+
     this.#connection.subscribe(this.#audioPlayer);
   }
 
@@ -413,8 +419,9 @@ export class GuildPlayer {
       return;
     }
     this.#resetSessionTempoFor(track);
-    // Attach the opus pipeline only after setCurrent so the encoder's first
-    // read already has a source. Re-play() of the same resource is a no-op.
+    await this.#waitForSourceAudio(source);
+    // Attach the opus pipeline only after PCM has arrived so the encoder's
+    // first packet is music, not keep-alive silence.
     this.#ensureMixerPlaying();
     this.#clearPreparedIncoming();
     this.#crossfadeStarted = false;
@@ -607,6 +614,29 @@ export class GuildPlayer {
     );
   }
 
+  #waitForSourceAudio(source, timeoutMs = 15_000) {
+    if (!source || source.error || source.ended || (source.available ?? 0) > 0) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        source.off?.('data', done);
+        source.off?.('end', done);
+        source.off?.('error', done);
+        resolve();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      timer.unref?.();
+      source.on('data', done);
+      source.on('end', done);
+      source.on('error', done);
+    });
+  }
+
   /**
    * @discordjs/voice destroys playStream when leaving Playing. If MixStream was
    * destroyed mid-session, rebuild it so later setCurrent/play can succeed.
@@ -642,6 +672,7 @@ export class GuildPlayer {
       this.#attachMixerResource();
     }
     try {
+      this.#connection?.subscribe?.(this.#audioPlayer);
       this.#audioPlayer.play(this.#mixerResource);
       this.#mixerStarted = true;
     } catch (err) {
@@ -650,6 +681,7 @@ export class GuildPlayer {
       if (this.#isMixerStreamDead() || !this.#mixStream.currentSource) return;
       this.#attachMixerResource();
       try {
+        this.#connection?.subscribe?.(this.#audioPlayer);
         this.#audioPlayer.play(this.#mixerResource);
         this.#mixerStarted = true;
       } catch (err2) {
