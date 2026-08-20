@@ -192,22 +192,24 @@ test('GuildPlayer: a flowing mixer pipeline still plays PCM after createAudioRes
 
   const mix = player.mixStream
   const sink = new PassThrough()
-  sink.on('data', (chunk) => received.push(Buffer.from(chunk)))
+  sink.on('data', (chunk) => {
+    const view = new Int16Array(chunk.buffer, chunk.byteOffset, Math.floor(chunk.byteLength / 2))
+    if (view.length > 0) received.push(view[0])
+  })
   mix.pipe(sink)
-  await new Promise((resolve) => setImmediate(resolve))
-
-  await player.playNext()
-
-  const deadline = Date.now() + 1000
-  while (received.length === 0 && Date.now() < deadline) {
+  try {
     await new Promise((resolve) => setImmediate(resolve))
+
+    await player.playNext()
+
+    const deadline = Date.now() + 1000
+    while (!received.includes(4321) && Date.now() < deadline) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+
+    assert.ok(received.includes(4321), `expected real PCM after leading silence, got ${received.slice(0, 8)}`)
+  } finally {
+    mix.unpipe(sink)
+    await player.stop()
   }
-
-  const pcm = Buffer.concat(received)
-  assert.ok(pcm.length >= FRAME_BYTES, 'mixer pipeline must emit PCM after playNext')
-  const view = new Int16Array(pcm.buffer, pcm.byteOffset, FRAME_BYTES / 2)
-  assert.equal(view[0], 4321)
-
-  mix.unpipe(sink)
-  await player.stop()
 })

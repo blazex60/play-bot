@@ -132,8 +132,8 @@ export class MixStream extends Readable {
     this.#incomingSkipSec = 0;
     this.#incomingSkippedSec = 0;
 
-    source.on('data', () => this.#scheduleRead());
-    source.on('end', () => this.#scheduleRead());
+    source.on('data', () => this.#wakeConsumer());
+    source.on('end', () => this.#wakeConsumer());
     source.on('error', (err) => {
       // Consumer (GuildPlayer) dropCurrent/advances; do not finishCurrent here —
       // that would race snaphandoff against the error handoff.
@@ -190,8 +190,8 @@ export class MixStream extends Readable {
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
       : null;
 
-    source.on('data', () => this.#scheduleRead());
-    source.on('end', () => this.#scheduleRead());
+    source.on('data', () => this.#wakeConsumer());
+    source.on('end', () => this.#wakeConsumer());
     source.on('error', (err) => {
       // Cancel overlap only; do not emit sourceerror (that aborts outgoing).
       this.emit('incomingerror', err);
@@ -283,7 +283,7 @@ export class MixStream extends Readable {
         if (this.readableFlowing) {
           this.pause();
           setImmediate(() => {
-            if (!this.#destroyed && this.isPaused()) this.resume();
+            if (!this.#destroyed && this.#betweenTracks && this.isPaused()) this.resume();
           });
         }
         return;
@@ -566,8 +566,8 @@ export class MixStream extends Readable {
     this.#durationSec = null;
     this.#betweenTracks = false;
 
-    next.on('data', () => this.#scheduleRead());
-    next.on('end', () => this.#scheduleRead());
+    next.on('data', () => this.#wakeConsumer());
+    next.on('end', () => this.#wakeConsumer());
     next.on('error', (err) => {
       this.emit('sourceerror', err);
     });
@@ -624,8 +624,8 @@ export class MixStream extends Readable {
     this.#underrunSince = null;
     this.#betweenTracks = false;
 
-    source.on('data', () => this.#scheduleRead());
-    source.on('end', () => this.#scheduleRead());
+    source.on('data', () => this.#wakeConsumer());
+    source.on('end', () => this.#wakeConsumer());
     source.on('error', (err) => {
       this.emit('sourceerror', err);
     });
