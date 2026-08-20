@@ -12,6 +12,7 @@ import {
   cleanupTempFile,
   isNormalizeDurationAllowed,
   prefetchTrack,
+  stageTempFileCopy,
 } from './normalize.js';
 import { shouldReconnectRetry } from './player/playbackPolicy.js';
 import { MixStream } from './audio/mixStream.js';
@@ -320,6 +321,7 @@ export class GuildPlayer {
   /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
   #queueRefill = null;
   #prefetchTrackFn;
+  #stageTempFileCopyFn;
   #separateTrackStemsFn;
   #getCachedStemsFn;
   #planStemTransitionFn;
@@ -395,6 +397,7 @@ export class GuildPlayer {
     analysisQueue = null,
     prefetchTrackFn = prefetchTrack,
     probeTempoBackendFn = probeTempoBackend,
+    stageTempFileCopyFn = stageTempFileCopy,
     separateTrackStemsFn = separateTrackStems,
     getCachedStemsFn = getCachedStems,
     planStemTransitionFn = planStemTransition,
@@ -419,6 +422,7 @@ export class GuildPlayer {
     this.#analysisQueue = analysisQueue;
     this.#prefetchTrackFn = prefetchTrackFn;
     this.#probeTempoBackendFn = probeTempoBackendFn;
+    this.#stageTempFileCopyFn = stageTempFileCopyFn;
     this.#separateTrackStemsFn = separateTrackStemsFn;
     this.#getCachedStemsFn = getCachedStemsFn;
     this.#planStemTransitionFn = planStemTransitionFn;
@@ -1262,22 +1266,38 @@ export class GuildPlayer {
 
   #scheduleAnalysis(track, filePath) {
     if (!track?.videoId || !filePath || !this.#analyzeTrackFileFn) return;
+    // Phase 8 (Codex, PR #39 round-14): stage an independent copy of
+    // filePath for stem separation NOW, before this job is even enqueued —
+    // several unrelated call sites (track promotion/stop/skip/prefetch
+    // discard) can delete filePath at any point once this method returns,
+    // including the entire time this job sits waiting its turn on the
+    // shared analysisQueue (which a single full-track Demucs job can
+    // occupy for minutes — docs/mix-transition-phase8.md §9). Copying
+    // later, e.g. as the first statement inside the enqueued callback,
+    // would already be too late in exactly that scenario. Best-effort: if
+    // staging fails, separation for this track is simply skipped below.
+    const stagedPathPromise = this.#stageTempFileCopyFn(filePath).catch((err) => {
+      console.warn('[GuildPlayer] failed to stage file for stem separation:', err.message);
+      return null;
+    });
     this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
       const cached = await this.#lookupPersistentAnalysis(track);
       const analysis = cached ?? await this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
-      // Phase 8 (docs/mix-transition-phase8.md): chained into the SAME
-      // enqueued job (not a separate fire-and-forget call) so filePath is
-      // guaranteed to still be alive — several call sites clean it up soon
-      // after analysis resolves. Best-effort: a failure here just means
-      // this track never becomes stem-mix eligible, the existing beatmix/
-      // phrase-crossfade/legacy ladder is untouched either way.
-      // Skip rather than start a many-minute Demucs run against a job the
-      // queue already decided to cancel (e.g. a mixer underrun killed this
-      // job right as #runAnalysis finished).
-      if (!signal?.aborted) {
-        await this.#separateTrackStemsFn(filePath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
-          console.warn('[GuildPlayer] stem separation failed:', err.message);
-        });
+      // Best-effort: a failure here just means this track never becomes
+      // stem-mix eligible, the existing beatmix/phrase-crossfade/legacy
+      // ladder is untouched either way.
+      const stagedPath = await stagedPathPromise;
+      try {
+        // Skip rather than start a many-minute Demucs run against a job
+        // the queue already decided to cancel (e.g. a mixer underrun
+        // killed this job right as #runAnalysis finished).
+        if (!signal?.aborted && stagedPath) {
+          await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
+            console.warn('[GuildPlayer] stem separation failed:', err.message);
+          });
+        }
+      } finally {
+        if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
       }
       return analysis;
     }).catch((err) => {

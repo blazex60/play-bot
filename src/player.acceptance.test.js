@@ -1534,6 +1534,64 @@ test('acceptance (mixer): persistent analysis cache skips Demucs lookahead', asy
   await player.stop();
 });
 
+test('acceptance (mixer): stem separation input is staged before the analysis queue can lose it (Codex)', async () => {
+  // Codex (PR #39, round 14): #scheduleAnalysis()'s stem-separation call
+  // used the SAME filePath several unrelated cleanup call sites (track
+  // promotion/stop/skip/prefetch discard) can delete at any time — including
+  // the entire span this job sits queued behind another guild's full-track
+  // Demucs run (docs/mix-transition-phase8.md §9's already-documented
+  // analysisQueue contention). By the time this job's turn came up, filePath
+  // could already be gone. The fix stages an independent copy immediately,
+  // synchronously off the same call that hands filePath to #scheduleAnalysis
+  // — before enqueue, not after — so separation always reads from a copy
+  // nothing else can touch, never from the (possibly already-deleted)
+  // original.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const originalFilePath = '/tmp/musicbot-original-vid-b';
+  const stagedFilePath = '/tmp/musicbot-staged-vid-b';
+  const stageCalls = [];
+  const separateCalls = [];
+  const analysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 60,
+    lastVocalEndSec: 50,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => analysis,
+    prefetchTrackFn: async () => ({ filePath: originalFilePath, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => {
+      stageCalls.push(filePath);
+      return stagedFilePath;
+    },
+    separateTrackStemsFn: async (filePath, videoId) => {
+      separateCalls.push({ filePath, videoId });
+      return null;
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+    videoId: 'vid-b',
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.deepEqual(stageCalls, [originalFilePath],
+    'expected the original prefetched file to be staged, exactly once');
+  assert.equal(separateCalls.length, 1, 'expected exactly one separation attempt');
+  assert.equal(separateCalls[0].filePath, stagedFilePath,
+    'expected separation to receive the staged copy, not the original filePath');
+  assert.equal(separateCalls[0].videoId, 'vid-b');
+  await player.stop();
+});
+
 test('acceptance (mixer): early queue refill is a single shared attempt', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   let calls = 0;
