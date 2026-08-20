@@ -76,6 +76,11 @@ export function makePlayer({
   prefetchTrackFn = async () => ({ filePath: '/tmp/musicbot-test-prefetch', measured: { measured_I: -16 } }),
   probeTempoBackendFn,
   framesPerTrack = 2,
+  stageTempFileCopyFn,
+  separateTrackStemsFn,
+  getCachedStemsFn,
+  planStemTransitionFn,
+  createFileSourceFn,
   pcmWaitTimeoutMs,
   connection,
 } = {}) {
@@ -104,6 +109,11 @@ export function makePlayer({
     analyzeTrackFileFn,
     prefetchTrackFn,
     probeTempoBackendFn,
+    stageTempFileCopyFn,
+    separateTrackStemsFn,
+    getCachedStemsFn,
+    planStemTransitionFn,
+    createFileSourceFn,
     pcmWaitTimeoutMs,
     connection: connection ?? {
       subscribe(subscribedPlayer) {

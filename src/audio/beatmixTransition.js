@@ -143,10 +143,15 @@ export function hasVocalAnalysis(analysis) {
  * hasVocalAnalysis()) — there is no verifiably vocal-safe window to offer.
  * @returns {{ sec: number, barIndex: number, score: number, reasons: string[] }[]} sorted best-first
  */
-export function findExitCandidates(outgoing, { minOverlapSec = 2 } = {}) {
+export function findExitCandidates(outgoing, { minOverlapSec = 2, requireVocalSafe = true } = {}) {
   if (!outgoing) return [];
   const durationSec = outgoing.durationSec;
   if (!(durationSec > 0)) return [];
+  // Phase 8 (docs/mix-transition-phase8.md): requireVocalSafe=false still
+  // needs hasVocalAnalysis() true — planStemTransition()'s vocal-fade-out
+  // timing reads lastVocalEndSec, so a candidate can only be offered when
+  // that's a real reading, not a failed-analysis null (see this function's
+  // own docstring above and hasVocalAnalysis()'s).
   if (!hasVocalAnalysis(outgoing)) return [];
   const vocalFloor = Number.isFinite(outgoing.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0;
   const phrasePool = Array.isArray(outgoing.phrases?.tail) ? outgoing.phrases.tail : [];
@@ -157,7 +162,9 @@ export function findExitCandidates(outgoing, { minOverlapSec = 2 } = {}) {
     ));
 
   return pool
-    .filter((c) => c.sec >= vocalFloor - 1e-6 && durationSec - c.sec >= minOverlapSec - 1e-6)
+    .filter((c) => (
+      (!requireVocalSafe || c.sec >= vocalFloor - 1e-6) && durationSec - c.sec >= minOverlapSec - 1e-6
+    ))
     .sort((a, b) => b.score - a.score || a.sec - b.sec);
 }
 
@@ -199,12 +206,22 @@ export function findEntryCandidates(incoming) {
  * plan's `confidence`. Key compatibility is scored when available but never
  * gates eligibility (§9.2: "キー一致は必須条件にしない").
  */
-export function scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match = null }) {
-  const exitMargin = exit.sec - (Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0);
+export function scoreTransitionPair({
+  outgoing, incoming, exit, entry, targetBpm, match = null, stemAware = false,
+}) {
+  // Phase 8: a stem-mix candidate's outgoing exit is allowed to sit mid-
+  // vocal (findExitCandidates({requireVocalSafe:false})) — the outgoing
+  // vocal stem simply fades out on its own schedule instead of needing to
+  // already be silent by the exit point. Scoring that exit margin the same
+  // way a plain (non-stem) candidate is scored would wrongly tank a
+  // perfectly fine stem-mix pair, so only the entry-side margin (which
+  // Phase 8 does NOT relax — see beatmixTransition.js's planBeatmixTransition
+  // docstring) still contributes to vocalSafety here.
   const entryMargin = entryVocalMargin(incoming, entry.sec);
-  const vocalSafety = Math.min(
-    clamp01(exitMargin / VOCAL_MARGIN_FULL_CREDIT_SEC),
-    clamp01(entryMargin / VOCAL_MARGIN_FULL_CREDIT_SEC),
+  const entryVocalSafety = clamp01(entryMargin / VOCAL_MARGIN_FULL_CREDIT_SEC);
+  const vocalSafety = stemAware ? entryVocalSafety : Math.min(
+    clamp01((exit.sec - (Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0)) / VOCAL_MARGIN_FULL_CREDIT_SEC),
+    entryVocalSafety,
   );
 
   const phraseAlignment = clamp01(((exit.score ?? 0) + (entry.score ?? 0)) / 2);
@@ -260,6 +277,19 @@ export function planBeatmixTransition(outgoing, incoming, {
   overlapBars = BEATMIX_OVERLAP_BARS,
   minOverlapBars = MIN_OVERLAP_BARS,
   tempoBackend = 'rubberband',
+  // Phase 8 (docs/mix-transition-phase8.md): all three default to today's
+  // exact tier-1 behavior. planStemTransition() is the only caller that
+  // passes false/true here — a stem-mix candidate's outgoing vocal simply
+  // fades out on its own schedule instead of needing to already be silent
+  // by the exit point, so the whole-overlap vocal-avoidance this tier
+  // otherwise enforces on the OUTGOING side becomes unnecessary once stems
+  // let the two tracks' vocal layers never actually collide in the mixed
+  // output. Only the outgoing side is relaxed — findEntryCandidates()'s
+  // incoming-entry vocal-safety check is untouched (a deliberate scope cut,
+  // see the doc's 未決事項).
+  requireExitVocalSafe = true,
+  requireEntryForwardSafe = true,
+  stemAware = false,
 } = {}) {
   if (!outgoing || !incoming) return rejected(['missing-analysis']);
 
@@ -354,6 +384,7 @@ export function planBeatmixTransition(outgoing, incoming, {
   // the precise, per-pair room check below ever sees it.
   const exitCandidates = findExitCandidates(outgoing, {
     minOverlapSec: Math.max(minOverlapSec, barSec * minOverlapBars * outgoingRatio),
+    requireVocalSafe: requireExitVocalSafe,
   });
   if (exitCandidates.length === 0) return rejected(['no-exit-candidate']);
 
@@ -372,7 +403,13 @@ export function planBeatmixTransition(outgoing, incoming, {
       // nothing about whether the overlap that FOLLOWS it stays clear — an
       // entry 0.1s before firstVocalStartSec, or 0.1s before a gap ends,
       // would otherwise let a multi-bar overlap run straight into vocals.
-      const forwardSafePlayback = entryForwardSafeSec(incoming, entry.sec) / match.ratio;
+      // requireEntryForwardSafe=false (stem-mix only) skips this cap: the
+      // incoming vocal stem's own delayed start (buildStemEnvelopes()) is
+      // what keeps it clear of the outgoing vocal, not forward room in the
+      // incoming track's OWN head window.
+      const forwardSafePlayback = requireEntryForwardSafe
+        ? entryForwardSafeSec(incoming, entry.sec) / match.ratio
+        : Infinity;
       for (let bars = overlapBars; bars >= minOverlapBars; bars -= 1) {
         const fadeSec = barSec * bars;
         if (
@@ -380,7 +417,7 @@ export function planBeatmixTransition(outgoing, incoming, {
           || fadeSec > roomInIncomingPlayback + 1e-6
           || fadeSec > forwardSafePlayback + 1e-6
         ) continue;
-        const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match });
+        const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware });
         if (!best || pairScore > best.pairScore) best = { exit, entry, bars, fadeSec, pairScore };
         break; // widest bar count that fits this pair is the one worth scoring
       }
@@ -403,6 +440,11 @@ export function planBeatmixTransition(outgoing, incoming, {
       exitStartSec: best.exit.sec,
       exitDownbeatSec: best.exit.sec,
       exitBarIndex: best.exit.barIndex,
+      // Phase 8: planStemTransition()'s buildStemEnvelopes() converts native
+      // vocal-tail seconds to playback seconds — exposed here so that
+      // conversion can reuse the exact ratio this function already computed
+      // rather than recomputing it separately (which could silently diverge).
+      tempoRatioApplied: outgoingRatio,
     },
     incoming: {
       nativeBpm: incomingBpm,

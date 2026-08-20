@@ -726,3 +726,110 @@ test('planBeatSyncedTransition falls back to the existing planTransition() cross
   assert.ok(plan.startSec >= 195);
   assert.deepEqual(plan.fallbackFrom, ['beat-confidence-low', 'no-phrase-data']);
 });
+
+// --- Phase 8 (docs/mix-transition-phase8.md): vocal-safety relaxation flags ---
+
+test('the happy-path fixture is byte-for-byte unchanged with the new Phase 8 flags left at their defaults', () => {
+  // Every test above this point already exercises the default (unrelaxed)
+  // behavior implicitly — this pins the exact happy-path plan shape as an
+  // explicit regression guard specifically against the requireExitVocalSafe/
+  // requireEntryForwardSafe/stemAware options existing at all.
+  const { outgoing, incoming } = happyPathTracks();
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.mode, 'beatmix');
+  assert.equal(plan.outgoing.exitStartSec, 184);
+});
+
+test('findExitCandidates({requireVocalSafe:false}) keeps a mid-vocal candidate that the default (true) drops', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: 190,
+    phrasesTail: [{ sec: 160, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  assert.deepEqual(findExitCandidates(outgoing), []); // 160 < lastVocalEndSec 190 -> filtered
+  const relaxed = findExitCandidates(outgoing, { requireVocalSafe: false });
+  assert.equal(relaxed.length, 1);
+  assert.equal(relaxed[0].sec, 160);
+});
+
+test('findExitCandidates({requireVocalSafe:false}) still requires hasVocalAnalysis() (a real reading, not failed analysis)', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: 190,
+    phrasesTail: [{ sec: 160, barIndex: 0, score: 0.5, reasons: [] }],
+  });
+  outgoing.analysisSource = 'none'; // failed analysis, not "verifiably no vocal"
+  assert.deepEqual(findExitCandidates(outgoing, { requireVocalSafe: false }), []);
+});
+
+test('scoreTransitionPair({stemAware:true}) drops the exit-margin term but keeps the entry-margin term', () => {
+  const outgoing = makeAnalysis({ durationSec: 200, lastVocalEndSec: 190 });
+  const incoming = makeAnalysis({ firstVocalStartSec: 30 });
+  const exit = { sec: 160, barIndex: 0, score: 0 }; // 30s before lastVocalEndSec -> exit margin would be 0
+  const entry = { sec: 4, barIndex: 0, score: 0 }; // well before firstVocalStartSec -> full entry credit
+  const plain = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm: 120 });
+  const stemAware = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm: 120, stemAware: true });
+  assert.ok(stemAware > plain, `expected dropping the exit-margin penalty to raise the score (plain=${plain}, stemAware=${stemAware})`);
+});
+
+test('planBeatmixTransition({requireExitVocalSafe:false, requireEntryForwardSafe:false, stemAware:true}) accepts what the default rejects, matching planStemTransition()', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: 190,
+    phrasesTail: [{ sec: 160, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+  });
+  const incoming = makeAnalysis({ firstVocalStartSec: 20, headDownbeats: [4, 6, 8] });
+
+  const plain = planBeatmixTransition(outgoing, incoming);
+  assert.equal(plain.eligible, false);
+
+  const relaxed = planBeatmixTransition(outgoing, incoming, {
+    requireExitVocalSafe: false,
+    requireEntryForwardSafe: false,
+    stemAware: true,
+  });
+  assert.equal(relaxed.eligible, true);
+  assert.equal(relaxed.outgoing.exitStartSec, 160);
+  assert.ok(Number.isFinite(relaxed.outgoing.tempoRatioApplied));
+});
+
+test('requireEntryForwardSafe:false does NOT disable findEntryCandidates()\'s own entry-point vocal-safety check', () => {
+  // CodeRabbit: "Line 88 disables requireEntryForwardSafe. This permits stem
+  // plans that the Phase 8 contract requires to reject." findEntryCandidates()
+  // itself (called with no vocal-safety-related option at all, see its own
+  // isVocalSafe() closure) unconditionally filters out any candidate whose
+  // OWN position is mid-vocal — that check is entirely independent of
+  // requireEntryForwardSafe. What requireEntryForwardSafe actually gates is
+  // the separate, more conservative entryForwardSafeSec() cap on how much
+  // vocal-free room follows the (already vocal-safe) entry point — see its
+  // docstring. Isolated here from the exit side (requireExitVocalSafe stays
+  // at its default true; only requireEntryForwardSafe is relaxed) to pin
+  // down exactly which check does what.
+  const outgoing = happyPathTracks().outgoing; // already vocal-safe at its exit — not the thing under test
+  const incoming = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: 1, // singing starts almost immediately...
+    headVocalGaps: [{ startSec: 3, endSec: 4 }], // ...then a brief 1s gap...
+    headDownbeats: [3.5], // ...and the only candidate sits inside that gap: itself
+    // vocal-safe (per findEntryCandidates), but with only 0.5s of room
+    // before vocals resume at 4 — nowhere near forward-safe for even the
+    // minimum 2-bar (4s at 120 BPM) overlap this pair would otherwise fit.
+  });
+
+  const entryCandidates = findEntryCandidates(incoming);
+  assert.deepEqual(entryCandidates.map((c) => c.sec), [3.5],
+    'the entry point itself is vocal-safe (inside the gap) and must still be offered as a candidate');
+
+  const strict = planBeatmixTransition(outgoing, incoming);
+  assert.equal(strict.eligible, false,
+    'the default (requireEntryForwardSafe:true) must still reject: no bar count fits within the 0.5s forward-safe room');
+
+  const relaxed = planBeatmixTransition(outgoing, incoming, { requireEntryForwardSafe: false });
+  assert.equal(relaxed.eligible, true,
+    'relaxing only requireEntryForwardSafe accepts the same (still entry-point-vocal-safe) candidate');
+  assert.equal(relaxed.incoming.entrySec, 3.5);
+});

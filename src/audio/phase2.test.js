@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { gainForPosition, mixFrames, FRAME_BYTES, OVERLAP_GAIN, blendFrame, softLimitFrame } from './fade.js';
+import {
+  gainForPosition, gainForStemPosition, mixFrames, mixNFrames, FRAME_BYTES, OVERLAP_GAIN, blendFrame, softLimitFrame,
+} from './fade.js';
 import { planTransition, snapStartToBar } from './transition.js';
 import { recommendOverlapSec } from './trackAnalysis.js';
 import { designHighpass, createBiquadProcessor } from './eq.js';
@@ -735,4 +737,102 @@ test('softLimitFrame is continuous across the ceiling threshold (no discontinuit
     Math.abs(view[0] - view[1]) <= 2,
     `expected adjacent inputs straddling the threshold to stay adjacent after limiting, got ${view[0]} vs ${view[1]}`,
   );
+});
+
+function fillFrame(value) {
+  const buf = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(buf.buffer).fill(value);
+  return buf;
+}
+
+test('mixNFrames([a,b],[ga,gb]) is byte-for-byte identical to mixFrames(a,b,ga,gb)', () => {
+  // Phase 8: mixFrames() is now a thin delegating wrapper over mixNFrames()
+  // specifically so this holds by construction — asserted explicitly here
+  // as a readable, load-bearing regression check.
+  const a = fillFrame(5000);
+  const b = fillFrame(-3000);
+  assert.deepEqual(mixNFrames([a, b], [0.8, 0.6]), mixFrames(a, b, 0.8, 0.6));
+});
+
+test('mixNFrames never exceeds the clip ceiling regardless of stream count', () => {
+  // Phase 8: a 4-way full-scale sum at unity gain must still land inside
+  // the same +-0.95*32767 ceiling mixFrames() already enforces for 2 — the
+  // soft-clip curve plus the final hard clamp guarantee this for ANY gain
+  // combination, not a pre-scaled per-stream headroom (see mixNFrames()'s
+  // own docstring — headroom stays flat at OVERLAP_GAIN regardless of n).
+  const frames = [fillFrame(32767), fillFrame(32767), fillFrame(32767), fillFrame(32767)];
+  const mixed = mixNFrames(frames, [1, 1, 1, 1]);
+  const view = new Int16Array(mixed.buffer, mixed.byteOffset, mixed.byteLength / 2);
+  const ceiling = 32767 * 0.95;
+  for (const sample of view) {
+    assert.ok(Math.abs(sample) <= ceiling + 1, `expected sample ${sample} to stay within the clip ceiling`);
+  }
+});
+
+test('mixNFrames reconstructs a single track from 2 complementary stems at the same loudness as a plain 2-source mix', () => {
+  // Phase 8 (Codex): the bug this pins — at the start of a stem crossfade,
+  // outVocal+outInstrumental (gain ~1 each) must reconstruct the outgoing
+  // track at the SAME loudness mixFrames()'s plain 2-source case already
+  // produces for a single full-mix stream, not ~6dB quieter (which an
+  // earlier version produced by treating the 4 stem streams as 4
+  // independent full-amplitude sources instead of 2 complementary pairs).
+  // A vocal+instrumental split partitions one track's energy, so summing
+  // them back at gain 1 approximates the ORIGINAL track's sample value —
+  // modeled here as two half-amplitude stems that sum to the same content
+  // a plain single full-mix source of that amplitude would carry.
+  const outVocal = fillFrame(8000);
+  const outInstrumental = fillFrame(8000);
+  const reconstructedOriginal = fillFrame(16000);
+  const inVocal = fillFrame(0);
+  const inInstrumental = fillFrame(0);
+
+  const stemMixed = mixNFrames(
+    [outVocal, outInstrumental, inInstrumental, inVocal],
+    [1, 1, 0, 0],
+  );
+  const plainMixed = mixFrames(reconstructedOriginal, fillFrame(0), 1, 0);
+  assert.deepEqual(stemMixed, plainMixed,
+    'expected the reconstructed-track stem sum to match a plain 2-source mix of the same original content');
+});
+
+test('gainForStemPosition matches gainForPosition exactly when startOffsetSec is 0 and fadeSec spans the whole window', () => {
+  // Phase 8: this is the outInstrumental/inInstrumental case — its envelope
+  // must be provably unchanged from the pre-Phase-8 crossfade math.
+  // positionSec === fadeSec is deliberately excluded: gainForPosition()
+  // computes cos(pi/2)/sin(pi/2) there (a ~6e-17 float artifact, not
+  // exactly 0/1), while gainForStemPosition()'s boundary clamp returns the
+  // clean 0/1 post-fade value directly — both are "silent"/"full" in any
+  // audible sense, but not bit-identical at that single point.
+  for (const positionSec of [0, 1.5, 3, 6, 7.999]) {
+    for (const role of ['out', 'in']) {
+      for (const curve of ['linear', 'equal-power']) {
+        const expected = gainForPosition({ positionSec, fadeSec: 8, curve, role });
+        const actual = gainForStemPosition({ positionSec, startOffsetSec: 0, fadeSec: 8, curve, role });
+        assert.equal(actual, expected, `positionSec=${positionSec} role=${role} curve=${curve}`);
+      }
+    }
+  }
+});
+
+test('gainForStemPosition locks at the pre-fade value before startOffsetSec, then ramps', () => {
+  // The inVocal case: silent (role 'in' -> 0) until the outgoing vocal has
+  // faded out, then ramps in over its own (shorter) remaining window.
+  assert.equal(gainForStemPosition({ positionSec: 0, startOffsetSec: 5, fadeSec: 2, role: 'in' }), 0);
+  assert.equal(gainForStemPosition({ positionSec: 4.999, startOffsetSec: 5, fadeSec: 2, role: 'in' }), 0);
+  const midRamp = gainForStemPosition({ positionSec: 6, startOffsetSec: 5, fadeSec: 2, role: 'in' });
+  assert.ok(midRamp > 0 && midRamp < 1, `expected a mid-ramp gain strictly between 0 and 1, got ${midRamp}`);
+  assert.equal(gainForStemPosition({ positionSec: 7, startOffsetSec: 5, fadeSec: 2, role: 'in' }), 1);
+});
+
+test('gainForStemPosition resolves a zero-length fade window to the POST-fade value, not the pre-fade one', () => {
+  // Regression: a stem whose own fadeSec is 0 (e.g. the outgoing vocal had
+  // already faded out natively before the exit point, so outVocal has
+  // nothing left to fade) means "already past the end of this stem's fade,"
+  // NOT "not fading at all." gainForPosition()'s own fadeSec<=0 convention
+  // ("stays at full signal") does not apply here — getting this backwards
+  // would leave a silent-since-before-the-transition outgoing vocal stem
+  // playing at full gain for the whole crossfade.
+  assert.equal(gainForStemPosition({ positionSec: 0, startOffsetSec: 0, fadeSec: 0, role: 'out' }), 0);
+  assert.equal(gainForStemPosition({ positionSec: 3, startOffsetSec: 0, fadeSec: 0, role: 'out' }), 0);
+  assert.equal(gainForStemPosition({ positionSec: 0, startOffsetSec: 0, fadeSec: 0, role: 'in' }), 1);
 });

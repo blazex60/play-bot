@@ -266,7 +266,7 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - essentia.js キーはベストエフォート
 - Guild 単位の `/fade` でクロスフェード / tail-fade を切れる（既定はオン。無効時はギャップレス）
 
-### Phase 7 — Beatmatch / Phrase Mix（Auto DJ 化） 🚧
+### Phase 7 — Beatmatch / Phrase Mix（Auto DJ 化） ✅
 
 詳細は [`docs/mix-transition-phase7.md`](mix-transition-phase7.md)。
 
@@ -274,6 +274,15 @@ Phase 1.5 の結論に従って実装。優先順位は 5.4 の A → B → C �
 - Session tempo 方式（現在の playback BPM に incoming を合わせる）を採用。tempo は spawn 時に確定させ、promotion 後に戻さない
 - tempo matching は ffmpeg 内蔵の `rubberband` フィルタを使う（新規バイナリ依存なし）
 - 7A（analysis foundation）→ 7B（tempo sync）→ 7C（beatmix planner）→ 7D（mix execution）→ 7E（ordering / calibration）の順で実装する
+
+### Phase 8 — Stem Mixing
+
+詳細は [`docs/mix-transition-phase8.md`](mix-transition-phase8.md)（`docs/mix-transition-phase7.md` §22 候補案を継承）。
+
+- 出る曲・入る曲の両方を Demucs で vocal/instrumental の 2 stem に分離し、重畳区間だけ 4 本の PCM を独立したゲイン包絡で混ぜる
+- 出る曲の歌がまだ残っている退出点でも、入る曲の歌をその歌が消えるまで遅らせるだけで受理できるようになる（Phase 7 のビートミックスは歌の途中の退出点を必ず却下していた）
+- テンポ同期・ダウンビート整合は Phase 7C の `planBeatmixTransition()` をそのまま再利用し、緩和するのは出る曲側の全体窓ボーカル安全性チェックのみ
+- 分離済み stem 音声は初の永続 temp キャッシュ（`src/audio/stemCache.js`）として保持する
 
 ---
 
@@ -334,3 +343,4 @@ Phase 0 → Phase 1 ─┬→ Phase 1.5 → Phase 2 ──┐
 | 7C | ✅ | beatmix planner。`src/audio/beatmixTransition.js`（entry/exit candidate 検索、pair scoring、`planBeatmixTransition()`/`planPhraseCrossfade()`、§16 fallback ladder を実装する `planBeatSyncedTransition()`）。**まだ実際の再生には未接続** — `player.js` は引き続き既存の `planTransition()` を呼ぶ。`transition.js`/`MixStream`/`player.js` は無変更（bar envelope 実行は 7D） |
 | 7D | ✅ | PR #34。mix execution。`player.js#maybeStartCrossfade` が `planBeatSyncedTransition()` を呼ぶよう接続（§16 fallback ladder が実際の再生を駆動）。beatmix/phrase-crossfade の entry point は `createFileSource({ startSec })` の入力側 seek で処理し（`incomingOffsetSec` の PCM skip 方式は使わない、§9.3）、beatmix は `tempoFilter`（rubberband）を incoming の spawn に適用する。`MixStream.startCrossfade()` は `mode:'beatmix'` プランの bar envelope を実行 — bass-swap EQ を `eq.swapBar` まで dry→wet に線形ブレンドしてから完全適用する（§11.1、`fade.js` の新規 `blendFrame()`）。非 beatmix の crossfade/phrase-crossfade は EQ ランプなし（`eqRampSec` が `null` に解決し即座に全適用、既存 Phase 6 挙動を完全維持）。tail-fade 経路に `softLimitFrame()` を追加適用（§11.2、既存 `scaleFrame` のみだった箇所）。§2.3/§8.4 の session tempo は beatmix 開始時に `#pendingSessionTempo` へ退避し、promotion 時（通常の crossfade promote と、crossfade が間に合わず natural end で snaphandoff adopt された場合の両方）に適用する — 非 beatmix promotion は従来通り native BPM へリセット。`durationSec`/`positionSec`/exit 判定の秒数はすべて `compensateDurationSec()` で native → playback ドメインへ変換してから比較する（outgoing 自身が既に stretch 済みの chained beatmix でもズレない）。tempo backend probe（実 ffmpeg spawn）は両トラックに BPM が無い大多数のケースではスキップする（`mightBeatmix` 事前チェック）。`MAX_CROSSFADE_SEC`（legacy crossfade の上限）とは別に `MAX_TRANSITION_LEAD_SEC`（`TAIL_WINDOW_SEC` 由来、45秒）を新設し、低 BPM な beatmix の prep window が早期リターンで潰れないようにした。6 ラウンドのレビュー（CodeRabbit + Codex）で entrySec 減算漏れ・tempoBackend の null 誤変換・prepared source の再利用ミスマッチ・tempoHonored 未達時の beatmix 続行・session tempo の head/tail BPM 混同・incoming PCM stall 時の beat grid ズレ等を修正 |
 | 7E | ✅ | ordering edge cost 拡張（§12）。`src/mix/ordering.js#transitionCost()` に beatmix-aware 項を追加 — 新規項を個別実装せず、7C の `findExitCandidates()`/`findEntryCandidates()`/`scoreTransitionPair()` を再利用（vocal safety + phrase alignment + tempo compatibility + downbeat confidence + energy continuity + harmonic distance を 1 つの 0..1 品質スコアに集約済み）。v3 analysis（`analysisSource !== 'none'` かつ phrase/vocal データあり）が両側にある場合のみ有効化し、無い場合は既存の bpm/key/energy 3 項のみ（7E 以前と完全に同じ挙動）にフォールバックする。`bpmDelta()` の half/double 許容ルールと矛盾しないよう `canTempoMatch()`/`tempoRatio()` の同じオクターブ正規化を使う。**§21 の残りタスク（15〜30 実曲 QA、tempo/downbeat/phrase/overlap bars の実測 calibration）は実音声の人間による聴取評価が必須であり、本エージェント環境では実施不可能 — 未着手のまま。** `SOFT_LIMIT_RATIO`/`HARD_LIMIT_RATIO`（`tempo.js`）、`BEAT_CONFIDENCE_MIN`/`DOWNBEAT_CONFIDENCE_MIN`（`beatmixTransition.js`）と同様、`DEFAULT_BEATMIX_WEIGHT` も暫定値のまま |
+| 8 | ✅ | `docs/mix-transition-phase8.md`。Stem Mixing。`src/audio/stemCache.js`（永続 stem キャッシュ、Bot process は SQLite 不使用のため `meta.json` サイドカーのみで管理）、`src/audio/fade.js` の `mixNFrames()`/`gainForStemPosition()`、`src/audio/beatmixTransition.js`（`requireVocalSafe`/`requireExitVocalSafe`/`requireEntryForwardSafe`/`stemAware` フラグ、既定値は Phase 7 と完全同一）、`src/audio/stemTransition.js`（`planStemTransition()`/`buildStemEnvelopes()`）、`src/audio/mixStream.js`（`startStemCrossfade()`、重畳区間のみ 4 本 PCM を混ぜ、`incoming.full` は同じケイデンスで読み捨ててバックプレッシャによる位置ズレを防ぐ）、`player.js`（`#scheduleAnalysis()` へ分離を連結、`#ensureOutgoingStemPrep()`/`#ensureIncomingStemPrep()` を `#maybeStartCrossfade()` の `prepDue` ゲートで遅延生成）。**フルトラック Demucs の CPU コスト・実音源での N=3/4 ヘッドルーム検証・実 Demucs バイナリでの出力ディレクトリ命名検証は本エージェント環境では実施不可能 — `docs/mix-transition-phase8.md` §9 未決事項のまま** |

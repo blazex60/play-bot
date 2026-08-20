@@ -166,7 +166,7 @@ async function rmsEnvelope(spawnFn, filePath) {
   };
 }
 
-function resolveDemucsBin() {
+export function resolveDemucsBin() {
   return process.env.DEMUCS_BIN
     || (process.env.DEMUCS_VENV ? path.join(process.env.DEMUCS_VENV, 'bin', 'demucs') : 'demucs');
 }

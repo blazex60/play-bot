@@ -1,10 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdir, writeFile, readFile, rm, access } from 'node:fs/promises'
 import {
   MAX_NORMALIZE_DURATION_SEC,
   NormalizeError,
   isNormalizeDurationAllowed,
   parseLoudnormJson,
+  stageTempFileCopy,
+  cleanupTempFile,
+  TEMP_DIR,
 } from './normalize.js'
 
 test('parseLoudnormJson: ffmpeg stderr末尾のJSONをパースする', () => {
@@ -69,4 +73,27 @@ test('isNormalizeDurationAllowed: 尺不明や30分超は拒否する', () => {
   assert.equal(isNormalizeDurationAllowed({ duration: Number.NaN }), false)
   assert.equal(isNormalizeDurationAllowed({ duration: Number.POSITIVE_INFINITY }), false)
   assert.equal(isNormalizeDurationAllowed({ duration: MAX_NORMALIZE_DURATION_SEC + 1 }), false)
+})
+
+test('stageTempFileCopy: 独立したコピーを作成し、元ファイル削除後も内容が残る（Codex, PR #39）', async () => {
+  await mkdir(TEMP_DIR, { recursive: true })
+  const original = `${TEMP_DIR}/stage-test-original-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  await writeFile(original, 'hello stem separation')
+  let staged
+  try {
+    staged = await stageTempFileCopy(original)
+    assert.notEqual(staged, original, 'expected a distinct path, not the original')
+
+    // The whole point: deleting the original must not affect the staged
+    // copy — that decoupling is what protects a queued stem-separation job
+    // from unrelated cleanup deleting the source file out from under it.
+    await cleanupTempFile(original)
+    await assert.rejects(() => access(original), 'expected the original to actually be gone')
+
+    const content = await readFile(staged, 'utf8')
+    assert.equal(content, 'hello stem separation')
+  } finally {
+    if (staged) await cleanupTempFile(staged)
+    await rm(original, { force: true })
+  }
 })

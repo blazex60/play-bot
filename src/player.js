@@ -12,6 +12,7 @@ import {
   cleanupTempFile,
   isNormalizeDurationAllowed,
   prefetchTrack,
+  stageTempFileCopy,
 } from './normalize.js';
 import { shouldReconnectRetry } from './player/playbackPolicy.js';
 import { MixStream } from './audio/mixStream.js';
@@ -19,10 +20,12 @@ import { createStreamSource, createFileSource } from './audio/pcmSource.js';
 import { analyzeTrackFile, ANALYSIS_VERSION } from './audio/trackAnalysis.js';
 import { planBeatSyncedTransition } from './audio/beatmixTransition.js';
 import { probeDurationSec } from './audio/duration.js';
-import { createSessionTempoState, resetSessionTempo, probeTempoBackend, compensateDurationSec } from './audio/tempo.js';
+import { createSessionTempoState, resetSessionTempo, probeTempoBackend, compensateDurationSec, buildTempoFilter } from './audio/tempo.js';
 import { TAIL_WINDOW_SEC } from './audio/vocalActivity.js';
 import { LoopMode } from './queue.js';
 import { getAnalysisQueue } from './audio/analysisQueue.js';
+import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
+import { planStemTransition } from './audio/stemTransition.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
@@ -42,6 +45,15 @@ const MAX_CROSSFADE_SEC = 6;
  * round-2). A fixed overlap-length guess (e.g. 20s) undercounts this.
  */
 const MAX_TRANSITION_LEAD_SEC = TAIL_WINDOW_SEC;
+// Phase 8: #ensureOutgoingStemPrep() seeks the outgoing stems to a FIXED
+// native exitStartSec once, at prepDue — #current itself keeps playing live
+// the whole time until actually taken. Normal jitter (CROSSFADE_ARM_INTERVAL_MS
+// polling) keeps that gap tiny; this tolerates a few ticks of it while still
+// catching the case where #takePreparedIncoming()'s await stretched
+// arbitrarily far (a still-downloading/normalizing incoming track), which
+// would otherwise start the outgoing stems from a position #current has
+// already played past (Codex).
+const OUTGOING_STEM_DRIFT_TOLERANCE_SEC = 0.5;
 const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
@@ -106,6 +118,36 @@ function sleep(ms) {
  * BPM (§2.3/§8.4).
  */
 function normalizeTransitionPlan(rawPlan) {
+  if (rawPlan.mode === 'stem-mix') {
+    // Phase 8 (docs/mix-transition-phase8.md): planStemTransition()'s output
+    // is a planBeatmixTransition()-shaped plan plus a `stems` sub-object —
+    // identical to the 'beatmix' branch below except stems is carried
+    // through to mixPlan (MixStream.startStemCrossfade() reads it directly).
+    return {
+      mixPlan: {
+        mode: 'stem-mix',
+        fadeSec: rawPlan.fadeSec,
+        startSec: rawPlan.outgoing?.exitStartSec ?? null,
+        curve: rawPlan.gain?.curve ?? 'equal-power',
+        baseSwap: true,
+        highpassHz: rawPlan.eq?.highpassHz ?? 120,
+        lowshelfGainDb: 2,
+        incomingOffsetSec: 0,
+        targetBpm: rawPlan.targetBpm,
+        sync: rawPlan.sync,
+        eq: rawPlan.eq,
+        stems: rawPlan.stems,
+      },
+      exitStartSec: rawPlan.outgoing?.exitStartSec ?? null,
+      entrySec: Math.max(0, rawPlan.incoming?.entrySec ?? 0),
+      tempoFilter: rawPlan.incoming?.tempoFilter ?? null,
+      sessionTempo: {
+        nativeBpm: rawPlan.incoming?.nativeBpm ?? null,
+        playbackBpm: rawPlan.incoming?.playbackBpm ?? rawPlan.targetBpm ?? null,
+        tempoRatio: rawPlan.incoming?.tempoRatio ?? 1,
+      },
+    };
+  }
   if (rawPlan.mode === 'beatmix') {
     return {
       mixPlan: {
@@ -198,6 +240,12 @@ export class GuildPlayer {
   #lastActiveAt = 0;
   #watchdogTimer = null;
   #currentTempFile = null;
+  // Phase 8: mirrors #incomingMeasured's lifecycle exactly (set at spawn,
+  // transferred at every point #currentTempFile itself is transferred from
+  // #incomingTempFile, cleared at every point #currentTempFile is cleared)
+  // so #ensureOutgoingStemPrep() can loudnorm the outgoing stems with the
+  // same measured LUFS value the currently-playing full-mix source used.
+  #currentMeasured = null;
   #prefetchEntries = new Map();
   #createAudioResource;
   #resolveAudioStream;
@@ -256,6 +304,29 @@ export class GuildPlayer {
   #analysisCache = new Map();
   #analysisMissAt = new Map();
   #probedDurationCache = new Map();
+  /**
+   * videoId -> attempt token for the #scheduleAnalysis() job currently in
+   * flight for it (Codex, PR #39 round-15/16). #ensureFullPrefetch() and
+   * #createPcmSource() both call #scheduleAnalysis() for the same
+   * prefetched file — the second, consuming that same prefetch entry once
+   * the track actually starts — so without this guard every normalized
+   * track gets staged and enqueued for stem separation twice. The first
+   * attempt already populates the in-memory and persistent analysis/stem
+   * caches everything else reads from, so the second is pure waste.
+   *
+   * A per-attempt token (not just presence in a Set) matters because
+   * analysisQueue's kill()/noteUnderrun() rejects a job's promise via
+   * Promise.race() the instant it's killed — independent of whether that
+   * job's own callback (and its own finally) has actually finished
+   * running. Without a token, a killed job A's delayed finally could run
+   * AFTER a newer job B has already been scheduled for the same videoId
+   * (started in the gap between A's immediate kill-rejection and A's
+   * callback actually unwinding), and A's cleanup would then delete B's
+   * still-active guard entry — letting a third job start concurrently
+   * with B. Only deleting when the stored token still matches the
+   * attempt that's settling closes that gap.
+   */
+  #scheduledAnalysisTokens = new Map();
   #crossfadeArmTimer = null;
   #crossfadeStarted = false;
   #crossfadeArming = false;
@@ -273,6 +344,52 @@ export class GuildPlayer {
   /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
   #queueRefill = null;
   #prefetchTrackFn;
+  #stageTempFileCopyFn;
+  #separateTrackStemsFn;
+  #getCachedStemsFn;
+  #planStemTransitionFn;
+  /** Test-only override — the two stem-prep methods call createFileSource() directly (they bypass #createPcmSource entirely, since stem WAVs need no download/normalize/loudnorm pass), so a dedicated injection point mirrors this file's existing DI convention for every other real-process spawn. */
+  #createFileSourceFn;
+  /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
+  #preparedOutgoingStems = null;
+  /** Identity key of an in-flight #ensureOutgoingStemPrep() cache-revalidation await, or null. Lets a later/different call — or an explicit clear — invalidate an earlier one still awaiting, instead of every arm tick spawning its own independent attempt. */
+  #preparingOutgoingStemsKey = null;
+  /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
+  #preparedIncomingStems = null;
+  /** Identity key of an in-flight #ensureIncomingStemPrep() cache-revalidation await, or null — same rationale as #preparingOutgoingStemsKey. */
+  #preparingIncomingStemsKey = null;
+  /**
+   * Phase 8 (Codex): memoizes a POSITIVE stem-cache lookup for the current
+   * (current,next) pair — #maybeStartCrossfade() re-runs the eligibility
+   * check on every CROSSFADE_ARM_INTERVAL_MS tick for up to the whole lead
+   * window, and getCachedStems() touches the entry's mtime on every hit, so
+   * without this a single transition attempt generates hundreds of
+   * redundant metadata writes once both sides are already cached. Only
+   * positive results are memoized — a miss must keep re-checking every
+   * tick, since background separation completing mid-window is the whole
+   * point of prepping this early, and a miss never touches mtime anyway.
+   * @type {{ key: string, outCachedStems: object, inCachedStems: object } | null}
+   */
+  #stemCacheHit = null;
+  /**
+   * videoId:videoId key of a (current, next) pair whose stem-mix attempt
+   * was aborted at take time (spawn/prep failure, drift, or an unhonored
+   * transform) rather than downgraded to a plain crossfade — because the
+   * cache lookup and `planStemTransitionFn()` above are independent of
+   * spawn success, leaving this unset would have every subsequent ~200ms
+   * arm tick re-select the SAME relaxed stem-mix plan, abort it again, and
+   * never let rawPlan's own plain-crossfade fallback run at all (Codex).
+   * Checked at plan-selection time to skip stem-mix for this exact pair.
+   * Explicitly cleared in #onCrossfadePromoted() once that pair's
+   * transition attempt actually concludes — comparing against the CURRENT
+   * pair's key alone isn't enough, since QUEUE loop mode or a duplicated
+   * playlist entry can bring the SAME pair back around later, and a
+   * since-resolved (or merely transient) earlier failure must not
+   * permanently downgrade every future occurrence of that pair for the
+   * rest of the GuildPlayer's lifetime (Codex).
+   * @type {string | null}
+   */
+  #stemMixUnavailableKey = null;
 
   constructor({
     guildId,
@@ -303,6 +420,11 @@ export class GuildPlayer {
     analysisQueue = null,
     prefetchTrackFn = prefetchTrack,
     probeTempoBackendFn = probeTempoBackend,
+    stageTempFileCopyFn = stageTempFileCopy,
+    separateTrackStemsFn = separateTrackStems,
+    getCachedStemsFn = getCachedStems,
+    planStemTransitionFn = planStemTransition,
+    createFileSourceFn = createFileSource,
     pcmWaitTimeoutMs = PCM_WAIT_TIMEOUT_MS,
   }) {
     this.#guildId = guildId;
@@ -323,6 +445,11 @@ export class GuildPlayer {
     this.#analysisQueue = analysisQueue;
     this.#prefetchTrackFn = prefetchTrackFn;
     this.#probeTempoBackendFn = probeTempoBackendFn;
+    this.#stageTempFileCopyFn = stageTempFileCopyFn;
+    this.#separateTrackStemsFn = separateTrackStemsFn;
+    this.#getCachedStemsFn = getCachedStemsFn;
+    this.#planStemTransitionFn = planStemTransitionFn;
+    this.#createFileSourceFn = createFileSourceFn;
     this.#pcmWaitTimeoutMs = Number.isFinite(pcmWaitTimeoutMs)
       ? pcmWaitTimeoutMs
       : PCM_WAIT_TIMEOUT_MS;
@@ -600,9 +727,26 @@ export class GuildPlayer {
     }
 
     this.#preparedIncoming = null;
+    // A stem-mix attempt could have been prepping in parallel with this
+    // snap-adopted full-mix source — #clearPreparedIncoming() is what
+    // normally piggybacks the stem cleanup onto every abandoned-prep call
+    // site, but this path sets #preparedIncoming directly (adopting the
+    // source, not discarding it) and would otherwise leave four ffmpeg
+    // processes alive for the rest of the adopted track.
+    this.#clearPreparedOutgoingStems();
+    this.#clearPreparedIncomingStems();
+    // Same reasoning as #onCrossfadePromoted()/#handleAfter()'s reset
+    // (Codex): a snap-adopted plain source is a THIRD way this (current,
+    // next) pair's transition attempt can conclude, alongside those two —
+    // an earlier failed stem-mix attempt for this exact pair must not
+    // leave it permanently downgraded for a later QUEUE-loop/duplicate
+    // recurrence just because THIS occurrence happened to resolve via
+    // snap-adoption instead of a crossfade promotion or a natural end.
+    this.#stemMixUnavailableKey = null;
     const outgoingTemp = this.#currentTempFile;
     this.#currentTempFile = this.#incomingTempFile;
     this.#incomingTempFile = null;
+    this.#currentMeasured = this.#incomingMeasured;
     this.#incomingMeasured = null;
 
     if (this.#queue.loopMode !== LoopMode.TRACK && this.#queue.current !== next) {
@@ -776,6 +920,15 @@ export class GuildPlayer {
     this.#forceSkip = false;
     this.#hadError = false;
     this.#clearCrossfadeArm();
+    // Codex: #stemMixUnavailableKey scopes a failed stem-mix attempt to the
+    // (current, next) pair it happened against — clear it here, once that
+    // pairing's transition attempt has actually concluded (this fires for
+    // every promotion, stem-mix or not), so a LATER recurrence of the same
+    // videoId pair (QUEUE loop mode, a duplicated playlist entry) gets a
+    // fresh, unbiased stem-mix attempt instead of staying downgraded for
+    // the rest of the GuildPlayer's lifetime over a since-resolved (or
+    // simply transient) earlier failure.
+    this.#stemMixUnavailableKey = null;
 
     const target = this.#crossfadeTargetTrack;
     this.#crossfadeTargetTrack = null;
@@ -797,6 +950,7 @@ export class GuildPlayer {
     const outgoingTemp = this.#currentTempFile;
     this.#currentTempFile = this.#incomingTempFile;
     this.#incomingTempFile = null;
+    this.#currentMeasured = this.#incomingMeasured;
     this.#incomingMeasured = null;
 
     const nextTrack = this.#queue.current;
@@ -993,6 +1147,11 @@ export class GuildPlayer {
 
   async #handleAfter() {
     this.#clearCrossfadeArm();
+    // Same reasoning as #onCrossfadePromoted()'s reset (Codex): a natural,
+    // non-crossfade track end (no fallback was even eligible for the
+    // failed pair) must also release the marker once that pair's attempt
+    // has concluded, not just the crossfade-promotion path.
+    this.#stemMixUnavailableKey = null;
     await this.#cleanupCurrentTempFile();
 
     const upcomingBeforeAdvance = this.#queue.loopMode === LoopMode.TRACK
@@ -1069,6 +1228,7 @@ export class GuildPlayer {
 
     if (!forIncoming) {
       this.#currentTempFile = null;
+      this.#currentMeasured = null;
     }
 
     // Mixer path forces normalize when duration allows (crossfade quality).
@@ -1111,6 +1271,7 @@ export class GuildPlayer {
         this.#incomingMeasured = prefetched.measured;
       } else {
         this.#currentTempFile = prefetched.filePath;
+        this.#currentMeasured = prefetched.measured;
       }
       this.#scheduleAnalysis(track, prefetched.filePath);
       const source = createFileSource(prefetched.filePath, { measured: prefetched.measured, startSec, tempoFilter });
@@ -1128,11 +1289,86 @@ export class GuildPlayer {
 
   #scheduleAnalysis(track, filePath) {
     if (!track?.videoId || !filePath || !this.#analyzeTrackFileFn) return;
+    // Codex (PR #39 round-15/16): #ensureFullPrefetch() and
+    // #createPcmSource() both call #scheduleAnalysis() for the same
+    // prefetched file — the second, consuming that same prefetch entry
+    // once the track actually starts — so without this guard every
+    // normalized track gets staged and enqueued for stem separation
+    // twice. Skip while a prior attempt for this exact videoId is still
+    // in flight; that first attempt already populates the in-memory and
+    // persistent analysis/stem caches everything else reads from, so a
+    // second is pure waste. The token (not just videoId presence) guards
+    // against a killed job's delayed cleanup clobbering a newer job's
+    // entry — see #scheduledAnalysisTokens's own docstring.
+    if (this.#scheduledAnalysisTokens.has(track.videoId)) return;
+    const analysisToken = {};
+    this.#scheduledAnalysisTokens.set(track.videoId, analysisToken);
+    // Phase 8 (Codex, PR #39 round-14): stage an independent copy of
+    // filePath for stem separation NOW, before this job is even enqueued —
+    // several unrelated call sites (track promotion/stop/skip/prefetch
+    // discard) can delete filePath at any point once this method returns,
+    // including the entire time this job sits waiting its turn on the
+    // shared analysisQueue (which a single full-track Demucs job can
+    // occupy for minutes — docs/mix-transition-phase8.md §9). Copying
+    // later, e.g. as the first statement inside the enqueued callback,
+    // would already be too late in exactly that scenario. Best-effort: if
+    // staging fails, separation for this track is simply skipped below.
+    const stagedPathPromise = this.#stageTempFileCopyFn(filePath).catch((err) => {
+      console.warn('[GuildPlayer] failed to stage file for stem separation:', err.message);
+      return null;
+    });
     this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
-      const cached = await this.#lookupPersistentAnalysis(track);
-      if (cached) return cached;
-      return this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
+      // CodeRabbit (PR #39 round-15): the staged copy must be cleaned up
+      // whether THIS job succeeds, fails at any step, or is cancelled —
+      // #lookupPersistentAnalysis()/#runAnalysis() rejecting (including an
+      // ANALYSIS_KILLED abort) must not skip cleanup just because it
+      // happens before the separation step below. The try/finally wraps
+      // the whole callback, not just the separation call, so every exit
+      // path removes it regardless of outcome.
+      //
+      // Codex (PR #39 round-17): #runAnalysis() itself must also read from
+      // the staged copy, not the original filePath — the whole reason
+      // filePath got staged in the first place is that it can be deleted
+      // by unrelated cleanup at any point once this job is enqueued,
+      // #runAnalysis() is just as exposed to that as separation was.
+      // Awaited once up front (already-settled by the time this callback
+      // runs, in the overwhelming majority of cases) so both steps below
+      // share the same value; falls back to filePath only if staging
+      // itself failed, matching this job's existing best-effort posture.
+      const stagedPath = await stagedPathPromise;
+      try {
+        const cached = await this.#lookupPersistentAnalysis(track);
+        const analysis = cached ?? await this.#runAnalysis(track, stagedPath ?? filePath, { spawnFn: spawnNice, signal });
+        // Best-effort: a failure here just means this track never becomes
+        // stem-mix eligible, the existing beatmix/phrase-crossfade/legacy
+        // ladder is untouched either way.
+        // Skip rather than start a many-minute Demucs run against a job
+        // the queue already decided to cancel (e.g. a mixer underrun
+        // killed this job right as #runAnalysis finished).
+        if (!signal?.aborted && stagedPath) {
+          await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
+            console.warn('[GuildPlayer] stem separation failed:', err.message);
+          });
+        }
+        return analysis;
+      } finally {
+        if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
+        // Compare-and-delete: analysisQueue.kill()/noteUnderrun() rejects
+        // via Promise.race() the instant a job is killed, well before this
+        // callback's own finally can run (Codex). If a newer attempt for
+        // this same videoId already replaced our entry in that gap, its
+        // token won't match ours — leave it alone.
+        if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
+          this.#scheduledAnalysisTokens.delete(track.videoId);
+        }
+      }
     }).catch((err) => {
+      // Belt-and-suspenders: the finally above already removes this on
+      // every path through the callback body. This only matters if
+      // enqueue() itself rejects without ever invoking that callback.
+      if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
+        this.#scheduledAnalysisTokens.delete(track.videoId);
+      }
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
         return;
@@ -1237,6 +1473,211 @@ export class GuildPlayer {
     }
   }
 
+  /**
+   * Phase 8: the outgoing stem pair must be stretched to match whatever
+   * session tempo #current is ACTUALLY playing at right now, not
+   * re-derived from analysis fields — buildTempoFilter() is a pure
+   * function, so recomputing it from #sessionTempo (already tracking the
+   * exact {nativeBpm, playbackBpm} the live spawn used) reproduces the
+   * identical filter string deterministically, without needing to persist
+   * it anywhere new.
+   */
+  #outgoingStemTempoFilter(tempoBackend) {
+    const built = buildTempoFilter({
+      nativeBpm: this.#sessionTempo.nativeBpm,
+      targetBpm: this.#sessionTempo.playbackBpm,
+      backend: tempoBackend,
+    });
+    // buildTempoFilter() returns { filter: null } both when no stretch is
+    // needed AND when a needed stretch couldn't be expressed (nativeBpm
+    // missing, deviation past the backend's limit) — those two cases must
+    // not collapse into the same "spawn unstretched" result here: the
+    // second one would silently decode the outgoing stems at native tempo
+    // while #current keeps playing stretched, drifting apart for the whole
+    // stem window. undefined signals "stem-mix unavailable" to callers.
+    const ratio = this.#sessionTempo.tempoRatio ?? 1;
+    if (built.filter == null && Math.abs(ratio - 1) > 1e-9) return undefined;
+    return built.filter;
+  }
+
+  /**
+   * Phase 8 (docs/mix-transition-phase8.md): the outgoing side's stem pair
+   * must be spawned LATE — seeked to the exit point — from inside
+   * #maybeStartCrossfade()'s own prepDue gate, never at track-promotion
+   * time. A PcmSource opened at startSec:0 and left unread for however long
+   * the track has left to play would just sit blocked on backpressure at
+   * the wrong native position by the time it's actually needed.
+   */
+  async #ensureOutgoingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
+    // Loudnorm the stems with the same measured LUFS #current's own full-mix
+    // source used — otherwise the stem window jumps to unfiltered loudness
+    // relative to the surrounding, already-normalized audio. Included in the
+    // identity check (not just videoId/startSec/tempoFilter): if this fires
+    // before #currentMeasured is populated, an unmeasured pair gets prepped;
+    // without this, a later tick that finally sees the real value would
+    // treat the existing prep as still valid and never re-spawn with it.
+    const measured = this.#currentMeasured;
+    if (
+      this.#preparedOutgoingStems?.videoId === videoId
+      && this.#preparedOutgoingStems.prep?.startSec === startSec
+      && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
+      && this.#preparedOutgoingStems.prep?.measured === measured
+    ) return;
+    // Dedup concurrent in-flight attempts for the SAME identity — the cache
+    // revalidation below is async, and the 200ms arm interval can call this
+    // again before it resolves. Without this, every such tick spawns its
+    // own independent ffmpeg pair; whichever's await happens to resolve
+    // last silently wins even if it started before another, and a
+    // completion that lands after the pair has already been taken (or
+    // cleared) installs an orphaned pair whose paused processes never get
+    // destroyed (Codex).
+    const key = `${videoId}:${startSec}:${tempoFilter}:${measured}`;
+    if (this.#preparingOutgoingStemsKey === key) return;
+    this.#preparingOutgoingStemsKey = key;
+    try {
+      // Revalidate against the live cache right before actually spawning —
+      // this only runs on a genuine (re)prep, i.e. rarely, not on the
+      // steady-state no-op ticks above, so it doesn't reintroduce the
+      // per-tick fs cost player.js's #stemCacheHit memo exists to avoid.
+      // `cached` (the caller's argument) may be a memoized lookup from
+      // several arm-ticks ago; pruneStemCache() can evict the entry any
+      // time in the background, and a stale path here would spawn ffmpeg
+      // against a deleted file, silently failing prep forever for this
+      // pair as long as the memo key doesn't change (Codex).
+      const fresh = await this.#getCachedStemsFn(videoId);
+      // A newer call (different identity) or an explicit clear (stop, plan
+      // downgrade, ...) superseded this attempt while it awaited — the
+      // caller no longer wants this result; do not install it.
+      if (this.#preparingOutgoingStemsKey !== key) return;
+      if (!fresh) {
+        this.#clearPreparedOutgoingStems();
+        return;
+      }
+      const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
+      const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
+      this.#clearPreparedOutgoingStems();
+      this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
+    } finally {
+      // Always release the in-flight marker for THIS attempt, including on
+      // a rejected getCachedStemsFn() — otherwise a transient cache-read
+      // error leaves the key stuck forever, and every later tick for this
+      // same identity hits the dedup no-op above, permanently disabling
+      // stem prep for the rest of the transition even if a later read
+      // would have succeeded (CodeRabbit). Only clear it if it's still
+      // OURS — a newer call already replacing it with its own key must
+      // keep that key, not have it wiped out from under it.
+      if (this.#preparingOutgoingStemsKey === key) this.#preparingOutgoingStemsKey = null;
+    }
+  }
+
+  #takePreparedOutgoingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {
+    if (
+      this.#preparedOutgoingStems?.videoId === videoId
+      && this.#preparedOutgoingStems.prep?.startSec === startSec
+      && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
+      // #currentMeasured can still change between the prepDue tick that
+      // prepped these stems and this take — e.g. normalization for the
+      // OTHER side resolving in the same arm pass shouldn't matter here,
+      // but a stale unmeasured pair must not silently win over a since-
+      // populated value (CodeRabbit, follow-up to the ensure-side fix).
+      && this.#preparedOutgoingStems.prep?.measured === this.#currentMeasured
+    ) {
+      const { vocal, instrumental } = this.#preparedOutgoingStems;
+      this.#preparedOutgoingStems = null;
+      return { vocal, instrumental };
+    }
+    this.#clearPreparedOutgoingStems();
+    return null;
+  }
+
+  #clearPreparedOutgoingStems() {
+    this.#preparedOutgoingStems?.vocal?.destroy?.();
+    this.#preparedOutgoingStems?.instrumental?.destroy?.();
+    this.#preparedOutgoingStems = null;
+    // Invalidate any in-flight #ensureOutgoingStemPrep() attempt too — a
+    // completion for a pair the caller just explicitly discarded must not
+    // be allowed to silently reinstall one once its await resolves.
+    this.#preparingOutgoingStemsKey = null;
+  }
+
+  /**
+   * Incoming-side stem pair — same late-binding rationale as
+   * #ensureOutgoingStemPrep(). The incoming side's FULL-mix continuation
+   * source (needed once the stem window ends) is NOT prepared here — that
+   * still goes through the existing #ensureIncomingPrep()/
+   * #takePreparedIncoming() machinery (download/normalize/analysis-
+   * scheduling already lives there; no need to duplicate it), spawned with
+   * the SAME startSec/tempoFilter so all three incoming sources decode in
+   * lockstep (see mixStream.js's startStemCrossfade() docstring).
+   */
+  async #ensureIncomingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
+    // Same rationale as #ensureOutgoingStemPrep() — reuse whichever measured
+    // value the incoming full-mix prep has captured for this track so far,
+    // and include it in the identity check so a later tick that sees
+    // #incomingMeasured finally populated (a slow download/prefetch can
+    // still be resolving the first time this fires) re-preps with it
+    // instead of permanently keeping an unmeasured pair.
+    const measured = this.#incomingMeasured;
+    if (
+      this.#preparedIncomingStems?.videoId === videoId
+      && this.#preparedIncomingStems.prep?.startSec === startSec
+      && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
+      && this.#preparedIncomingStems.prep?.measured === measured
+    ) return;
+    // Dedup concurrent in-flight attempts — see #ensureOutgoingStemPrep()'s
+    // matching comment (Codex).
+    const key = `${videoId}:${startSec}:${tempoFilter}:${measured}`;
+    if (this.#preparingIncomingStemsKey === key) return;
+    this.#preparingIncomingStemsKey = key;
+    try {
+      // Revalidate against the live cache right before actually spawning —
+      // see #ensureOutgoingStemPrep()'s matching comment (Codex).
+      const fresh = await this.#getCachedStemsFn(videoId);
+      if (this.#preparingIncomingStemsKey !== key) return;
+      if (!fresh) {
+        this.#clearPreparedIncomingStems();
+        return;
+      }
+      const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
+      const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
+      this.#clearPreparedIncomingStems();
+      this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
+    } finally {
+      // Always release the in-flight marker for THIS attempt — see
+      // #ensureOutgoingStemPrep()'s matching comment (CodeRabbit).
+      if (this.#preparingIncomingStemsKey === key) this.#preparingIncomingStemsKey = null;
+    }
+  }
+
+  #takePreparedIncomingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {
+    if (
+      this.#preparedIncomingStems?.videoId === videoId
+      && this.#preparedIncomingStems.prep?.startSec === startSec
+      && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
+      // #takePreparedIncoming() (the full-mix side) can resolve normalization
+      // and populate #incomingMeasured within the SAME arm pass, after these
+      // stems were already prepped unmeasured — without this check the stale
+      // unmeasured pair would win over the full-mix source's now-measured
+      // loudness (CodeRabbit, follow-up to the ensure-side fix).
+      && this.#preparedIncomingStems.prep?.measured === this.#incomingMeasured
+    ) {
+      const { vocal, instrumental } = this.#preparedIncomingStems;
+      this.#preparedIncomingStems = null;
+      return { vocal, instrumental };
+    }
+    this.#clearPreparedIncomingStems();
+    return null;
+  }
+
+  #clearPreparedIncomingStems() {
+    this.#preparedIncomingStems?.vocal?.destroy?.();
+    this.#preparedIncomingStems?.instrumental?.destroy?.();
+    this.#preparedIncomingStems = null;
+    // Invalidate any in-flight #ensureIncomingStemPrep() attempt too — see
+    // #clearPreparedOutgoingStems()'s matching comment.
+    this.#preparingIncomingStemsKey = null;
+  }
+
   /** Destroys a prepared entry's source, resolved or still in flight. */
   #destroyPreparedSource(entry) {
     if (!entry) return;
@@ -1253,6 +1694,12 @@ export class GuildPlayer {
     // Invalidate in-flight createPcmSource so it won't assign #incomingTempFile
     // after cancel (stop / skip / replace prep / playNextMixer).
     this.#incomingPrepId += 1;
+    // Phase 8: a prepared stem pair is only ever prepped alongside an
+    // attempted stem-mix transition's full-mix incoming prep — piggyback on
+    // every existing call site that abandons the latter rather than
+    // duplicating them.
+    this.#clearPreparedOutgoingStems();
+    this.#clearPreparedIncomingStems();
     if (!this.#preparedIncoming) return;
     const pending = this.#preparedIncoming;
     this.#preparedIncoming = null;
@@ -1338,6 +1785,7 @@ export class GuildPlayer {
       if (forPlayback && this.#incomingTempFile) {
         this.#currentTempFile = this.#incomingTempFile;
         this.#incomingTempFile = null;
+        this.#currentMeasured = this.#incomingMeasured;
         this.#incomingMeasured = null;
       }
       return source;
@@ -1434,8 +1882,59 @@ export class GuildPlayer {
         tempoBackend,
         maxOverlapSec: MAX_CROSSFADE_SEC,
       });
-      if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
-      const norm = normalizeTransitionPlan(rawPlan);
+
+      // Phase 8 (docs/mix-transition-phase8.md): only attempted when plain
+      // tier-1 beatmix did NOT win the fallback ladder (mode !== 'beatmix')
+      // — stem-mix reuses 100% of beatmix's tempo/downbeat/meter gating (via
+      // planStemTransition()'s relaxed-flag options into
+      // planBeatmixTransition()), so if beatmix already succeeded there is
+      // nothing for it to improve on; it exists specifically to rescue the
+      // case where only the whole-overlap vocal-safety requirement stood in
+      // the way. Gated on stems already being cached (a cheap fs check) so
+      // this never triggers separation itself — #scheduleAnalysis() already
+      // does that in the background, well before a transition is imminent.
+      // Looked up once here and reused at both the prepDue and readyToFade
+      // points below — a second fs check right before spawning would risk
+      // observing a DIFFERENT cache state than what eligibility was actually
+      // decided against a few lines up.
+      //
+      // Tried BEFORE rawPlan's own gapless/no-fade early return (not after)
+      // — planStemTransition() is derived independently from outAnalysis/
+      // inAnalysis, not from rawPlan, so a rawPlan that fell all the way to
+      // 'gapless' (e.g. low aggregate/vocal confidence even with strong
+      // beat/downbeat analysis) must not preempt an otherwise-eligible
+      // stem-mix plan (Codex).
+      let outCachedStems = null;
+      let inCachedStems = null;
+      let norm = null;
+      const stemCacheLookupKey = `${current.videoId ?? ''}:${next.videoId ?? ''}`;
+      if (rawPlan.mode !== 'beatmix' && this.#stemMixUnavailableKey !== stemCacheLookupKey) {
+        if (this.#stemCacheHit?.key === stemCacheLookupKey) {
+          ({ outCachedStems, inCachedStems } = this.#stemCacheHit);
+        } else {
+          [outCachedStems, inCachedStems] = await Promise.all([
+            this.#getCachedStemsFn(current.videoId),
+            this.#getCachedStemsFn(next.videoId),
+          ]);
+          if (outCachedStems && inCachedStems) {
+            this.#stemCacheHit = { key: stemCacheLookupKey, outCachedStems, inCachedStems };
+          }
+        }
+        if (outCachedStems && inCachedStems) {
+          const stemPlan = this.#planStemTransitionFn(outAnalysis, inAnalysis, {
+            outgoingPlaybackBpm,
+            tempoBackend,
+            maxOverlapSec: MAX_CROSSFADE_SEC,
+          });
+          if (stemPlan.eligible) {
+            norm = normalizeTransitionPlan(stemPlan);
+          }
+        }
+      }
+      if (!norm) {
+        if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
+        norm = normalizeTransitionPlan(rawPlan);
+      }
 
       // §2.3/§8.4: TRACK loop mode repeats the SAME track (`next === current`
       // above) — planBeatSyncedTransition still picks a head-window entry
@@ -1448,11 +1947,27 @@ export class GuildPlayer {
       // out of beatmix since its bar envelope assumed the original,
       // downbeat-aligned candidate rather than the file's real start.
       if (next === current) {
+        if (norm.mixPlan.mode === 'stem-mix') {
+          // stem-mix's own exitStartSec was chosen with vocal-safety
+          // relaxed (requireExitVocalSafe/requireEntryForwardSafe: false)
+          // — reusing it for a plain (non-separated) crossfade can violate
+          // 禁止5 (vocal-on-vocal collision), since without the per-stem
+          // envelope there's nothing keeping the outgoing vocal tail clear
+          // of the incoming track's own start. Re-plan from rawPlan (the
+          // ordinary, non-relaxed fallback-ladder result) instead of merely
+          // stripping stems from the relaxed plan (Codex) — matches the
+          // same beatmix/plain-crossfade downgrade this loop-mode override
+          // already performs safely for non-stem plans.
+          if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
+          norm = normalizeTransitionPlan(rawPlan);
+        }
         norm.entrySec = 0;
         norm.tempoFilter = null;
         norm.sessionTempo = null;
         if (norm.mixPlan.mode === 'beatmix') {
-          norm.mixPlan = { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false };
+          norm.mixPlan = {
+            ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null,
+          };
         }
       }
 
@@ -1497,6 +2012,32 @@ export class GuildPlayer {
           tempoFilter: norm.tempoFilter,
           sessionTempo: norm.sessionTempo,
         });
+        // Phase 8: late-bound (see #ensureOutgoingStemPrep()'s docstring) —
+        // fired from this same gate, not at track-promotion time.
+        if (norm.mixPlan.mode === 'stem-mix' && outCachedStems && inCachedStems) {
+          const outgoingStemTempoFilter = this.#outgoingStemTempoFilter(tempoBackend);
+          // undefined means a required stretch couldn't be expressed — spawning
+          // the stems anyway would decode them at native tempo while #current
+          // keeps playing stretched, drifting apart for the whole stem window.
+          // Skip prep entirely so #takePreparedOutgoingStems() naturally misses
+          // at take time and the transition downgrades to a plain crossfade.
+          if (outgoingStemTempoFilter !== undefined) {
+            // Fire-and-forget, like #ensureIncomingPrep() above — but these
+            // two are async (revalidate the cache before spawning; see
+            // #ensureOutgoingStemPrep()'s docstring), so an unhandled
+            // rejection would otherwise surface as an unhandled-rejection
+            // crash instead of the fail-soft downgrade #takePreparedXStems()
+            // already provides when prep never lands.
+            this.#ensureOutgoingStemPrep(outCachedStems, current.videoId, {
+              startSec: norm.exitStartSec ?? 0,
+              tempoFilter: outgoingStemTempoFilter,
+            }).catch((err) => console.warn('[GuildPlayer] outgoing stem prep failed:', err.message));
+            this.#ensureIncomingStemPrep(inCachedStems, next.videoId, {
+              startSec: norm.entrySec,
+              tempoFilter: norm.tempoFilter,
+            }).catch((err) => console.warn('[GuildPlayer] incoming stem prep failed:', err.message));
+          }
+        }
       }
 
       const readyToFade = startSec != null
@@ -1547,28 +2088,131 @@ export class GuildPlayer {
       // fell back to native, unstretched tempo. Either field being set means
       // the plan required a transform this source didn't actually apply.
       const requiresUnhonoredTransform = norm.entrySec > 0 || norm.tempoFilter != null;
-      const mixPlan = (!sourceHonorsPlan && requiresUnhonoredTransform)
-        ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false }
+      const forcePlainCrossfade = !sourceHonorsPlan && requiresUnhonoredTransform;
+      if (forcePlainCrossfade) {
+        // The stem pairs (if any were prepped) were prepped for a plan this
+        // source cannot honor — release their ffmpeg processes now rather
+        // than leaving them blocked on backpressure until an unrelated
+        // #clearPreparedIncoming() call happens to sweep them up later.
+        this.#clearPreparedOutgoingStems();
+        this.#clearPreparedIncomingStems();
+        if (norm.mixPlan.mode === 'stem-mix') {
+          // stem-mix's exitStartSec/entrySec were chosen with vocal-safety
+          // relaxed (requireExitVocalSafe/requireEntryForwardSafe: false).
+          // Downgrading to a plain (non-separated) crossfade but keeping
+          // that same window would reuse a position that's only safe WITH
+          // the per-stem envelope keeping the outgoing vocal tail clear of
+          // the incoming track's own start — a plain crossfade has no such
+          // envelope, so this can violate 禁止5 (vocal-on-vocal collision).
+          // Abort this attempt entirely rather than downgrade the window
+          // (Codex); mark the pair unavailable so the NEXT arm tick's plan
+          // selection above falls through to rawPlan's own, non-relaxed
+          // selection instead of re-picking this same relaxed stem plan
+          // and looping on this same abort forever (Codex round-9 follow-up).
+          this.#stemMixUnavailableKey = stemCacheLookupKey;
+          source.destroy();
+          await this.#cleanupIncomingTempFile();
+          return;
+        }
+      }
+      let mixPlan = forcePlainCrossfade
+        ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null }
         : norm.mixPlan;
 
-      // Set promotion state BEFORE calling startCrossfade(): if the outgoing
-      // source is already at EOF, startCrossfade()'s synchronous
-      // #scheduleRead() can promote the incoming source (and fire
-      // #onCrossfadePromoted synchronously) before this call returns —
-      // #onCrossfadePromoted must see the real target/tempo, not stale
-      // values from a previous crossfade attempt. Rolled back on failure.
+      // Phase 8 (Codex): the outgoing stems were seeked to a FIXED native
+      // exitStartSec back at prepDue and don't track #current's live
+      // position — the normal small overshoot past `startSec` here (one
+      // arm-tick's worth) is harmless and already tolerated by the
+      // non-stem-mix path too. What actually breaks alignment is the
+      // #takePreparedIncoming() await ABOVE stretching arbitrarily long (a
+      // still-downloading/normalizing incoming track) while #current keeps
+      // playing — so compare against the position snapshot taken before
+      // that await, not against `startSec` itself.
+      if (mixPlan.mode === 'stem-mix') {
+        const freshPositionSec = this.#mixStream?.positionSec ?? positionSec;
+        if (freshPositionSec - positionSec > OUTGOING_STEM_DRIFT_TOLERANCE_SEC) {
+          // Same reasoning as the forcePlainCrossfade abort above — a plain
+          // crossfade reusing stem-mix's relaxed window is unsafe (Codex),
+          // and marking the pair unavailable avoids looping on this same
+          // abort every arm tick (Codex round-9 follow-up).
+          this.#stemMixUnavailableKey = stemCacheLookupKey;
+          this.#clearPreparedOutgoingStems();
+          this.#clearPreparedIncomingStems();
+          source.destroy();
+          await this.#cleanupIncomingTempFile();
+          return;
+        }
+      }
+
+      // Phase 8: take the two prepared stem pairs only now that we know a
+      // plain crossfade isn't already forced (sourceHonorsPlan check above)
+      // — if either pair didn't finish prepping in time, downgrade to the
+      // plain crossfade `source` (the incoming full mix) is already valid
+      // for, rather than aborting an otherwise-ready transition.
+      let outgoingStems = null;
+      let incomingStems = null;
+      if (mixPlan.mode === 'stem-mix') {
+        // Take BOTH unconditionally (never short-circuit on the first) —
+        // each #takePreparedXStems() call is self-contained (transfers
+        // ownership out of the prepared-field, or clears/destroys it on a
+        // mismatch), so skipping one when the other is missing would leave
+        // it dangling in its prepared-field, unconsumed, until some later
+        // unrelated #clearPreparedIncoming() call happened to sweep it up.
+        outgoingStems = this.#takePreparedOutgoingStems(current.videoId, {
+          startSec: norm.exitStartSec ?? 0,
+          tempoFilter: this.#outgoingStemTempoFilter(tempoBackend),
+        });
+        incomingStems = this.#takePreparedIncomingStems(next.videoId, {
+          startSec: norm.entrySec,
+          tempoFilter: norm.tempoFilter,
+        });
+        if (!outgoingStems || !incomingStems) {
+          outgoingStems?.vocal?.destroy?.();
+          outgoingStems?.instrumental?.destroy?.();
+          incomingStems?.vocal?.destroy?.();
+          incomingStems?.instrumental?.destroy?.();
+          // Same reasoning as the other stem-mix abort paths above — a
+          // plain crossfade reusing this window is unsafe (Codex). Without
+          // marking the pair unavailable, the cache lookup and
+          // planStemTransitionFn() above are independent of spawn success,
+          // so every subsequent arm tick would re-select this same relaxed
+          // stem plan and abort again here — retrying until the outgoing
+          // track reaches EOF and never letting rawPlan's plain-crossfade
+          // fallback run at all (Codex round-9 follow-up).
+          this.#stemMixUnavailableKey = stemCacheLookupKey;
+          source.destroy();
+          await this.#cleanupIncomingTempFile();
+          return;
+        }
+      }
+
+      // Set promotion state BEFORE calling startCrossfade()/
+      // startStemCrossfade(): if the outgoing source is already at EOF, the
+      // synchronous #scheduleRead() inside either can promote the incoming
+      // source (and fire #onCrossfadePromoted synchronously) before this
+      // call returns — #onCrossfadePromoted must see the real target/tempo,
+      // not stale values from a previous crossfade attempt. Rolled back on
+      // failure.
       this.#pendingSessionTempo = pendingSessionTempo;
       this.#pendingIncomingEntrySec = pendingEntrySec;
       this.#crossfadeTargetTrack = next;
       this.#crossfadeStarted = true;
 
-      const started = this.#mixStream.startCrossfade(source, mixPlan);
+      const started = mixPlan.mode === 'stem-mix'
+        ? this.#mixStream.startStemCrossfade(
+          { outgoing: outgoingStems, incoming: { ...incomingStems, full: source } },
+          mixPlan,
+        )
+        : this.#mixStream.startCrossfade(source, mixPlan);
       if (!started) {
         this.#pendingSessionTempo = null;
         this.#pendingIncomingEntrySec = 0;
         this.#crossfadeTargetTrack = null;
         this.#crossfadeStarted = false;
-        source.destroy();
+        // startStemCrossfade() already destroys every source it was handed
+        // (including `source`/incoming.full) on a rejected call, mirroring
+        // startCrossfade()'s own contract — avoid double-destroying it here.
+        if (mixPlan.mode !== 'stem-mix') source.destroy();
         await this.#cleanupIncomingTempFile();
         return;
       }
@@ -1735,6 +2379,7 @@ export class GuildPlayer {
   async #cleanupCurrentTempFile() {
     const filePath = this.#currentTempFile;
     this.#currentTempFile = null;
+    this.#currentMeasured = null;
     if (filePath) {
       await cleanupTempFile(filePath);
     }
