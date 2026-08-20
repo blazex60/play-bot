@@ -29,38 +29,74 @@ function collectFrames(stream, count) {
   });
 }
 
-function firstSample(chunk) {
-  const view = new Int16Array(chunk.buffer, chunk.byteOffset, Math.floor(chunk.byteLength / 2));
-  return view.length > 0 ? view[0] : 0;
+function pcmView(chunk) {
+  return new Int16Array(chunk.buffer, chunk.byteOffset, Math.floor(chunk.byteLength / 2));
 }
 
-async function waitForSample(samples, value, timeoutMs = 1000) {
+function pcmContains(chunks, value) {
+  for (const chunk of chunks) {
+    const view = pcmView(chunk);
+    for (let i = 0; i < view.length; i++) {
+      if (view[i] === value) return true;
+    }
+  }
+  return false;
+}
+
+function previewFrameSamples(chunks, max = 8) {
+  const out = [];
+  const step = FRAME_BYTES / 2;
+  for (const chunk of chunks) {
+    const view = pcmView(chunk);
+    for (let i = 0; i < view.length && out.length < max; i += step) {
+      out.push(view[i]);
+    }
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+async function waitForPcm(chunks, value, timeoutMs = 1000) {
   const deadline = Date.now() + timeoutMs;
-  while (!samples.includes(value) && Date.now() < deadline) {
+  while (!pcmContains(chunks, value) && Date.now() < deadline) {
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
 
+function fillFrame(value) {
+  const buf = Buffer.alloc(FRAME_BYTES);
+  pcmView(buf).fill(value);
+  return buf;
+}
+
 test('MixStream pushes gapless frames from a PCM source', async () => {
   const mix = new MixStream();
-  const source = PcmSource.fromBuffers([silence(FRAME_BYTES * 3)]);
-  mix.setCurrent(source);
+  try {
+    const source = PcmSource.fromBuffers([silence(FRAME_BYTES * 3)]);
+    mix.setCurrent(source);
 
-  const frames = await collectFrames(mix, 3);
-  assert.equal(frames.length, 3);
-  assert.equal(frames[0].length, FRAME_BYTES);
+    const frames = await collectFrames(mix, 3);
+    assert.equal(frames.length, 3);
+    assert.equal(frames[0].length, FRAME_BYTES);
+  } finally {
+    mix.endMixer();
+  }
 });
 
 test('MixStream emits trackend when the current source ends', async () => {
   const mix = new MixStream();
-  const source = PcmSource.fromBuffers([silence(FRAME_BYTES)]);
-  let ended = false;
-  mix.on('trackend', () => { ended = true; });
-  mix.setCurrent(source);
+  try {
+    const source = PcmSource.fromBuffers([silence(FRAME_BYTES)]);
+    let ended = false;
+    mix.on('trackend', () => { ended = true; });
+    mix.setCurrent(source);
 
-  await collectFrames(mix, 1);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(ended, true);
+    await collectFrames(mix, 1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(ended, true);
+  } finally {
+    mix.endMixer();
+  }
 });
 
 test('MixStream dropCurrent emits trackend immediately', async () => {
@@ -111,10 +147,14 @@ test('MixStream.isDestroyed is true after endMixer', () => {
 
 test('MixStream reports playback position in seconds', async () => {
   const mix = new MixStream();
-  const source = PcmSource.fromBuffers([silence(FRAME_BYTES * 5)]);
-  mix.setCurrent(source);
-  await collectFrames(mix, 2);
-  assert.ok(mix.positionSec > 0);
+  try {
+    const source = PcmSource.fromBuffers([silence(FRAME_BYTES * 5)]);
+    mix.setCurrent(source);
+    await collectFrames(mix, 2);
+    assert.ok(mix.positionSec > 0);
+  } finally {
+    mix.endMixer();
+  }
 });
 
 test('MixStream waiting for the first source does not fire the underrun watchdog', async () => {
@@ -153,22 +193,21 @@ test('MixStream waiting for the first source does not fire the underrun watchdog
 test('MixStream delivers PCM after a flowing consumer attaches before setCurrent', async () => {
   const mix = new MixStream();
   const sink = new PassThrough();
-  const samples = [];
-  sink.on('data', (chunk) => samples.push(firstSample(chunk)));
+  const received = [];
+  sink.on('data', (chunk) => received.push(Buffer.from(chunk)));
   mix.pipe(sink);
 
   try {
     await new Promise((resolve) => setImmediate(resolve));
 
-    const tone = Buffer.alloc(FRAME_BYTES);
-    new Int16Array(tone.buffer).fill(1234);
-    mix.setCurrent(PcmSource.fromBuffers([Buffer.from(tone), Buffer.from(tone)]));
+    mix.setCurrent(PcmSource.fromBuffers([fillFrame(1234), fillFrame(1234)]));
 
     // fromBuffers appends in a microtask, so MixStream may emit a brief
-    // silence frame first (same as production waiting on ffmpeg). Wait for
-    // the real tone rather than asserting on the first sample.
-    await waitForSample(samples, 1234);
-    assert.ok(samples.includes(1234), `expected real PCM after leading silence, got ${samples.slice(0, 8)}`);
+    // silence frame first (same as production waiting on ffmpeg). Pipe
+    // backpressure can also coalesce later PCM into a chunk that does not
+    // start with the tone — scan the whole buffer rather than sample[0].
+    await waitForPcm(received, 1234);
+    assert.ok(pcmContains(received, 1234), `expected real PCM after leading silence, got ${previewFrameSamples(received)}`);
   } finally {
     mix.unpipe(sink);
     mix.endMixer();
@@ -177,24 +216,19 @@ test('MixStream delivers PCM after a flowing consumer attaches before setCurrent
 
 test('MixStream setCurrent after a flowing between-tracks gap delivers the next track', async () => {
   const mix = new MixStream();
-  const first = Buffer.alloc(FRAME_BYTES);
-  new Int16Array(first.buffer).fill(111);
-  const second = Buffer.alloc(FRAME_BYTES);
-  new Int16Array(second.buffer).fill(2222);
-
   const sink = new PassThrough();
-  const samples = [];
-  sink.on('data', (chunk) => samples.push(firstSample(chunk)));
+  const received = [];
+  sink.on('data', (chunk) => received.push(Buffer.from(chunk)));
   mix.pipe(sink);
 
   try {
     const ended = new Promise((resolve) => mix.once('trackend', resolve));
-    mix.setCurrent(PcmSource.fromBuffers([Buffer.from(first)]));
+    mix.setCurrent(PcmSource.fromBuffers([fillFrame(111)]));
     await ended;
 
-    mix.setCurrent(PcmSource.fromBuffers([Buffer.from(second), Buffer.from(second)]));
-    await waitForSample(samples, 2222);
-    assert.ok(samples.includes(2222), `expected next-track PCM after the flowing gap, got ${samples.slice(0, 8)}`);
+    mix.setCurrent(PcmSource.fromBuffers([fillFrame(2222), fillFrame(2222)]));
+    await waitForPcm(received, 2222);
+    assert.ok(pcmContains(received, 2222), `expected next-track PCM after the flowing gap, got ${previewFrameSamples(received)}`);
   } finally {
     mix.unpipe(sink);
     mix.endMixer();

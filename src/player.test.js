@@ -181,7 +181,7 @@ test('GuildPlayer: a flowing mixer pipeline still plays PCM after createAudioRes
   const { PcmSource } = await import('./audio/pcmSource.js')
 
   const tone = Buffer.alloc(FRAME_BYTES)
-  new Int16Array(tone.buffer).fill(4321)
+  new Int16Array(tone.buffer, tone.byteOffset, FRAME_BYTES / 2).fill(4321)
   const received = []
 
   const { player } = makePlayer({
@@ -192,22 +192,29 @@ test('GuildPlayer: a flowing mixer pipeline still plays PCM after createAudioRes
 
   const mix = player.mixStream
   const sink = new PassThrough()
-  sink.on('data', (chunk) => {
-    const view = new Int16Array(chunk.buffer, chunk.byteOffset, Math.floor(chunk.byteLength / 2))
-    if (view.length > 0) received.push(view[0])
-  })
+  sink.on('data', (chunk) => received.push(Buffer.from(chunk)))
   mix.pipe(sink)
   try {
     await new Promise((resolve) => setImmediate(resolve))
 
     await player.playNext()
 
+    const containsTone = () => {
+      for (const chunk of received) {
+        const view = new Int16Array(chunk.buffer, chunk.byteOffset, Math.floor(chunk.byteLength / 2))
+        for (let i = 0; i < view.length; i++) {
+          if (view[i] === 4321) return true
+        }
+      }
+      return false
+    }
+
     const deadline = Date.now() + 1000
-    while (!received.includes(4321) && Date.now() < deadline) {
+    while (!containsTone() && Date.now() < deadline) {
       await new Promise((resolve) => setImmediate(resolve))
     }
 
-    assert.ok(received.includes(4321), `expected real PCM after leading silence, got ${received.slice(0, 8)}`)
+    assert.ok(containsTone(), 'expected real PCM after leading silence')
   } finally {
     mix.unpipe(sink)
     await player.stop()
