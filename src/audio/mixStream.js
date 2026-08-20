@@ -721,10 +721,6 @@ export class MixStream extends Readable {
     // the rest, same tolerant philosophy as #readCrossfadeFrame()).
     if ((!outVocalFrame && !outVocalDone) || (!outInstFrame && !outInstDone)
       || (!inVocalFrame && !inVocalDone) || (!inInstFrame && !inInstDone)) {
-      this.#heldOutVocalFrame = outVocalFrame;
-      this.#heldOutInstrumentalFrame = outInstFrame;
-      this.#heldInVocalFrame = inVocalFrame;
-      this.#heldInInstrumentalFrame = inInstFrame;
       // A transient stall in just one of six concurrent decoders (4 stems +
       // #incoming + #current) must not silence the whole mix — the ordinary
       // (non-stem) crossfade path keeps playing #current while its own
@@ -736,6 +732,25 @@ export class MixStream extends Readable {
       // tick of the outgoing track is far less audible than a dead gap
       // (Codex). Does not advance #fadeElapsedSec/#stemCrossfadeTicks —
       // this tick doesn't count as a real stem-mix tick, same as before.
+      //
+      // Deliberately do NOT hold whichever of the 4 frames DID arrive this
+      // tick (unlike the pre-fallback version of this branch, which cached
+      // them in #held*Frame for reuse next tick): once #current is played
+      // here, those frames represent audio from an EARLIER moment than
+      // whatever #current just played. Reusing them on the recovery tick
+      // would mix content read at two different ticks into one output
+      // frame — and, worse, "emit" that already-superseded content after
+      // the listener already heard #current's own version of roughly that
+      // moment, an audible discontinuity (Codex). Discarding them instead
+      // means the recovery tick reads all 4 stems fresh, keeping them
+      // mutually time-consistent with each other — each may end up up to
+      // one frame ahead of #fadeElapsedSec's own position, but that's
+      // bounded (one stall = one frame) and covered by the same clamped-
+      // terminal-gain safety margin the whole catch-up design relies on.
+      this.#heldOutVocalFrame = null;
+      this.#heldOutInstrumentalFrame = null;
+      this.#heldInVocalFrame = null;
+      this.#heldInInstrumentalFrame = null;
       return this.#readExact(this.#current, FRAME_BYTES);
     }
     this.#heldOutVocalFrame = null;
@@ -868,7 +883,6 @@ export class MixStream extends Readable {
 
   #promoteStemIncoming() {
     const next = this.#incoming;
-    const fadeElapsedSec = this.#fadeElapsedSec;
     this.#clearStemSources();
     this.#outEq = null;
     this.#inEq = null;
@@ -893,9 +907,16 @@ export class MixStream extends Readable {
     // lockstep with the stem mix throughout the window (see
     // #readStemCrossfadeFrame()), so its own read position already sits at
     // the right native continuation point — consumedBytes only needs to
-    // reflect how much playback-domain audio has been heard so far
-    // (fadeElapsedSec), not an extra skip/offset calculation.
-    this.#consumedBytes = Math.round(fadeElapsedSec * BYTES_PER_SECOND);
+    // reflect how much playback-domain audio has actually been read from
+    // `next` so far. That is normally fadeElapsedSec's worth (the caught-up
+    // case), but MAX_STEM_CATCHUP_HOLD_TICKS can force promotion while
+    // #incoming is still short of #stemCrossfadeTicks frames — deriving
+    // consumedBytes from fadeElapsedSec in that case overstates it by the
+    // residual deficit, since that many frames were never actually read
+    // from `next`. Using #incomingStemFramesRead (the real count) instead
+    // keeps consumedBytes matching next's true read position in both cases
+    // (Codex: forced promotion desyncs position bookkeeping).
+    this.#consumedBytes = this.#incomingStemFramesRead * FRAME_BYTES;
     this.#durationSec = null;
     this.#betweenTracks = false;
 

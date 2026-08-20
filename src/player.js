@@ -1818,10 +1818,24 @@ export class GuildPlayer {
       // out of beatmix since its bar envelope assumed the original,
       // downbeat-aligned candidate rather than the file's real start.
       if (next === current) {
+        if (norm.mixPlan.mode === 'stem-mix') {
+          // stem-mix's own exitStartSec was chosen with vocal-safety
+          // relaxed (requireExitVocalSafe/requireEntryForwardSafe: false)
+          // — reusing it for a plain (non-separated) crossfade can violate
+          // 禁止5 (vocal-on-vocal collision), since without the per-stem
+          // envelope there's nothing keeping the outgoing vocal tail clear
+          // of the incoming track's own start. Re-plan from rawPlan (the
+          // ordinary, non-relaxed fallback-ladder result) instead of merely
+          // stripping stems from the relaxed plan (Codex) — matches the
+          // same beatmix/plain-crossfade downgrade this loop-mode override
+          // already performs safely for non-stem plans.
+          if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
+          norm = normalizeTransitionPlan(rawPlan);
+        }
         norm.entrySec = 0;
         norm.tempoFilter = null;
         norm.sessionTempo = null;
-        if (norm.mixPlan.mode === 'beatmix' || norm.mixPlan.mode === 'stem-mix') {
+        if (norm.mixPlan.mode === 'beatmix') {
           norm.mixPlan = {
             ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null,
           };
@@ -1953,6 +1967,21 @@ export class GuildPlayer {
         // #clearPreparedIncoming() call happens to sweep them up later.
         this.#clearPreparedOutgoingStems();
         this.#clearPreparedIncomingStems();
+        if (norm.mixPlan.mode === 'stem-mix') {
+          // stem-mix's exitStartSec/entrySec were chosen with vocal-safety
+          // relaxed (requireExitVocalSafe/requireEntryForwardSafe: false).
+          // Downgrading to a plain (non-separated) crossfade but keeping
+          // that same window would reuse a position that's only safe WITH
+          // the per-stem envelope keeping the outgoing vocal tail clear of
+          // the incoming track's own start — a plain crossfade has no such
+          // envelope, so this can violate 禁止5 (vocal-on-vocal collision).
+          // Abort this attempt entirely rather than downgrade the window
+          // (Codex); a later arm tick re-plans from scratch (falling
+          // through to rawPlan's own, non-relaxed selection).
+          source.destroy();
+          await this.#cleanupIncomingTempFile();
+          return;
+        }
       }
       let mixPlan = forcePlainCrossfade
         ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null }
@@ -1970,9 +1999,13 @@ export class GuildPlayer {
       if (mixPlan.mode === 'stem-mix') {
         const freshPositionSec = this.#mixStream?.positionSec ?? positionSec;
         if (freshPositionSec - positionSec > OUTGOING_STEM_DRIFT_TOLERANCE_SEC) {
+          // Same reasoning as the forcePlainCrossfade abort above — a plain
+          // crossfade reusing stem-mix's relaxed window is unsafe (Codex).
           this.#clearPreparedOutgoingStems();
           this.#clearPreparedIncomingStems();
-          mixPlan = { ...mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null };
+          source.destroy();
+          await this.#cleanupIncomingTempFile();
+          return;
         }
       }
 
@@ -2003,9 +2036,11 @@ export class GuildPlayer {
           outgoingStems?.instrumental?.destroy?.();
           incomingStems?.vocal?.destroy?.();
           incomingStems?.instrumental?.destroy?.();
-          mixPlan = { ...mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null };
-          outgoingStems = null;
-          incomingStems = null;
+          // Same reasoning as the other stem-mix abort paths above — a
+          // plain crossfade reusing this window is unsafe (Codex).
+          source.destroy();
+          await this.#cleanupIncomingTempFile();
+          return;
         }
       }
 

@@ -1935,3 +1935,59 @@ test('acceptance (mixer): a rejected prep revalidation does not permanently disa
     await player.stop();
   }
 });
+
+test('acceptance (mixer): missing prepared stems at take time aborts instead of downgrading to a plain crossfade', async () => {
+  // Codex: stem-mix's exitStartSec/entrySec are chosen with vocal-safety
+  // relaxed (requireExitVocalSafe/requireEntryForwardSafe: false) — reusing
+  // that same window for a plain (non-separated) crossfade when one side's
+  // stem prep never lands would reintroduce the vocal-collision risk 禁止5
+  // guards against, since a plain crossfade has no per-stem envelope to
+  // keep the outgoing vocal tail clear of the incoming track's own start.
+  // #takePreparedOutgoingStems() returning null at take time (outgoing stem
+  // spawning keeps failing here) must abort this attempt entirely — never
+  // fall through to mixStream.startCrossfade() at the same window.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  const stemSourceCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => ({
+      vocalPath: `/tmp/${videoId}.vocal.wav`,
+      instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+    }),
+    createFileSourceFn: (filePath, opts) => {
+      stemSourceCalls.push({ filePath, opts });
+      if (filePath.includes('vid-a')) {
+        // Outgoing stem prep keeps failing to spawn — incoming succeeds.
+        throw new Error('simulated outgoing stem spawn failure');
+      }
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 200; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    assert.equal(startedPlan, null,
+      'expected the transition to abort rather than downgrade to an unsafe plain crossfade');
+    assert.ok(stemSourceCalls.some((c) => c.filePath.includes('vid-a')),
+      'expected outgoing stem prep to have been attempted (and to keep failing)');
+  } finally {
+    await player.stop();
+  }
+});

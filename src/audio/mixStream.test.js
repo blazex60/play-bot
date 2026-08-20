@@ -752,6 +752,60 @@ test('MixStream startStemCrossfade caps how long it holds for a #incoming that n
   }
 });
 
+test('MixStream startStemCrossfade corrects position bookkeeping when the hold cap forces promotion with a residual deficit', async () => {
+  // Codex: #promoteStemIncoming() used to derive #consumedBytes from
+  // fadeElapsedSec, which keeps growing on every hold tick even when
+  // #incoming's OWN read position lags behind — exactly the scenario the
+  // hold-tick cap above forces promotion through. That overstated the
+  // reported position by however many frames #incoming never actually
+  // delivered. consumedBytes must instead reflect #incomingStemFramesRead,
+  // the count of frames actually read from #incoming.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 200), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const outgoing = { vocal: stemSource(2000, 200), instrumental: stemSource(3000, 200) };
+    let served = 0;
+    const fullSource = new EventEmitter();
+    fullSource.ended = false;
+    fullSource.error = null;
+    fullSource.destroy = () => { fullSource.removeAllListeners(); fullSource.ended = true; };
+    fullSource.read = () => {
+      if (served >= 3) return null; // permanently stalls after 3 frames actually read
+      served += 1;
+      return fillFrame(6000);
+    };
+
+    const incoming = {
+      vocal: stemSource(4000, 200),
+      instrumental: stemSource(5000, 200),
+      full: fullSource,
+    };
+    const plan = makeStemPlan(0.2);
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    let positionAtPromotion = null;
+    mix.on('trackend', (info) => {
+      if (info?.promoted && positionAtPromotion === null) positionAtPromotion = mix.positionSec;
+    });
+    mix.on('data', () => {});
+    const deadline = Date.now() + 5000;
+    while (positionAtPromotion === null && Date.now() < deadline) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.ok(positionAtPromotion !== null, 'expected forced promotion to occur');
+    // Only 3 frames (0.06s) were ever actually read from #incoming, no
+    // matter how many ticks the hold ran for by the time the cap tripped —
+    // position must match that, not the much larger fadeElapsedSec.
+    assert.ok(positionAtPromotion < 0.1,
+      `expected position to reflect the 3 actually-read frames (~0.06s), got ${positionAtPromotion}`);
+  } finally {
+    mix.endMixer();
+  }
+});
+
 test('MixStream startStemCrossfade: inVocal contributes nothing before its own startOffsetSec (delayed-envelope wiring)', async () => {
   // The core Phase 8 correctness property: during the window before inVocal
   // starts fading in, its underlying PCM content must have ZERO effect on
