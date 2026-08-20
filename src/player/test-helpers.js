@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { AudioPlayerStatus, StreamType } from '@discordjs/voice';
 import { GuildPlayer } from '../player.js';
 import { GuildQueue, createTrack } from '../queue.js';
@@ -7,6 +8,31 @@ import { FRAME_BYTES } from '../audio/fade.js';
 
 export function nextTurn() {
   return new Promise(resolve => setImmediate(resolve));
+}
+
+export function makePendingPcmSource() {
+  const source = new EventEmitter();
+  source.ended = false;
+  source.error = null;
+  source.available = 0;
+  source.read = () => null;
+  source.destroy = () => {
+    source.removeAllListeners();
+    source.ended = true;
+  };
+  return source;
+}
+
+export function deliverPcm(source, bytes = FRAME_BYTES) {
+  const frame = Buffer.alloc(bytes);
+  source.available = bytes;
+  source.read = (n) => {
+    const chunk = frame.subarray(0, Math.min(n, frame.length));
+    source.available = 0;
+    source.read = () => null;
+    return chunk;
+  };
+  source.emit('data');
 }
 
 export function makeAudioPlayer() {
@@ -21,10 +47,12 @@ export function makeAudioPlayer() {
       this.state = { status: AudioPlayerStatus.Playing, resource };
     },
     pause() {
+      if (this.state.status !== AudioPlayerStatus.Playing) return false;
       this.state = { ...this.state, status: AudioPlayerStatus.Paused };
       return true;
     },
     unpause() {
+      if (this.state.status !== AudioPlayerStatus.Paused) return false;
       this.state = { ...this.state, status: AudioPlayerStatus.Playing };
       return true;
     },
@@ -52,6 +80,8 @@ export function makePlayer({
   getCachedStemsFn,
   planStemTransitionFn,
   createFileSourceFn,
+  pcmWaitTimeoutMs,
+  connection,
 } = {}) {
   const queue = new GuildQueue();
   queue.add(track ?? createTrack({
@@ -82,7 +112,8 @@ export function makePlayer({
     getCachedStemsFn,
     planStemTransitionFn,
     createFileSourceFn,
-    connection: {
+    pcmWaitTimeoutMs,
+    connection: connection ?? {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer);
       },
@@ -92,6 +123,11 @@ export function makePlayer({
       return { url };
     },
     createAudioResourceFn(stream, options) {
+      assert.equal(options?.inputType, StreamType.Raw);
+      assert.ok(
+        stream?.currentSource,
+        'createAudioResource must run after MixStream.setCurrent so the opus encoder is not starved',
+      );
       const resource = {
         stream,
         options,
@@ -107,4 +143,4 @@ export function makePlayer({
   return { player, audioPlayer, resources, queue };
 }
 
-export { StreamType };
+export { StreamType, FRAME_BYTES };

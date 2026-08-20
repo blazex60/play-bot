@@ -1,10 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { AudioPlayerStatus, StreamType } from '@discordjs/voice'
+import { AudioPlayerStatus, NoSubscriberBehavior, StreamType } from '@discordjs/voice'
 import { createTrack } from './queue.js'
 import { triggerTrackEnd } from './player/playbackDrive.js'
-import { makePlayer, makeAudioPlayer, nextTurn } from './player/test-helpers.js'
-import { ANALYSIS_VERSION } from './audio/trackAnalysis.js'
+import { makePlayer, makeAudioPlayer, nextTurn, makePendingPcmSource, deliverPcm } from './player/test-helpers.js'
+import {
+  ANALYSIS_VERSION,
+} from './audio/trackAnalysis.js'
+import {
+  MIXER_AUDIO_PLAYER_OPTIONS,
+  MIXER_AUDIO_RESOURCE_OPTIONS,
+  MIXER_MAX_MISSED_FRAMES,
+} from './player.js'
 
 // --- Phase 7B §8.4: session tempo bookkeeping. Phase 7D wires an actual
 // stretch (beatmix promotion) into it — see player.acceptance.test.js's
@@ -95,11 +102,211 @@ test('GuildPlayer.playNext plays the mixer resource as StreamType.Raw', async ()
   await player.playNext()
 
   assert.equal(audioPlayer.resource, resources[0])
-  assert.deepEqual(resources[0].options, {
-    inputType: StreamType.Raw,
-  })
+  assert.deepEqual(resources[0].options, MIXER_AUDIO_RESOURCE_OPTIONS)
 
   await player.stop()
+})
+
+test('GuildPlayer pipelines MixStream only after a PCM source is attached', async () => {
+  const { player, resources } = makePlayer()
+
+  assert.equal(resources.length, 0, 'constructor must not opus-pipeline an empty MixStream')
+  await player.playNext()
+  assert.equal(resources.length, 1)
+  assert.equal(resources[0].stream, player.mixStream)
+  assert.ok(player.mixStream.currentSource, 'opus pipeline must start after setCurrent')
+
+  await player.stop()
+})
+
+test('GuildPlayer does not opus-pipeline until the PCM source has data', async () => {
+  let source
+  const { player, resources } = makePlayer({
+    createPcmSourceFn: async () => {
+      source = makePendingPcmSource()
+      return source
+    },
+  })
+
+  const playing = player.playNext()
+  await nextTurn()
+  assert.equal(resources.length, 0, 'must not pipeline before ffmpeg/yt-dlp produces PCM')
+  assert.equal(player.mixStream.currentSource, null, 'must not setCurrent on an empty decoder')
+
+  source.emit('data')
+  await nextTurn()
+  assert.equal(resources.length, 0, 'EOF-style data with available=0 is not buffered PCM')
+  assert.equal(player.mixStream.currentSource, null)
+
+  deliverPcm(source)
+  await playing
+
+  assert.equal(resources.length, 1)
+  assert.ok(player.mixStream.currentSource)
+
+  await player.stop()
+})
+
+test('GuildPlayer cancels a pending PCM wait when skip supersedes playback', async () => {
+  const { PcmSource } = await import('./audio/pcmSource.js')
+  const { FRAME_BYTES } = await import('./audio/fade.js')
+  const started = []
+  let sourceCount = 0
+  const first = createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', videoId: 'vid-a' })
+  const second = createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', videoId: 'vid-b' })
+  const { player, queue, resources } = makePlayer({
+    track: first,
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => {
+      sourceCount += 1
+      if (sourceCount > 1) return PcmSource.fromBuffers([Buffer.alloc(FRAME_BYTES)])
+      return makePendingPcmSource()
+    },
+  })
+  queue.add(second)
+
+  const abandonedPlay = player.playNext()
+  await nextTurn()
+  await player.skip()
+  await abandonedPlay
+  for (let i = 0; i < 10 && started.length === 0; i += 1) await nextTurn()
+
+  assert.deepEqual(started, ['vid-b'])
+  assert.equal(queue.current, second)
+  assert.equal(resources.length, 1, 'the abandoned track must not start the opus pipeline')
+
+  await player.stop()
+})
+
+test('GuildPlayer treats a PCM wait timeout as a startup failure', async () => {
+  const disconnected = []
+  const started = []
+  const { player, resources } = makePlayer({
+    pcmWaitTimeoutMs: 30,
+    onDisconnect: async () => { disconnected.push(1) },
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => makePendingPcmSource(),
+  })
+
+  await player.playNext()
+  for (let i = 0; i < 20 && disconnected.length === 0; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+
+  assert.equal(resources.length, 0, 'timeout must not attach the opus pipeline')
+  assert.deepEqual(started, [])
+  assert.equal(disconnected.length, 1)
+})
+
+test('GuildPlayer treats EOF without buffered PCM as a startup failure', async () => {
+  const disconnected = []
+  const started = []
+  let source
+  const { player, resources } = makePlayer({
+    onDisconnect: async () => { disconnected.push(1) },
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => {
+      source = makePendingPcmSource()
+      return source
+    },
+  })
+
+  const playing = player.playNext()
+  await nextTurn()
+  source.emit('data')
+  source.ended = true
+  source.emit('end')
+  await playing
+  for (let i = 0; i < 20 && disconnected.length === 0; i += 1) await nextTurn()
+
+  assert.equal(resources.length, 0)
+  assert.deepEqual(started, [])
+  assert.equal(disconnected.length, 1)
+})
+
+test('GuildPlayer honors pause while waiting for the first PCM', async () => {
+  const started = []
+  let source
+  const { player, audioPlayer, resources } = makePlayer({
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', videoId: 'vid-a' }),
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => {
+      source = makePendingPcmSource()
+      return source
+    },
+  })
+
+  const playing = player.playNext()
+  await nextTurn()
+  assert.equal(player.pause(), true, 'pause during PCM wait must succeed')
+  deliverPcm(source)
+  await playing
+
+  assert.ok(player.mixStream.currentSource)
+  assert.equal(resources.length, 0, 'paused startup must not play() the mixer')
+  assert.equal(audioPlayer.state.status, AudioPlayerStatus.Idle)
+  assert.deepEqual(started, ['vid-a'])
+
+  assert.equal(player.resume(), true)
+  assert.equal(resources.length, 1)
+  assert.equal(audioPlayer.state.status, AudioPlayerStatus.Playing)
+
+  await player.stop()
+})
+
+test('GuildPlayer cancels a pending PCM wait when stop tears the session down', async () => {
+  const started = []
+  let source
+  const { player, resources } = makePlayer({
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => {
+      source = makePendingPcmSource()
+      return source
+    },
+  })
+
+  const playing = player.playNext()
+  await nextTurn()
+  await player.stop()
+  deliverPcm(source)
+  await playing
+
+  assert.equal(resources.length, 0)
+  assert.deepEqual(started, [])
+})
+
+test('GuildPlayer cancels a pending PCM wait when the voice connection is destroyed', async () => {
+  const { EventEmitter } = await import('node:events')
+  const { VoiceConnectionStatus } = await import('@discordjs/voice')
+  const started = []
+  let source
+  const connection = new EventEmitter()
+  connection.subscribe = () => {}
+  const { player, resources } = makePlayer({
+    connection,
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => {
+      source = makePendingPcmSource()
+      return source
+    },
+  })
+
+  const playing = player.playNext()
+  await nextTurn()
+  connection.emit('stateChange', { status: VoiceConnectionStatus.Ready }, { status: VoiceConnectionStatus.Destroyed })
+  deliverPcm(source)
+  await playing
+
+  assert.equal(resources.length, 0)
+  assert.deepEqual(started, [])
+})
+
+test('mixer AudioPlayer pauses without a ready subscriber and survives encoder hiccups', () => {
+  assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.noSubscriber, NoSubscriberBehavior.Pause)
+  assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.maxMissedFrames, MIXER_MAX_MISSED_FRAMES)
+  assert.ok(MIXER_MAX_MISSED_FRAMES > 5)
+  assert.equal(MIXER_AUDIO_RESOURCE_OPTIONS.silencePaddingFrames, 0)
+  assert.equal(MIXER_AUDIO_RESOURCE_OPTIONS.inputType, StreamType.Raw)
 })
 
 test('GuildPlayer: playNext calls onTrackStart with the track videoId', async () => {

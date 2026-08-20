@@ -160,11 +160,9 @@ test('MixStream reports playback position in seconds', async () => {
 });
 
 test('MixStream waiting for the first source does not fire the underrun watchdog', async () => {
-  // createAudioResource(StreamType.Raw) pipelines MixStream into an opus
-  // encoder immediately, before GuildPlayer.setCurrent. That pull used to
-  // count as an underrun: after MAX_UNDERRUN_MS the mixer emitted
-  // sourceerror, raced the real PCM source, and Discord transmitted
-  // silence (speaking indicator) with no track playing.
+  // createAudioResource(StreamType.Raw) used to pipeline MixStream before
+  // GuildPlayer.setCurrent. Keep-alive silence must not count as an underrun:
+  // after MAX_UNDERRUN_MS that used to emit sourceerror and race the real PCM.
   const mix = new MixStream();
   const errors = [];
   mix.on('sourceerror', (err) => errors.push(err.message));
@@ -186,6 +184,54 @@ test('MixStream waiting for the first source does not fire the underrun watchdog
     }
 
     assert.deepEqual(errors, []);
+  } finally {
+    mix.unpipe(sink);
+    mix.endMixer();
+  }
+});
+
+test('MixStream keep-alive before setCurrent never starves a 20 ms reader', async () => {
+  // @discordjs/voice AudioPlayer pulls every 20 ms. Five consecutive null
+  // reads (default maxMissedFrames) stop() the player and destroy MixStream.
+  const mix = new MixStream();
+  try {
+    let consecutiveMisses = 0;
+    let maxMisses = 0;
+    let hits = 0;
+    const deadline = Date.now() + 140;
+    while (Date.now() < deadline) {
+      const chunk = mix.read(FRAME_BYTES);
+      if (chunk && chunk.length) {
+        hits += 1;
+        consecutiveMisses = 0;
+      } else {
+        consecutiveMisses += 1;
+        if (consecutiveMisses > maxMisses) maxMisses = consecutiveMisses;
+      }
+      await new Promise((resolve) => setTimeout(resolve, FRAME_MS));
+    }
+    assert.ok(hits >= 4, `expected keep-alive frames, got ${hits}`);
+    assert.ok(
+      maxMisses < 5,
+      `AudioPlayer would destroy MixStream after 5 missed frames; max streak was ${maxMisses}`,
+    );
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream delivers PCM after keep-alive silence while the decoder is late', async () => {
+  const mix = new MixStream();
+  const sink = new PassThrough();
+  const received = [];
+  sink.on('data', (chunk) => received.push(Buffer.from(chunk)));
+  mix.pipe(sink);
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    mix.setCurrent(PcmSource.fromBuffers([fillFrame(3456), fillFrame(3456)]));
+    await waitForPcm(received, 3456);
+    assert.ok(pcmContains(received, 3456), `expected real PCM after keep-alive, got ${previewFrameSamples(received)}`);
   } finally {
     mix.unpipe(sink);
     mix.endMixer();

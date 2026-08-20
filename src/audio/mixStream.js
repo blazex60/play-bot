@@ -355,17 +355,17 @@ export class MixStream extends Readable {
   }
 
   #unpauseIfNeeded() {
-    if (this.isPaused()) this.resume();
+    // Only resume a stream that was already flowing and then paused (pipe
+    // backpressure or an explicit pause). A never-piped MixStream is paused
+    // with readableFlowing === null; resume() would dump PCM with no consumer.
+    if (this.readableFlowing === false) this.resume();
   }
 
   #wakeConsumer() {
     // A newly attached/ready source must not wait for the between-track pacing
     // timer. Resuming here preserves the existing source-ready wake-up; the
     // pacing callback itself never resumes against downstream backpressure.
-    if (!this.#betweenTracks && this.#betweenTrackTimer) {
-      clearTimeout(this.#betweenTrackTimer);
-      this.#betweenTrackTimer = null;
-    }
+    if (!this.#betweenTracks) this.#clearKeepAliveTimer();
     this.#unpauseIfNeeded();
     this.#scheduleRead();
   }
@@ -376,49 +376,50 @@ export class MixStream extends Readable {
     }
   }
 
+  #clearKeepAliveTimer() {
+    if (this.#betweenTrackTimer) {
+      clearTimeout(this.#betweenTrackTimer);
+      this.#betweenTrackTimer = null;
+    }
+  }
+
+  /**
+   * Pace 20 ms PCM silence while idle or between tracks. push() may
+   * synchronously request another frame; install the timer first so a
+   * re-entrant _read() leaves #pendingRead set instead of spinning.
+   * Do not resume() here: that overrides pipe backpressure and grows an
+   * encoded-silence backlog.
+   */
+  #pushKeepAliveSilence() {
+    if (this.#betweenTrackTimer) return;
+    this.#pendingRead = false;
+    this.#betweenTrackTimer = setTimeout(() => {
+      this.#betweenTrackTimer = null;
+      if (this.#destroyed) return;
+      if (this.#current && !this.#betweenTracks) return;
+      if (this.readableFlowing) this.#pendingRead = true;
+      this.#scheduleRead();
+    }, FRAME_MS);
+    this.#betweenTrackTimer.unref?.();
+    this.push(SILENCE_FRAME);
+  }
+
   #tryPushFrame() {
     if (!this.#pendingRead || this.#destroyed) return;
 
     const frame = this.#readFrame();
     if (frame === null) {
-      // Pipeline from createAudioResource(StreamType.Raw) starts flowing
-      // MixStream immediately, before GuildPlayer.setCurrent / play().
-      // Waiting for the first source is not an underrun — do not push
-      // silence or start the 8s watchdog, or Discord transmits packets
-      // (speaking indicator) while no track is attached, then sourceerror
-      // races the real PCM source and playback never starts.
-      if (!this.#current && !this.#betweenTracks && !this.#incoming) {
+      // No PCM this tick. Keep delivering 20 ms silence so a piped opus
+      // encoder stays readable: @discordjs/voice AudioPlayer.checkPlayable()
+      // otherwise starts silencePaddingFrames (default 5) and then destroy()s
+      // this MixStream after ~100 ms. Waiting for the first source is not an
+      // underrun — do not start the 8s watchdog.
+      if (!this.#current && !this.#incoming) {
+        this.#pushKeepAliveSilence();
         return;
       }
-      // Between tracks (handoff / prefetch) we MUST keep delivering frames.
-      // Starving the AudioPlayer for ~5 packets (~100ms) makes it Idle, and
-      // @discordjs/voice then destroy()s this MixStream — killing the mixer
-      // for the rest of the session (2nd track never audible, queue races).
       if (this.#betweenTracks) {
-        // push() may synchronously make a flowing consumer request another
-        // frame. Install the guard first so that re-entrant _read() leaves
-        // #pendingRead set for the timer instead of pushing silence in a
-        // tight loop.
-        if (this.#betweenTrackTimer) return;
-        this.#pendingRead = false;
-        // Silence represents 20 ms of audio, so never produce it faster than
-        // real time.  A read requested during this interval leaves
-        // #pendingRead set; the timer services that demand when the frame is
-        // due.  If pipe() has applied backpressure, _read() is not called and
-        // the timer has nothing to do.  In particular, do not call resume()
-        // here: doing so overrides pipe's pause and grows an encoded-silence
-        // backlog while the next track is being prepared.
-        this.#betweenTrackTimer = setTimeout(() => {
-          this.#betweenTrackTimer = null;
-          if (this.#destroyed || !this.#betweenTracks) return;
-          // Flowing consumers represent active demand. pipe() switches this
-          // to false when a destination returns false, so do not manufacture
-          // a read (or resume the stream) while downstream is backpressured.
-          if (this.readableFlowing) this.#pendingRead = true;
-          this.#scheduleRead();
-        }, FRAME_MS);
-        this.#betweenTrackTimer.unref?.();
-        this.push(SILENCE_FRAME);
+        this.#pushKeepAliveSilence();
         return;
       }
       if (!this.#underrunSince) {
@@ -434,6 +435,8 @@ export class MixStream extends Readable {
       this.emit('underrun');
       return;
     }
+
+    this.#clearKeepAliveTimer();
 
     const recovering = this.#underrunSince != null;
     this.#underrunSince = null;

@@ -7,6 +7,10 @@ import {
   parseJsonLines,
   mapEntryToTrack,
   spawnAsync,
+  buildYtdlpArgs,
+  ytdlpCookieArgs,
+  YTDLP_EXTRACTOR_ARGS,
+  YTDLP_AUDIO_FORMAT,
 } from './search.js'
 
 test('isPlaylistUrl: playlist URLs are detected', () => {
@@ -78,4 +82,28 @@ test('spawnAsync kills a hung process when timeoutMs elapses', async () => {
     (err) => err instanceof YtdlpError && /timed out after 40ms/.test(err.message),
   )
   assert.ok(Date.now() - started < 1000)
+})
+
+test('buildYtdlpArgs: solves n-sig in Node and skips player clients that 403 googlevideo', () => {
+  const args = buildYtdlpArgs('-f', YTDLP_AUDIO_FORMAT, '--no-playlist', '-o', '-', 'https://example.com/a')
+  assert.equal(args[0], '--js-runtimes')
+  assert.equal(args[1], 'node')
+  assert.ok(args.includes('--no-cache-dir'))
+  const extractorAt = args.indexOf('--extractor-args')
+  assert.ok(extractorAt >= 0)
+  assert.equal(args[extractorAt + 1], YTDLP_EXTRACTOR_ARGS)
+  assert.match(YTDLP_EXTRACTOR_ARGS, /android_sdkless/)
+  assert.match(YTDLP_EXTRACTOR_ARGS, /web_safari/)
+  const formatAt = args.indexOf('-f')
+  assert.ok(formatAt >= 0)
+  assert.equal(args[formatAt + 1], YTDLP_AUDIO_FORMAT)
+})
+
+test('ytdlpCookieArgs: only passed when YTDLP_COOKIES_FILE is a non-empty path', () => {
+  assert.deepEqual(ytdlpCookieArgs({}), [])
+  assert.deepEqual(ytdlpCookieArgs({ YTDLP_COOKIES_FILE: '   ' }), [])
+  assert.deepEqual(
+    ytdlpCookieArgs({ YTDLP_COOKIES_FILE: '/app/data/youtube-cookies.txt' }),
+    ['--cookies', '/app/data/youtube-cookies.txt'],
+  )
 })
