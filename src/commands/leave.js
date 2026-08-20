@@ -10,6 +10,7 @@ export default {
     if (!session) return false
     sessions.delete(interaction.guildId)
     cancelPendingRecommendations(interaction.guildId)
+    await session.player.stop()
     session.connection.destroy()
     await interaction.reply({ content: `👋 ${interaction.member.displayName} がボットをVCから退出させました`, ...replyFlags(interaction.guildId, 'leave') })
   },

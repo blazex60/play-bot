@@ -4,6 +4,7 @@ import {
   AudioPlayerStatus,
   NoSubscriberBehavior,
   StreamType,
+  VoiceConnectionStatus,
 } from '@discordjs/voice';
 import { resolveAudioStream } from './search.js';
 import { getGuildSettings } from './settings.js';
@@ -50,6 +51,8 @@ const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
  * longer than that; 50 × 20 ms = 1 s.
  */
 export const MIXER_MAX_MISSED_FRAMES = 50;
+/** How long GuildPlayer waits for ffmpeg/yt-dlp to produce the first PCM. */
+export const PCM_WAIT_TIMEOUT_MS = 15_000;
 
 export const MIXER_AUDIO_PLAYER_OPTIONS = {
   behaviors: {
@@ -184,6 +187,10 @@ export class GuildPlayer {
   #queueExhaustedTimeoutMs;
   #recordPlayFn;
   #onTrackStart;
+  #cancelSourceAudioWait = null;
+  #pcmWaitGeneration = 0;
+  #pcmWaitTimeoutMs = PCM_WAIT_TIMEOUT_MS;
+  #pauseRequested = false;
   #audioPlayer;
   #forceSkip = false;
   #hadError = false;
@@ -296,6 +303,7 @@ export class GuildPlayer {
     analysisQueue = null,
     prefetchTrackFn = prefetchTrack,
     probeTempoBackendFn = probeTempoBackend,
+    pcmWaitTimeoutMs = PCM_WAIT_TIMEOUT_MS,
   }) {
     this.#guildId = guildId;
     this.#connection = connection;
@@ -315,6 +323,9 @@ export class GuildPlayer {
     this.#analysisQueue = analysisQueue;
     this.#prefetchTrackFn = prefetchTrackFn;
     this.#probeTempoBackendFn = probeTempoBackendFn;
+    this.#pcmWaitTimeoutMs = Number.isFinite(pcmWaitTimeoutMs)
+      ? pcmWaitTimeoutMs
+      : PCM_WAIT_TIMEOUT_MS;
 
     this.#initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
@@ -345,10 +356,22 @@ export class GuildPlayer {
     this.#audioPlayer.on('error', err => {
       console.error('[GuildPlayer] audioPlayer error:', err);
       this.#hadError = true;
+      this.#abortSourceAudioWait();
       this.#mixStream?.dropCurrent();
     });
 
+    // AutoPaused means playable.length === 0. Re-subscribe so a Ready
+    // connection is visible on the next 20 ms tick and playback resumes.
+    this.#audioPlayer.on(AudioPlayerStatus.AutoPaused, () => {
+      this.#connection?.subscribe?.(this.#audioPlayer);
+    });
+
     this.#connection.subscribe(this.#audioPlayer);
+    this.#connection.on?.('stateChange', (_oldState, newState) => {
+      if (newState?.status === VoiceConnectionStatus.Destroyed) {
+        this.#abortSourceAudioWait();
+      }
+    });
   }
 
   async playNext() {
@@ -397,6 +420,27 @@ export class GuildPlayer {
       return;
     }
 
+    // Wait for real PCM *before* setCurrent. MixStream's 8s underrun guard
+    // starts as soon as a current source is attached; a slow decoder would
+    // sourceerror/skip the track while this 15s wait was still pending.
+    // Between tracks MixStream stays in keep-alive silence until then.
+    const waitGeneration = this.#pcmWaitGeneration;
+    const waited = await this.#waitForSourceAudio(source);
+    if (this.#isSourceAudioWaitSuperseded(track, waited, waitGeneration)) {
+      this.#discardUnusedSource(source);
+      return;
+    }
+    if (waited !== 'ready') {
+      this.#discardUnusedSource(source);
+      this.#hadError = true;
+      if (this.#handlingAfter) {
+        this.#pendingAfter = true;
+      } else {
+        this.#advanceAfterPlayback();
+      }
+      return;
+    }
+
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
     this.#resetWatchdog();
@@ -413,9 +457,12 @@ export class GuildPlayer {
       return;
     }
     this.#resetSessionTempoFor(track);
-    // Attach the opus pipeline only after setCurrent so the encoder's first
-    // read already has a source. Re-play() of the same resource is a no-op.
-    this.#ensureMixerPlaying();
+    // Attach the opus pipeline only after PCM has arrived so the encoder's
+    // first packet is music, not keep-alive silence. A /pause during the
+    // wait leaves AudioPlayer Idle; honor it and do not start until resume.
+    if (!this.#pauseRequested) {
+      this.#ensureMixerPlaying();
+    }
     this.#clearPreparedIncoming();
     this.#crossfadeStarted = false;
     this.#crossfadeTargetTrack = null;
@@ -467,6 +514,7 @@ export class GuildPlayer {
     this.#mixStream.on('sourceerror', (err) => {
       console.error('[GuildPlayer] mix source error:', err.message);
       this.#hadError = true;
+      this.#abortSourceAudioWait();
       this.#mixStream.dropCurrent();
     });
     this.#mixStream.on('incomingerror', (err) => {
@@ -607,6 +655,70 @@ export class GuildPlayer {
     );
   }
 
+  #inspectSourceAudio(source) {
+    if (!source) return 'empty';
+    if (source.error) return 'error';
+    if ((source.available ?? 0) > 0) return 'ready';
+    if (source.ended) return 'empty';
+    return null;
+  }
+
+  #isSourceAudioWaitSuperseded(track, waited, waitGeneration) {
+    return waited === 'aborted'
+      || waitGeneration !== this.#pcmWaitGeneration
+      || this.#queue.current !== track
+      || this.#forceSkip;
+  }
+
+  #discardUnusedSource(source) {
+    if (!source) return;
+    if (this.#mixStream?.currentSource === source) return;
+    source.destroy?.();
+  }
+
+  #abortSourceAudioWait() {
+    this.#pcmWaitGeneration += 1;
+    const cancel = this.#cancelSourceAudioWait;
+    this.#cancelSourceAudioWait = null;
+    cancel?.();
+  }
+
+  #waitForSourceAudio(source) {
+    this.#cancelSourceAudioWait?.();
+    const immediate = this.#inspectSourceAudio(source);
+    if (immediate) return Promise.resolve(immediate);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (reason) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        source.off?.('data', onData);
+        source.off?.('end', onEnd);
+        source.off?.('error', onError);
+        if (this.#cancelSourceAudioWait === cancel) {
+          this.#cancelSourceAudioWait = null;
+        }
+        resolve(reason);
+      };
+      const onData = () => {
+        // PcmSource emits `data` on ffmpeg EOF even when available === 0.
+        // That wake-up is not buffered audio; keep waiting until end/error
+        // or a later chunk actually fills the buffer.
+        const result = this.#inspectSourceAudio(source);
+        if (result) finish(result);
+      };
+      const onEnd = () => finish(this.#inspectSourceAudio(source) ?? 'empty');
+      const onError = () => finish('error');
+      const cancel = () => finish('aborted');
+      this.#cancelSourceAudioWait = cancel;
+      const timer = setTimeout(() => finish('timeout'), this.#pcmWaitTimeoutMs);
+      source.on('data', onData);
+      source.on('end', onEnd);
+      source.on('error', onError);
+    });
+  }
+
   /**
    * @discordjs/voice destroys playStream when leaving Playing. If MixStream was
    * destroyed mid-session, rebuild it so later setCurrent/play can succeed.
@@ -642,6 +754,7 @@ export class GuildPlayer {
       this.#attachMixerResource();
     }
     try {
+      this.#connection?.subscribe?.(this.#audioPlayer);
       this.#audioPlayer.play(this.#mixerResource);
       this.#mixerStarted = true;
     } catch (err) {
@@ -650,6 +763,7 @@ export class GuildPlayer {
       if (this.#isMixerStreamDead() || !this.#mixStream.currentSource) return;
       this.#attachMixerResource();
       try {
+        this.#connection?.subscribe?.(this.#audioPlayer);
         this.#audioPlayer.play(this.#mixerResource);
         this.#mixerStarted = true;
       } catch (err2) {
@@ -783,7 +897,16 @@ export class GuildPlayer {
   }
 
   pause() {
-    return this.#audioPlayer.pause();
+    if (this.#audioPlayer.pause()) {
+      this.#pauseRequested = true;
+      return true;
+    }
+    // AudioPlayer.pause() is a no-op while Idle (PCM still buffering).
+    if (this.#cancelSourceAudioWait != null || Boolean(this.#mixStream?.currentSource)) {
+      this.#pauseRequested = true;
+      return true;
+    }
+    return false;
   }
 
   get status() {
@@ -791,16 +914,29 @@ export class GuildPlayer {
   }
 
   resume() {
+    if (this.#pauseRequested) {
+      this.#pauseRequested = false;
+      if (this.#cancelSourceAudioWait) return true;
+      if (this.#mixStream?.currentSource) {
+        if (!this.#mixerStarted) this.#ensureMixerPlaying();
+        else this.#audioPlayer.unpause();
+        return true;
+      }
+      return true;
+    }
     return this.#audioPlayer.unpause();
   }
 
   async skip() {
     this.#forceSkip = true;
+    this.#abortSourceAudioWait();
     this.#mixStream?.dropCurrent();
   }
 
   async stop() {
+    this.#pauseRequested = false;
     this.#queue.clear();
+    this.#abortSourceAudioWait();
     this.#clearWatchdog();
     this.#clearCrossfadeArm();
     this.#clearPreparedIncoming();
