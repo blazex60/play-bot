@@ -2,6 +2,7 @@ import {
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
+  NoSubscriberBehavior,
   StreamType,
 } from '@discordjs/voice';
 import { resolveAudioStream } from './search.js';
@@ -43,6 +44,34 @@ const MAX_TRANSITION_LEAD_SEC = TAIL_WINDOW_SEC;
 const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
+/**
+ * Default AudioPlayer.maxMissedFrames is 5 (100 ms of null opus reads), after
+ * which stop() destroy()s the session MixStream. ffmpeg/yt-dlp hiccups are
+ * longer than that; 50 × 20 ms = 1 s.
+ */
+export const MIXER_MAX_MISSED_FRAMES = 50;
+
+export const MIXER_AUDIO_PLAYER_OPTIONS = {
+  behaviors: {
+    // Default Pause: if the VC drops out of Ready (reconnect), do not keep
+    // reading MixStream and discarding packets / advancing tracks unheard.
+    // sessions.js already waits for Ready before constructing GuildPlayer.
+    noSubscriber: NoSubscriberBehavior.Pause,
+    maxMissedFrames: MIXER_MAX_MISSED_FRAMES,
+  },
+};
+
+/**
+ * silencePaddingFrames default 5: when the opus encoder is not readable,
+ * AudioResource.read() returns Discord SILENCE_FRAME and never reads MixStream
+ * again, then ends the resource (~100 ms). MixStream is session-lived, so
+ * padding-to-end is never correct.
+ */
+export const MIXER_AUDIO_RESOURCE_OPTIONS = {
+  inputType: StreamType.Raw,
+  inlineVolume: false,
+  silencePaddingFrames: 0,
+};
 
 function fallbackAnalysis(track) {
   return {
@@ -247,7 +276,7 @@ export class GuildPlayer {
     queueExhaustedTimeoutMs = QUEUE_EXHAUSTED_TIMEOUT,
     recordPlayFn = null,
     onTrackStart = null,
-    audioPlayer = createAudioPlayer(),
+    audioPlayer = createAudioPlayer(MIXER_AUDIO_PLAYER_OPTIONS),
     createAudioResourceFn = createAudioResource,
     resolveAudioStreamFn = resolveAudioStream,
     /**
@@ -384,9 +413,9 @@ export class GuildPlayer {
       return;
     }
     this.#resetSessionTempoFor(track);
-    if (!this.#mixerStarted) {
-      this.#ensureMixerPlaying();
-    }
+    // Attach the opus pipeline only after setCurrent so the encoder's first
+    // read already has a source. Re-play() of the same resource is a no-op.
+    this.#ensureMixerPlaying();
     this.#clearPreparedIncoming();
     this.#crossfadeStarted = false;
     this.#crossfadeTargetTrack = null;
@@ -426,9 +455,8 @@ export class GuildPlayer {
 
   #initMixerPipeline() {
     this.#mixStream = new MixStream();
-    this.#mixerResource = this.#createAudioResource(this.#mixStream, {
-      inputType: StreamType.Raw,
-    });
+    this.#mixerResource = null;
+    this.#mixerStarted = false;
     this.#mixStream.on('trackend', (info) => {
       if (info?.promoted) {
         this.#onCrossfadePromoted();
@@ -562,18 +590,31 @@ export class GuildPlayer {
     }
   }
 
-  #isMixerDead() {
+  #isMixerStreamDead() {
     return !this.#mixStream
       || this.#mixStream.isDestroyed()
-      || this.#mixStream.destroyed
-      || this.#mixerResource?.ended;
+      || this.#mixStream.destroyed;
+  }
+
+  #isMixerDead() {
+    return this.#isMixerStreamDead() || this.#mixerResource?.ended === true;
+  }
+
+  #attachMixerResource() {
+    this.#mixerResource = this.#createAudioResource(
+      this.#mixStream,
+      MIXER_AUDIO_RESOURCE_OPTIONS,
+    );
   }
 
   /**
    * @discordjs/voice destroys playStream when leaving Playing. If MixStream was
    * destroyed mid-session, rebuild it so later setCurrent/play can succeed.
+   * Never pipeline an empty MixStream into AudioPlayer — that leaves the opus
+   * encoder unreadable, and default missed-frames/silence-padding destroy it
+   * again before playNext can attach PCM.
    */
-  #recoverMixerPlayback({ play = true } = {}) {
+  #recoverMixerPlayback({ play = false } = {}) {
     if (this.#isMixerDead()) {
       console.warn('[GuildPlayer] mixer resource ended; rebuilding pipeline');
       try {
@@ -586,37 +627,34 @@ export class GuildPlayer {
       }
       this.#initMixerPipeline();
     }
-    if (!play) {
-      this.#mixerStarted = false;
-      return;
-    }
-    try {
-      this.#audioPlayer.play(this.#mixerResource);
-      this.#mixerStarted = true;
-    } catch (err) {
-      console.error('[GuildPlayer] mixer recovery play failed:', err.message);
-      this.#initMixerPipeline();
-      try {
-        this.#audioPlayer.play(this.#mixerResource);
-        this.#mixerStarted = true;
-      } catch (err2) {
-        console.error('[GuildPlayer] mixer recovery rebuild play failed:', err2.message);
-      }
-    }
+    this.#mixerStarted = false;
+    if (play) this.#ensureMixerPlaying();
   }
 
   #ensureMixerPlaying() {
-    if (!this.#mixerResource) return;
-    if (this.#isMixerDead()) {
-      this.#recoverMixerPlayback();
-      return;
+    if (this.#isMixerStreamDead()) {
+      this.#recoverMixerPlayback({ play: false });
+    }
+    if (this.#isMixerStreamDead()) return;
+    const hasSource = Boolean(this.#mixStream.currentSource) || this.#mixStream.isCrossfading;
+    if (!this.#mixerResource || this.#mixerResource.ended) {
+      if (!hasSource) return;
+      this.#attachMixerResource();
     }
     try {
       this.#audioPlayer.play(this.#mixerResource);
       this.#mixerStarted = true;
     } catch (err) {
       console.error('[GuildPlayer] mixer play failed, rebuilding:', err.message);
-      this.#recoverMixerPlayback();
+      this.#recoverMixerPlayback({ play: false });
+      if (this.#isMixerStreamDead() || !this.#mixStream.currentSource) return;
+      this.#attachMixerResource();
+      try {
+        this.#audioPlayer.play(this.#mixerResource);
+        this.#mixerStarted = true;
+      } catch (err2) {
+        console.error('[GuildPlayer] mixer recovery rebuild play failed:', err2.message);
+      }
     }
   }
 

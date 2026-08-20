@@ -84,6 +84,11 @@ export function makePlayer({
       return { url };
     },
     createAudioResourceFn(stream, options) {
+      assert.equal(options?.inputType, StreamType.Raw);
+      assert.ok(
+        stream?.currentSource,
+        'createAudioResource must run after MixStream.setCurrent so the opus encoder is not starved',
+      );
       const resource = {
         stream,
         options,
