@@ -305,17 +305,28 @@ export class GuildPlayer {
   #analysisMissAt = new Map();
   #probedDurationCache = new Map();
   /**
-   * videoIds with a #scheduleAnalysis() job currently in flight (Codex,
-   * PR #39 round-15). #ensureFullPrefetch() and #createPcmSource() both
-   * call #scheduleAnalysis() for the same prefetched file — the second,
-   * consuming that same prefetch entry once the track actually starts —
-   * so without this guard every normalized track gets staged and enqueued
-   * for stem separation twice. The first attempt already populates the
-   * in-memory and persistent analysis/stem caches everything else reads
-   * from, so the second is pure waste. Added in #scheduleAnalysis(),
-   * removed once that job settles (success, failure, or abort).
+   * videoId -> attempt token for the #scheduleAnalysis() job currently in
+   * flight for it (Codex, PR #39 round-15/16). #ensureFullPrefetch() and
+   * #createPcmSource() both call #scheduleAnalysis() for the same
+   * prefetched file — the second, consuming that same prefetch entry once
+   * the track actually starts — so without this guard every normalized
+   * track gets staged and enqueued for stem separation twice. The first
+   * attempt already populates the in-memory and persistent analysis/stem
+   * caches everything else reads from, so the second is pure waste.
+   *
+   * A per-attempt token (not just presence in a Set) matters because
+   * analysisQueue's kill()/noteUnderrun() rejects a job's promise via
+   * Promise.race() the instant it's killed — independent of whether that
+   * job's own callback (and its own finally) has actually finished
+   * running. Without a token, a killed job A's delayed finally could run
+   * AFTER a newer job B has already been scheduled for the same videoId
+   * (started in the gap between A's immediate kill-rejection and A's
+   * callback actually unwinding), and A's cleanup would then delete B's
+   * still-active guard entry — letting a third job start concurrently
+   * with B. Only deleting when the stored token still matches the
+   * attempt that's settling closes that gap.
    */
-  #scheduledAnalysisVideoIds = new Set();
+  #scheduledAnalysisTokens = new Map();
   #crossfadeArmTimer = null;
   #crossfadeStarted = false;
   #crossfadeArming = false;
@@ -1278,16 +1289,20 @@ export class GuildPlayer {
 
   #scheduleAnalysis(track, filePath) {
     if (!track?.videoId || !filePath || !this.#analyzeTrackFileFn) return;
-    // Codex (PR #39 round-15): #ensureFullPrefetch() and #createPcmSource()
-    // both call #scheduleAnalysis() for the same prefetched file — the
-    // second, consuming that same prefetch entry once the track actually
-    // starts — so without this guard every normalized track gets staged
-    // and enqueued for stem separation twice. Skip while a prior attempt
-    // for this exact videoId is still in flight; that first attempt
-    // already populates the in-memory and persistent analysis/stem caches
-    // everything else reads from, so a second is pure waste.
-    if (this.#scheduledAnalysisVideoIds.has(track.videoId)) return;
-    this.#scheduledAnalysisVideoIds.add(track.videoId);
+    // Codex (PR #39 round-15/16): #ensureFullPrefetch() and
+    // #createPcmSource() both call #scheduleAnalysis() for the same
+    // prefetched file — the second, consuming that same prefetch entry
+    // once the track actually starts — so without this guard every
+    // normalized track gets staged and enqueued for stem separation
+    // twice. Skip while a prior attempt for this exact videoId is still
+    // in flight; that first attempt already populates the in-memory and
+    // persistent analysis/stem caches everything else reads from, so a
+    // second is pure waste. The token (not just videoId presence) guards
+    // against a killed job's delayed cleanup clobbering a newer job's
+    // entry — see #scheduledAnalysisTokens's own docstring.
+    if (this.#scheduledAnalysisTokens.has(track.videoId)) return;
+    const analysisToken = {};
+    this.#scheduledAnalysisTokens.set(track.videoId, analysisToken);
     // Phase 8 (Codex, PR #39 round-14): stage an independent copy of
     // filePath for stem separation NOW, before this job is even enqueued —
     // several unrelated call sites (track promotion/stop/skip/prefetch
@@ -1309,36 +1324,51 @@ export class GuildPlayer {
       // ANALYSIS_KILLED abort) must not skip cleanup just because it
       // happens before the separation step below. The try/finally wraps
       // the whole callback, not just the separation call, so every exit
-      // path awaits stagedPathPromise (already-settled by the time this
-      // runs, in the overwhelming majority of cases) and removes it.
+      // path removes it regardless of outcome.
+      //
+      // Codex (PR #39 round-17): #runAnalysis() itself must also read from
+      // the staged copy, not the original filePath — the whole reason
+      // filePath got staged in the first place is that it can be deleted
+      // by unrelated cleanup at any point once this job is enqueued,
+      // #runAnalysis() is just as exposed to that as separation was.
+      // Awaited once up front (already-settled by the time this callback
+      // runs, in the overwhelming majority of cases) so both steps below
+      // share the same value; falls back to filePath only if staging
+      // itself failed, matching this job's existing best-effort posture.
+      const stagedPath = await stagedPathPromise;
       try {
         const cached = await this.#lookupPersistentAnalysis(track);
-        const analysis = cached ?? await this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
+        const analysis = cached ?? await this.#runAnalysis(track, stagedPath ?? filePath, { spawnFn: spawnNice, signal });
         // Best-effort: a failure here just means this track never becomes
         // stem-mix eligible, the existing beatmix/phrase-crossfade/legacy
         // ladder is untouched either way.
         // Skip rather than start a many-minute Demucs run against a job
         // the queue already decided to cancel (e.g. a mixer underrun
         // killed this job right as #runAnalysis finished).
-        if (!signal?.aborted) {
-          const stagedPath = await stagedPathPromise;
-          if (stagedPath) {
-            await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
-              console.warn('[GuildPlayer] stem separation failed:', err.message);
-            });
-          }
+        if (!signal?.aborted && stagedPath) {
+          await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
+            console.warn('[GuildPlayer] stem separation failed:', err.message);
+          });
         }
         return analysis;
       } finally {
-        const stagedPath = await stagedPathPromise;
         if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
-        this.#scheduledAnalysisVideoIds.delete(track.videoId);
+        // Compare-and-delete: analysisQueue.kill()/noteUnderrun() rejects
+        // via Promise.race() the instant a job is killed, well before this
+        // callback's own finally can run (Codex). If a newer attempt for
+        // this same videoId already replaced our entry in that gap, its
+        // token won't match ours — leave it alone.
+        if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
+          this.#scheduledAnalysisTokens.delete(track.videoId);
+        }
       }
     }).catch((err) => {
       // Belt-and-suspenders: the finally above already removes this on
       // every path through the callback body. This only matters if
       // enqueue() itself rejects without ever invoking that callback.
-      this.#scheduledAnalysisVideoIds.delete(track.videoId);
+      if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
+        this.#scheduledAnalysisTokens.delete(track.videoId);
+      }
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
         return;

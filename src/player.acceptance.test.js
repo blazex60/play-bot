@@ -1641,6 +1641,57 @@ test('acceptance (mixer): staged copy is cleaned up even when analysis fails bef
   }
 });
 
+test('acceptance (mixer): analysis reads from the staged copy too, not just separation (Codex)', async () => {
+  // Codex (PR #39, round 17): the whole reason filePath gets staged is
+  // that unrelated cleanup can delete it at any point once this job is
+  // enqueued — #runAnalysis() is just as exposed to that as separation
+  // was, but round-14/15's fix only routed the STAGED path into
+  // separateTrackStemsFn(), leaving #runAnalysis() reading the original,
+  // possibly-already-deleted filePath.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const originalFilePath = '/tmp/musicbot-original-vid-analysis';
+  const stagedFilePath = '/tmp/musicbot-staged-vid-analysis';
+  const analyzeCalls = [];
+  const separateCalls = [];
+  const analysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 60,
+    lastVocalEndSec: 50,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async (fp) => {
+      analyzeCalls.push(fp);
+      return analysis;
+    },
+    prefetchTrackFn: async () => ({ filePath: originalFilePath, measured: {} }),
+    stageTempFileCopyFn: async () => stagedFilePath,
+    separateTrackStemsFn: async (fp, videoId) => {
+      separateCalls.push({ fp, videoId });
+      return null;
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track Analysis',
+    webpageUrl: 'https://example.com/analysis',
+    duration: 60,
+    videoId: 'vid-analysis',
+  }));
+
+  await player.playNext();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.deepEqual(analyzeCalls, [stagedFilePath],
+    'expected analysis to read from the staged copy, not the original filePath');
+  assert.equal(separateCalls.length, 1);
+  assert.equal(separateCalls[0].fp, stagedFilePath);
+  await player.stop();
+});
+
 test('acceptance (mixer): early queue refill is a single shared attempt', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   let calls = 0;
