@@ -346,6 +346,19 @@ export class GuildPlayer {
    * @type {{ key: string, outCachedStems: object, inCachedStems: object } | null}
    */
   #stemCacheHit = null;
+  /**
+   * videoId:videoId key of a (current, next) pair whose stem-mix attempt
+   * was aborted at take time (spawn/prep failure, drift, or an unhonored
+   * transform) rather than downgraded to a plain crossfade — because the
+   * cache lookup and `planStemTransitionFn()` above are independent of
+   * spawn success, leaving this unset would have every subsequent ~200ms
+   * arm tick re-select the SAME relaxed stem-mix plan, abort it again, and
+   * never let rawPlan's own plain-crossfade fallback run at all (Codex).
+   * Checked at plan-selection time to skip stem-mix for this exact pair
+   * until current/next changes and the key no longer matches.
+   * @type {string | null}
+   */
+  #stemMixUnavailableKey = null;
 
   constructor({
     guildId,
@@ -1778,8 +1791,8 @@ export class GuildPlayer {
       let outCachedStems = null;
       let inCachedStems = null;
       let norm = null;
-      if (rawPlan.mode !== 'beatmix') {
-        const stemCacheLookupKey = `${current.videoId ?? ''}:${next.videoId ?? ''}`;
+      const stemCacheLookupKey = `${current.videoId ?? ''}:${next.videoId ?? ''}`;
+      if (rawPlan.mode !== 'beatmix' && this.#stemMixUnavailableKey !== stemCacheLookupKey) {
         if (this.#stemCacheHit?.key === stemCacheLookupKey) {
           ({ outCachedStems, inCachedStems } = this.#stemCacheHit);
         } else {
@@ -1976,8 +1989,11 @@ export class GuildPlayer {
           // the incoming track's own start — a plain crossfade has no such
           // envelope, so this can violate 禁止5 (vocal-on-vocal collision).
           // Abort this attempt entirely rather than downgrade the window
-          // (Codex); a later arm tick re-plans from scratch (falling
-          // through to rawPlan's own, non-relaxed selection).
+          // (Codex); mark the pair unavailable so the NEXT arm tick's plan
+          // selection above falls through to rawPlan's own, non-relaxed
+          // selection instead of re-picking this same relaxed stem plan
+          // and looping on this same abort forever (Codex round-9 follow-up).
+          this.#stemMixUnavailableKey = stemCacheLookupKey;
           source.destroy();
           await this.#cleanupIncomingTempFile();
           return;
@@ -2000,7 +2016,10 @@ export class GuildPlayer {
         const freshPositionSec = this.#mixStream?.positionSec ?? positionSec;
         if (freshPositionSec - positionSec > OUTGOING_STEM_DRIFT_TOLERANCE_SEC) {
           // Same reasoning as the forcePlainCrossfade abort above — a plain
-          // crossfade reusing stem-mix's relaxed window is unsafe (Codex).
+          // crossfade reusing stem-mix's relaxed window is unsafe (Codex),
+          // and marking the pair unavailable avoids looping on this same
+          // abort every arm tick (Codex round-9 follow-up).
+          this.#stemMixUnavailableKey = stemCacheLookupKey;
           this.#clearPreparedOutgoingStems();
           this.#clearPreparedIncomingStems();
           source.destroy();
@@ -2037,7 +2056,14 @@ export class GuildPlayer {
           incomingStems?.vocal?.destroy?.();
           incomingStems?.instrumental?.destroy?.();
           // Same reasoning as the other stem-mix abort paths above — a
-          // plain crossfade reusing this window is unsafe (Codex).
+          // plain crossfade reusing this window is unsafe (Codex). Without
+          // marking the pair unavailable, the cache lookup and
+          // planStemTransitionFn() above are independent of spawn success,
+          // so every subsequent arm tick would re-select this same relaxed
+          // stem plan and abort again here — retrying until the outgoing
+          // track reaches EOF and never letting rawPlan's plain-crossfade
+          // fallback run at all (Codex round-9 follow-up).
+          this.#stemMixUnavailableKey = stemCacheLookupKey;
           source.destroy();
           await this.#cleanupIncomingTempFile();
           return;

@@ -87,10 +87,6 @@ export class MixStream extends Readable {
   #outInstrumental = null;
   #inVocal = null;
   #inInstrumental = null;
-  #heldOutVocalFrame = null;
-  #heldOutInstrumentalFrame = null;
-  #heldInVocalFrame = null;
-  #heldInInstrumentalFrame = null;
   /** Frames actually drained from #incoming during the current stem window — used to catch up any deficit before promotion. */
   #incomingStemFramesRead = 0;
   /** Total stem-mix ticks processed during the current window (including ticks held past fadeSec while catching up #incoming) — the live target #incomingStemFramesRead must reach before promotion. */
@@ -330,10 +326,6 @@ export class MixStream extends Readable {
     this.#inInstrumental?.removeAllListeners();
     this.#inInstrumental?.destroy();
     this.#inInstrumental = null;
-    this.#heldOutVocalFrame = null;
-    this.#heldOutInstrumentalFrame = null;
-    this.#heldInVocalFrame = null;
-    this.#heldInInstrumentalFrame = null;
     this.#stemCrossfade = null;
   }
 
@@ -696,67 +688,42 @@ export class MixStream extends Readable {
 
   /**
    * Phase 8: mixes 4 independently-enveloped stem streams instead of the
-   * plain path's 2 whole-track streams. A stem that hits EOF/error before
-   * the window finishes contributes silence for its remaining envelope
-   * duration (per-stem exhaustion) rather than aborting the whole
-   * transition — local-file stem reads (unlike a network-piped source)
-   * essentially only fail at spawn time, which startStemCrossfade()'s
-   * upfront `.error` check already screens out, so a MID-window failure
-   * here is expected to be rare; silence-substitution is a safe,
-   * self-contained fallback for it that needs no extra source juggling.
+   * plain path's 2 whole-track streams. Any of the 4 that has no frame this
+   * tick — whether permanently exhausted (EOF) or merely a transient
+   * underrun — contributes silence for THIS tick only and is retried
+   * normally next tick; the other stems keep playing and the fade clock
+   * always advances. Two earlier designs were tried and both broke under
+   * Codex review across rounds 8-9:
+   *   1. Return null (silence the WHOLE mix) when any one of 4 isn't ready —
+   *      the original design; silenced all 4 stems for what's usually just
+   *      one decoder's brief hiccup.
+   *   2. Substitute #current's real (non-gain-weighted) audio for the whole
+   *      tick, holding whichever of the 4 stems DID arrive for reuse once
+   *      the stalled one catches up — fixed (1)'s full-silence problem, but
+   *      whichever held frames got reused on the recovery tick had already
+   *      been "sonically superseded" by the #current audio played as filler
+   *      in between, an audible replay (Codex, round 8→9). Discarding the
+   *      held frames instead (round 9) fixed the replay but left the 3
+   *      already-consumed-and-discarded stems permanently 1 tick ahead of
+   *      the stalled one once it resumes, since a Readable's `.read()`
+   *      can't be un-consumed — a skew that grows with every further stall
+   *      (Codex, round 9 follow-up).
+   * This design (per-stem silence substitution, unconditional every tick —
+   * same shape as the existing EOF/exhaustion handling, just no longer
+   * gated on `.ended`) avoids both: nothing is ever held across ticks, so
+   * there is nothing to go stale or desync. The cost is a stem that stalls
+   * plays with a fixed, self-correcting one-or-few-frame content/envelope
+   * offset for exactly as long as the stall lasted — audibly milder than
+   * either full-mix silence or a cross-tick replay, and bounded by the same
+   * "MID-window stalls are rare, local-file stem reads essentially only
+   * fail at spawn time" assumption `startStemCrossfade()`'s upfront
+   * `.error` check already relies on.
    */
   #readStemCrossfadeFrame() {
-    const outVocalFrame = this.#heldOutVocalFrame ?? this.#readExact(this.#outVocal, FRAME_BYTES);
-    const outVocalDone = !outVocalFrame && this.#outVocal?.ended;
-    const outInstFrame = this.#heldOutInstrumentalFrame ?? this.#readExact(this.#outInstrumental, FRAME_BYTES);
-    const outInstDone = !outInstFrame && this.#outInstrumental?.ended;
-    const inVocalFrame = this.#heldInVocalFrame ?? this.#readExact(this.#inVocal, FRAME_BYTES);
-    const inVocalDone = !inVocalFrame && this.#inVocal?.ended;
-    const inInstFrame = this.#heldInInstrumentalFrame ?? this.#readExact(this.#inInstrumental, FRAME_BYTES);
-    const inInstDone = !inInstFrame && this.#inInstrumental?.ended;
-
-    // A slot is ready (has a frame), permanently exhausted (ended with
-    // nothing left — substitute silence for the rest of the window), or
-    // still catching up (underrun — hold whatever DID arrive and wait for
-    // the rest, same tolerant philosophy as #readCrossfadeFrame()).
-    if ((!outVocalFrame && !outVocalDone) || (!outInstFrame && !outInstDone)
-      || (!inVocalFrame && !inVocalDone) || (!inInstFrame && !inInstDone)) {
-      // A transient stall in just one of six concurrent decoders (4 stems +
-      // #incoming + #current) must not silence the whole mix — the ordinary
-      // (non-stem) crossfade path keeps playing #current while its own
-      // incoming decoder catches up, and a stem stall deserves the same
-      // grace. #current is already read every "ready" tick below purely for
-      // lockstep-drain bookkeeping (its content discarded there); on a held
-      // tick, output that frame instead of SILENCE_FRAME — it isn't gain-
-      // weighted to the crossfade envelope, but a single mistimed-volume
-      // tick of the outgoing track is far less audible than a dead gap
-      // (Codex). Does not advance #fadeElapsedSec/#stemCrossfadeTicks —
-      // this tick doesn't count as a real stem-mix tick, same as before.
-      //
-      // Deliberately do NOT hold whichever of the 4 frames DID arrive this
-      // tick (unlike the pre-fallback version of this branch, which cached
-      // them in #held*Frame for reuse next tick): once #current is played
-      // here, those frames represent audio from an EARLIER moment than
-      // whatever #current just played. Reusing them on the recovery tick
-      // would mix content read at two different ticks into one output
-      // frame — and, worse, "emit" that already-superseded content after
-      // the listener already heard #current's own version of roughly that
-      // moment, an audible discontinuity (Codex). Discarding them instead
-      // means the recovery tick reads all 4 stems fresh, keeping them
-      // mutually time-consistent with each other — each may end up up to
-      // one frame ahead of #fadeElapsedSec's own position, but that's
-      // bounded (one stall = one frame) and covered by the same clamped-
-      // terminal-gain safety margin the whole catch-up design relies on.
-      this.#heldOutVocalFrame = null;
-      this.#heldOutInstrumentalFrame = null;
-      this.#heldInVocalFrame = null;
-      this.#heldInInstrumentalFrame = null;
-      return this.#readExact(this.#current, FRAME_BYTES);
-    }
-    this.#heldOutVocalFrame = null;
-    this.#heldOutInstrumentalFrame = null;
-    this.#heldInVocalFrame = null;
-    this.#heldInInstrumentalFrame = null;
+    const outVocalFrame = this.#readExact(this.#outVocal, FRAME_BYTES);
+    const outInstFrame = this.#readExact(this.#outInstrumental, FRAME_BYTES);
+    const inVocalFrame = this.#readExact(this.#inVocal, FRAME_BYTES);
+    const inInstFrame = this.#readExact(this.#inInstrumental, FRAME_BYTES);
 
     const outVocal = outVocalFrame ?? SILENCE_FRAME;
     const outInst = outInstFrame ?? SILENCE_FRAME;

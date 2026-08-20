@@ -2,7 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
-import { FRAME_BYTES, FRAME_MS } from './fade.js';
+import {
+  FRAME_BYTES, FRAME_MS, gainForStemPosition, mixNFrames,
+} from './fade.js';
 import { MixStream } from './mixStream.js';
 import { PcmSource } from './pcmSource.js';
 import { MAX_UNDERRUN_MS } from './config.js';
@@ -655,17 +657,21 @@ test('MixStream startStemCrossfade catch-up target grows across multiple held ti
   }
 });
 
-test('MixStream startStemCrossfade falls back to #current instead of silence when a stem stalls', async () => {
-  // Codex: with six concurrent decoders (4 stems + #incoming + #current), a
-  // transient stall in just ONE stem used to output SILENCE_FRAME for that
-  // whole tick — unlike the ordinary (non-stem) crossfade path, which keeps
-  // playing #current while its own incoming decoder catches up. #current is
-  // already read every "ready" tick purely for lockstep-drain bookkeeping;
-  // on a held tick it should be OUTPUT instead of silence.
+test('MixStream startStemCrossfade substitutes per-stem silence (not a full-mix gap, not #current, not held-and-replayed) when a stem stalls', async () => {
+  // Codex, rounds 8-9: two earlier designs for a transient single-stem
+  // stall both broke under review — silencing the WHOLE mix (round 8's
+  // original bug) and substituting/holding #current's audio across the
+  // stall+recovery tick pair (round 8's fix, then round 9's fix on top of
+  // it) both introduced their own audible defects (see the docstring on
+  // #readStemCrossfadeFrame()). The current design: whichever of the 4
+  // stems has no frame this tick contributes SILENCE_FRAME for THIS tick
+  // only (same shape as the existing EOF/exhaustion handling) while the
+  // other 3 keep playing their real, gain-weighted content, and the fade
+  // clock always advances — nothing is ever held across ticks, so nothing
+  // can go stale or desync.
   const mix = new MixStream();
   try {
-    const currentValue = 9999;
-    mix.setCurrent(stemSource(currentValue, 50), { durationSec: 60 });
+    mix.setCurrent(stemSource(9999, 50), { durationSec: 60 });
     await new Promise((resolve) => setImmediate(resolve));
 
     const fadeFrames = 10;
@@ -680,19 +686,58 @@ test('MixStream startStemCrossfade falls back to #current instead of silence whe
       return fillFrame(2000);
     };
 
-    const outgoing = { vocal: outVocalSource, instrumental: stemSource(3000, fadeFrames) };
+    const outInstValue = 3000;
+    const inInstValue = 5000;
+    const inVocalValue = 4000;
+    const outgoing = { vocal: outVocalSource, instrumental: stemSource(outInstValue, fadeFrames) };
     const incoming = {
-      vocal: stemSource(4000, fadeFrames),
-      instrumental: stemSource(5000, fadeFrames),
+      vocal: stemSource(inVocalValue, fadeFrames),
+      instrumental: stemSource(inInstValue, fadeFrames),
       full: stemSource(6000, fadeFrames),
     };
     const plan = makeStemPlan(0.2);
     const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
     assert.equal(ok, true);
 
-    const [frame] = await collectFrames(mix, 1);
-    assert.deepEqual(frame, fillFrame(currentValue),
-      'expected the stalled tick to output #current\'s real audio, not silence');
+    let promoted = false;
+    mix.on('trackend', (info) => { if (info?.promoted) promoted = true; });
+    let frame = null;
+    mix.on('data', (chunk) => { if (frame === null) frame = chunk; });
+    const deadline = Date.now() + 5000;
+    while (frame === null && Date.now() < deadline) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.ok(frame, 'expected the first frame to arrive');
+    const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
+    // The other 3 stems' real content, silence standing in for outVocal —
+    // the exact same math #readStemCrossfadeFrame() itself uses at
+    // fadeElapsedSec=0, computed independently here so this test would
+    // actually fail against either superseded design (full silence, or
+    // #current's raw audio).
+    const expected = mixNFrames(
+      [SILENCE_FRAME, fillFrame(outInstValue), fillFrame(inInstValue), fillFrame(inVocalValue)],
+      [
+        gainForStemPosition({ positionSec: 0, ...plan.stems.outVocal }),
+        gainForStemPosition({ positionSec: 0, ...plan.stems.outInstrumental }),
+        gainForStemPosition({ positionSec: 0, ...plan.stems.inInstrumental }),
+        gainForStemPosition({ positionSec: 0, ...plan.stems.inVocal }),
+      ],
+    );
+    assert.deepEqual(frame, expected,
+      'expected the stalled tick to mix the other 3 stems\' real content with silence standing in for outVocal');
+    assert.notDeepEqual(frame, SILENCE_FRAME, 'must not silence the whole mix for one stalled stem');
+    assert.notDeepEqual(frame, fillFrame(9999), 'must not fall back to raw #current audio');
+
+    // The stall must not have paused the fade clock: exactly fadeFrames
+    // ticks (including the stalled one) should complete the window and
+    // promote — if the stall had been held-and-not-counted, one extra tick
+    // would be needed. The stream is already flowing (the 'data' listener
+    // above), so it drains on its own; just wait for the trackend.
+    const promoteDeadline = Date.now() + 5000;
+    while (!promoted && Date.now() < promoteDeadline) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(promoted, true, `expected promotion after exactly ${fadeFrames} total ticks (the stalled tick counted)`);
   } finally {
     mix.endMixer();
   }

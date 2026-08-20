@@ -1951,13 +1951,17 @@ test('acceptance (mixer): missing prepared stems at take time aborts instead of 
   const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
 
   const stemSourceCalls = [];
+  let incomingSourceTakes = 0;
   const { player, queue } = makePlayer({
-    trackDuration: 8,
-    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
     getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
     analyzeTrackFileFn: null,
     probeTempoBackendFn: async () => 'rubberband',
-    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    createPcmSourceFn: async () => {
+      incomingSourceTakes += 1;
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
     getCachedStemsFn: async (videoId) => ({
       vocalPath: `/tmp/${videoId}.vocal.wav`,
       instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
@@ -1986,7 +1990,25 @@ test('acceptance (mixer): missing prepared stems at take time aborts instead of 
     assert.equal(startedPlan, null,
       'expected the transition to abort rather than downgrade to an unsafe plain crossfade');
     assert.ok(stemSourceCalls.some((c) => c.filePath.includes('vid-a')),
-      'expected outgoing stem prep to have been attempted (and to keep failing)');
+      'expected outgoing stem prep to have been attempted');
+    const takesAfterFirstAbort = incomingSourceTakes;
+    assert.ok(takesAfterFirstAbort >= 1, 'expected the incoming full-mix source to have been taken at least once');
+
+    // Codex (round-9 follow-up): the cache lookup and stem-plan selection
+    // above are independent of spawn success, so without marking this pair
+    // unavailable, readyToFade stays true for the rest of the outgoing
+    // track — every subsequent ~200ms arm tick would re-select the same
+    // relaxed stem plan, re-take a fresh incoming full-mix source (deleting
+    // and re-fetching its temp file), and abort again, retrying forever
+    // instead of ever letting rawPlan's own fallback run. Wait through
+    // several more arm ticks and confirm the retry-take loop has actually
+    // stopped, not just that the FIRST abort didn't downgrade unsafely.
+    for (let i = 0; i < 400; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    assert.equal(incomingSourceTakes, takesAfterFirstAbort,
+      'expected the incoming-source retry-take loop to stop once the pair is marked unavailable, not retry forever');
   } finally {
     await player.stop();
   }
