@@ -99,6 +99,8 @@ export class MixStream extends Readable {
   #outInstrumentalDeficit = 0;
   #inVocalDeficit = 0;
   #inInstrumentalDeficit = 0;
+  /** Same per-tick deficit tracking as the 4 stems above, but for #current's own lockstep-drain read (its rare error-cancellation fallback position). */
+  #currentFallbackDeficit = 0;
   /** Frames actually drained from #incoming during the current stem window — used to catch up any deficit before promotion. */
   #incomingStemFramesRead = 0;
   /** Total stem-mix ticks processed during the current window (including ticks held past fadeSec while catching up #incoming) — the live target #incomingStemFramesRead must reach before promotion. */
@@ -299,6 +301,7 @@ export class MixStream extends Readable {
     this.#outInstrumentalDeficit = 0;
     this.#inVocalDeficit = 0;
     this.#inInstrumentalDeficit = 0;
+    this.#currentFallbackDeficit = 0;
     this.#outEq = baseSwap ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120) : null;
     this.#inEq = baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
@@ -828,8 +831,12 @@ export class MixStream extends Readable {
     // handler). Without draining it too, it would sit frozen at its
     // position from the START of the stem window, replaying already-heard
     // audio on that (rare) cancel path — same best-effort lockstep drain
-    // as #incoming, for the same reason (Codex).
-    this.#readExact(this.#current, FRAME_BYTES);
+    // as #incoming, for the same reason (Codex). Uses the same per-tick
+    // catch-up drain as the 4 stems (not just a plain #readExact()) so a
+    // tick where #current itself has no complete frame yet doesn't leave
+    // it permanently trailing the stem timeline either — same underlying
+    // bug, just on this fallback's own read instead of a stem's (Codex).
+    [, this.#currentFallbackDeficit] = this.#readStemCatchingUp(this.#current, FRAME_BYTES, this.#currentFallbackDeficit);
 
     if (this.#fadeElapsedSec >= fadeSec) {
       // Drain any accumulated #incoming deficit (early-window buffering

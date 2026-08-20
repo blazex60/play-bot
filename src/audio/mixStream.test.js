@@ -1040,6 +1040,110 @@ test('MixStream startStemCrossfade promotes instead of hanging when incoming.ful
   }
 });
 
+test('MixStream startStemCrossfade catches up #current\'s own fallback drain before a cancellation', async () => {
+  // Codex: #current's lockstep-drain read (used only if incoming.full
+  // errors mid-window, reverting playback straight to #current) was a
+  // plain #readExact() with no catch-up — a tick where #current itself
+  // has no complete frame yet just skipped that read, leaving its
+  // position trailing the stem timeline by however many ticks it missed.
+  // Resuming from that stale position on cancellation would replay
+  // already-elapsed audio. #readStemCatchingUp() (the same per-tick
+  // catch-up already applied to the 4 stems) now applies to this read too.
+  //
+  // All sources here have enough buffered frames to sustain the fade
+  // window without underrunning, so MixStream's internal read loop never
+  // needs to wait on real I/O — it can produce several ticks' worth of
+  // frames synchronously (Readable's own highWaterMark buffering) before
+  // any 'data' event is observed from outside. That makes an *awaited*
+  // frame count (e.g. `await collectFrames(mix, 2)`) unreliable for
+  // pinning down "exactly 2 ticks processed": the window can finish
+  // before such an await ever gets a turn to run. Triggering the
+  // cancellation off #incoming.full's own read count instead — a plain,
+  // always-succeeding read done once per tick (see the "keep #incoming
+  // draining in lockstep" comment in #readStemCrossfadeFrame()) whose
+  // growth rate is completely unaffected by the #current fallback-drain
+  // fix under test here — pins the cancellation to an exact tick
+  // deterministically without that trigger itself masking the bug (unlike
+  // keying it off #current's own read count, which grows at a DIFFERENT
+  // rate with the fix than without it, self-canceling the very thing this
+  // test needs to discriminate).
+  const mix = new MixStream();
+  try {
+    let currentReads = 0;
+    const currentSource = new EventEmitter();
+    currentSource.ended = false;
+    currentSource.error = null;
+    currentSource.destroy = () => { currentSource.removeAllListeners(); currentSource.ended = true; };
+    currentSource.read = () => {
+      currentReads += 1;
+      if (currentReads === 1) return null; // stall on the very first tick only
+      // Every subsequent underlying read call gets a UNIQUE value (not
+      // just "stale vs fresh") so the post-cancellation frame can pin
+      // down exactly how many reads were actually consumed during the
+      // stem window — a plain #readExact() (no catch-up) would have
+      // consumed one fewer.
+      return fillFrame(9000 + currentReads);
+    };
+    mix.setCurrent(currentSource, { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 10;
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    let incomingFullReads = 0;
+    const incomingFull = new EventEmitter();
+    incomingFull.ended = false;
+    incomingFull.error = null;
+    incomingFull.destroy = () => { incomingFull.removeAllListeners(); incomingFull.ended = true; };
+    incomingFull.read = () => {
+      incomingFullReads += 1;
+      if (incomingFullReads === 2) {
+        // End of tick 2's #incoming keep-in-sync read (the top of
+        // #readStemCrossfadeFrame()'s tick body), still ahead of that
+        // same tick's #current fallback-drain read further down — the
+        // cancellation lands mid-tick-2, so tick 2's own #current
+        // catch-up still runs (with the fix, its 2 reads still happen),
+        // and only tick 3 onward sees the plain, non-crossfade path.
+        incomingFull.emit('error', new Error('simulated incoming failure'));
+      }
+      return fillFrame(6000);
+    };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: incomingFull,
+    };
+
+    const plan = makeStemPlan(0.2);
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    // Collect frames (by content, not by tick position — buffering can
+    // reorder how many ticks land in one 'data' flush) until the expected
+    // post-cancellation frame (#current's raw output, read #4) shows up,
+    // stopping the stream as soon as it does so a mock #current that never
+    // stalls again can't free-run indefinitely.
+    const target = fillFrame(9004);
+    const seen = await new Promise((resolve, reject) => {
+      const frames = [];
+      mix.on('error', reject);
+      mix.on('data', (chunk) => {
+        frames.push(chunk);
+        if (chunk.equals(target) || frames.length >= 8) {
+          mix.endMixer();
+          resolve(frames);
+        }
+      });
+    });
+
+    assert.ok(seen.some((f) => f.equals(target)),
+      'expected #current to resume exactly where the stem-window catch-up left it (read #4)');
+    assert.ok(!seen.some((f) => f.equals(fillFrame(9003))),
+      'expected #current to have caught up during the stem window, not still be one read behind (read #3 must never surface as #current\'s own plain output)');
+  } finally {
+    mix.endMixer();
+  }
+});
+
 test('MixStream startStemCrossfade rejects and destroys every source when one already carries an error', async () => {
   const mix = new MixStream();
   try {
