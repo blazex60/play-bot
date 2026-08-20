@@ -120,7 +120,13 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal }) 
   const cached = await getCachedStems(videoId);
   if (cached) return cached;
 
-  const jobTmpRoot = await mkdtemp(path.join(tmpdir(), 'musicbot-stemsep-'));
+  // Staged under STEM_CACHE_DIR itself, NOT os.tmpdir() — the eventual
+  // rename() below must land on the same filesystem as its source, or it
+  // fails with EXDEV. In the production container STEM_CACHE_DIR resolves
+  // under the bind-mounted ./data volume while os.tmpdir() is the
+  // container's own /tmp, a different filesystem entirely.
+  await mkdir(STEM_CACHE_DIR, { recursive: true });
+  const jobTmpRoot = await mkdtemp(path.join(STEM_CACHE_DIR, '.stemsep-'));
   try {
     const inputWav = path.join(jobTmpRoot, 'input.wav');
     const cut = await spawnCapture(spawnFn, 'ffmpeg', [
@@ -188,6 +194,12 @@ export async function pruneStemCache({ maxBytes = DEFAULT_STEM_CACHE_MAX_BYTES }
   const sized = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    // runSeparation()'s staging dirs (`.stemsep-*`, cleaned up in its own
+    // finally block) now live alongside real videoId entries under
+    // STEM_CACHE_DIR — never a valid videoId shape (isSafeVideoId requires
+    // [A-Za-z0-9_-]), so skip anything that isn't one rather than risking
+    // an in-progress separation's staging dir getting evicted mid-write.
+    if (!isSafeVideoId(entry.name)) continue;
     const dirPath = path.join(STEM_CACHE_DIR, entry.name);
     let totalBytes = 0;
     let mtimeMs = 0;

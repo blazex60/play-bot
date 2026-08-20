@@ -85,11 +85,19 @@ export function softLimitFrame(frame, ceiling = 0.95) {
 /**
  * Mix N s16le frames with gains. Applies headroom, soft-limits in float
  * domain, then clamps to int16 (soft-limit must run before hard clip).
- * Headroom is OVERLAP_GAIN (tuned for summing 2 streams) at n<=2; scaled
- * down further at n=3/4 (Phase 8's stem-mix crossfade sums 4 streams) —
- * exact scaling factor is provisional pending real-track listening
- * calibration (docs/mix-transition-phase8.md 未決事項), same caveat as
- * OVERLAP_GAIN itself already carries.
+ * Headroom is always OVERLAP_GAIN (tuned for summing 2 -16 LUFS streams),
+ * regardless of frame count — Phase 8's stem-mix crossfade passes 4 frames,
+ * but they are two COMPLEMENTARY pairs (outVocal+outInstrumental reconstruct
+ * the outgoing track, inVocal+inInstrumental reconstruct the incoming one),
+ * not 4 independently full-amplitude sources. Scaling headroom down by
+ * stream count (an earlier version of this function did `OVERLAP_GAIN *
+ * (2/n)`) treated it as the latter, making the reconstructed track ~6dB
+ * quieter than the real 2-source crossfade case for the entire window
+ * where only one pair has non-negligible gain — then jumping back up at
+ * promotion to the unscaled single full-mix source (Codex). The soft-clip
+ * curve below plus the final hard clamp already protect against clipping
+ * for any actual gain combination regardless of headroom, so there is no
+ * safety reason to scale it down.
  * @param {Buffer[]} frames
  * @param {number[]} gains
  * @returns {Buffer}
@@ -99,8 +107,7 @@ export function mixNFrames(frames, gains) {
   const out = Buffer.allocUnsafe(FRAME_BYTES);
   const dest = new Int16Array(out.buffer, out.byteOffset, FRAME_BYTES / 2);
   const views = frames.map((f) => new Int16Array(f.buffer, f.byteOffset, FRAME_BYTES / 2));
-  const headroom = n <= 2 ? OVERLAP_GAIN : OVERLAP_GAIN * (2 / n);
-  const scaledGains = gains.map((g) => g * headroom);
+  const scaledGains = gains.map((g) => g * OVERLAP_GAIN);
   const ceiling = 0.95;
   const max = 32767 * ceiling;
   for (let i = 0; i < dest.length; i++) {

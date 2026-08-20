@@ -1205,6 +1205,12 @@ export class GuildPlayer {
       this.#preparedOutgoingStems?.videoId === videoId
       && this.#preparedOutgoingStems.prep?.startSec === startSec
       && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
+      // #currentMeasured can still change between the prepDue tick that
+      // prepped these stems and this take — e.g. normalization for the
+      // OTHER side resolving in the same arm pass shouldn't matter here,
+      // but a stale unmeasured pair must not silently win over a since-
+      // populated value (CodeRabbit, follow-up to the ensure-side fix).
+      && this.#preparedOutgoingStems.prep?.measured === this.#currentMeasured
     ) {
       const { vocal, instrumental } = this.#preparedOutgoingStems;
       this.#preparedOutgoingStems = null;
@@ -1255,6 +1261,12 @@ export class GuildPlayer {
       this.#preparedIncomingStems?.videoId === videoId
       && this.#preparedIncomingStems.prep?.startSec === startSec
       && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
+      // #takePreparedIncoming() (the full-mix side) can resolve normalization
+      // and populate #incomingMeasured within the SAME arm pass, after these
+      // stems were already prepped unmeasured — without this check the stale
+      // unmeasured pair would win over the full-mix source's now-measured
+      // loudness (CodeRabbit, follow-up to the ensure-side fix).
+      && this.#preparedIncomingStems.prep?.measured === this.#incomingMeasured
     ) {
       const { vocal, instrumental } = this.#preparedIncomingStems;
       this.#preparedIncomingStems = null;

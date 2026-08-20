@@ -754,11 +754,12 @@ test('mixNFrames([a,b],[ga,gb]) is byte-for-byte identical to mixFrames(a,b,ga,g
   assert.deepEqual(mixNFrames([a, b], [0.8, 0.6]), mixFrames(a, b, 0.8, 0.6));
 });
 
-test('mixNFrames scales down headroom for more than 2 streams without exceeding the clip ceiling', () => {
+test('mixNFrames never exceeds the clip ceiling regardless of stream count', () => {
   // Phase 8: a 4-way full-scale sum at unity gain must still land inside
   // the same +-0.95*32767 ceiling mixFrames() already enforces for 2 — the
-  // per-stream headroom must shrink as stream count grows, or a 4-stem
-  // crossfade clips/distorts far more than a plain 2-source one ever did.
+  // soft-clip curve plus the final hard clamp guarantee this for ANY gain
+  // combination, not a pre-scaled per-stream headroom (see mixNFrames()'s
+  // own docstring — headroom stays flat at OVERLAP_GAIN regardless of n).
   const frames = [fillFrame(32767), fillFrame(32767), fillFrame(32767), fillFrame(32767)];
   const mixed = mixNFrames(frames, [1, 1, 1, 1]);
   const view = new Int16Array(mixed.buffer, mixed.byteOffset, mixed.byteLength / 2);
@@ -766,6 +767,32 @@ test('mixNFrames scales down headroom for more than 2 streams without exceeding 
   for (const sample of view) {
     assert.ok(Math.abs(sample) <= ceiling + 1, `expected sample ${sample} to stay within the clip ceiling`);
   }
+});
+
+test('mixNFrames reconstructs a single track from 2 complementary stems at the same loudness as a plain 2-source mix', () => {
+  // Phase 8 (Codex): the bug this pins — at the start of a stem crossfade,
+  // outVocal+outInstrumental (gain ~1 each) must reconstruct the outgoing
+  // track at the SAME loudness mixFrames()'s plain 2-source case already
+  // produces for a single full-mix stream, not ~6dB quieter (which an
+  // earlier version produced by treating the 4 stem streams as 4
+  // independent full-amplitude sources instead of 2 complementary pairs).
+  // A vocal+instrumental split partitions one track's energy, so summing
+  // them back at gain 1 approximates the ORIGINAL track's sample value —
+  // modeled here as two half-amplitude stems that sum to the same content
+  // a plain single full-mix source of that amplitude would carry.
+  const outVocal = fillFrame(8000);
+  const outInstrumental = fillFrame(8000);
+  const reconstructedOriginal = fillFrame(16000);
+  const inVocal = fillFrame(0);
+  const inInstrumental = fillFrame(0);
+
+  const stemMixed = mixNFrames(
+    [outVocal, outInstrumental, inInstrumental, inVocal],
+    [1, 1, 0, 0],
+  );
+  const plainMixed = mixFrames(reconstructedOriginal, fillFrame(0), 1, 0);
+  assert.deepEqual(stemMixed, plainMixed,
+    'expected the reconstructed-track stem sum to match a plain 2-source mix of the same original content');
 });
 
 test('gainForStemPosition matches gainForPosition exactly when startOffsetSec is 0 and fadeSec spans the whole window', () => {

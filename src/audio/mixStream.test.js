@@ -367,6 +367,77 @@ test('MixStream startStemCrossfade mixes 4 stems then promotes to the incoming f
   }
 });
 
+test('MixStream startStemCrossfade catches up incoming.full\'s read deficit before promotion', async () => {
+  // Codex: #readExact(this.#incoming, ...) is a best-effort, non-blocking
+  // drain each tick — if incoming.full's decoder isn't ready yet (spawn
+  // startup latency), that tick's read is simply skipped while the stem
+  // mix itself still advances fadeElapsedSec. Without a catch-up drain
+  // right before promotion, incoming.full would permanently lag by
+  // however many ticks it missed, replaying already-elapsed content once
+  // promoted to #current.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 10; // 0.2s at 20ms/frame
+    const outgoing = { vocal: stemSource(2000, fadeFrames + 2), instrumental: stemSource(3000, fadeFrames + 2) };
+
+    // Simulates incoming.full not having buffered anything for its first 3
+    // reads (same "not ready yet" shape #readExact() already tolerates for
+    // any source — null, not ended), then serving normally.
+    const readyAfterReads = 3;
+    const totalFrames = 30; // finite, like test #13's stemSource(6000, 30) — must
+    // eventually end so a tight synchronous push loop after promotion (this
+    // fake, unlike a real PcmSource, has no I/O latency of its own) doesn't
+    // spin forever instead of yielding back to the microtask queue.
+    let readCount = 0;
+    let served = 0;
+    const fullSource = new EventEmitter();
+    fullSource.ended = false;
+    fullSource.error = null;
+    fullSource.destroy = () => { fullSource.removeAllListeners(); fullSource.ended = true; };
+    fullSource.read = () => {
+      readCount += 1;
+      if (readCount <= readyAfterReads) return null;
+      if (served >= totalFrames) {
+        fullSource.ended = true;
+        return null;
+      }
+      served += 1;
+      return fillFrame(6000);
+    };
+
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames + 2),
+      instrumental: stemSource(5000, fadeFrames + 2),
+      full: fullSource,
+    };
+    const plan = makeStemPlan(0.2);
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    let servedAtPromotion = null;
+    const promotedPromise = new Promise((resolve) => {
+      mix.on('trackend', (info) => {
+        if (info?.promoted) {
+          servedAtPromotion = served;
+          resolve();
+        }
+      });
+    });
+    mix.on('data', () => {});
+    await promotedPromise;
+
+    const expectedFrames = Math.round(0.2 / (FRAME_MS / 1000));
+    assert.equal(servedAtPromotion, expectedFrames,
+      `expected the catch-up drain to have read all ${expectedFrames} frames from incoming.full by promotion, got ${servedAtPromotion}`);
+  } finally {
+    mix.endMixer();
+  }
+});
+
 test('MixStream startStemCrossfade: inVocal contributes nothing before its own startOffsetSec (delayed-envelope wiring)', async () => {
   // The core Phase 8 correctness property: during the window before inVocal
   // starts fading in, its underlying PCM content must have ZERO effect on

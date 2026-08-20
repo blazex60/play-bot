@@ -147,6 +147,25 @@ test('separateTrackStems dedupes concurrent calls for the same videoId (only one
   }
 });
 
+test('separateTrackStems stages its working directory under STEM_CACHE_DIR, not os.tmpdir()', async () => {
+  // Codex: the eventual rename() of Demucs' output into the persistent
+  // cache must land on the SAME filesystem as its source, or it fails with
+  // EXDEV — in the production container, STEM_CACHE_DIR (data/, bind-
+  // mounted) and os.tmpdir() (the container's own /tmp) are different
+  // filesystems. Staging under STEM_CACHE_DIR itself keeps the rename local.
+  const videoId = uniqueVideoId('staging-dir');
+  try {
+    const cmds = [];
+    await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn({ cmds }) });
+    const ffmpegCall = cmds.find((c) => c.cmd === 'ffmpeg');
+    const inputWav = ffmpegCall.args[ffmpegCall.args.length - 1];
+    assert.ok(inputWav.startsWith(STEM_CACHE_DIR),
+      `expected the ffmpeg cut step's working file (${inputWav}) to be staged under STEM_CACHE_DIR`);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
 test('separateTrackStems re-checks the cache and skips re-running Demucs when already cached', async () => {
   const videoId = uniqueVideoId('already-cached');
   try {

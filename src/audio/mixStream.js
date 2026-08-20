@@ -78,6 +78,8 @@ export class MixStream extends Readable {
   #heldOutInstrumentalFrame = null;
   #heldInVocalFrame = null;
   #heldInInstrumentalFrame = null;
+  /** Frames actually drained from #incoming during the current stem window — used to catch up any deficit before promotion. */
+  #incomingStemFramesRead = 0;
 
   constructor() {
     super();
@@ -265,6 +267,7 @@ export class MixStream extends Readable {
       eqRampSec: computeEqRampSec(plan),
     };
     this.#fadeElapsedSec = 0;
+    this.#incomingStemFramesRead = 0;
     this.#outEq = baseSwap ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120) : null;
     this.#inEq = baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
@@ -742,13 +745,31 @@ export class MixStream extends Readable {
     // stems) draining in lockstep with the stems it stands in for, so its
     // position lands correctly for #promoteStemIncoming() — best-effort,
     // not blocking: a tick where it isn't ready yet (spawn startup latency)
-    // is simply skipped, which can leave it trailing by that latency at
-    // promotion time. That bounded drift (not the unbounded, backpressure-
-    // driven staleness a fully-unread #incoming would accumulate over a
-    // multi-second window) is provisional — see the doc's 未決事項.
-    this.#readExact(this.#incoming, FRAME_BYTES);
+    // is simply skipped, which can leave it trailing by that latency. The
+    // catch-up drain right before promotion below recovers this deficit
+    // rather than leaving #incoming permanently behind (Codex).
+    if (this.#readExact(this.#incoming, FRAME_BYTES)) {
+      this.#incomingStemFramesRead += 1;
+    }
+    // #current (the ORIGINAL outgoing full-mix source, distinct from
+    // #outVocal/#outInstrumental which read the separated stem files) is
+    // the fallback #clearIncoming()/#clearStemSources() resumes from if
+    // incoming.full errors mid-window (see startStemCrossfade()'s error
+    // handler). Without draining it too, it would sit frozen at its
+    // position from the START of the stem window, replaying already-heard
+    // audio on that (rare) cancel path — same best-effort lockstep drain
+    // as #incoming, for the same reason (Codex).
+    this.#readExact(this.#current, FRAME_BYTES);
 
     if (this.#fadeElapsedSec >= fadeSec) {
+      // Drain any accumulated #incoming deficit (early-window buffering
+      // stalls the best-effort read above skipped) before promoting it to
+      // #current — each tick only ever recovers at most one missed frame
+      // otherwise, which can never fully catch up a multi-frame backlog.
+      const expectedFrames = Math.round(fadeSec / (FRAME_MS / 1000));
+      while (this.#incomingStemFramesRead < expectedFrames && this.#readExact(this.#incoming, FRAME_BYTES)) {
+        this.#incomingStemFramesRead += 1;
+      }
       this.#promoteStemIncoming();
     }
     return mixed;
