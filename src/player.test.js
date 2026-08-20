@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { AudioPlayerStatus, StreamType } from '@discordjs/voice'
 import { createTrack } from './queue.js'
 import { triggerTrackEnd } from './player/playbackDrive.js'
-import { makePlayer, nextTurn } from './player/test-helpers.js'
+import { makePlayer, makeAudioPlayer, nextTurn } from './player/test-helpers.js'
 import { ANALYSIS_VERSION } from './audio/trackAnalysis.js'
 
 // --- Phase 7B §8.4: session tempo bookkeeping. Phase 7D wires an actual
@@ -169,4 +169,54 @@ test('GuildPlayer: queue exhaustion with no handleQueueExhausted disconnects as 
 
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(disconnected, true)
+})
+
+test('GuildPlayer: a flowing mixer pipeline still plays PCM after createAudioResource attaches', async () => {
+  // @discordjs/voice createAudioResource(StreamType.Raw) pipelines MixStream
+  // into an opus encoder immediately. That used to start the underrun
+  // watchdog and/or pause MixStream before playNext setCurrent, so Discord
+  // sent packets (speaking) while the track never became audible.
+  const { PassThrough } = await import('node:stream')
+  const { FRAME_BYTES } = await import('./audio/fade.js')
+  const { PcmSource } = await import('./audio/pcmSource.js')
+
+  const tone = Buffer.alloc(FRAME_BYTES)
+  new Int16Array(tone.buffer, tone.byteOffset, FRAME_BYTES / 2).fill(4321)
+  const received = []
+
+  const { player } = makePlayer({
+    framesPerTrack: 8,
+    createPcmSourceFn: async () => PcmSource.fromBuffers([Buffer.from(tone), Buffer.from(tone)]),
+    audioPlayer: makeAudioPlayer(),
+  })
+
+  const mix = player.mixStream
+  const sink = new PassThrough()
+  sink.on('data', (chunk) => received.push(Buffer.from(chunk)))
+  mix.pipe(sink)
+  try {
+    await new Promise((resolve) => setImmediate(resolve))
+
+    await player.playNext()
+
+    const containsTone = () => {
+      for (const chunk of received) {
+        const view = new Int16Array(chunk.buffer, chunk.byteOffset, Math.floor(chunk.byteLength / 2))
+        for (let i = 0; i < view.length; i++) {
+          if (view[i] === 4321) return true
+        }
+      }
+      return false
+    }
+
+    const deadline = Date.now() + 1000
+    while (!containsTone() && Date.now() < deadline) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+
+    assert.ok(containsTone(), 'expected real PCM after leading silence')
+  } finally {
+    mix.unpipe(sink)
+    await player.stop()
+  }
 })

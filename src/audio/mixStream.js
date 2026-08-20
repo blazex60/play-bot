@@ -61,6 +61,7 @@ export class MixStream extends Readable {
   #heldInFrame = null;
   #incomingSkipSec = 0;
   #incomingSkippedSec = 0;
+  #betweenTrackTimer = null;
 
   constructor() {
     super();
@@ -132,15 +133,15 @@ export class MixStream extends Readable {
     this.#incomingSkipSec = 0;
     this.#incomingSkippedSec = 0;
 
-    source.on('data', () => this.#scheduleRead());
-    source.on('end', () => this.#scheduleRead());
+    source.on('data', () => this.#wakeConsumer());
+    source.on('end', () => this.#wakeConsumer());
     source.on('error', (err) => {
       // Consumer (GuildPlayer) dropCurrent/advances; do not finishCurrent here —
       // that would race snaphandoff against the error handoff.
       this.emit('sourceerror', err);
     });
 
-    this.#scheduleRead();
+    this.#wakeConsumer();
     return true;
   }
 
@@ -190,15 +191,15 @@ export class MixStream extends Readable {
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
       : null;
 
-    source.on('data', () => this.#scheduleRead());
-    source.on('end', () => this.#scheduleRead());
+    source.on('data', () => this.#wakeConsumer());
+    source.on('end', () => this.#wakeConsumer());
     source.on('error', (err) => {
       // Cancel overlap only; do not emit sourceerror (that aborts outgoing).
       this.emit('incomingerror', err);
       this.#clearIncoming();
     });
 
-    this.#scheduleRead();
+    this.#wakeConsumer();
     this.emit('crossfadestart', plan);
     return true;
   }
@@ -214,11 +215,14 @@ export class MixStream extends Readable {
     this.#underrunSince = null;
     this.#crossfade = null;
     this.emit('trackend');
+    this.#wakeConsumer();
   }
 
   endMixer() {
     if (this.#destroyed) return;
     this.#destroyed = true;
+    if (this.#betweenTrackTimer) clearTimeout(this.#betweenTrackTimer);
+    this.#betweenTrackTimer = null;
     this.#current?.destroy();
     this.#incoming?.destroy();
     this.#current = null;
@@ -229,6 +233,22 @@ export class MixStream extends Readable {
   _read() {
     this.#pendingRead = true;
     this.#tryPushFrame();
+  }
+
+  #unpauseIfNeeded() {
+    if (this.isPaused()) this.resume();
+  }
+
+  #wakeConsumer() {
+    // A newly attached/ready source must not wait for the between-track pacing
+    // timer. Resuming here preserves the existing source-ready wake-up; the
+    // pacing callback itself never resumes against downstream backpressure.
+    if (!this.#betweenTracks && this.#betweenTrackTimer) {
+      clearTimeout(this.#betweenTrackTimer);
+      this.#betweenTrackTimer = null;
+    }
+    this.#unpauseIfNeeded();
+    this.#scheduleRead();
   }
 
   #scheduleRead() {
@@ -242,16 +262,44 @@ export class MixStream extends Readable {
 
     const frame = this.#readFrame();
     if (frame === null) {
+      // Pipeline from createAudioResource(StreamType.Raw) starts flowing
+      // MixStream immediately, before GuildPlayer.setCurrent / play().
+      // Waiting for the first source is not an underrun — do not push
+      // silence or start the 8s watchdog, or Discord transmits packets
+      // (speaking indicator) while no track is attached, then sourceerror
+      // races the real PCM source and playback never starts.
+      if (!this.#current && !this.#betweenTracks && !this.#incoming) {
+        return;
+      }
       // Between tracks (handoff / prefetch) we MUST keep delivering frames.
       // Starving the AudioPlayer for ~5 packets (~100ms) makes it Idle, and
       // @discordjs/voice then destroy()s this MixStream — killing the mixer
       // for the rest of the session (2nd track never audible, queue races).
       if (this.#betweenTracks) {
-        this.push(SILENCE_FRAME);
+        // push() may synchronously make a flowing consumer request another
+        // frame. Install the guard first so that re-entrant _read() leaves
+        // #pendingRead set for the timer instead of pushing silence in a
+        // tight loop.
+        if (this.#betweenTrackTimer) return;
         this.#pendingRead = false;
-        // Flowing-mode consumers (tests using 'data') would otherwise sync-spin
-        // on endless silence. AudioPlayer uses paused reads, so it is unaffected.
-        if (this.readableFlowing) this.pause();
+        // Silence represents 20 ms of audio, so never produce it faster than
+        // real time.  A read requested during this interval leaves
+        // #pendingRead set; the timer services that demand when the frame is
+        // due.  If pipe() has applied backpressure, _read() is not called and
+        // the timer has nothing to do.  In particular, do not call resume()
+        // here: doing so overrides pipe's pause and grows an encoded-silence
+        // backlog while the next track is being prepared.
+        this.#betweenTrackTimer = setTimeout(() => {
+          this.#betweenTrackTimer = null;
+          if (this.#destroyed || !this.#betweenTracks) return;
+          // Flowing consumers represent active demand. pipe() switches this
+          // to false when a destination returns false, so do not manufacture
+          // a read (or resume the stream) while downstream is backpressured.
+          if (this.readableFlowing) this.#pendingRead = true;
+          this.#scheduleRead();
+        }, FRAME_MS);
+        this.#betweenTrackTimer.unref?.();
+        this.push(SILENCE_FRAME);
         return;
       }
       if (!this.#underrunSince) {
@@ -279,6 +327,8 @@ export class MixStream extends Readable {
 
   _destroy(err, callback) {
     this.#destroyed = true;
+    if (this.#betweenTrackTimer) clearTimeout(this.#betweenTrackTimer);
+    this.#betweenTrackTimer = null;
     this.#current?.destroy();
     this.#incoming?.destroy();
     this.#current = null;
@@ -532,8 +582,8 @@ export class MixStream extends Readable {
     this.#durationSec = null;
     this.#betweenTracks = false;
 
-    next.on('data', () => this.#scheduleRead());
-    next.on('end', () => this.#scheduleRead());
+    next.on('data', () => this.#wakeConsumer());
+    next.on('end', () => this.#wakeConsumer());
     next.on('error', (err) => {
       this.emit('sourceerror', err);
     });
@@ -590,13 +640,13 @@ export class MixStream extends Readable {
     this.#underrunSince = null;
     this.#betweenTracks = false;
 
-    source.on('data', () => this.#scheduleRead());
-    source.on('end', () => this.#scheduleRead());
+    source.on('data', () => this.#wakeConsumer());
+    source.on('end', () => this.#wakeConsumer());
     source.on('error', (err) => {
       this.emit('sourceerror', err);
     });
 
-    // Do not #scheduleRead here: natural-end snap runs inside #readFrame while
+    // Do not #wakeConsumer here: natural-end snap runs inside #readFrame while
     // #pendingRead is still true; scheduling would re-enter #tryPushFrame and
     // double-push. The caller reads the first adopted frame instead (like promote).
     return true;
