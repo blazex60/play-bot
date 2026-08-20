@@ -579,6 +579,14 @@ export class GuildPlayer {
     }
 
     this.#preparedIncoming = null;
+    // A stem-mix attempt could have been prepping in parallel with this
+    // snap-adopted full-mix source — #clearPreparedIncoming() is what
+    // normally piggybacks the stem cleanup onto every abandoned-prep call
+    // site, but this path sets #preparedIncoming directly (adopting the
+    // source, not discarding it) and would otherwise leave four ffmpeg
+    // processes alive for the rest of the adopted track.
+    this.#clearPreparedOutgoingStems();
+    this.#clearPreparedIncomingStems();
     const outgoingTemp = this.#currentTempFile;
     this.#currentTempFile = this.#incomingTempFile;
     this.#incomingTempFile = null;
@@ -1172,19 +1180,24 @@ export class GuildPlayer {
    * the wrong native position by the time it's actually needed.
    */
   #ensureOutgoingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
+    // Loudnorm the stems with the same measured LUFS #current's own full-mix
+    // source used — otherwise the stem window jumps to unfiltered loudness
+    // relative to the surrounding, already-normalized audio. Included in the
+    // identity check (not just videoId/startSec/tempoFilter): if this fires
+    // before #currentMeasured is populated, an unmeasured pair gets prepped;
+    // without this, a later tick that finally sees the real value would
+    // treat the existing prep as still valid and never re-spawn with it.
+    const measured = this.#currentMeasured;
     if (
       this.#preparedOutgoingStems?.videoId === videoId
       && this.#preparedOutgoingStems.prep?.startSec === startSec
       && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
+      && this.#preparedOutgoingStems.prep?.measured === measured
     ) return;
     this.#clearPreparedOutgoingStems();
-    // Loudnorm the stems with the same measured LUFS #current's own full-mix
-    // source used — otherwise the stem window jumps to unfiltered loudness
-    // relative to the surrounding, already-normalized audio.
-    const measured = this.#currentMeasured;
     const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter, measured });
     const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter, measured });
-    this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter }, vocal, instrumental };
+    this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
   }
 
   #takePreparedOutgoingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {
@@ -1218,18 +1231,23 @@ export class GuildPlayer {
    * lockstep (see mixStream.js's startStemCrossfade() docstring).
    */
   #ensureIncomingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
+    // Same rationale as #ensureOutgoingStemPrep() — reuse whichever measured
+    // value the incoming full-mix prep has captured for this track so far,
+    // and include it in the identity check so a later tick that sees
+    // #incomingMeasured finally populated (a slow download/prefetch can
+    // still be resolving the first time this fires) re-preps with it
+    // instead of permanently keeping an unmeasured pair.
+    const measured = this.#incomingMeasured;
     if (
       this.#preparedIncomingStems?.videoId === videoId
       && this.#preparedIncomingStems.prep?.startSec === startSec
       && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
+      && this.#preparedIncomingStems.prep?.measured === measured
     ) return;
     this.#clearPreparedIncomingStems();
-    // Same rationale as #ensureOutgoingStemPrep() — reuse whichever measured
-    // value the incoming full-mix prep has captured for this track so far.
-    const measured = this.#incomingMeasured;
     const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter, measured });
     const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter, measured });
-    this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter }, vocal, instrumental };
+    this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
   }
 
   #takePreparedIncomingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {
@@ -1456,8 +1474,6 @@ export class GuildPlayer {
         tempoBackend,
         maxOverlapSec: MAX_CROSSFADE_SEC,
       });
-      if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
-      let norm = normalizeTransitionPlan(rawPlan);
 
       // Phase 8 (docs/mix-transition-phase8.md): only attempted when plain
       // tier-1 beatmix did NOT win the fallback ladder (mode !== 'beatmix')
@@ -1473,8 +1489,16 @@ export class GuildPlayer {
       // points below — a second fs check right before spawning would risk
       // observing a DIFFERENT cache state than what eligibility was actually
       // decided against a few lines up.
+      //
+      // Tried BEFORE rawPlan's own gapless/no-fade early return (not after)
+      // — planStemTransition() is derived independently from outAnalysis/
+      // inAnalysis, not from rawPlan, so a rawPlan that fell all the way to
+      // 'gapless' (e.g. low aggregate/vocal confidence even with strong
+      // beat/downbeat analysis) must not preempt an otherwise-eligible
+      // stem-mix plan (Codex).
       let outCachedStems = null;
       let inCachedStems = null;
+      let norm = null;
       if (rawPlan.mode !== 'beatmix') {
         [outCachedStems, inCachedStems] = await Promise.all([
           this.#getCachedStemsFn(current.videoId),
@@ -1490,6 +1514,10 @@ export class GuildPlayer {
             norm = normalizeTransitionPlan(stemPlan);
           }
         }
+      }
+      if (!norm) {
+        if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
+        norm = normalizeTransitionPlan(rawPlan);
       }
 
       // §2.3/§8.4: TRACK loop mode repeats the SAME track (`next === current`

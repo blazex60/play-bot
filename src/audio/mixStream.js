@@ -436,6 +436,15 @@ export class MixStream extends Readable {
     this.#pendingRead = false;
     this.#current?._onFrameConsumed?.();
     this.#incoming?._onFrameConsumed?.();
+    // Phase 8: a stem crossfade reads 4 additional real decoders (ffmpeg-
+    // backed PcmSources, same MAX_BUFFER_BYTES pause-on-backpressure as
+    // #current/#incoming) that #readStemCrossfadeFrame() consumes from
+    // directly — without this, they pause after their initial ~2s buffer
+    // and never resume, stalling any overlap longer than that.
+    this.#outVocal?._onFrameConsumed?.();
+    this.#outInstrumental?._onFrameConsumed?.();
+    this.#inVocal?._onFrameConsumed?.();
+    this.#inInstrumental?._onFrameConsumed?.();
   }
 
   _destroy(err, callback) {

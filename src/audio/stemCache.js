@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, rename, rm, stat, readFile, writeFile, access } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, rename, rm, stat, readFile, writeFile, access, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,6 +64,13 @@ export async function getCachedStems(videoId) {
     if (meta.demucsModel !== DEMUCS_MODEL) return null;
     await access(vocalPath);
     await access(instrumentalPath);
+    // Touch meta.json's mtime on every hit — pruneStemCache() sorts by each
+    // entry's max file mtime, so without this a track reused on every
+    // transition looks no more recent than one separated once and never
+    // touched again, making eviction creation-order FIFO instead of LRU.
+    // Best-effort: a failed touch must not turn a real cache hit into a miss.
+    const now = new Date();
+    await utimes(path.join(dir, META_FILE), now, now).catch(() => {});
     return { vocalPath, instrumentalPath };
   } catch {
     return null;
