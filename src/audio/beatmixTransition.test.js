@@ -793,3 +793,43 @@ test('planBeatmixTransition({requireExitVocalSafe:false, requireEntryForwardSafe
   assert.equal(relaxed.outgoing.exitStartSec, 160);
   assert.ok(Number.isFinite(relaxed.outgoing.tempoRatioApplied));
 });
+
+test('requireEntryForwardSafe:false does NOT disable findEntryCandidates()\'s own entry-point vocal-safety check', () => {
+  // CodeRabbit: "Line 88 disables requireEntryForwardSafe. This permits stem
+  // plans that the Phase 8 contract requires to reject." findEntryCandidates()
+  // itself (called with no vocal-safety-related option at all, see its own
+  // isVocalSafe() closure) unconditionally filters out any candidate whose
+  // OWN position is mid-vocal — that check is entirely independent of
+  // requireEntryForwardSafe. What requireEntryForwardSafe actually gates is
+  // the separate, more conservative entryForwardSafeSec() cap on how much
+  // vocal-free room follows the (already vocal-safe) entry point — see its
+  // docstring. Isolated here from the exit side (requireExitVocalSafe stays
+  // at its default true; only requireEntryForwardSafe is relaxed) to pin
+  // down exactly which check does what.
+  const outgoing = happyPathTracks().outgoing; // already vocal-safe at its exit — not the thing under test
+  const incoming = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.75,
+    downbeatConfidence: 0.65,
+    durationSec: 200,
+    firstVocalStartSec: 1, // singing starts almost immediately...
+    headVocalGaps: [{ startSec: 3, endSec: 4 }], // ...then a brief 1s gap...
+    headDownbeats: [3.5], // ...and the only candidate sits inside that gap: itself
+    // vocal-safe (per findEntryCandidates), but with only 0.5s of room
+    // before vocals resume at 4 — nowhere near forward-safe for even the
+    // minimum 2-bar (4s at 120 BPM) overlap this pair would otherwise fit.
+  });
+
+  const entryCandidates = findEntryCandidates(incoming);
+  assert.deepEqual(entryCandidates.map((c) => c.sec), [3.5],
+    'the entry point itself is vocal-safe (inside the gap) and must still be offered as a candidate');
+
+  const strict = planBeatmixTransition(outgoing, incoming);
+  assert.equal(strict.eligible, false,
+    'the default (requireEntryForwardSafe:true) must still reject: no bar count fits within the 0.5s forward-safe room');
+
+  const relaxed = planBeatmixTransition(outgoing, incoming, { requireEntryForwardSafe: false });
+  assert.equal(relaxed.eligible, true,
+    'relaxing only requireEntryForwardSafe accepts the same (still entry-point-vocal-safe) candidate');
+  assert.equal(relaxed.incoming.entrySec, 3.5);
+});

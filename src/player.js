@@ -1201,7 +1201,7 @@ export class GuildPlayer {
    * the track has left to play would just sit blocked on backpressure at
    * the wrong native position by the time it's actually needed.
    */
-  #ensureOutgoingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
+  async #ensureOutgoingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
     // Loudnorm the stems with the same measured LUFS #current's own full-mix
     // source used — otherwise the stem window jumps to unfiltered loudness
     // relative to the surrounding, already-normalized audio. Included in the
@@ -1216,9 +1216,23 @@ export class GuildPlayer {
       && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
       && this.#preparedOutgoingStems.prep?.measured === measured
     ) return;
+    // Revalidate against the live cache right before actually spawning —
+    // this only runs on a genuine (re)prep, i.e. rarely, not on the steady-
+    // state no-op ticks above, so it doesn't reintroduce the per-tick fs
+    // cost player.js's #stemCacheHit memo exists to avoid. `cached` (the
+    // caller's argument) may be a memoized lookup from several arm-ticks
+    // ago; pruneStemCache() can evict the entry any time in the background,
+    // and a stale path here would spawn ffmpeg against a deleted file,
+    // silently failing prep forever for this pair as long as the memo key
+    // doesn't change (Codex).
+    const fresh = await this.#getCachedStemsFn(videoId);
+    if (!fresh) {
+      this.#clearPreparedOutgoingStems();
+      return;
+    }
     this.#clearPreparedOutgoingStems();
-    const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter, measured });
-    const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter, measured });
+    const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
+    const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
     this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
   }
 
@@ -1258,7 +1272,7 @@ export class GuildPlayer {
    * the SAME startSec/tempoFilter so all three incoming sources decode in
    * lockstep (see mixStream.js's startStemCrossfade() docstring).
    */
-  #ensureIncomingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
+  async #ensureIncomingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
     // Same rationale as #ensureOutgoingStemPrep() — reuse whichever measured
     // value the incoming full-mix prep has captured for this track so far,
     // and include it in the identity check so a later tick that sees
@@ -1272,9 +1286,16 @@ export class GuildPlayer {
       && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
       && this.#preparedIncomingStems.prep?.measured === measured
     ) return;
+    // Revalidate against the live cache right before actually spawning — see
+    // #ensureOutgoingStemPrep()'s matching comment (Codex).
+    const fresh = await this.#getCachedStemsFn(videoId);
+    if (!fresh) {
+      this.#clearPreparedIncomingStems();
+      return;
+    }
     this.#clearPreparedIncomingStems();
-    const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter, measured });
-    const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter, measured });
+    const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
+    const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
     this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
   }
 
@@ -1634,14 +1655,20 @@ export class GuildPlayer {
           // Skip prep entirely so #takePreparedOutgoingStems() naturally misses
           // at take time and the transition downgrades to a plain crossfade.
           if (outgoingStemTempoFilter !== undefined) {
+            // Fire-and-forget, like #ensureIncomingPrep() above — but these
+            // two are async (revalidate the cache before spawning; see
+            // #ensureOutgoingStemPrep()'s docstring), so an unhandled
+            // rejection would otherwise surface as an unhandled-rejection
+            // crash instead of the fail-soft downgrade #takePreparedXStems()
+            // already provides when prep never lands.
             this.#ensureOutgoingStemPrep(outCachedStems, current.videoId, {
               startSec: norm.exitStartSec ?? 0,
               tempoFilter: outgoingStemTempoFilter,
-            });
+            }).catch((err) => console.warn('[GuildPlayer] outgoing stem prep failed:', err.message));
             this.#ensureIncomingStemPrep(inCachedStems, next.videoId, {
               startSec: norm.entrySec,
               tempoFilter: norm.tempoFilter,
-            });
+            }).catch((err) => console.warn('[GuildPlayer] incoming stem prep failed:', err.message));
           }
         }
       }

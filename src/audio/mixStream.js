@@ -80,6 +80,8 @@ export class MixStream extends Readable {
   #heldInInstrumentalFrame = null;
   /** Frames actually drained from #incoming during the current stem window — used to catch up any deficit before promotion. */
   #incomingStemFramesRead = 0;
+  /** Total stem-mix ticks processed during the current window (including ticks held past fadeSec while catching up #incoming) — the live target #incomingStemFramesRead must reach before promotion. */
+  #stemCrossfadeTicks = 0;
 
   constructor() {
     super();
@@ -268,6 +270,7 @@ export class MixStream extends Readable {
     };
     this.#fadeElapsedSec = 0;
     this.#incomingStemFramesRead = 0;
+    this.#stemCrossfadeTicks = 0;
     this.#outEq = baseSwap ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120) : null;
     this.#inEq = baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
@@ -739,6 +742,15 @@ export class MixStream extends Readable {
     );
     this.#consumedBytes += FRAME_BYTES;
     this.#fadeElapsedSec += FRAME_MS / 1000;
+    // Counts every processed tick, including ticks held past fadeSec while
+    // catching up #incoming — unlike a fadeSec-derived constant, this grows
+    // by 1 on each such hold tick too, since a hold tick also advances the
+    // audible stems by one frame. Comparing #incomingStemFramesRead against
+    // this live count (not a fixed target) is what makes promotion wait for
+    // the ACTUAL number of ticks elapsed, not just the nominal window length
+    // (Codex: a fixed target let a held tick's own new #incoming frame count
+    // toward covering old backlog, still leaving a 1-frame gap at promotion).
+    this.#stemCrossfadeTicks += 1;
 
     // Keep #incoming (the post-window full-mix continuation source, seeked
     // once at prep time to the same entrySec/tempoFilter as the incoming
@@ -766,8 +778,18 @@ export class MixStream extends Readable {
       // stalls the best-effort read above skipped) before promoting it to
       // #current — each tick only ever recovers at most one missed frame
       // otherwise, which can never fully catch up a multi-frame backlog.
-      const expectedFrames = Math.round(fadeSec / (FRAME_MS / 1000));
-      while (this.#incomingStemFramesRead < expectedFrames && this.#readExact(this.#incoming, FRAME_BYTES)) {
+      // Target #stemCrossfadeTicks (the live count of ticks actually
+      // processed so far), not a fadeSec-derived constant: a constant target
+      // stops growing once computed, but a tick spent here HOLDING (this
+      // very branch, below) is itself one more processed tick — its own
+      // #incoming read at the top of the function competes for the same
+      // fixed target as the old backlog, so a constant target could be
+      // satisfied one frame short of the real backlog at promotion (Codex,
+      // caught after the earlier Math.ceil fix: "every held tick also
+      // advances the audible incoming stems, but expectedFrames remains
+      // fixed"). #stemCrossfadeTicks increments every processed tick
+      // (including this hold), so it stays exactly in step.
+      while (this.#incomingStemFramesRead < this.#stemCrossfadeTicks && this.#readExact(this.#incoming, FRAME_BYTES)) {
         this.#incomingStemFramesRead += 1;
       }
       // Only promote once #incoming has actually caught up — a decoder
@@ -779,7 +801,17 @@ export class MixStream extends Readable {
       // a few more ticks is audibly equivalent to the post-promotion
       // full-mix source (inVocal/inInstrumental already at full gain,
       // out* already silent) — just retry the catch-up next tick (Codex).
-      if (this.#incomingStemFramesRead >= expectedFrames) {
+      // #stemCrossfadeTicks growing on every hold tick (the fix above) means
+      // the target keeps rising for as long as we hold — if #incoming ends
+      // (genuinely out of data, e.g. a very short track/clip) before
+      // catching up, it can never gain enough frames to reach a still-
+      // growing target, holding — and, since the 4 stem sources can go on
+      // producing silence-substituted frames indefinitely once THEY end too
+      // (see the held/Done handling above), spinning the synchronous push
+      // loop — forever. Ended is exactly "no more frames will ever arrive",
+      // so promote with whatever #incoming did manage to read rather than
+      // wait on frames that can never come.
+      if (this.#incomingStemFramesRead >= this.#stemCrossfadeTicks || this.#incoming?.ended) {
         this.#promoteStemIncoming();
       }
     }

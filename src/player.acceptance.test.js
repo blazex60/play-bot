@@ -1731,3 +1731,64 @@ test('acceptance (mixer): stem-mix is skipped (falls back to the existing ladder
     await player.stop();
   }
 });
+
+test('acceptance (mixer): a memoized stem-cache hit that is evicted before prep is revalidated, not spawned stale', async () => {
+  // Codex: player.js's #stemCacheHit memoizes a positive (current.videoId,
+  // next.videoId) cache lookup across many arm-ticks (avoiding a
+  // getCachedStemsFn() call — and its mtime touch — on every ~200ms tick
+  // while a stem-mix candidate is still just being watched, not yet due for
+  // prep). If pruneStemCache() evicts that entry in the background between
+  // the memo being set and #ensureOutgoingStemPrep()/#ensureIncomingStemPrep()
+  // actually spawning from it, spawning against the stale (now-deleted)
+  // paths would silently and permanently fail prep for as long as this pair
+  // remains current/next. getCachedStemsFn here reports a hit for the first
+  // 2 calls (enough to populate the memo through the initial eligibility
+  // check) and a miss on every call after — simulating exactly that
+  // eviction window.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  let getCachedStemsCalls = 0;
+  const stemSourceCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => {
+      getCachedStemsCalls += 1;
+      if (getCachedStemsCalls > 2) return null;
+      return {
+        vocalPath: `/tmp/${videoId}.vocal.wav`,
+        instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+      };
+    },
+    createFileSourceFn: (filePath, opts) => {
+      stemSourceCalls.push({ filePath, opts });
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 200; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.ok(getCachedStemsCalls > 2, 'expected the eligibility check to have populated the memo before eviction');
+    // The stale memo must never be trusted to actually spawn ffmpeg
+    // sources — revalidation at prep time must have caught the eviction.
+    assert.equal(stemSourceCalls.length, 0, 'expected zero stem sources spawned from a since-evicted cache entry');
+    if (startedPlan) assert.notEqual(startedPlan.mode, 'stem-mix');
+  } finally {
+    await player.stop();
+  }
+});

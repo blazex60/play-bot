@@ -430,9 +430,180 @@ test('MixStream startStemCrossfade catches up incoming.full\'s read deficit befo
     mix.on('data', () => {});
     await promotedPromise;
 
-    const expectedFrames = Math.round(0.2 / (FRAME_MS / 1000));
+    // NOT Math.ceil(0.2/(FRAME_MS/1000)) (10): #fadeElapsedSec is
+    // accumulated via repeated += FRAME_MS/1000, so exactly which tick it
+    // first reaches fadeSec on is itself subject to float rounding — it
+    // actually crosses 0.2 on tick 11 here, one past the "ideal" division's
+    // result (the same reason the catch-up target compares against a live
+    // tick count, not a fadeSec-derived constant — see mixStream.js). 11 is
+    // the real, deterministic tick count for this exact fixture, confirmed
+    // by running it; the invariant under test — zero deficit at promotion —
+    // holds regardless of which tick that turns out to be.
+    assert.equal(servedAtPromotion, 11,
+      `expected the catch-up drain to have read all frames from incoming.full by the real promotion tick, got ${servedAtPromotion}`);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade catch-up target uses ceil, not round, for a non-frame-aligned fadeSec', async () => {
+  // CodeRabbit: fadeSec (bar-duration derived, e.g. 4 bars at 123 BPM =
+  // ~7.805s) is rarely an exact multiple of FRAME_MS — #fadeElapsedSec
+  // only crosses it on the ceil()'th tick, not the round()'th. Using
+  // Math.round() for the catch-up target could satisfy it ONE tick before
+  // that real last tick, so a miss on that final tick would look
+  // "already caught up" while incoming.full is actually still one frame
+  // short at promotion — reproduced here at a fast timescale: fadeSec =
+  // 0.204s → fadeSec/FRAME_SEC = 10.2, round() = 10 (buggy), ceil() = 11
+  // (correct).
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeSec = 0.204;
+    const fadeFrames = 13; // comfortably more than the 11 real ticks needed
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+
+    // Misses exactly once, right as the 11th frame would be served —
+    // simulating a transient stall on the specific tick that crosses
+    // fadeSec — then recovers on retry (the catch-up loop's own re-read).
+    let served = 0;
+    let missedOnce = false;
+    const totalFrames = 30;
+    const fullSource = new EventEmitter();
+    fullSource.ended = false;
+    fullSource.error = null;
+    fullSource.destroy = () => { fullSource.removeAllListeners(); fullSource.ended = true; };
+    fullSource.read = () => {
+      if (served === 10 && !missedOnce) {
+        missedOnce = true;
+        return null;
+      }
+      if (served >= totalFrames) {
+        fullSource.ended = true;
+        return null;
+      }
+      served += 1;
+      return fillFrame(6000);
+    };
+
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: fullSource,
+    };
+    const plan = makeStemPlan(fadeSec);
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    let servedAtPromotion = null;
+    const promotedPromise = new Promise((resolve) => {
+      mix.on('trackend', (info) => {
+        if (info?.promoted) {
+          servedAtPromotion = served;
+          resolve();
+        }
+      });
+    });
+    mix.on('data', () => {});
+    await promotedPromise;
+
+    const expectedFrames = Math.ceil(fadeSec / (FRAME_MS / 1000));
+    assert.equal(expectedFrames, 11, 'sanity check on the test fixture\'s own arithmetic');
     assert.equal(servedAtPromotion, expectedFrames,
-      `expected the catch-up drain to have read all ${expectedFrames} frames from incoming.full by promotion, got ${servedAtPromotion}`);
+      `expected the catch-up loop to have drained the frame missed right at the fadeSec boundary (${expectedFrames}), got ${servedAtPromotion}`);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade catch-up target grows across multiple held ticks (Codex: fixed target masks a hold-tick deficit)', async () => {
+  // Codex, after the earlier Math.ceil fix: every tick spent HOLDING (this
+  // very branch, waiting for incoming.full to catch up) is itself one more
+  // real tick whose own #incoming frame the catch-up target must also cover
+  // — a target derived once from fadeSec (a constant) doesn't grow across
+  // those extra hold ticks, so a deficit that survives exactly one hold tick
+  // can get satisfied one real frame short, replaying ~20ms of already-heard
+  // audio right after promotion. Scripted call-by-call so the exact point of
+  // divergence between the old fixed target (would promote after 10 reads,
+  // with 11 real ticks elapsed) and the fix (correctly holds for a 12th
+  // tick, promoting only once reads == ticks elapsed) is unambiguous.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 20;
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+
+    // calls 1-3: not ready yet (spawn latency, as in the sibling test).
+    // calls 4-9: serve normally (6 successes).
+    // call 10 (tick 10's top-of-function read, crossing the fadeSec=0.2s
+    // threshold): serves (7th success).
+    // call 11 (tick 10's 1st catch-up attempt): serves (8th success).
+    // call 12 (tick 10's 2nd catch-up attempt): misses — tick 10 ends on
+    // hold with 8 real frames served for 10 ticks elapsed (both the old
+    // fixed target=10 and the live target=10 agree here: still short).
+    // call 13 (tick 11's top-of-function read): serves (9th success).
+    // call 14 (tick 11's 1st catch-up attempt): serves (10th success) — the
+    // OLD fixed target (10) would already be satisfied here and promote,
+    // even though tick 11 (not tick 10) is the one in progress: only 10
+    // real frames for 11 real ticks elapsed, a 1-frame deficit.
+    // call 15 (tick 11's 2nd catch-up attempt, only reached by the FIX
+    // since its live target is now 11, not 10): misses — tick 11 also ends
+    // on hold, correctly, since 10 < 11.
+    // calls 16+: serve normally, closing the gap for good at tick 12 (12
+    // real frames for 12 real ticks elapsed — zero deficit).
+    const script = [null, null, null, 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', 'ok', null];
+    let served = 0;
+    let callIndex = 0;
+    const totalFrames = 40;
+    const fullSource = new EventEmitter();
+    fullSource.ended = false;
+    fullSource.error = null;
+    fullSource.destroy = () => { fullSource.removeAllListeners(); fullSource.ended = true; };
+    fullSource.read = () => {
+      const outcome = callIndex < script.length ? script[callIndex] : 'ok';
+      callIndex += 1;
+      if (outcome === null) return null;
+      if (served >= totalFrames) {
+        fullSource.ended = true;
+        return null;
+      }
+      served += 1;
+      return fillFrame(6000);
+    };
+
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: fullSource,
+    };
+    const plan = makeStemPlan(0.2);
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    let servedAtPromotion = null;
+    const promotedPromise = new Promise((resolve) => {
+      mix.on('trackend', (info) => {
+        if (info?.promoted) {
+          servedAtPromotion = served;
+          resolve();
+        }
+      });
+    });
+    mix.on('data', () => {});
+    await promotedPromise;
+
+    // Correct (fixed) result: promotion waits for the 12th real tick, by
+    // which point exactly 12 real frames have been served — no deficit. The
+    // old, now-fixed code would have promoted one tick earlier with only 10
+    // frames served (a 1-frame / ~20ms repeat at promotion).
+    assert.equal(servedAtPromotion, 12,
+      `expected promotion to wait until incoming.full's read count caught up to the real elapsed tick count (12), got ${servedAtPromotion}`);
   } finally {
     mix.endMixer();
   }
@@ -503,6 +674,45 @@ test('MixStream startStemCrossfade substitutes silence for a stem that ends earl
     assert.equal(frames.length, fadeFrames, 'expected the transition to run to completion despite the early-ending stem');
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(promoted, true);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade promotes instead of hanging when incoming.full ends before catching up', async () => {
+  // Regression: #stemCrossfadeTicks (the live catch-up target, growing on
+  // every tick spent holding for a deficit) can never be satisfied by a
+  // #incoming that has already reached EOF — a genuinely short/exhausted
+  // source can't be drained faster than it has frames. Without a guard, the
+  // hold loops forever: each hold tick is itself a "processed tick" (the 4
+  // stem sources keep producing silence-substituted frames once THEY end
+  // too, per the sibling "substitutes silence" test), which spins the
+  // synchronous internal push loop indefinitely and never yields back to
+  // the event loop — this reproduces as a hang, not a rejected assertion,
+  // caught only by giving this test a chance to actually finish.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 10; // 0.2s at 20ms/frame
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, 5), // ends well before the 10-tick window does
+    };
+    const plan = makeStemPlan(0.2);
+    mix.startStemCrossfade({ outgoing, incoming }, plan);
+
+    let promoted = false;
+    mix.on('trackend', (info) => { if (info?.promoted) promoted = true; });
+    // Not hanging (collectFrames() resolving at all) IS the regression test
+    // — a bounded frame count just gives it something to await.
+    const frames = await collectFrames(mix, fadeFrames);
+    assert.ok(frames.length > 0, 'expected the mix to keep producing frames instead of hanging');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(promoted, true, 'expected promotion to proceed once incoming.full ends, rather than holding on an unreachable target');
   } finally {
     mix.endMixer();
   }
