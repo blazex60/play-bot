@@ -1671,22 +1671,24 @@ test('acceptance (mixer): stem-mix transition is chosen when both sides have cac
   let startedPlan = null;
   player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
 
-  await player.playNext();
-  for (let i = 0; i < 60; i += 1) {
-    player.mixStream.read(FRAME_BYTES);
+  try {
+    await player.playNext();
+    for (let i = 0; i < 60; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.ok(startedPlan, 'expected a crossfade to have armed');
+    assert.equal(startedPlan.mode, 'stem-mix');
+    assert.ok(startedPlan.stems);
+    assert.equal(stemSourceCalls.length, 4, 'expected 2 outgoing + 2 incoming stem sources to be spawned');
+    assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-a.vocal.wav'));
+    assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-a.instrumental.wav'));
+    assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-b.vocal.wav'));
+    assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-b.instrumental.wav'));
+  } finally {
+    await player.stop();
   }
-  await new Promise((resolve) => setTimeout(resolve, 300));
-
-  assert.ok(startedPlan, 'expected a crossfade to have armed');
-  assert.equal(startedPlan.mode, 'stem-mix');
-  assert.ok(startedPlan.stems);
-  assert.equal(stemSourceCalls.length, 4, 'expected 2 outgoing + 2 incoming stem sources to be spawned');
-  assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-a.vocal.wav'));
-  assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-a.instrumental.wav'));
-  assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-b.vocal.wav'));
-  assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-b.instrumental.wav'));
-
-  await player.stop();
 });
 
 test('acceptance (mixer): stem-mix is skipped (falls back to the existing ladder) when stems are not cached', async () => {

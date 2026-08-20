@@ -24,17 +24,21 @@ function clamp01(n) {
 }
 
 /**
- * Phase 7 §11.1: for a `mode: 'beatmix'` plan, the bass-swap EQ ramps in over
- * `eq.swapBar` bars instead of applying instantly for the whole crossfade
- * (the doc's diagram — A/B LOW% cross over gradually, not switched at bar 1).
- * `sync.beatsPerBar` and `targetBpm` (the session tempo both sides play the
- * overlap at) give the real bar length; any other mode (plain crossfade,
- * phrase-crossfade) keeps the existing instant on/off EQ, so this returns
- * null for them.
+ * Phase 7 §11.1: for a `mode: 'beatmix'` plan (and Phase 8's `'stem-mix'`,
+ * which is derived from and carries the same sync/eq/targetBpm fields as a
+ * beatmix plan), the bass-swap EQ ramps in over `eq.swapBar` bars instead of
+ * applying instantly for the whole crossfade (the doc's diagram — A/B LOW%
+ * cross over gradually, not switched at bar 1). `sync.beatsPerBar` and
+ * `targetBpm` (the session tempo both sides play the overlap at) give the
+ * real bar length; any other mode (plain crossfade, phrase-crossfade) keeps
+ * the existing instant on/off EQ, so this returns null for them.
  * @returns {number|null} ramp duration in seconds, or null for "apply fully".
  */
 function computeEqRampSec(plan) {
-  if (plan.mode !== 'beatmix') return null;
+  // stem-mix plans carry the same sync/eq/targetBpm fields as the beatmix
+  // plan they were derived from (planStemTransition() spreads it through)
+  // — the bar-timed ramp applies identically to the instrumental pair.
+  if (plan.mode !== 'beatmix' && plan.mode !== 'stem-mix') return null;
   const targetBpm = plan.targetBpm;
   const beatsPerBar = plan.sync?.beatsPerBar;
   const swapBar = plan.eq?.swapBar;
@@ -271,15 +275,19 @@ export class MixStream extends Readable {
       s.on('end', () => this.#wakeConsumer());
     }
     // Stem sources read local, already-separated cache files (§8.2 of the
-    // doc) — an error here is treated the same as a natural EOF by
+    // doc) — an error there is treated the same as a natural EOF by
     // #readStemCrossfadeFrame()'s per-stem exhaustion handling (that stem
     // just contributes silence for the rest of the window), not as a
     // whole-transition abort, so no listener is needed beyond #wakeConsumer.
+    // `incoming.full` is different: it is what #promoteStemIncoming() installs
+    // as #current, never mixed/validated frame-by-frame itself, so a failure
+    // here must cancel the whole overlap now — otherwise a dead source could
+    // silently get promoted later. Same posture/cleanup as plain
+    // startCrossfade()'s incoming error handler, plus the stem sources.
     incoming.full.on('error', (err) => {
-      // Only surfaces if #incoming (the continuation source) fails before
-      // promotion; #finishCurrent()'s normal error handling takes over once
-      // it's actually promoted to #current.
       this.emit('incomingerror', err);
+      this.#clearIncoming();
+      this.#clearStemSources();
     });
 
     this.#wakeConsumer();

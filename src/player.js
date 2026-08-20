@@ -194,6 +194,12 @@ export class GuildPlayer {
   #lastActiveAt = 0;
   #watchdogTimer = null;
   #currentTempFile = null;
+  // Phase 8: mirrors #incomingMeasured's lifecycle exactly (set at spawn,
+  // transferred at every point #currentTempFile itself is transferred from
+  // #incomingTempFile, cleared at every point #currentTempFile is cleared)
+  // so #ensureOutgoingStemPrep() can loudnorm the outgoing stems with the
+  // same measured LUFS value the currently-playing full-mix source used.
+  #currentMeasured = null;
   #prefetchEntries = new Map();
   #createAudioResource;
   #resolveAudioStream;
@@ -576,6 +582,7 @@ export class GuildPlayer {
     const outgoingTemp = this.#currentTempFile;
     this.#currentTempFile = this.#incomingTempFile;
     this.#incomingTempFile = null;
+    this.#currentMeasured = this.#incomingMeasured;
     this.#incomingMeasured = null;
 
     if (this.#queue.loopMode !== LoopMode.TRACK && this.#queue.current !== next) {
@@ -694,6 +701,7 @@ export class GuildPlayer {
     const outgoingTemp = this.#currentTempFile;
     this.#currentTempFile = this.#incomingTempFile;
     this.#incomingTempFile = null;
+    this.#currentMeasured = this.#incomingMeasured;
     this.#incomingMeasured = null;
 
     const nextTrack = this.#queue.current;
@@ -944,6 +952,7 @@ export class GuildPlayer {
 
     if (!forIncoming) {
       this.#currentTempFile = null;
+      this.#currentMeasured = null;
     }
 
     // Mixer path forces normalize when duration allows (crossfade quality).
@@ -986,6 +995,7 @@ export class GuildPlayer {
         this.#incomingMeasured = prefetched.measured;
       } else {
         this.#currentTempFile = prefetched.filePath;
+        this.#currentMeasured = prefetched.measured;
       }
       this.#scheduleAnalysis(track, prefetched.filePath);
       const source = createFileSource(prefetched.filePath, { measured: prefetched.measured, startSec, tempoFilter });
@@ -1012,9 +1022,14 @@ export class GuildPlayer {
       // after analysis resolves. Best-effort: a failure here just means
       // this track never becomes stem-mix eligible, the existing beatmix/
       // phrase-crossfade/legacy ladder is untouched either way.
-      await this.#separateTrackStemsFn(filePath, track.videoId, { spawnFn: spawnNice }).catch((err) => {
-        console.warn('[GuildPlayer] stem separation failed:', err.message);
-      });
+      // Skip rather than start a many-minute Demucs run against a job the
+      // queue already decided to cancel (e.g. a mixer underrun killed this
+      // job right as #runAnalysis finished).
+      if (!signal?.aborted) {
+        await this.#separateTrackStemsFn(filePath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
+          console.warn('[GuildPlayer] stem separation failed:', err.message);
+        });
+      }
       return analysis;
     }).catch((err) => {
       if (err?.code === 'ANALYSIS_KILLED') {
@@ -1131,11 +1146,21 @@ export class GuildPlayer {
    * it anywhere new.
    */
   #outgoingStemTempoFilter(tempoBackend) {
-    return buildTempoFilter({
+    const built = buildTempoFilter({
       nativeBpm: this.#sessionTempo.nativeBpm,
       targetBpm: this.#sessionTempo.playbackBpm,
       backend: tempoBackend,
-    }).filter;
+    });
+    // buildTempoFilter() returns { filter: null } both when no stretch is
+    // needed AND when a needed stretch couldn't be expressed (nativeBpm
+    // missing, deviation past the backend's limit) — those two cases must
+    // not collapse into the same "spawn unstretched" result here: the
+    // second one would silently decode the outgoing stems at native tempo
+    // while #current keeps playing stretched, drifting apart for the whole
+    // stem window. undefined signals "stem-mix unavailable" to callers.
+    const ratio = this.#sessionTempo.tempoRatio ?? 1;
+    if (built.filter == null && Math.abs(ratio - 1) > 1e-9) return undefined;
+    return built.filter;
   }
 
   /**
@@ -1153,8 +1178,12 @@ export class GuildPlayer {
       && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
     ) return;
     this.#clearPreparedOutgoingStems();
-    const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter });
-    const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter });
+    // Loudnorm the stems with the same measured LUFS #current's own full-mix
+    // source used — otherwise the stem window jumps to unfiltered loudness
+    // relative to the surrounding, already-normalized audio.
+    const measured = this.#currentMeasured;
+    const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter, measured });
+    const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter, measured });
     this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter }, vocal, instrumental };
   }
 
@@ -1195,8 +1224,11 @@ export class GuildPlayer {
       && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
     ) return;
     this.#clearPreparedIncomingStems();
-    const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter });
-    const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter });
+    // Same rationale as #ensureOutgoingStemPrep() — reuse whichever measured
+    // value the incoming full-mix prep has captured for this track so far.
+    const measured = this.#incomingMeasured;
+    const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter, measured });
+    const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter, measured });
     this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter }, vocal, instrumental };
   }
 
@@ -1327,6 +1359,7 @@ export class GuildPlayer {
       if (forPlayback && this.#incomingTempFile) {
         this.#currentTempFile = this.#incomingTempFile;
         this.#incomingTempFile = null;
+        this.#currentMeasured = this.#incomingMeasured;
         this.#incomingMeasured = null;
       }
       return source;
@@ -1524,14 +1557,22 @@ export class GuildPlayer {
         // Phase 8: late-bound (see #ensureOutgoingStemPrep()'s docstring) —
         // fired from this same gate, not at track-promotion time.
         if (norm.mixPlan.mode === 'stem-mix' && outCachedStems && inCachedStems) {
-          this.#ensureOutgoingStemPrep(outCachedStems, current.videoId, {
-            startSec: norm.exitStartSec ?? 0,
-            tempoFilter: this.#outgoingStemTempoFilter(tempoBackend),
-          });
-          this.#ensureIncomingStemPrep(inCachedStems, next.videoId, {
-            startSec: norm.entrySec,
-            tempoFilter: norm.tempoFilter,
-          });
+          const outgoingStemTempoFilter = this.#outgoingStemTempoFilter(tempoBackend);
+          // undefined means a required stretch couldn't be expressed — spawning
+          // the stems anyway would decode them at native tempo while #current
+          // keeps playing stretched, drifting apart for the whole stem window.
+          // Skip prep entirely so #takePreparedOutgoingStems() naturally misses
+          // at take time and the transition downgrades to a plain crossfade.
+          if (outgoingStemTempoFilter !== undefined) {
+            this.#ensureOutgoingStemPrep(outCachedStems, current.videoId, {
+              startSec: norm.exitStartSec ?? 0,
+              tempoFilter: outgoingStemTempoFilter,
+            });
+            this.#ensureIncomingStemPrep(inCachedStems, next.videoId, {
+              startSec: norm.entrySec,
+              tempoFilter: norm.tempoFilter,
+            });
+          }
         }
       }
 
@@ -1583,7 +1624,16 @@ export class GuildPlayer {
       // fell back to native, unstretched tempo. Either field being set means
       // the plan required a transform this source didn't actually apply.
       const requiresUnhonoredTransform = norm.entrySec > 0 || norm.tempoFilter != null;
-      let mixPlan = (!sourceHonorsPlan && requiresUnhonoredTransform)
+      const forcePlainCrossfade = !sourceHonorsPlan && requiresUnhonoredTransform;
+      if (forcePlainCrossfade) {
+        // The stem pairs (if any were prepped) were prepped for a plan this
+        // source cannot honor — release their ffmpeg processes now rather
+        // than leaving them blocked on backpressure until an unrelated
+        // #clearPreparedIncoming() call happens to sweep them up later.
+        this.#clearPreparedOutgoingStems();
+        this.#clearPreparedIncomingStems();
+      }
+      let mixPlan = forcePlainCrossfade
         ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null }
         : norm.mixPlan;
 
@@ -1813,6 +1863,7 @@ export class GuildPlayer {
   async #cleanupCurrentTempFile() {
     const filePath = this.#currentTempFile;
     this.#currentTempFile = null;
+    this.#currentMeasured = null;
     if (filePath) {
       await cleanupTempFile(filePath);
     }

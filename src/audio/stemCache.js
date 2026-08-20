@@ -1,8 +1,11 @@
 import { mkdtemp, mkdir, readdir, rename, rm, stat, readFile, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnCapture } from './spawnCapture.js';
 import { resolveDemucsBin, DEMUCS_MODEL } from './vocalActivity.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * Phase 8 (docs/mix-transition-phase8.md): a filesystem-only, PERSISTENT
@@ -13,8 +16,23 @@ import { resolveDemucsBin, DEMUCS_MODEL } from './vocalActivity.js';
  * every transition attempt would defeat the point. No SQLite: the Bot
  * process never opens better-sqlite3 (CLAUDE.md) — cache membership is a
  * meta.json sidecar per entry, keyed by videoId.
+ *
+ * Lives under the repo's `data/` dir (docker-compose.yml mounts `./data` as
+ * the only persistent volume) rather than os.tmpdir(), which is wiped on
+ * every `docker compose up --build` redeploy — matching db/index.js's
+ * DEFAULT_DB_PATH convention, including the env override.
  */
-export const STEM_CACHE_DIR = path.join(tmpdir(), 'music-bot-stems');
+export const STEM_CACHE_DIR = process.env.MUSICBOT_STEM_CACHE_DIR
+  ?? path.join(__dirname, '..', '..', 'data', 'stems');
+
+/** Plain-identifier guard for videoId, which comes from external track
+ * metadata, not a controlled allowlist — used as a path component below, so
+ * a value containing `..` or a separator must never reach entryDir(). */
+const SAFE_VIDEO_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+function isSafeVideoId(videoId) {
+  return typeof videoId === 'string' && SAFE_VIDEO_ID.test(videoId);
+}
 /** Provisional — full-track Demucs is unbenchmarked in this repo (see doc's 未決事項). */
 export const STEM_SEPARATION_TIMEOUT_MS = 600_000;
 /** Provisional cap — see doc's 未決事項. */
@@ -35,7 +53,7 @@ function entryDir(videoId) {
  * @returns {Promise<{ vocalPath: string, instrumentalPath: string } | null>}
  */
 export async function getCachedStems(videoId) {
-  if (!videoId) return null;
+  if (!isSafeVideoId(videoId)) return null;
   const dir = entryDir(videoId);
   const vocalPath = path.join(dir, VOCAL_FILE);
   const instrumentalPath = path.join(dir, INSTRUMENTAL_FILE);
@@ -62,14 +80,16 @@ export async function getCachedStems(videoId) {
  * would name that subdirectory.
  * @param {string} filePath already-downloaded/normalized full-track audio
  * @param {string} videoId
- * @param {{ spawnFn?: Function, timeoutMs?: number }} [opts]
+ * @param {{ spawnFn?: Function, timeoutMs?: number, signal?: AbortSignal }} [opts]
  * @returns {Promise<{ vocalPath: string, instrumentalPath: string } | null>}
  */
 export async function separateTrackStems(filePath, videoId, {
   spawnFn,
   timeoutMs = STEM_SEPARATION_TIMEOUT_MS,
+  signal,
 } = {}) {
-  if (!filePath || !videoId) return null;
+  if (!filePath || !isSafeVideoId(videoId)) return null;
+  if (signal?.aborted) return null;
 
   const cached = await getCachedStems(videoId);
   if (cached) return cached;
@@ -77,13 +97,17 @@ export async function separateTrackStems(filePath, videoId, {
   const existing = inFlight.get(videoId);
   if (existing) return existing;
 
-  const job = runSeparation(filePath, videoId, { spawnFn, timeoutMs })
+  // Dedup is per-videoId, shared across every caller currently awaiting it —
+  // an abort from any one caller's signal cancels the shared in-flight job
+  // for all of them, same as analysisQueue's own kill-current semantics
+  // (queue-wide, not per-caller).
+  const job = runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal })
     .finally(() => inFlight.delete(videoId));
   inFlight.set(videoId, job);
   return job;
 }
 
-async function runSeparation(filePath, videoId, { spawnFn, timeoutMs }) {
+async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal }) {
   // Re-check inside the (de-duplicated) job in case a concurrent caller for
   // the same videoId finished between the caller's first check and now.
   const cached = await getCachedStems(videoId);
@@ -97,8 +121,9 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs }) {
       '-i', filePath,
       '-ac', '2', '-ar', '44100',
       inputWav,
-    ], { timeoutMs });
+    ], { timeoutMs, signal });
     if (cut.code !== 0) return null;
+    if (signal?.aborted) return null;
 
     const demucsBin = resolveDemucsBin();
     const demucs = await spawnCapture(spawnFn, demucsBin, [
@@ -106,7 +131,7 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs }) {
       '-n', DEMUCS_MODEL,
       '-o', jobTmpRoot,
       inputWav,
-    ], { timeoutMs });
+    ], { timeoutMs, signal });
     if (demucs.code !== 0) return null;
 
     const stemDir = path.join(jobTmpRoot, DEMUCS_MODEL, 'input');
@@ -125,6 +150,11 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs }) {
       demucsModel: DEMUCS_MODEL,
       separatedAt: Date.now(),
     }));
+    // Enforce the size cap after every write, not just at Bot startup —
+    // a long-running process would otherwise grow the cache unbounded.
+    pruneStemCache().catch((err) => {
+      console.warn(`[stemCache] prune after separation failed: ${err.message}`);
+    });
     return { vocalPath, instrumentalPath };
   } catch (err) {
     console.warn(`[stemCache] separation failed for ${videoId}: ${err.message}`);

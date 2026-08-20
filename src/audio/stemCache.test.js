@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdir, writeFile, rm, readFile, stat, utimes } from 'node:fs/promises';
+import { mkdir, writeFile, rm, readFile, readdir, stat, utimes } from 'node:fs/promises';
 import path from 'node:path';
 import {
   STEM_CACHE_DIR,
@@ -169,10 +169,37 @@ async function entryTotalBytes(videoId) {
   return total;
 }
 
+/**
+ * STEM_CACHE_DIR is the same persistent, machine-shared directory a real
+ * Bot process caches into (data/stems — see stemCache.js's module docstring).
+ * A dev machine running this suite alongside a populated real cache must not
+ * have its unrelated entries swept up by this test's tight maxBytes cap —
+ * baseline against whatever was already there before this test's own writes.
+ */
+async function currentTotalBytes() {
+  let entries;
+  try {
+    entries = await readdir(STEM_CACHE_DIR, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      total += await entryTotalBytes(entry.name);
+    } catch {
+      // Racing with another writer/pruner — skip, best-effort baseline only.
+    }
+  }
+  return total;
+}
+
 test('pruneStemCache evicts the oldest entries once the total size exceeds maxBytes', async () => {
   const oldId = uniqueVideoId('prune-old');
   const newId = uniqueVideoId('prune-new');
   try {
+    const baseline = await currentTotalBytes();
     await separateTrackStems('/tmp/fake-track-source', oldId, { spawnFn: fakeSpawn() });
     // Backdate the old entry's files so mtime-based LRU picks it first.
     const oldDir = path.join(STEM_CACHE_DIR, oldId);
@@ -183,9 +210,10 @@ test('pruneStemCache evicts the oldest entries once the total size exceeds maxBy
     await separateTrackStems('/tmp/fake-track-source', newId, { spawnFn: fakeSpawn() });
 
     const newSize = await entryTotalBytes(newId);
-    // Cap tight enough that only the newer entry survives — big enough to
-    // hold the new entry, too small to hold both.
-    await pruneStemCache({ maxBytes: newSize });
+    // Cap tight enough that only the newer entry (plus whatever pre-existed
+    // before this test ran) survives — big enough to hold the new entry on
+    // top of the baseline, too small to also hold the old test entry.
+    await pruneStemCache({ maxBytes: baseline + newSize });
 
     assert.equal(await getCachedStems(oldId), null, 'expected the older entry to be evicted');
     assert.ok(await getCachedStems(newId), 'expected the newer entry to survive');

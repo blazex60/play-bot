@@ -399,6 +399,11 @@ test('MixStream startStemCrossfade: inVocal contributes nothing before its own s
 
   const withLowInVocal = await firstMixedFrame(-32000);
   const withHighInVocal = await firstMixedFrame(32000);
+  // Fail loudly if the captured frame was underrun silence rather than a
+  // real mix — otherwise the deepEqual below would pass vacuously (both
+  // sides all-zero regardless of whether the envelope wiring is correct).
+  assert.ok(pcmView(withLowInVocal).some((s) => s !== 0),
+    'expected a real mixed frame, not underrun silence');
   assert.deepEqual(withLowInVocal, withHighInVocal,
     'expected wildly different inVocal content to produce an IDENTICAL first frame, since inVocal gain is still 0 there');
 });
