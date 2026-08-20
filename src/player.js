@@ -1405,30 +1405,40 @@ export class GuildPlayer {
     const key = `${videoId}:${startSec}:${tempoFilter}:${measured}`;
     if (this.#preparingOutgoingStemsKey === key) return;
     this.#preparingOutgoingStemsKey = key;
-    // Revalidate against the live cache right before actually spawning —
-    // this only runs on a genuine (re)prep, i.e. rarely, not on the steady-
-    // state no-op ticks above, so it doesn't reintroduce the per-tick fs
-    // cost player.js's #stemCacheHit memo exists to avoid. `cached` (the
-    // caller's argument) may be a memoized lookup from several arm-ticks
-    // ago; pruneStemCache() can evict the entry any time in the background,
-    // and a stale path here would spawn ffmpeg against a deleted file,
-    // silently failing prep forever for this pair as long as the memo key
-    // doesn't change (Codex).
-    const fresh = await this.#getCachedStemsFn(videoId);
-    // A newer call (different identity) or an explicit clear (stop, plan
-    // downgrade, ...) superseded this attempt while it awaited — the
-    // caller no longer wants this result; do not install it.
-    if (this.#preparingOutgoingStemsKey !== key) return;
-    if (!fresh) {
-      this.#preparingOutgoingStemsKey = null;
+    try {
+      // Revalidate against the live cache right before actually spawning —
+      // this only runs on a genuine (re)prep, i.e. rarely, not on the
+      // steady-state no-op ticks above, so it doesn't reintroduce the
+      // per-tick fs cost player.js's #stemCacheHit memo exists to avoid.
+      // `cached` (the caller's argument) may be a memoized lookup from
+      // several arm-ticks ago; pruneStemCache() can evict the entry any
+      // time in the background, and a stale path here would spawn ffmpeg
+      // against a deleted file, silently failing prep forever for this
+      // pair as long as the memo key doesn't change (Codex).
+      const fresh = await this.#getCachedStemsFn(videoId);
+      // A newer call (different identity) or an explicit clear (stop, plan
+      // downgrade, ...) superseded this attempt while it awaited — the
+      // caller no longer wants this result; do not install it.
+      if (this.#preparingOutgoingStemsKey !== key) return;
+      if (!fresh) {
+        this.#clearPreparedOutgoingStems();
+        return;
+      }
+      const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
+      const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
       this.#clearPreparedOutgoingStems();
-      return;
+      this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
+    } finally {
+      // Always release the in-flight marker for THIS attempt, including on
+      // a rejected getCachedStemsFn() — otherwise a transient cache-read
+      // error leaves the key stuck forever, and every later tick for this
+      // same identity hits the dedup no-op above, permanently disabling
+      // stem prep for the rest of the transition even if a later read
+      // would have succeeded (CodeRabbit). Only clear it if it's still
+      // OURS — a newer call already replacing it with its own key must
+      // keep that key, not have it wiped out from under it.
+      if (this.#preparingOutgoingStemsKey === key) this.#preparingOutgoingStemsKey = null;
     }
-    const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
-    const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
-    this.#preparingOutgoingStemsKey = null;
-    this.#clearPreparedOutgoingStems();
-    this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
   }
 
   #takePreparedOutgoingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {
@@ -1490,20 +1500,24 @@ export class GuildPlayer {
     const key = `${videoId}:${startSec}:${tempoFilter}:${measured}`;
     if (this.#preparingIncomingStemsKey === key) return;
     this.#preparingIncomingStemsKey = key;
-    // Revalidate against the live cache right before actually spawning — see
-    // #ensureOutgoingStemPrep()'s matching comment (Codex).
-    const fresh = await this.#getCachedStemsFn(videoId);
-    if (this.#preparingIncomingStemsKey !== key) return;
-    if (!fresh) {
-      this.#preparingIncomingStemsKey = null;
+    try {
+      // Revalidate against the live cache right before actually spawning —
+      // see #ensureOutgoingStemPrep()'s matching comment (Codex).
+      const fresh = await this.#getCachedStemsFn(videoId);
+      if (this.#preparingIncomingStemsKey !== key) return;
+      if (!fresh) {
+        this.#clearPreparedIncomingStems();
+        return;
+      }
+      const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
+      const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
       this.#clearPreparedIncomingStems();
-      return;
+      this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
+    } finally {
+      // Always release the in-flight marker for THIS attempt — see
+      // #ensureOutgoingStemPrep()'s matching comment (CodeRabbit).
+      if (this.#preparingIncomingStemsKey === key) this.#preparingIncomingStemsKey = null;
     }
-    const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
-    const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
-    this.#preparingIncomingStemsKey = null;
-    this.#clearPreparedIncomingStems();
-    this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
   }
 
   #takePreparedIncomingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {

@@ -655,6 +655,103 @@ test('MixStream startStemCrossfade catch-up target grows across multiple held ti
   }
 });
 
+test('MixStream startStemCrossfade falls back to #current instead of silence when a stem stalls', async () => {
+  // Codex: with six concurrent decoders (4 stems + #incoming + #current), a
+  // transient stall in just ONE stem used to output SILENCE_FRAME for that
+  // whole tick — unlike the ordinary (non-stem) crossfade path, which keeps
+  // playing #current while its own incoming decoder catches up. #current is
+  // already read every "ready" tick purely for lockstep-drain bookkeeping;
+  // on a held tick it should be OUTPUT instead of silence.
+  const mix = new MixStream();
+  try {
+    const currentValue = 9999;
+    mix.setCurrent(stemSource(currentValue, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 10;
+    let outVocalReads = 0;
+    const outVocalSource = new EventEmitter();
+    outVocalSource.ended = false;
+    outVocalSource.error = null;
+    outVocalSource.destroy = () => { outVocalSource.removeAllListeners(); outVocalSource.ended = true; };
+    outVocalSource.read = () => {
+      outVocalReads += 1;
+      if (outVocalReads === 1) return null; // transient stall on the very first tick only
+      return fillFrame(2000);
+    };
+
+    const outgoing = { vocal: outVocalSource, instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames),
+    };
+    const plan = makeStemPlan(0.2);
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const [frame] = await collectFrames(mix, 1);
+    assert.deepEqual(frame, fillFrame(currentValue),
+      'expected the stalled tick to output #current\'s real audio, not silence');
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade caps how long it holds for a #incoming that never catches up', async () => {
+  // Codex: #stemCrossfadeTicks (the live catch-up target) grows by 1 on
+  // every hold tick — if #incoming settles into providing at most one new
+  // frame per subsequent tick (or, as here, stops providing new frames
+  // entirely without ever reaching .ended), a pre-existing deficit can
+  // never close: the target keeps pace with (or outpaces) whatever
+  // #incoming can supply, forever. Left uncapped this blocks promotion —
+  // and therefore GuildPlayer's queue advancement — for up to the rest of
+  // the incoming track. MAX_STEM_CATCHUP_HOLD_TICKS bounds the wait.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 200), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Stems need to outlast the whole capped hold window, not just the
+    // nominal 10-frame (0.2s) fade window.
+    const outgoing = { vocal: stemSource(2000, 200), instrumental: stemSource(3000, 200) };
+    let served = 0;
+    const fullSource = new EventEmitter();
+    // Deliberately never ends — isolates this fix (the hold-tick cap) from
+    // the separate #incoming?.ended fallback tested elsewhere.
+    fullSource.ended = false;
+    fullSource.error = null;
+    fullSource.destroy = () => { fullSource.removeAllListeners(); fullSource.ended = true; };
+    fullSource.read = () => {
+      if (served >= 3) return null; // permanently stalls — the deficit can never close
+      served += 1;
+      return fillFrame(6000);
+    };
+
+    const incoming = {
+      vocal: stemSource(4000, 200),
+      instrumental: stemSource(5000, 200),
+      full: fullSource,
+    };
+    const plan = makeStemPlan(0.2);
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    let promoted = false;
+    mix.on('trackend', (info) => { if (info?.promoted) promoted = true; });
+    mix.on('data', () => {});
+    // Generous real-time budget — the cap should force promotion well
+    // within this, not hang for the (simulated) rest of the incoming track.
+    const deadline = Date.now() + 5000;
+    while (!promoted && Date.now() < deadline) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(promoted, true, 'expected the hold cap to force promotion despite #incoming never catching up');
+  } finally {
+    mix.endMixer();
+  }
+});
+
 test('MixStream startStemCrossfade: inVocal contributes nothing before its own startOffsetSec (delayed-envelope wiring)', async () => {
   // The core Phase 8 correctness property: during the window before inVocal
   // starts fading in, its underlying PCM content must have ZERO effect on

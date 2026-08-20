@@ -18,6 +18,19 @@ import {
 import { MAX_UNDERRUN_MS } from './config.js';
 
 const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
+/**
+ * Phase 8: hard cap on how many ticks #readStemCrossfadeFrame() will hold
+ * promotion waiting for #incoming to catch up to #stemCrossfadeTicks's live
+ * (ever-growing) target. A transient stall (spawn latency, a missed read)
+ * closes within a handful of ticks; sustained decoder pressure (CPU
+ * contention keeping #incoming to ~1 new frame per tick, matching the
+ * target's own growth rate 1-for-1) would otherwise never close the gap and
+ * block GuildPlayer's queue advancement for up to the rest of the incoming
+ * track (Codex). 50 ticks (1s) comfortably covers ordinary spawn-latency
+ * deficits while bounding the worst case to something GuildPlayer can
+ * recover from quickly.
+ */
+const MAX_STEM_CATCHUP_HOLD_TICKS = 50;
 
 function clamp01(n) {
   return n < 0 ? 0 : n > 1 ? 1 : n;
@@ -82,6 +95,8 @@ export class MixStream extends Readable {
   #incomingStemFramesRead = 0;
   /** Total stem-mix ticks processed during the current window (including ticks held past fadeSec while catching up #incoming) — the live target #incomingStemFramesRead must reach before promotion. */
   #stemCrossfadeTicks = 0;
+  /** Ticks spent holding past fadeSec waiting for #incoming to catch up — capped by MAX_STEM_CATCHUP_HOLD_TICKS so sustained decoder pressure can't block promotion indefinitely. */
+  #stemCatchupHoldTicks = 0;
 
   constructor() {
     super();
@@ -271,6 +286,7 @@ export class MixStream extends Readable {
     this.#fadeElapsedSec = 0;
     this.#incomingStemFramesRead = 0;
     this.#stemCrossfadeTicks = 0;
+    this.#stemCatchupHoldTicks = 0;
     this.#outEq = baseSwap ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120) : null;
     this.#inEq = baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
@@ -709,7 +725,18 @@ export class MixStream extends Readable {
       this.#heldOutInstrumentalFrame = outInstFrame;
       this.#heldInVocalFrame = inVocalFrame;
       this.#heldInInstrumentalFrame = inInstFrame;
-      return null;
+      // A transient stall in just one of six concurrent decoders (4 stems +
+      // #incoming + #current) must not silence the whole mix — the ordinary
+      // (non-stem) crossfade path keeps playing #current while its own
+      // incoming decoder catches up, and a stem stall deserves the same
+      // grace. #current is already read every "ready" tick below purely for
+      // lockstep-drain bookkeeping (its content discarded there); on a held
+      // tick, output that frame instead of SILENCE_FRAME — it isn't gain-
+      // weighted to the crossfade envelope, but a single mistimed-volume
+      // tick of the outgoing track is far less audible than a dead gap
+      // (Codex). Does not advance #fadeElapsedSec/#stemCrossfadeTicks —
+      // this tick doesn't count as a real stem-mix tick, same as before.
+      return this.#readExact(this.#current, FRAME_BYTES);
     }
     this.#heldOutVocalFrame = null;
     this.#heldOutInstrumentalFrame = null;
@@ -814,8 +841,26 @@ export class MixStream extends Readable {
       // loop — forever. Ended is exactly "no more frames will ever arrive",
       // so promote with whatever #incoming did manage to read rather than
       // wait on frames that can never come.
-      if (this.#incomingStemFramesRead >= this.#stemCrossfadeTicks || this.#incoming?.ended) {
+      //
+      // That reasoning breaks down under SUSTAINED pressure: if #incoming
+      // settles into producing at most one new frame per tick from here on
+      // (e.g. CPU contention), it can never close a pre-existing deficit —
+      // #stemCrossfadeTicks grows by 1 every hold tick too, exactly
+      // matching #incoming's own best-case growth rate, so the gap it
+      // needed to close stays constant forever instead of shrinking. Left
+      // unbounded this blocks GuildPlayer's queue advancement for
+      // potentially the rest of the incoming track (Codex). Cap the hold at
+      // MAX_STEM_CATCHUP_HOLD_TICKS and promote anyway past that point —
+      // still audibly safe per the clamped-gain reasoning above, just with
+      // a small remaining desync instead of an unbounded stall.
+      const caughtUp = this.#incomingStemFramesRead >= this.#stemCrossfadeTicks;
+      if (caughtUp || this.#incoming?.ended) {
         this.#promoteStemIncoming();
+      } else {
+        this.#stemCatchupHoldTicks += 1;
+        if (this.#stemCatchupHoldTicks >= MAX_STEM_CATCHUP_HOLD_TICKS) {
+          this.#promoteStemIncoming();
+        }
       }
     }
     return mixed;

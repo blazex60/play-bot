@@ -1862,3 +1862,76 @@ test('acceptance (mixer): concurrent arm ticks do not spawn duplicate stem sourc
     await player.stop();
   }
 });
+
+test('acceptance (mixer): a rejected prep revalidation does not permanently disable stem-mix for that pair', async () => {
+  // CodeRabbit: #preparing*StemsKey is set before the cache-revalidation
+  // await, but was only ever cleared on the SUCCESS paths below it — a
+  // rejected getCachedStemsFn() (a transient fs/cache read error) skipped
+  // straight past those resets. Every later arm tick for the same identity
+  // then hit the dedup no-op (`#preparing*StemsKey === key`) forever, since
+  // nothing had cleared it, permanently disabling stem prep for the rest of
+  // the transition even though a later read would have succeeded. The fix
+  // wraps the revalidation in try/finally so the key is always released.
+  //
+  // getCachedStemsFn succeeds for the first 2 calls (the eligibility
+  // check's Promise.all, memoized afterward by #stemCacheHit), rejects for
+  // the next few (simulating a transient failure hit by the ensure-side
+  // revalidation), then succeeds — the 200ms arm interval's natural retries
+  // should recover once the key is properly released each time.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  let getCachedStemsCalls = 0;
+  const stemSourceCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => {
+      getCachedStemsCalls += 1;
+      if (getCachedStemsCalls > 2 && getCachedStemsCalls <= 6) {
+        throw new Error('transient cache read failure');
+      }
+      return {
+        vocalPath: `/tmp/${videoId}.vocal.wav`,
+        instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+      };
+    },
+    createFileSourceFn: (filePath, opts) => {
+      stemSourceCalls.push({ filePath, opts });
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    // Stay under the fixture's 1.0s exit candidate while several arm ticks
+    // (200ms each) retry the rejected revalidation and eventually succeed.
+    for (let i = 0; i < 10; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+
+    // Now cross the exit point so readyToFade/take can proceed.
+    for (let i = 0; i < 60; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    assert.ok(getCachedStemsCalls > 6, 'expected retries past the rejected calls');
+    assert.ok(startedPlan, 'expected a crossfade to have armed once revalidation recovered');
+    assert.equal(startedPlan.mode, 'stem-mix');
+    assert.equal(stemSourceCalls.length, 4,
+      `expected exactly 2 outgoing + 2 incoming stem sources once revalidation recovered, got ${stemSourceCalls.length}`);
+  } finally {
+    await player.stop();
+  }
+});
