@@ -2013,3 +2013,82 @@ test('acceptance (mixer): missing prepared stems at take time aborts instead of 
     await player.stop();
   }
 });
+
+test('acceptance (mixer): a stem-mix pair marked unavailable gets a fresh attempt when it recurs (QUEUE loop)', async () => {
+  // Codex: #stemMixUnavailableKey is scoped by (current, next).videoId
+  // alone — QUEUE loop mode (or a duplicated playlist entry) can bring the
+  // SAME pair back around later, and without an explicit reset, a
+  // since-resolved (or merely transient) earlier failure would downgrade
+  // every future occurrence of that pair for the rest of the GuildPlayer's
+  // lifetime. #onCrossfadePromoted()/#handleAfter() now clear the marker
+  // once the failed pair's own transition attempt concludes — verify a
+  // SECOND lap through the same A→B pair (after two triggerTrackEnd()
+  // advances: A→B, then B→A) attempts stem-mix again instead of staying
+  // silently downgraded.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  const stemSourceCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => ({
+      vocalPath: `/tmp/${videoId}.vocal.wav`,
+      instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+    }),
+    createFileSourceFn: (filePath, opts) => {
+      stemSourceCalls.push({ filePath, opts });
+      if (filePath.includes('vid-a')) {
+        // Outgoing stem prep for A keeps failing to spawn — every A→B
+        // attempt aborts, whichever lap it happens on.
+        throw new Error('simulated outgoing stem spawn failure');
+      }
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.loopMode = LoopMode.QUEUE;
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 200; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    const vidACallsAfterFirstLap = stemSourceCalls.filter((c) => c.filePath.includes('vid-a')).length;
+    assert.ok(vidACallsAfterFirstLap >= 1, 'expected the first A→B stem-mix attempt to have been made');
+
+    // Two natural (non-crossfade) advances: A ends → B (QUEUE loop), then
+    // B ends → back to A — bringing the exact same A→B pair around again.
+    // shouldReconnectRetry() replays the SAME track instead of advancing
+    // when a track "ends" less than RECONNECT_GRACE_MS (5s) after it
+    // started (a real premature-disconnect heuristic, unrelated to this
+    // test) — wait past that grace period before each triggerTrackEnd()
+    // so it reads as a genuine natural completion.
+    await new Promise((resolve) => setTimeout(resolve, 4200));
+    triggerTrackEnd({ mixStream: player.mixStream });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(queue.current.videoId, 'vid-b', 'expected the queue to have advanced to B');
+    await new Promise((resolve) => setTimeout(resolve, 5200));
+    triggerTrackEnd({ mixStream: player.mixStream });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(queue.current.videoId, 'vid-a', 'expected the QUEUE loop to have wrapped back to A');
+
+    for (let i = 0; i < 200; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    const vidACallsAfterSecondLap = stemSourceCalls.filter((c) => c.filePath.includes('vid-a')).length;
+    assert.ok(vidACallsAfterSecondLap > vidACallsAfterFirstLap,
+      'expected the recurring A→B pair to get a fresh stem-mix attempt on the second lap, not stay downgraded');
+  } finally {
+    await player.stop();
+  }
+});

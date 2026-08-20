@@ -87,6 +87,18 @@ export class MixStream extends Readable {
   #outInstrumental = null;
   #inVocal = null;
   #inInstrumental = null;
+  /**
+   * Per-stem count of ticks whose real frame was substituted with silence
+   * (a transient stall or a not-yet-ready decoder) and never made up —
+   * #readStemCatchingUp() drains an extra already-buffered frame per
+   * outstanding deficit point the next time that stem IS ready, so a
+   * momentary stall doesn't leave that stem's content permanently trailing
+   * the others by however many ticks it missed (Codex).
+   */
+  #outVocalDeficit = 0;
+  #outInstrumentalDeficit = 0;
+  #inVocalDeficit = 0;
+  #inInstrumentalDeficit = 0;
   /** Frames actually drained from #incoming during the current stem window — used to catch up any deficit before promotion. */
   #incomingStemFramesRead = 0;
   /** Total stem-mix ticks processed during the current window (including ticks held past fadeSec while catching up #incoming) — the live target #incomingStemFramesRead must reach before promotion. */
@@ -283,6 +295,10 @@ export class MixStream extends Readable {
     this.#incomingStemFramesRead = 0;
     this.#stemCrossfadeTicks = 0;
     this.#stemCatchupHoldTicks = 0;
+    this.#outVocalDeficit = 0;
+    this.#outInstrumentalDeficit = 0;
+    this.#inVocalDeficit = 0;
+    this.#inInstrumentalDeficit = 0;
     this.#outEq = baseSwap ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120) : null;
     this.#inEq = baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
@@ -505,6 +521,33 @@ export class MixStream extends Readable {
     return frame;
   }
 
+  /**
+   * Phase 8: like #readExact(), but also closes any outstanding per-stem
+   * deficit (ticks this stem was silence-substituted for and never made
+   * up) by draining extra already-buffered frames this tick, keeping only
+   * the freshest one — a stem that stalled for a tick otherwise plays that
+   * content permanently one-or-more ticks behind the others for the rest
+   * of the window, since a Readable's `.read()` can't be un-consumed and
+   * nothing else ever re-syncs it (Codex). Draining (not holding) the
+   * catch-up frames means at most one, already-buffered, already-decoded
+   * extra frame's worth of THIS stem's own audio is skipped to restore
+   * alignment — inaudible next to a growing cross-stem skew for the rest
+   * of the transition. Best-effort: if no extra data is buffered yet, the
+   * deficit carries forward and is retried on a later successful tick.
+   * @returns {[Buffer|null, number]} [frame, newDeficit]
+   */
+  #readStemCatchingUp(source, bytes, deficit) {
+    let frame = this.#readExact(source, bytes);
+    if (!frame) return [null, deficit + 1];
+    while (deficit > 0) {
+      const next = this.#readExact(source, bytes);
+      if (!next) break;
+      frame = next;
+      deficit -= 1;
+    }
+    return [frame, deficit];
+  }
+
   #readFrame() {
     if (this.#crossfade?.mode === 'tail-fade' && this.#current) {
       return this.#readTailFadeFrame();
@@ -711,19 +754,22 @@ export class MixStream extends Readable {
    * This design (per-stem silence substitution, unconditional every tick —
    * same shape as the existing EOF/exhaustion handling, just no longer
    * gated on `.ended`) avoids both: nothing is ever held across ticks, so
-   * there is nothing to go stale or desync. The cost is a stem that stalls
-   * plays with a fixed, self-correcting one-or-few-frame content/envelope
-   * offset for exactly as long as the stall lasted — audibly milder than
-   * either full-mix silence or a cross-tick replay, and bounded by the same
-   * "MID-window stalls are rare, local-file stem reads essentially only
-   * fail at spawn time" assumption `startStemCrossfade()`'s upfront
-   * `.error` check already relies on.
+   * there is nothing to go stale or desync. On its own, though, this still
+   * leaves a stalled stem's OWN content permanently trailing the other 3
+   * by however many ticks it missed, since it just resumes its normal
+   * one-frame-per-tick cadence from wherever it left off (Codex, round 9
+   * follow-up #2) — #readStemCatchingUp() closes that per-stem deficit by
+   * draining an extra already-buffered frame (discarding the older one)
+   * the next time that stem IS ready, so the skip is a single, bounded,
+   * self-contained skip within that one stem's own audio rather than a
+   * skew relative to the other 3 that never closes on its own.
    */
   #readStemCrossfadeFrame() {
-    const outVocalFrame = this.#readExact(this.#outVocal, FRAME_BYTES);
-    const outInstFrame = this.#readExact(this.#outInstrumental, FRAME_BYTES);
-    const inVocalFrame = this.#readExact(this.#inVocal, FRAME_BYTES);
-    const inInstFrame = this.#readExact(this.#inInstrumental, FRAME_BYTES);
+    let outVocalFrame; let outInstFrame; let inVocalFrame; let inInstFrame;
+    [outVocalFrame, this.#outVocalDeficit] = this.#readStemCatchingUp(this.#outVocal, FRAME_BYTES, this.#outVocalDeficit);
+    [outInstFrame, this.#outInstrumentalDeficit] = this.#readStemCatchingUp(this.#outInstrumental, FRAME_BYTES, this.#outInstrumentalDeficit);
+    [inVocalFrame, this.#inVocalDeficit] = this.#readStemCatchingUp(this.#inVocal, FRAME_BYTES, this.#inVocalDeficit);
+    [inInstFrame, this.#inInstrumentalDeficit] = this.#readStemCatchingUp(this.#inInstrumental, FRAME_BYTES, this.#inInstrumentalDeficit);
 
     const outVocal = outVocalFrame ?? SILENCE_FRAME;
     const outInst = outInstFrame ?? SILENCE_FRAME;

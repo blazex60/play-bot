@@ -354,8 +354,14 @@ export class GuildPlayer {
    * spawn success, leaving this unset would have every subsequent ~200ms
    * arm tick re-select the SAME relaxed stem-mix plan, abort it again, and
    * never let rawPlan's own plain-crossfade fallback run at all (Codex).
-   * Checked at plan-selection time to skip stem-mix for this exact pair
-   * until current/next changes and the key no longer matches.
+   * Checked at plan-selection time to skip stem-mix for this exact pair.
+   * Explicitly cleared in #onCrossfadePromoted() once that pair's
+   * transition attempt actually concludes — comparing against the CURRENT
+   * pair's key alone isn't enough, since QUEUE loop mode or a duplicated
+   * playlist entry can bring the SAME pair back around later, and a
+   * since-resolved (or merely transient) earlier failure must not
+   * permanently downgrade every future occurrence of that pair for the
+   * rest of the GuildPlayer's lifetime (Codex).
    * @type {string | null}
    */
   #stemMixUnavailableKey = null;
@@ -879,6 +885,15 @@ export class GuildPlayer {
     this.#forceSkip = false;
     this.#hadError = false;
     this.#clearCrossfadeArm();
+    // Codex: #stemMixUnavailableKey scopes a failed stem-mix attempt to the
+    // (current, next) pair it happened against — clear it here, once that
+    // pairing's transition attempt has actually concluded (this fires for
+    // every promotion, stem-mix or not), so a LATER recurrence of the same
+    // videoId pair (QUEUE loop mode, a duplicated playlist entry) gets a
+    // fresh, unbiased stem-mix attempt instead of staying downgraded for
+    // the rest of the GuildPlayer's lifetime over a since-resolved (or
+    // simply transient) earlier failure.
+    this.#stemMixUnavailableKey = null;
 
     const target = this.#crossfadeTargetTrack;
     this.#crossfadeTargetTrack = null;
@@ -1097,6 +1112,11 @@ export class GuildPlayer {
 
   async #handleAfter() {
     this.#clearCrossfadeArm();
+    // Same reasoning as #onCrossfadePromoted()'s reset (Codex): a natural,
+    // non-crossfade track end (no fallback was even eligible for the
+    // failed pair) must also release the marker once that pair's attempt
+    // has concluded, not just the crossfade-promotion path.
+    this.#stemMixUnavailableKey = null;
     await this.#cleanupCurrentTempFile();
 
     const upcomingBeforeAdvance = this.#queue.loopMode === LoopMode.TRACK

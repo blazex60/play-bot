@@ -743,6 +743,86 @@ test('MixStream startStemCrossfade substitutes per-stem silence (not a full-mix 
   }
 });
 
+test('MixStream startStemCrossfade catches up a stalled stem\'s content instead of leaving it permanently behind', async () => {
+  // Codex (round 9, follow-up #2): per-stem silence substitution alone
+  // avoids the full-mix-silence and cross-tick-replay bugs of the two
+  // earlier designs, but on its own it does nothing to correct the
+  // substituted stem's own read position — it just resumes its normal
+  // one-frame-per-tick cadence from wherever it left off, so its CONTENT
+  // stays permanently one tick behind the other 3 for the rest of the
+  // window. #readStemCatchingUp() must drain an extra already-buffered
+  // frame the next time the stalled stem IS ready, discarding the stale
+  // one, so the stem's content actually catches up to the current tick
+  // instead of trailing it forever.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(9999, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 10;
+    let outVocalReads = 0;
+    const outVocalSource = new EventEmitter();
+    outVocalSource.ended = false;
+    outVocalSource.error = null;
+    outVocalSource.destroy = () => { outVocalSource.removeAllListeners(); outVocalSource.ended = true; };
+    outVocalSource.read = () => {
+      outVocalReads += 1;
+      if (outVocalReads === 1) return null; // stall on the very first tick only
+      // Read #2 is the STALE frame the catch-up drain should discard; read
+      // #3+ is the FRESH content it should keep and mix on the recovery
+      // tick onward. Maximally separated (not just sequential) so a
+      // rounding/clipping coincidence in the mix math can't mask which one
+      // actually got used.
+      return outVocalReads === 2 ? fillFrame(-32000) : fillFrame(32000);
+    };
+
+    const outInstValue = 3000;
+    const inInstValue = 5000;
+    const inVocalValue = 4000;
+    const outgoing = { vocal: outVocalSource, instrumental: stemSource(outInstValue, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(inVocalValue, fadeFrames),
+      instrumental: stemSource(inInstValue, fadeFrames),
+      full: stemSource(6000, fadeFrames),
+    };
+    const plan = makeStemPlan(0.2);
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const frames = await collectFrames(mix, 2);
+    const recoveryFrame = frames[1];
+    const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
+    // Without catch-up, the recovery tick would mix outVocalReads=2's value
+    // (-32000, the stale first-successful-read); with catch-up, the drain
+    // consumes an extra frame and keeps outVocalReads=3's value (32000).
+    const expectedWithoutCatchup = mixNFrames(
+      [fillFrame(-32000), fillFrame(outInstValue), fillFrame(inInstValue), fillFrame(inVocalValue)],
+      [
+        gainForStemPosition({ positionSec: FRAME_MS / 1000, ...plan.stems.outVocal }),
+        gainForStemPosition({ positionSec: FRAME_MS / 1000, ...plan.stems.outInstrumental }),
+        gainForStemPosition({ positionSec: FRAME_MS / 1000, ...plan.stems.inInstrumental }),
+        gainForStemPosition({ positionSec: FRAME_MS / 1000, ...plan.stems.inVocal }),
+      ],
+    );
+    const expectedWithCatchup = mixNFrames(
+      [fillFrame(32000), fillFrame(outInstValue), fillFrame(inInstValue), fillFrame(inVocalValue)],
+      [
+        gainForStemPosition({ positionSec: FRAME_MS / 1000, ...plan.stems.outVocal }),
+        gainForStemPosition({ positionSec: FRAME_MS / 1000, ...plan.stems.outInstrumental }),
+        gainForStemPosition({ positionSec: FRAME_MS / 1000, ...plan.stems.inInstrumental }),
+        gainForStemPosition({ positionSec: FRAME_MS / 1000, ...plan.stems.inVocal }),
+      ],
+    );
+    assert.notDeepEqual(recoveryFrame, SILENCE_FRAME, 'sanity: recovery tick must not be silent');
+    assert.notDeepEqual(recoveryFrame, expectedWithoutCatchup,
+      'expected the recovery tick to have caught up (not still on the stale first-post-stall frame)');
+    assert.deepEqual(recoveryFrame, expectedWithCatchup,
+      'expected the recovery tick to mix the freshest available outVocal frame after draining the deficit');
+  } finally {
+    mix.endMixer();
+  }
+});
+
 test('MixStream startStemCrossfade caps how long it holds for a #incoming that never catches up', async () => {
   // Codex: #stemCrossfadeTicks (the live catch-up target) grows by 1 on
   // every hold tick — if #incoming settles into providing at most one new
