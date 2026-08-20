@@ -304,6 +304,18 @@ export class GuildPlayer {
   #analysisCache = new Map();
   #analysisMissAt = new Map();
   #probedDurationCache = new Map();
+  /**
+   * videoIds with a #scheduleAnalysis() job currently in flight (Codex,
+   * PR #39 round-15). #ensureFullPrefetch() and #createPcmSource() both
+   * call #scheduleAnalysis() for the same prefetched file — the second,
+   * consuming that same prefetch entry once the track actually starts —
+   * so without this guard every normalized track gets staged and enqueued
+   * for stem separation twice. The first attempt already populates the
+   * in-memory and persistent analysis/stem caches everything else reads
+   * from, so the second is pure waste. Added in #scheduleAnalysis(),
+   * removed once that job settles (success, failure, or abort).
+   */
+  #scheduledAnalysisVideoIds = new Set();
   #crossfadeArmTimer = null;
   #crossfadeStarted = false;
   #crossfadeArming = false;
@@ -1266,6 +1278,16 @@ export class GuildPlayer {
 
   #scheduleAnalysis(track, filePath) {
     if (!track?.videoId || !filePath || !this.#analyzeTrackFileFn) return;
+    // Codex (PR #39 round-15): #ensureFullPrefetch() and #createPcmSource()
+    // both call #scheduleAnalysis() for the same prefetched file — the
+    // second, consuming that same prefetch entry once the track actually
+    // starts — so without this guard every normalized track gets staged
+    // and enqueued for stem separation twice. Skip while a prior attempt
+    // for this exact videoId is still in flight; that first attempt
+    // already populates the in-memory and persistent analysis/stem caches
+    // everything else reads from, so a second is pure waste.
+    if (this.#scheduledAnalysisVideoIds.has(track.videoId)) return;
+    this.#scheduledAnalysisVideoIds.add(track.videoId);
     // Phase 8 (Codex, PR #39 round-14): stage an independent copy of
     // filePath for stem separation NOW, before this job is even enqueued —
     // several unrelated call sites (track promotion/stop/skip/prefetch
@@ -1281,26 +1303,42 @@ export class GuildPlayer {
       return null;
     });
     this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
-      const cached = await this.#lookupPersistentAnalysis(track);
-      const analysis = cached ?? await this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
-      // Best-effort: a failure here just means this track never becomes
-      // stem-mix eligible, the existing beatmix/phrase-crossfade/legacy
-      // ladder is untouched either way.
-      const stagedPath = await stagedPathPromise;
+      // CodeRabbit (PR #39 round-15): the staged copy must be cleaned up
+      // whether THIS job succeeds, fails at any step, or is cancelled —
+      // #lookupPersistentAnalysis()/#runAnalysis() rejecting (including an
+      // ANALYSIS_KILLED abort) must not skip cleanup just because it
+      // happens before the separation step below. The try/finally wraps
+      // the whole callback, not just the separation call, so every exit
+      // path awaits stagedPathPromise (already-settled by the time this
+      // runs, in the overwhelming majority of cases) and removes it.
       try {
+        const cached = await this.#lookupPersistentAnalysis(track);
+        const analysis = cached ?? await this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
+        // Best-effort: a failure here just means this track never becomes
+        // stem-mix eligible, the existing beatmix/phrase-crossfade/legacy
+        // ladder is untouched either way.
         // Skip rather than start a many-minute Demucs run against a job
         // the queue already decided to cancel (e.g. a mixer underrun
         // killed this job right as #runAnalysis finished).
-        if (!signal?.aborted && stagedPath) {
-          await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
-            console.warn('[GuildPlayer] stem separation failed:', err.message);
-          });
+        if (!signal?.aborted) {
+          const stagedPath = await stagedPathPromise;
+          if (stagedPath) {
+            await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
+              console.warn('[GuildPlayer] stem separation failed:', err.message);
+            });
+          }
         }
+        return analysis;
       } finally {
+        const stagedPath = await stagedPathPromise;
         if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
+        this.#scheduledAnalysisVideoIds.delete(track.videoId);
       }
-      return analysis;
     }).catch((err) => {
+      // Belt-and-suspenders: the finally above already removes this on
+      // every path through the callback body. This only matters if
+      // enqueue() itself rejects without ever invoking that callback.
+      this.#scheduledAnalysisVideoIds.delete(track.videoId);
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
         return;

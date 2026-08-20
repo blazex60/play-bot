@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -1590,6 +1590,55 @@ test('acceptance (mixer): stem separation input is staged before the analysis qu
     'expected separation to receive the staged copy, not the original filePath');
   assert.equal(separateCalls[0].videoId, 'vid-b');
   await player.stop();
+});
+
+test('acceptance (mixer): staged copy is cleaned up even when analysis fails before separation (CodeRabbit)', async () => {
+  // CodeRabbit (PR #39, round 15): the round-14 fix's try/finally only
+  // wrapped the separation call, not the earlier #lookupPersistentAnalysis()/
+  // #runAnalysis() steps. A rejection there (including an ANALYSIS_KILLED
+  // abort) exited the queued callback before it ever awaited the staged
+  // path or reached the finally block, permanently leaking the
+  // already-created staged copy on disk. The finally must wrap the WHOLE
+  // callback so every exit path — success, an analysis failure, or a
+  // cancellation — still cleans it up.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const stagedPath = `/tmp/musicbot-test-staged-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await writeFile(stagedPath, 'staged content');
+  let staged = false;
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => {
+      throw new Error('simulated analysis failure');
+    },
+    prefetchTrackFn: async () => ({ filePath: '/tmp/musicbot-original-vid-fail', measured: {} }),
+    stageTempFileCopyFn: async () => {
+      staged = true;
+      return stagedPath;
+    },
+    separateTrackStemsFn: async () => {
+      throw new Error('must not be called — analysis already failed');
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({
+    title: 'Track Fail',
+    webpageUrl: 'https://example.com/fail',
+    duration: 60,
+    videoId: 'vid-fail',
+  }));
+
+  try {
+    await player.playNext();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    assert.equal(staged, true, 'expected staging to have been attempted');
+    await assert.rejects(() => access(stagedPath),
+      'expected the staged copy to be cleaned up even though analysis failed before separation');
+  } finally {
+    await rm(stagedPath, { force: true });
+    await player.stop();
+  }
 });
 
 test('acceptance (mixer): early queue refill is a single shared attempt', async () => {
