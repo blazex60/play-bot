@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough, Writable } from 'node:stream';
-import { FRAME_BYTES } from './fade.js';
+import { FRAME_BYTES, FRAME_MS } from './fade.js';
 import { MixStream } from './mixStream.js';
 import { PcmSource } from './pcmSource.js';
 import { MAX_UNDERRUN_MS } from './config.js';

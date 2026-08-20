@@ -276,8 +276,12 @@ export class MixStream extends Readable {
       // @discordjs/voice then destroy()s this MixStream — killing the mixer
       // for the rest of the session (2nd track never audible, queue races).
       if (this.#betweenTracks) {
+        // push() may synchronously make a flowing consumer request another
+        // frame. Install the guard first so that re-entrant _read() leaves
+        // #pendingRead set for the timer instead of pushing silence in a
+        // tight loop.
+        if (this.#betweenTrackTimer) return;
         this.#pendingRead = false;
-        this.push(SILENCE_FRAME);
         // Silence represents 20 ms of audio, so never produce it faster than
         // real time.  A read requested during this interval leaves
         // #pendingRead set; the timer services that demand when the frame is
@@ -285,18 +289,17 @@ export class MixStream extends Readable {
         // the timer has nothing to do.  In particular, do not call resume()
         // here: doing so overrides pipe's pause and grows an encoded-silence
         // backlog while the next track is being prepared.
-        if (!this.#betweenTrackTimer) {
-          this.#betweenTrackTimer = setTimeout(() => {
-            this.#betweenTrackTimer = null;
-            if (this.#destroyed || !this.#betweenTracks) return;
-            // Flowing consumers represent active demand. pipe() switches this
-            // to false when a destination returns false, so do not manufacture
-            // a read (or resume the stream) while downstream is backpressured.
-            if (this.readableFlowing) this.#pendingRead = true;
-            this.#scheduleRead();
-          }, FRAME_MS);
-          this.#betweenTrackTimer.unref?.();
-        }
+        this.#betweenTrackTimer = setTimeout(() => {
+          this.#betweenTrackTimer = null;
+          if (this.#destroyed || !this.#betweenTracks) return;
+          // Flowing consumers represent active demand. pipe() switches this
+          // to false when a destination returns false, so do not manufacture
+          // a read (or resume the stream) while downstream is backpressured.
+          if (this.readableFlowing) this.#pendingRead = true;
+          this.#scheduleRead();
+        }, FRAME_MS);
+        this.#betweenTrackTimer.unref?.();
+        this.push(SILENCE_FRAME);
         return;
       }
       if (!this.#underrunSince) {
