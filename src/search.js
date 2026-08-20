@@ -3,10 +3,30 @@ import { createTrack } from './queue.js';
 
 export class YtdlpError extends Error {}
 
-const YTDLP_JS_RUNTIME_ARGS = ['--js-runtimes', 'node'];
+/**
+ * Node solves YouTube n-sig / PO-token JS challenges (required since 2025).
+ * --no-cache-dir avoids a stale player-JS cache, which googlevideo serves as
+ * HTTP 403 rather than "signature expired".
+ * android_sdkless / web_safari progressive and m3u8 URLs currently 403
+ * (yt-dlp#15712, yt-dlp#15569); drop them from the default client set.
+ */
+export const YTDLP_EXTRACTOR_ARGS = 'youtube:player_client=default,-android_sdkless,-web_safari';
+/** Prefer a progressive HTTPS audio stream; fall back to whatever remains. */
+export const YTDLP_AUDIO_FORMAT = 'bestaudio[protocol^=http]/bestaudio/best';
 
-function buildYtdlpArgs(...args) {
-  return [...YTDLP_JS_RUNTIME_ARGS, ...args];
+export function ytdlpCookieArgs(env = process.env) {
+  const file = env.YTDLP_COOKIES_FILE?.trim();
+  return file ? ['--cookies', file] : [];
+}
+
+export function buildYtdlpArgs(...args) {
+  return [
+    '--js-runtimes', 'node',
+    '--no-cache-dir',
+    '--extractor-args', YTDLP_EXTRACTOR_ARGS,
+    ...ytdlpCookieArgs(),
+    ...args,
+  ];
 }
 
 export function spawnAsync(cmd, args, { timeoutMs } = {}) {
@@ -151,7 +171,13 @@ export async function resolveRelated(videoId, { limit = 10 } = {}) {
 }
 
 export function resolveAudioStream(url) {
-  const proc = spawn('yt-dlp', buildYtdlpArgs('-f', 'bestaudio/best', '--no-playlist', '-o', '-', url));
+  const proc = spawn('yt-dlp', buildYtdlpArgs(
+    '-f', YTDLP_AUDIO_FORMAT,
+    '--hls-use-mpegts',
+    '--no-playlist',
+    '-o', '-',
+    url,
+  ));
   let stderrBuf = '';
   proc.stderr.on('data', d => { stderrBuf += d; });
   proc.on('error', err => {
