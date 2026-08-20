@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { rm, mkdir, rename, access } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { buildYtdlpArgs, YTDLP_AUDIO_FORMAT } from './search.js'
 import {
   SILENCE_TRIM_THRESHOLD_DB,
   SILENCE_TRIM_KEEP_SEC,
@@ -84,13 +85,12 @@ export const canNormalizeTrack = isNormalizeDurationAllowed
 
 export async function downloadAudio(url, destPath) {
   await mkdir(path.dirname(destPath), { recursive: true })
-  await spawnBuffered('yt-dlp', [
-    '--js-runtimes', 'node',
-    '-f', 'bestaudio/best',
+  await spawnBuffered('yt-dlp', buildYtdlpArgs(
+    '-f', YTDLP_AUDIO_FORMAT,
     '--no-playlist',
     '-o', destPath,
     url,
-  ])
+  ))
 }
 
 export async function analyzeLoudness(filePath) {
