@@ -327,8 +327,12 @@ export class GuildPlayer {
   #createFileSourceFn;
   /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
   #preparedOutgoingStems = null;
+  /** Identity key of an in-flight #ensureOutgoingStemPrep() cache-revalidation await, or null. Lets a later/different call — or an explicit clear — invalidate an earlier one still awaiting, instead of every arm tick spawning its own independent attempt. */
+  #preparingOutgoingStemsKey = null;
   /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
   #preparedIncomingStems = null;
+  /** Identity key of an in-flight #ensureIncomingStemPrep() cache-revalidation await, or null — same rationale as #preparingOutgoingStemsKey. */
+  #preparingIncomingStemsKey = null;
   /**
    * Phase 8 (Codex): memoizes a POSITIVE stem-cache lookup for the current
    * (current,next) pair — #maybeStartCrossfade() re-runs the eligibility
@@ -1390,6 +1394,17 @@ export class GuildPlayer {
       && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
       && this.#preparedOutgoingStems.prep?.measured === measured
     ) return;
+    // Dedup concurrent in-flight attempts for the SAME identity — the cache
+    // revalidation below is async, and the 200ms arm interval can call this
+    // again before it resolves. Without this, every such tick spawns its
+    // own independent ffmpeg pair; whichever's await happens to resolve
+    // last silently wins even if it started before another, and a
+    // completion that lands after the pair has already been taken (or
+    // cleared) installs an orphaned pair whose paused processes never get
+    // destroyed (Codex).
+    const key = `${videoId}:${startSec}:${tempoFilter}:${measured}`;
+    if (this.#preparingOutgoingStemsKey === key) return;
+    this.#preparingOutgoingStemsKey = key;
     // Revalidate against the live cache right before actually spawning —
     // this only runs on a genuine (re)prep, i.e. rarely, not on the steady-
     // state no-op ticks above, so it doesn't reintroduce the per-tick fs
@@ -1400,13 +1415,19 @@ export class GuildPlayer {
     // silently failing prep forever for this pair as long as the memo key
     // doesn't change (Codex).
     const fresh = await this.#getCachedStemsFn(videoId);
+    // A newer call (different identity) or an explicit clear (stop, plan
+    // downgrade, ...) superseded this attempt while it awaited — the
+    // caller no longer wants this result; do not install it.
+    if (this.#preparingOutgoingStemsKey !== key) return;
     if (!fresh) {
+      this.#preparingOutgoingStemsKey = null;
       this.#clearPreparedOutgoingStems();
       return;
     }
-    this.#clearPreparedOutgoingStems();
     const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
     const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
+    this.#preparingOutgoingStemsKey = null;
+    this.#clearPreparedOutgoingStems();
     this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
   }
 
@@ -1434,6 +1455,10 @@ export class GuildPlayer {
     this.#preparedOutgoingStems?.vocal?.destroy?.();
     this.#preparedOutgoingStems?.instrumental?.destroy?.();
     this.#preparedOutgoingStems = null;
+    // Invalidate any in-flight #ensureOutgoingStemPrep() attempt too — a
+    // completion for a pair the caller just explicitly discarded must not
+    // be allowed to silently reinstall one once its await resolves.
+    this.#preparingOutgoingStemsKey = null;
   }
 
   /**
@@ -1460,16 +1485,24 @@ export class GuildPlayer {
       && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
       && this.#preparedIncomingStems.prep?.measured === measured
     ) return;
+    // Dedup concurrent in-flight attempts — see #ensureOutgoingStemPrep()'s
+    // matching comment (Codex).
+    const key = `${videoId}:${startSec}:${tempoFilter}:${measured}`;
+    if (this.#preparingIncomingStemsKey === key) return;
+    this.#preparingIncomingStemsKey = key;
     // Revalidate against the live cache right before actually spawning — see
     // #ensureOutgoingStemPrep()'s matching comment (Codex).
     const fresh = await this.#getCachedStemsFn(videoId);
+    if (this.#preparingIncomingStemsKey !== key) return;
     if (!fresh) {
+      this.#preparingIncomingStemsKey = null;
       this.#clearPreparedIncomingStems();
       return;
     }
-    this.#clearPreparedIncomingStems();
     const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
     const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
+    this.#preparingIncomingStemsKey = null;
+    this.#clearPreparedIncomingStems();
     this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
   }
 
@@ -1497,6 +1530,9 @@ export class GuildPlayer {
     this.#preparedIncomingStems?.vocal?.destroy?.();
     this.#preparedIncomingStems?.instrumental?.destroy?.();
     this.#preparedIncomingStems = null;
+    // Invalidate any in-flight #ensureIncomingStemPrep() attempt too — see
+    // #clearPreparedOutgoingStems()'s matching comment.
+    this.#preparingIncomingStemsKey = null;
   }
 
   /** Destroys a prepared entry's source, resolved or still in flight. */

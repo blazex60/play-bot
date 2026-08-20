@@ -10,7 +10,7 @@ import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
 import { handleRecommendChoice, handleShowRecommendations, RECOMMEND_CUSTOM_ID_PREFIX, RECOMMEND_SHOW_CUSTOM_ID } from './recommendFlow.js'
 import { loadSettings, resolveAdminRoleId } from './settings.js'
 import { cleanupStaleTempDir } from './normalize.js'
-import { pruneStemCache } from './audio/stemCache.js'
+import { pruneStemCache, cleanupStaleStemStaging } from './audio/stemCache.js'
 import { startBotApi } from './botApi.js'
 import { checkCommandAllowed } from './permissions.js'
 
@@ -21,6 +21,11 @@ await cleanupStaleTempDir()
 // Phase 8 (docs/mix-transition-phase8.md): unlike cleanupStaleTempDir(),
 // this must NOT wipe the whole directory on every start — the persistent
 // stem cache only pays for itself if entries survive across restarts.
+// cleanupStaleStemStaging() runs first (and only here, at startup) to
+// remove any .stemsep-* directory orphaned by a killed process/container —
+// pruneStemCache() deliberately never touches those (they could belong to
+// an in-progress job), so nothing else ever reclaims them (Codex).
+await cleanupStaleStemStaging()
 await pruneStemCache()
 
 const client = new Client({

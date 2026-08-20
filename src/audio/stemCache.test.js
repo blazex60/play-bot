@@ -8,6 +8,7 @@ import {
   getCachedStems,
   separateTrackStems,
   pruneStemCache,
+  cleanupStaleStemStaging,
 } from './stemCache.js';
 import { DEMUCS_MODEL } from './vocalActivity.js';
 
@@ -248,6 +249,37 @@ test('pruneStemCache does nothing when the total size is already under maxBytes'
     await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn() });
     await pruneStemCache({ maxBytes: Number.MAX_SAFE_INTEGER });
     assert.ok(await getCachedStems(videoId), 'expected the entry to survive a prune well under the cap');
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('cleanupStaleStemStaging removes an orphaned .stemsep-* directory left by a killed process', async () => {
+  // Codex: runSeparation()'s own finally block removes its jobTmpRoot on
+  // every normal exit, but a killed process or a recreated container skips
+  // that finally entirely — the staging dir (and its partial WAVs) is then
+  // orphaned forever, since pruneStemCache() deliberately skips anything
+  // that isn't a valid videoId shape (so it never touches an in-progress
+  // job's staging dir). Only cleanupStaleStemStaging(), called once at
+  // startup, ever reclaims these.
+  await mkdir(STEM_CACHE_DIR, { recursive: true });
+  const staleDir = path.join(STEM_CACHE_DIR, `.stemsep-orphan-${Date.now()}`);
+  await mkdir(staleDir, { recursive: true });
+  await writeFile(path.join(staleDir, 'input.wav'), 'partial-orphaned-data');
+  try {
+    await cleanupStaleStemStaging();
+    await assert.rejects(() => stat(staleDir), 'expected the orphaned staging directory to be removed');
+  } finally {
+    await rm(staleDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('cleanupStaleStemStaging leaves real videoId cache entries untouched', async () => {
+  const videoId = uniqueVideoId('staging-cleanup-noop');
+  try {
+    await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn() });
+    await cleanupStaleStemStaging();
+    assert.ok(await getCachedStems(videoId), 'expected a real cache entry to survive staging cleanup');
   } finally {
     await cleanup(videoId);
   }

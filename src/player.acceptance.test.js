@@ -1792,3 +1792,73 @@ test('acceptance (mixer): a memoized stem-cache hit that is evicted before prep 
     await player.stop();
   }
 });
+
+test('acceptance (mixer): concurrent arm ticks do not spawn duplicate stem sources while a prep revalidation is in flight', async () => {
+  // Codex: #ensureOutgoingStemPrep()/#ensureIncomingStemPrep()'s cache
+  // revalidation (added for the memo-eviction fix above) is async, and the
+  // 200ms arm interval can call either method again before the FIRST call's
+  // await resolves — the identity-based no-op check at the top has nothing
+  // to compare against yet, since nothing has been installed. Without a
+  // dedup guard, every such tick spawns its own independent ffmpeg pair;
+  // slowing getCachedStemsFn down here (well past several arm intervals)
+  // reliably reproduces the race and would multiply stemSourceCalls past 4
+  // without the #preparing*StemsKey guard.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  const stemSourceCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => {
+      await new Promise((resolve) => setTimeout(resolve, 300)); // outlasts a couple 200ms arm ticks
+      return {
+        vocalPath: `/tmp/${videoId}.vocal.wav`,
+        instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+      };
+    },
+    createFileSourceFn: (filePath, opts) => {
+      stemSourceCalls.push({ filePath, opts });
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    // Stay well under the fixture's 1.0s exit candidate (readyToFade must
+    // stay false) while still comfortably past prepDue's threshold
+    // (CROSSFADE_PREP_LEAD_SEC=15s dwarfs this whole 8s track, so prepDue
+    // is true almost from position 0) — this opens a window where prep is
+    // actively being (re)attempted every arm tick but the take can't fire
+    // yet, which is exactly the window the race lives in.
+    for (let i = 0; i < 10; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    // Several 200ms arm ticks fire here while getCachedStemsFn's 300ms
+    // delay is in flight — this is what used to spawn duplicate stem
+    // sources without the #preparing*StemsKey dedup guard.
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    // Now cross the 1.0s exit point so readyToFade/take can proceed.
+    for (let i = 0; i < 60; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    assert.ok(startedPlan, 'expected a crossfade to have armed despite the slow cache revalidation');
+    assert.equal(startedPlan.mode, 'stem-mix');
+    assert.equal(stemSourceCalls.length, 4,
+      `expected exactly 2 outgoing + 2 incoming stem sources despite concurrent arm ticks, got ${stemSourceCalls.length}`);
+  } finally {
+    await player.stop();
+  }
+});

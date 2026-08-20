@@ -178,6 +178,36 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal }) 
 }
 
 /**
+ * Removes every `.stemsep-*` staging directory left under STEM_CACHE_DIR —
+ * runSeparation()'s own `finally` block already removes its staging dir on
+ * every normal exit (success, failure, or an aborted signal), but a killed
+ * process or a recreated container skips that `finally` entirely, orphaning
+ * the directory (and its input WAV / partial Demucs output) on the
+ * persistent volume forever. pruneStemCache() deliberately skips anything
+ * that isn't a valid videoId shape so it never touches a currently-running
+ * job's staging dir mid-write (see its own comment) — which also means an
+ * orphan's bytes are silently excluded from the 2GB accounting, and repeated
+ * interrupted deployments can eventually fill the volume.
+ *
+ * Only safe to call at startup, before this process could have created any
+ * `.stemsep-*` directory of its own — call it once, alongside
+ * pruneStemCache(), not on every prune (unlike pruneStemCache(), a mid-run
+ * call here WOULD delete an active job's staging dir).
+ */
+export async function cleanupStaleStemStaging() {
+  let entries;
+  try {
+    entries = await readdir(STEM_CACHE_DIR, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('.stemsep-')) continue;
+    await rm(path.join(STEM_CACHE_DIR, entry.name), { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
  * Size-capped, LRU-by-mtime eviction — unlike normalize.js's
  * cleanupStaleTempDir(), this must NOT wipe the whole directory on every
  * call, or the cache never pays for itself. Call once at startup.
