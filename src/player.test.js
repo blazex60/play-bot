@@ -119,8 +119,8 @@ test('GuildPlayer pipelines MixStream only after a PCM source is attached', asyn
   await player.stop()
 })
 
-test('mixer AudioPlayer keeps playing through encoder hiccups without a ready subscriber', () => {
-  assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.noSubscriber, NoSubscriberBehavior.Play)
+test('mixer AudioPlayer pauses without a ready subscriber and survives encoder hiccups', () => {
+  assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.noSubscriber, NoSubscriberBehavior.Pause)
   assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.maxMissedFrames, MIXER_MAX_MISSED_FRAMES)
   assert.ok(MIXER_MAX_MISSED_FRAMES > 5)
   assert.equal(MIXER_AUDIO_RESOURCE_OPTIONS.silencePaddingFrames, 0)

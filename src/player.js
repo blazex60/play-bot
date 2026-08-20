@@ -53,7 +53,10 @@ export const MIXER_MAX_MISSED_FRAMES = 50;
 
 export const MIXER_AUDIO_PLAYER_OPTIONS = {
   behaviors: {
-    noSubscriber: NoSubscriberBehavior.Play,
+    // Default Pause: if the VC drops out of Ready (reconnect), do not keep
+    // reading MixStream and discarding packets / advancing tracks unheard.
+    // sessions.js already waits for Ready before constructing GuildPlayer.
+    noSubscriber: NoSubscriberBehavior.Pause,
     maxMissedFrames: MIXER_MAX_MISSED_FRAMES,
   },
 };
