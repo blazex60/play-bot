@@ -17,10 +17,12 @@ import { createStreamSource, createFileSource } from './audio/pcmSource.js';
 import { analyzeTrackFile, ANALYSIS_VERSION } from './audio/trackAnalysis.js';
 import { planBeatSyncedTransition } from './audio/beatmixTransition.js';
 import { probeDurationSec } from './audio/duration.js';
-import { createSessionTempoState, resetSessionTempo, probeTempoBackend, compensateDurationSec } from './audio/tempo.js';
+import { createSessionTempoState, resetSessionTempo, probeTempoBackend, compensateDurationSec, buildTempoFilter } from './audio/tempo.js';
 import { TAIL_WINDOW_SEC } from './audio/vocalActivity.js';
 import { LoopMode } from './queue.js';
 import { getAnalysisQueue } from './audio/analysisQueue.js';
+import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
+import { planStemTransition } from './audio/stemTransition.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
@@ -74,6 +76,36 @@ function sleep(ms) {
  * BPM (§2.3/§8.4).
  */
 function normalizeTransitionPlan(rawPlan) {
+  if (rawPlan.mode === 'stem-mix') {
+    // Phase 8 (docs/mix-transition-phase8.md): planStemTransition()'s output
+    // is a planBeatmixTransition()-shaped plan plus a `stems` sub-object —
+    // identical to the 'beatmix' branch below except stems is carried
+    // through to mixPlan (MixStream.startStemCrossfade() reads it directly).
+    return {
+      mixPlan: {
+        mode: 'stem-mix',
+        fadeSec: rawPlan.fadeSec,
+        startSec: rawPlan.outgoing?.exitStartSec ?? null,
+        curve: rawPlan.gain?.curve ?? 'equal-power',
+        baseSwap: true,
+        highpassHz: rawPlan.eq?.highpassHz ?? 120,
+        lowshelfGainDb: 2,
+        incomingOffsetSec: 0,
+        targetBpm: rawPlan.targetBpm,
+        sync: rawPlan.sync,
+        eq: rawPlan.eq,
+        stems: rawPlan.stems,
+      },
+      exitStartSec: rawPlan.outgoing?.exitStartSec ?? null,
+      entrySec: Math.max(0, rawPlan.incoming?.entrySec ?? 0),
+      tempoFilter: rawPlan.incoming?.tempoFilter ?? null,
+      sessionTempo: {
+        nativeBpm: rawPlan.incoming?.nativeBpm ?? null,
+        playbackBpm: rawPlan.incoming?.playbackBpm ?? rawPlan.targetBpm ?? null,
+        tempoRatio: rawPlan.incoming?.tempoRatio ?? 1,
+      },
+    };
+  }
   if (rawPlan.mode === 'beatmix') {
     return {
       mixPlan: {
@@ -237,6 +269,15 @@ export class GuildPlayer {
   /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
   #queueRefill = null;
   #prefetchTrackFn;
+  #separateTrackStemsFn;
+  #getCachedStemsFn;
+  #planStemTransitionFn;
+  /** Test-only override — the two stem-prep methods call createFileSource() directly (they bypass #createPcmSource entirely, since stem WAVs need no download/normalize/loudnorm pass), so a dedicated injection point mirrors this file's existing DI convention for every other real-process spawn. */
+  #createFileSourceFn;
+  /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
+  #preparedOutgoingStems = null;
+  /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
+  #preparedIncomingStems = null;
 
   constructor({
     guildId,
@@ -267,6 +308,10 @@ export class GuildPlayer {
     analysisQueue = null,
     prefetchTrackFn = prefetchTrack,
     probeTempoBackendFn = probeTempoBackend,
+    separateTrackStemsFn = separateTrackStems,
+    getCachedStemsFn = getCachedStems,
+    planStemTransitionFn = planStemTransition,
+    createFileSourceFn = createFileSource,
   }) {
     this.#guildId = guildId;
     this.#connection = connection;
@@ -286,6 +331,10 @@ export class GuildPlayer {
     this.#analysisQueue = analysisQueue;
     this.#prefetchTrackFn = prefetchTrackFn;
     this.#probeTempoBackendFn = probeTempoBackendFn;
+    this.#separateTrackStemsFn = separateTrackStemsFn;
+    this.#getCachedStemsFn = getCachedStemsFn;
+    this.#planStemTransitionFn = planStemTransitionFn;
+    this.#createFileSourceFn = createFileSourceFn;
 
     this.#initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
@@ -956,8 +1005,17 @@ export class GuildPlayer {
     if (!track?.videoId || !filePath || !this.#analyzeTrackFileFn) return;
     this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
       const cached = await this.#lookupPersistentAnalysis(track);
-      if (cached) return cached;
-      return this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
+      const analysis = cached ?? await this.#runAnalysis(track, filePath, { spawnFn: spawnNice, signal });
+      // Phase 8 (docs/mix-transition-phase8.md): chained into the SAME
+      // enqueued job (not a separate fire-and-forget call) so filePath is
+      // guaranteed to still be alive — several call sites clean it up soon
+      // after analysis resolves. Best-effort: a failure here just means
+      // this track never becomes stem-mix eligible, the existing beatmix/
+      // phrase-crossfade/legacy ladder is untouched either way.
+      await this.#separateTrackStemsFn(filePath, track.videoId, { spawnFn: spawnNice }).catch((err) => {
+        console.warn('[GuildPlayer] stem separation failed:', err.message);
+      });
+      return analysis;
     }).catch((err) => {
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
@@ -1063,6 +1121,105 @@ export class GuildPlayer {
     }
   }
 
+  /**
+   * Phase 8: the outgoing stem pair must be stretched to match whatever
+   * session tempo #current is ACTUALLY playing at right now, not
+   * re-derived from analysis fields — buildTempoFilter() is a pure
+   * function, so recomputing it from #sessionTempo (already tracking the
+   * exact {nativeBpm, playbackBpm} the live spawn used) reproduces the
+   * identical filter string deterministically, without needing to persist
+   * it anywhere new.
+   */
+  #outgoingStemTempoFilter(tempoBackend) {
+    return buildTempoFilter({
+      nativeBpm: this.#sessionTempo.nativeBpm,
+      targetBpm: this.#sessionTempo.playbackBpm,
+      backend: tempoBackend,
+    }).filter;
+  }
+
+  /**
+   * Phase 8 (docs/mix-transition-phase8.md): the outgoing side's stem pair
+   * must be spawned LATE — seeked to the exit point — from inside
+   * #maybeStartCrossfade()'s own prepDue gate, never at track-promotion
+   * time. A PcmSource opened at startSec:0 and left unread for however long
+   * the track has left to play would just sit blocked on backpressure at
+   * the wrong native position by the time it's actually needed.
+   */
+  #ensureOutgoingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
+    if (
+      this.#preparedOutgoingStems?.videoId === videoId
+      && this.#preparedOutgoingStems.prep?.startSec === startSec
+      && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
+    ) return;
+    this.#clearPreparedOutgoingStems();
+    const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter });
+    const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter });
+    this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter }, vocal, instrumental };
+  }
+
+  #takePreparedOutgoingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {
+    if (
+      this.#preparedOutgoingStems?.videoId === videoId
+      && this.#preparedOutgoingStems.prep?.startSec === startSec
+      && this.#preparedOutgoingStems.prep?.tempoFilter === tempoFilter
+    ) {
+      const { vocal, instrumental } = this.#preparedOutgoingStems;
+      this.#preparedOutgoingStems = null;
+      return { vocal, instrumental };
+    }
+    this.#clearPreparedOutgoingStems();
+    return null;
+  }
+
+  #clearPreparedOutgoingStems() {
+    this.#preparedOutgoingStems?.vocal?.destroy?.();
+    this.#preparedOutgoingStems?.instrumental?.destroy?.();
+    this.#preparedOutgoingStems = null;
+  }
+
+  /**
+   * Incoming-side stem pair — same late-binding rationale as
+   * #ensureOutgoingStemPrep(). The incoming side's FULL-mix continuation
+   * source (needed once the stem window ends) is NOT prepared here — that
+   * still goes through the existing #ensureIncomingPrep()/
+   * #takePreparedIncoming() machinery (download/normalize/analysis-
+   * scheduling already lives there; no need to duplicate it), spawned with
+   * the SAME startSec/tempoFilter so all three incoming sources decode in
+   * lockstep (see mixStream.js's startStemCrossfade() docstring).
+   */
+  #ensureIncomingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
+    if (
+      this.#preparedIncomingStems?.videoId === videoId
+      && this.#preparedIncomingStems.prep?.startSec === startSec
+      && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
+    ) return;
+    this.#clearPreparedIncomingStems();
+    const vocal = this.#createFileSourceFn(cached.vocalPath, { startSec, tempoFilter });
+    const instrumental = this.#createFileSourceFn(cached.instrumentalPath, { startSec, tempoFilter });
+    this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter }, vocal, instrumental };
+  }
+
+  #takePreparedIncomingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {
+    if (
+      this.#preparedIncomingStems?.videoId === videoId
+      && this.#preparedIncomingStems.prep?.startSec === startSec
+      && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
+    ) {
+      const { vocal, instrumental } = this.#preparedIncomingStems;
+      this.#preparedIncomingStems = null;
+      return { vocal, instrumental };
+    }
+    this.#clearPreparedIncomingStems();
+    return null;
+  }
+
+  #clearPreparedIncomingStems() {
+    this.#preparedIncomingStems?.vocal?.destroy?.();
+    this.#preparedIncomingStems?.instrumental?.destroy?.();
+    this.#preparedIncomingStems = null;
+  }
+
   /** Destroys a prepared entry's source, resolved or still in flight. */
   #destroyPreparedSource(entry) {
     if (!entry) return;
@@ -1079,6 +1236,12 @@ export class GuildPlayer {
     // Invalidate in-flight createPcmSource so it won't assign #incomingTempFile
     // after cancel (stop / skip / replace prep / playNextMixer).
     this.#incomingPrepId += 1;
+    // Phase 8: a prepared stem pair is only ever prepped alongside an
+    // attempted stem-mix transition's full-mix incoming prep — piggyback on
+    // every existing call site that abandons the latter rather than
+    // duplicating them.
+    this.#clearPreparedOutgoingStems();
+    this.#clearPreparedIncomingStems();
     if (!this.#preparedIncoming) return;
     const pending = this.#preparedIncoming;
     this.#preparedIncoming = null;
@@ -1261,7 +1424,40 @@ export class GuildPlayer {
         maxOverlapSec: MAX_CROSSFADE_SEC,
       });
       if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
-      const norm = normalizeTransitionPlan(rawPlan);
+      let norm = normalizeTransitionPlan(rawPlan);
+
+      // Phase 8 (docs/mix-transition-phase8.md): only attempted when plain
+      // tier-1 beatmix did NOT win the fallback ladder (mode !== 'beatmix')
+      // — stem-mix reuses 100% of beatmix's tempo/downbeat/meter gating (via
+      // planStemTransition()'s relaxed-flag options into
+      // planBeatmixTransition()), so if beatmix already succeeded there is
+      // nothing for it to improve on; it exists specifically to rescue the
+      // case where only the whole-overlap vocal-safety requirement stood in
+      // the way. Gated on stems already being cached (a cheap fs check) so
+      // this never triggers separation itself — #scheduleAnalysis() already
+      // does that in the background, well before a transition is imminent.
+      // Looked up once here and reused at both the prepDue and readyToFade
+      // points below — a second fs check right before spawning would risk
+      // observing a DIFFERENT cache state than what eligibility was actually
+      // decided against a few lines up.
+      let outCachedStems = null;
+      let inCachedStems = null;
+      if (rawPlan.mode !== 'beatmix') {
+        [outCachedStems, inCachedStems] = await Promise.all([
+          this.#getCachedStemsFn(current.videoId),
+          this.#getCachedStemsFn(next.videoId),
+        ]);
+        if (outCachedStems && inCachedStems) {
+          const stemPlan = this.#planStemTransitionFn(outAnalysis, inAnalysis, {
+            outgoingPlaybackBpm,
+            tempoBackend,
+            maxOverlapSec: MAX_CROSSFADE_SEC,
+          });
+          if (stemPlan.eligible) {
+            norm = normalizeTransitionPlan(stemPlan);
+          }
+        }
+      }
 
       // §2.3/§8.4: TRACK loop mode repeats the SAME track (`next === current`
       // above) — planBeatSyncedTransition still picks a head-window entry
@@ -1277,8 +1473,10 @@ export class GuildPlayer {
         norm.entrySec = 0;
         norm.tempoFilter = null;
         norm.sessionTempo = null;
-        if (norm.mixPlan.mode === 'beatmix') {
-          norm.mixPlan = { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false };
+        if (norm.mixPlan.mode === 'beatmix' || norm.mixPlan.mode === 'stem-mix') {
+          norm.mixPlan = {
+            ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null,
+          };
         }
       }
 
@@ -1323,6 +1521,18 @@ export class GuildPlayer {
           tempoFilter: norm.tempoFilter,
           sessionTempo: norm.sessionTempo,
         });
+        // Phase 8: late-bound (see #ensureOutgoingStemPrep()'s docstring) —
+        // fired from this same gate, not at track-promotion time.
+        if (norm.mixPlan.mode === 'stem-mix' && outCachedStems && inCachedStems) {
+          this.#ensureOutgoingStemPrep(outCachedStems, current.videoId, {
+            startSec: norm.exitStartSec ?? 0,
+            tempoFilter: this.#outgoingStemTempoFilter(tempoBackend),
+          });
+          this.#ensureIncomingStemPrep(inCachedStems, next.videoId, {
+            startSec: norm.entrySec,
+            tempoFilter: norm.tempoFilter,
+          });
+        }
       }
 
       const readyToFade = startSec != null
@@ -1373,28 +1583,70 @@ export class GuildPlayer {
       // fell back to native, unstretched tempo. Either field being set means
       // the plan required a transform this source didn't actually apply.
       const requiresUnhonoredTransform = norm.entrySec > 0 || norm.tempoFilter != null;
-      const mixPlan = (!sourceHonorsPlan && requiresUnhonoredTransform)
-        ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false }
+      let mixPlan = (!sourceHonorsPlan && requiresUnhonoredTransform)
+        ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null }
         : norm.mixPlan;
 
-      // Set promotion state BEFORE calling startCrossfade(): if the outgoing
-      // source is already at EOF, startCrossfade()'s synchronous
-      // #scheduleRead() can promote the incoming source (and fire
-      // #onCrossfadePromoted synchronously) before this call returns —
-      // #onCrossfadePromoted must see the real target/tempo, not stale
-      // values from a previous crossfade attempt. Rolled back on failure.
+      // Phase 8: take the two prepared stem pairs only now that we know a
+      // plain crossfade isn't already forced (sourceHonorsPlan check above)
+      // — if either pair didn't finish prepping in time, downgrade to the
+      // plain crossfade `source` (the incoming full mix) is already valid
+      // for, rather than aborting an otherwise-ready transition.
+      let outgoingStems = null;
+      let incomingStems = null;
+      if (mixPlan.mode === 'stem-mix') {
+        // Take BOTH unconditionally (never short-circuit on the first) —
+        // each #takePreparedXStems() call is self-contained (transfers
+        // ownership out of the prepared-field, or clears/destroys it on a
+        // mismatch), so skipping one when the other is missing would leave
+        // it dangling in its prepared-field, unconsumed, until some later
+        // unrelated #clearPreparedIncoming() call happened to sweep it up.
+        outgoingStems = this.#takePreparedOutgoingStems(current.videoId, {
+          startSec: norm.exitStartSec ?? 0,
+          tempoFilter: this.#outgoingStemTempoFilter(tempoBackend),
+        });
+        incomingStems = this.#takePreparedIncomingStems(next.videoId, {
+          startSec: norm.entrySec,
+          tempoFilter: norm.tempoFilter,
+        });
+        if (!outgoingStems || !incomingStems) {
+          outgoingStems?.vocal?.destroy?.();
+          outgoingStems?.instrumental?.destroy?.();
+          incomingStems?.vocal?.destroy?.();
+          incomingStems?.instrumental?.destroy?.();
+          mixPlan = { ...mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null };
+          outgoingStems = null;
+          incomingStems = null;
+        }
+      }
+
+      // Set promotion state BEFORE calling startCrossfade()/
+      // startStemCrossfade(): if the outgoing source is already at EOF, the
+      // synchronous #scheduleRead() inside either can promote the incoming
+      // source (and fire #onCrossfadePromoted synchronously) before this
+      // call returns — #onCrossfadePromoted must see the real target/tempo,
+      // not stale values from a previous crossfade attempt. Rolled back on
+      // failure.
       this.#pendingSessionTempo = pendingSessionTempo;
       this.#pendingIncomingEntrySec = pendingEntrySec;
       this.#crossfadeTargetTrack = next;
       this.#crossfadeStarted = true;
 
-      const started = this.#mixStream.startCrossfade(source, mixPlan);
+      const started = mixPlan.mode === 'stem-mix'
+        ? this.#mixStream.startStemCrossfade(
+          { outgoing: outgoingStems, incoming: { ...incomingStems, full: source } },
+          mixPlan,
+        )
+        : this.#mixStream.startCrossfade(source, mixPlan);
       if (!started) {
         this.#pendingSessionTempo = null;
         this.#pendingIncomingEntrySec = 0;
         this.#crossfadeTargetTrack = null;
         this.#crossfadeStarted = false;
-        source.destroy();
+        // startStemCrossfade() already destroys every source it was handed
+        // (including `source`/incoming.full) on a rejected call, mirroring
+        // startCrossfade()'s own contract — avoid double-destroying it here.
+        if (mixPlan.mode !== 'stem-mix') source.destroy();
         await this.#cleanupIncomingTempFile();
         return;
       }

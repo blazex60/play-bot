@@ -48,6 +48,10 @@ export function makePlayer({
   prefetchTrackFn = async () => ({ filePath: '/tmp/musicbot-test-prefetch', measured: { measured_I: -16 } }),
   probeTempoBackendFn,
   framesPerTrack = 2,
+  separateTrackStemsFn,
+  getCachedStemsFn,
+  planStemTransitionFn,
+  createFileSourceFn,
 } = {}) {
   const queue = new GuildQueue();
   queue.add(track ?? createTrack({
@@ -74,6 +78,10 @@ export function makePlayer({
     analyzeTrackFileFn,
     prefetchTrackFn,
     probeTempoBackendFn,
+    separateTrackStemsFn,
+    getCachedStemsFn,
+    planStemTransitionFn,
+    createFileSourceFn,
     connection: {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer);

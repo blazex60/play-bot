@@ -83,28 +83,79 @@ export function softLimitFrame(frame, ceiling = 0.95) {
 }
 
 /**
- * Mix two s16le frames with gains. Applies OVERLAP_GAIN, soft-limits in float
+ * Mix N s16le frames with gains. Applies headroom, soft-limits in float
  * domain, then clamps to int16 (soft-limit must run before hard clip).
+ * Headroom is OVERLAP_GAIN (tuned for summing 2 streams) at n<=2; scaled
+ * down further at n=3/4 (Phase 8's stem-mix crossfade sums 4 streams) —
+ * exact scaling factor is provisional pending real-track listening
+ * calibration (docs/mix-transition-phase8.md 未決事項), same caveat as
+ * OVERLAP_GAIN itself already carries.
+ * @param {Buffer[]} frames
+ * @param {number[]} gains
  * @returns {Buffer}
  */
-export function mixFrames(outFrame, inFrame, outGain, inGain) {
+export function mixNFrames(frames, gains) {
+  const n = frames.length;
   const out = Buffer.allocUnsafe(FRAME_BYTES);
-  const a = new Int16Array(outFrame.buffer, outFrame.byteOffset, FRAME_BYTES / 2);
-  const b = new Int16Array(inFrame.buffer, inFrame.byteOffset, FRAME_BYTES / 2);
   const dest = new Int16Array(out.buffer, out.byteOffset, FRAME_BYTES / 2);
-  const gOut = outGain * OVERLAP_GAIN;
-  const gIn = inGain * OVERLAP_GAIN;
+  const views = frames.map((f) => new Int16Array(f.buffer, f.byteOffset, FRAME_BYTES / 2));
+  const headroom = n <= 2 ? OVERLAP_GAIN : OVERLAP_GAIN * (2 / n);
+  const scaledGains = gains.map((g) => g * headroom);
   const ceiling = 0.95;
   const max = 32767 * ceiling;
   for (let i = 0; i < dest.length; i++) {
-    const x = (a[i] * gOut + b[i] * gIn) / 32768;
+    let sum = 0;
+    for (let k = 0; k < n; k++) {
+      sum += views[k][i] * scaledGains[k];
+    }
+    const x = sum / 32768;
     // cubic soft clip over the whole overlap mix (unlike softLimitFrame,
     // which is unity below its ceiling and only curves above it — this one
-    // runs across the full range since summing two sources can push the mix
-    // anywhere in it, not just near clipping).
+    // runs across the full range since summing multiple sources can push the
+    // mix anywhere in it, not just near clipping).
     const y = x < -1 ? -1 : x > 1 ? 1 : x - (x * x * x) / 3;
     const scaled = y * 32768;
     dest[i] = scaled > max ? max : scaled < -max ? -max : scaled;
   }
   return out;
+}
+
+/**
+ * Mix two s16le frames with gains — a thin wrapper over mixNFrames() so the
+ * 2-stream case is byte-for-byte identical to before Phase 8 by
+ * construction, not just by a test that could drift.
+ * @returns {Buffer}
+ */
+export function mixFrames(outFrame, inFrame, outGain, inGain) {
+  return mixNFrames([outFrame, inFrame], [outGain, inGain]);
+}
+
+/**
+ * Phase 8: a stem's own fade window can be a delayed sub-interval of the
+ * outer crossfade (e.g. the incoming vocal stem doesn't start fading in
+ * until the outgoing vocal has faded out) rather than spanning the whole
+ * overlap the way the instrumental pair's envelope still does. Locked at
+ * the pre-fade value before `startOffsetSec`, ramps via the same
+ * gainForPosition() math over `[startOffsetSec, startOffsetSec+fadeSec)`,
+ * locked at the post-fade value after. Degenerates to gainForPosition()
+ * exactly when `startOffsetSec` is 0 and this stem's `fadeSec` equals the
+ * outer crossfade's — the outInstrumental/inInstrumental case, whose
+ * behavior is therefore provably unchanged from the pre-Phase-8 math.
+ * @param {{ positionSec: number, startOffsetSec?: number, fadeSec?: number, curve?: 'linear'|'equal-power', role?: 'out'|'in' }} args
+ * @returns {number} gain 0..1
+ */
+export function gainForStemPosition({
+  positionSec, startOffsetSec = 0, fadeSec = 0, curve = 'equal-power', role = 'out',
+}) {
+  const preFadeValue = role === 'out' ? 1 : 0;
+  const postFadeValue = role === 'out' ? 0 : 1;
+  if (positionSec < startOffsetSec) return preFadeValue;
+  const local = positionSec - startOffsetSec;
+  // Unlike gainForPosition() — where fadeSec<=0 means "not fading, stays at
+  // full signal" — a zero-length STEM fade window means "already past its
+  // end" (e.g. the outgoing vocal had already faded out natively before the
+  // exit point, so outVocal's own fadeSec is 0): it must resolve to the
+  // POST-fade value, not get stuck at the pre-fade one.
+  if (!(fadeSec > 0) || local >= fadeSec) return postFadeValue;
+  return gainForPosition({ positionSec: local, fadeSec, curve, role });
 }

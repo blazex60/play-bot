@@ -10,6 +10,7 @@ import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
 import { handleRecommendChoice, handleShowRecommendations, RECOMMEND_CUSTOM_ID_PREFIX, RECOMMEND_SHOW_CUSTOM_ID } from './recommendFlow.js'
 import { loadSettings, resolveAdminRoleId } from './settings.js'
 import { cleanupStaleTempDir } from './normalize.js'
+import { pruneStemCache } from './audio/stemCache.js'
 import { startBotApi } from './botApi.js'
 import { checkCommandAllowed } from './permissions.js'
 
@@ -17,6 +18,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 await loadSettings()
 await cleanupStaleTempDir()
+// Phase 8 (docs/mix-transition-phase8.md): unlike cleanupStaleTempDir(),
+// this must NOT wipe the whole directory on every start — the persistent
+// stem cache only pays for itself if entries survive across restarts.
+await pruneStemCache()
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMembers],

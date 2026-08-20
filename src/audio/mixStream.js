@@ -4,7 +4,9 @@ import {
   FRAME_MS,
   BYTES_PER_SECOND,
   gainForPosition,
+  gainForStemPosition,
   mixFrames,
+  mixNFrames,
   scaleFrame,
   softLimitFrame,
   blendFrame,
@@ -62,6 +64,16 @@ export class MixStream extends Readable {
   #incomingSkipSec = 0;
   #incomingSkippedSec = 0;
   #betweenTrackTimer = null;
+  /** Phase 8 (docs/mix-transition-phase8.md): stem-mix crossfade state — mutually exclusive with #crossfade. */
+  #stemCrossfade = null;
+  #outVocal = null;
+  #outInstrumental = null;
+  #inVocal = null;
+  #inInstrumental = null;
+  #heldOutVocalFrame = null;
+  #heldOutInstrumentalFrame = null;
+  #heldInVocalFrame = null;
+  #heldInInstrumentalFrame = null;
 
   constructor() {
     super();
@@ -81,7 +93,7 @@ export class MixStream extends Readable {
   }
 
   get isCrossfading() {
-    return this.#crossfade != null;
+    return this.#crossfade != null || this.#stemCrossfade != null;
   }
 
   /** True after `endMixer()` / `_destroy()`. Distinct from Node's `.destroyed`. */
@@ -204,6 +216,97 @@ export class MixStream extends Readable {
     return true;
   }
 
+  /**
+   * Phase 8 (docs/mix-transition-phase8.md): begin a stem-aware crossfade —
+   * each side's vocal/instrumental stems get their own independent gain
+   * envelope (`plan.stems`) instead of one shared envelope per side.
+   * `incoming.full` is the SAME full-mix continuation source a plain
+   * startCrossfade() would have used (seeked to the same entrySec/
+   * tempoFilter as `incoming.vocal`/`incoming.instrumental`) — it is read
+   * and discarded in lockstep with the stems throughout the window (see
+   * #readStemCrossfadeFrame()) purely to keep its position synced for
+   * #promoteStemIncoming(), never mixed into the audible output itself.
+   * @param {{ outgoing: {vocal:object, instrumental:object}, incoming: {vocal:object, instrumental:object, full:object} }} sources
+   * @param {{ fadeSec: number, curve?: string, baseSwap?: boolean, highpassHz?: number, lowshelfGainDb?: number, mode?: string, stems: object }} plan
+   */
+  startStemCrossfade({ outgoing, incoming } = {}, plan) {
+    const allSources = [outgoing?.vocal, outgoing?.instrumental, incoming?.vocal, incoming?.instrumental, incoming?.full];
+    if (this.#destroyed || !this.#current || this.#crossfade || this.#stemCrossfade || allSources.some((s) => !s)) {
+      for (const s of allSources) s?.destroy?.();
+      return false;
+    }
+    if (!plan?.fadeSec || plan.fadeSec <= 0 || !plan?.stems) {
+      for (const s of allSources) s.destroy();
+      return false;
+    }
+    const errored = allSources.find((s) => s.error);
+    if (errored) {
+      // Incoming/outgoing-stem arming failure is recoverable — keep the
+      // outgoing (plain) track, same posture as startCrossfade().
+      for (const s of allSources) s.destroy();
+      this.emit('incomingerror', errored.error);
+      return false;
+    }
+
+    this.#incoming = incoming.full;
+    this.#outVocal = outgoing.vocal;
+    this.#outInstrumental = outgoing.instrumental;
+    this.#inVocal = incoming.vocal;
+    this.#inInstrumental = incoming.instrumental;
+    const baseSwap = plan.baseSwap === true;
+    this.#stemCrossfade = {
+      fadeSec: plan.fadeSec,
+      stems: plan.stems,
+      baseSwap,
+      eqRampSec: computeEqRampSec(plan),
+    };
+    this.#fadeElapsedSec = 0;
+    this.#outEq = baseSwap ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120) : null;
+    this.#inEq = baseSwap
+      ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
+      : null;
+
+    for (const s of allSources) {
+      s.on('data', () => this.#wakeConsumer());
+      s.on('end', () => this.#wakeConsumer());
+    }
+    // Stem sources read local, already-separated cache files (§8.2 of the
+    // doc) — an error here is treated the same as a natural EOF by
+    // #readStemCrossfadeFrame()'s per-stem exhaustion handling (that stem
+    // just contributes silence for the rest of the window), not as a
+    // whole-transition abort, so no listener is needed beyond #wakeConsumer.
+    incoming.full.on('error', (err) => {
+      // Only surfaces if #incoming (the continuation source) fails before
+      // promotion; #finishCurrent()'s normal error handling takes over once
+      // it's actually promoted to #current.
+      this.emit('incomingerror', err);
+    });
+
+    this.#wakeConsumer();
+    this.emit('crossfadestart', plan);
+    return true;
+  }
+
+  #clearStemSources() {
+    this.#outVocal?.removeAllListeners();
+    this.#outVocal?.destroy();
+    this.#outVocal = null;
+    this.#outInstrumental?.removeAllListeners();
+    this.#outInstrumental?.destroy();
+    this.#outInstrumental = null;
+    this.#inVocal?.removeAllListeners();
+    this.#inVocal?.destroy();
+    this.#inVocal = null;
+    this.#inInstrumental?.removeAllListeners();
+    this.#inInstrumental?.destroy();
+    this.#inInstrumental = null;
+    this.#heldOutVocalFrame = null;
+    this.#heldOutInstrumentalFrame = null;
+    this.#heldInVocalFrame = null;
+    this.#heldInInstrumentalFrame = null;
+    this.#stemCrossfade = null;
+  }
+
   dropCurrent() {
     if (this.#current) {
       this.#current.removeAllListeners();
@@ -211,6 +314,7 @@ export class MixStream extends Readable {
       this.#current = null;
     }
     this.#clearIncoming();
+    this.#clearStemSources();
     this.#betweenTracks = true;
     this.#underrunSince = null;
     this.#crossfade = null;
@@ -227,6 +331,7 @@ export class MixStream extends Readable {
     this.#incoming?.destroy();
     this.#current = null;
     this.#incoming = null;
+    this.#clearStemSources();
     this.push(null);
   }
 
@@ -338,6 +443,7 @@ export class MixStream extends Readable {
     this.#heldInFrame = null;
     this.#incomingSkipSec = 0;
     this.#incomingSkippedSec = 0;
+    this.#clearStemSources();
     callback(err);
   }
 
@@ -368,6 +474,9 @@ export class MixStream extends Readable {
   #readFrame() {
     if (this.#crossfade?.mode === 'tail-fade' && this.#current) {
       return this.#readTailFadeFrame();
+    }
+    if (this.#stemCrossfade && this.#current) {
+      return this.#readStemCrossfadeFrame();
     }
     if (this.#crossfade && this.#current && this.#incoming) {
       return this.#readCrossfadeFrame();
@@ -541,6 +650,133 @@ export class MixStream extends Readable {
       this.#promoteIncoming({ consumeIncoming: true });
     }
     return mixed;
+  }
+
+  /**
+   * Phase 8: mixes 4 independently-enveloped stem streams instead of the
+   * plain path's 2 whole-track streams. A stem that hits EOF/error before
+   * the window finishes contributes silence for its remaining envelope
+   * duration (per-stem exhaustion) rather than aborting the whole
+   * transition — local-file stem reads (unlike a network-piped source)
+   * essentially only fail at spawn time, which startStemCrossfade()'s
+   * upfront `.error` check already screens out, so a MID-window failure
+   * here is expected to be rare; silence-substitution is a safe,
+   * self-contained fallback for it that needs no extra source juggling.
+   */
+  #readStemCrossfadeFrame() {
+    const outVocalFrame = this.#heldOutVocalFrame ?? this.#readExact(this.#outVocal, FRAME_BYTES);
+    const outVocalDone = !outVocalFrame && this.#outVocal?.ended;
+    const outInstFrame = this.#heldOutInstrumentalFrame ?? this.#readExact(this.#outInstrumental, FRAME_BYTES);
+    const outInstDone = !outInstFrame && this.#outInstrumental?.ended;
+    const inVocalFrame = this.#heldInVocalFrame ?? this.#readExact(this.#inVocal, FRAME_BYTES);
+    const inVocalDone = !inVocalFrame && this.#inVocal?.ended;
+    const inInstFrame = this.#heldInInstrumentalFrame ?? this.#readExact(this.#inInstrumental, FRAME_BYTES);
+    const inInstDone = !inInstFrame && this.#inInstrumental?.ended;
+
+    // A slot is ready (has a frame), permanently exhausted (ended with
+    // nothing left — substitute silence for the rest of the window), or
+    // still catching up (underrun — hold whatever DID arrive and wait for
+    // the rest, same tolerant philosophy as #readCrossfadeFrame()).
+    if ((!outVocalFrame && !outVocalDone) || (!outInstFrame && !outInstDone)
+      || (!inVocalFrame && !inVocalDone) || (!inInstFrame && !inInstDone)) {
+      this.#heldOutVocalFrame = outVocalFrame;
+      this.#heldOutInstrumentalFrame = outInstFrame;
+      this.#heldInVocalFrame = inVocalFrame;
+      this.#heldInInstrumentalFrame = inInstFrame;
+      return null;
+    }
+    this.#heldOutVocalFrame = null;
+    this.#heldOutInstrumentalFrame = null;
+    this.#heldInVocalFrame = null;
+    this.#heldInInstrumentalFrame = null;
+
+    const outVocal = outVocalFrame ?? SILENCE_FRAME;
+    const outInst = outInstFrame ?? SILENCE_FRAME;
+    const inVocal = inVocalFrame ?? SILENCE_FRAME;
+    const inInst = inInstFrame ?? SILENCE_FRAME;
+
+    const { stems, fadeSec, eqRampSec } = this.#stemCrossfade;
+    const eqMix = eqRampSec != null ? clamp01(this.#fadeElapsedSec / eqRampSec) : 1;
+    // Bass-swap EQ applies only to the instrumental pair — bass energy
+    // lives there, not in the vocal stem, and post-sum filtering would
+    // re-couple vocal/instrumental through a shared filter, undermining the
+    // whole point of separating them (docs/mix-transition-phase8.md).
+    const processedOutInst = this.#outEq
+      ? blendFrame(outInst, this.#outEq(Buffer.from(outInst)), eqMix)
+      : outInst;
+    const processedInInst = this.#inEq
+      ? blendFrame(inInst, this.#inEq(Buffer.from(inInst)), eqMix)
+      : inInst;
+
+    const outVocalGain = gainForStemPosition({ positionSec: this.#fadeElapsedSec, ...stems.outVocal });
+    const outInstGain = gainForStemPosition({ positionSec: this.#fadeElapsedSec, ...stems.outInstrumental });
+    const inInstGain = gainForStemPosition({ positionSec: this.#fadeElapsedSec, ...stems.inInstrumental });
+    const inVocalGain = gainForStemPosition({ positionSec: this.#fadeElapsedSec, ...stems.inVocal });
+
+    const mixed = mixNFrames(
+      [outVocal, processedOutInst, processedInInst, inVocal],
+      [outVocalGain, outInstGain, inInstGain, inVocalGain],
+    );
+    this.#consumedBytes += FRAME_BYTES;
+    this.#fadeElapsedSec += FRAME_MS / 1000;
+
+    // Keep #incoming (the post-window full-mix continuation source, seeked
+    // once at prep time to the same entrySec/tempoFilter as the incoming
+    // stems) draining in lockstep with the stems it stands in for, so its
+    // position lands correctly for #promoteStemIncoming() — best-effort,
+    // not blocking: a tick where it isn't ready yet (spawn startup latency)
+    // is simply skipped, which can leave it trailing by that latency at
+    // promotion time. That bounded drift (not the unbounded, backpressure-
+    // driven staleness a fully-unread #incoming would accumulate over a
+    // multi-second window) is provisional — see the doc's 未決事項.
+    this.#readExact(this.#incoming, FRAME_BYTES);
+
+    if (this.#fadeElapsedSec >= fadeSec) {
+      this.#promoteStemIncoming();
+    }
+    return mixed;
+  }
+
+  #promoteStemIncoming() {
+    const next = this.#incoming;
+    const fadeElapsedSec = this.#fadeElapsedSec;
+    this.#clearStemSources();
+    this.#outEq = null;
+    this.#inEq = null;
+    this.#fadeElapsedSec = 0;
+
+    if (this.#current) {
+      this.#current.removeAllListeners();
+      this.#current.destroy();
+    }
+    this.#incoming = null;
+
+    if (!next) {
+      this.#current = null;
+      this.#betweenTracks = true;
+      this.emit('trackend', { promoted: true });
+      return;
+    }
+
+    next.removeAllListeners();
+    this.#current = next;
+    // Unlike #promoteIncoming(), #incoming here was read-and-discarded in
+    // lockstep with the stem mix throughout the window (see
+    // #readStemCrossfadeFrame()), so its own read position already sits at
+    // the right native continuation point — consumedBytes only needs to
+    // reflect how much playback-domain audio has been heard so far
+    // (fadeElapsedSec), not an extra skip/offset calculation.
+    this.#consumedBytes = Math.round(fadeElapsedSec * BYTES_PER_SECOND);
+    this.#durationSec = null;
+    this.#betweenTracks = false;
+
+    next.on('data', () => this.#wakeConsumer());
+    next.on('end', () => this.#wakeConsumer());
+    next.on('error', (err) => {
+      this.emit('sourceerror', err);
+    });
+
+    this.emit('trackend', { promoted: true });
   }
 
   #promoteIncoming({ consumeIncoming = true } = {}) {

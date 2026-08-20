@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough, Writable } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import { FRAME_BYTES, FRAME_MS } from './fade.js';
 import { MixStream } from './mixStream.js';
 import { PcmSource } from './pcmSource.js';
@@ -294,4 +295,183 @@ test('MixStream emits underrunClear only after recovering from underrun', async 
   await collectFrames(mix, 3);
   assert.equal(clears, 0, 'healthy frames must not clear another guild underrun');
   mix.endMixer();
+});
+
+// --- Phase 8 (docs/mix-transition-phase8.md): startStemCrossfade() -------
+
+function stemSource(value, frames) {
+  return PcmSource.fromBuffers(Array.from({ length: frames }, () => fillFrame(value)));
+}
+
+function makeStemPlan(fadeSec, overrides = {}) {
+  return {
+    fadeSec,
+    curve: 'equal-power',
+    baseSwap: false,
+    mode: 'stem-mix',
+    stems: {
+      outVocal: { role: 'out', fadeSec, curve: 'equal-power', startOffsetSec: 0 },
+      outInstrumental: { role: 'out', fadeSec, curve: 'equal-power', startOffsetSec: 0 },
+      inInstrumental: { role: 'in', fadeSec, curve: 'equal-power', startOffsetSec: 0 },
+      inVocal: { role: 'in', fadeSec, curve: 'equal-power', startOffsetSec: 0 },
+      ...overrides,
+    },
+  };
+}
+
+test('MixStream startStemCrossfade mixes 4 stems then promotes to the incoming full-mix source', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // A couple of spare frames past fadeSec's exact frame count absorb the
+    // usual +-1-frame float accumulation on `#fadeElapsedSec += 0.02` (the
+    // same imprecision the plain crossfade path already has) without
+    // pinning the test to an exact tick count.
+    const fadeFrames = 10; // 0.2s at 20ms/frame
+    const outgoing = { vocal: stemSource(2000, fadeFrames + 2), instrumental: stemSource(3000, fadeFrames + 2) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames + 2),
+      instrumental: stemSource(5000, fadeFrames + 2),
+      full: stemSource(6000, 30), // survives past promotion
+    };
+    const plan = makeStemPlan(0.2);
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+    assert.equal(mix.isCrossfading, true);
+
+    // Snapshot state SYNCHRONOUSLY inside the promoted-trackend listener,
+    // at the exact instant #current has just been switched to `next` —
+    // asserting after `await` would race a LATER, unrelated event (this
+    // synthetic fixture's incoming.full has few enough frames that a
+    // flowing consumer can drain it to EOF, triggering #finishCurrent()'s
+    // own plain trackend that nulls #current again, within the same
+    // microtask burst as promotion, before the `await` below resumes).
+    let sawCorrectPromotion = false;
+    const promotedPromise = new Promise((resolve) => {
+      mix.on('trackend', (info) => {
+        if (info?.promoted) {
+          sawCorrectPromotion = mix.isCrossfading === false && mix.currentSource === incoming.full;
+          resolve();
+        }
+      });
+    });
+    mix.on('data', () => {}); // keep the stream flowing so ticks actually happen
+    await promotedPromise;
+
+    assert.equal(sawCorrectPromotion, true, 'expected #current to be exactly incoming.full immediately upon promotion');
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade: inVocal contributes nothing before its own startOffsetSec (delayed-envelope wiring)', async () => {
+  // The core Phase 8 correctness property: during the window before inVocal
+  // starts fading in, its underlying PCM content must have ZERO effect on
+  // the mixed output — proving the per-stem gain envelope (not just the
+  // outer crossfade envelope) actually gates it.
+  async function firstMixedFrame(inVocalValue) {
+    const mix = new MixStream();
+    try {
+      mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+      await new Promise((resolve) => setImmediate(resolve));
+      const fadeFrames = 10;
+      const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+      const incoming = {
+        vocal: stemSource(inVocalValue, fadeFrames),
+        instrumental: stemSource(5000, fadeFrames),
+        full: stemSource(6000, fadeFrames),
+      };
+      // inVocal starts fading in only after the whole 0.2s window (never
+      // actually starts within the captured frames).
+      const plan = makeStemPlan(0.2, {
+        inVocal: { role: 'in', fadeSec: 0, curve: 'equal-power', startOffsetSec: 0.2 },
+      });
+      mix.startStemCrossfade({ outgoing, incoming }, plan);
+      const [frame] = await collectFrames(mix, 1);
+      return frame;
+    } finally {
+      mix.endMixer();
+    }
+  }
+
+  const withLowInVocal = await firstMixedFrame(-32000);
+  const withHighInVocal = await firstMixedFrame(32000);
+  assert.deepEqual(withLowInVocal, withHighInVocal,
+    'expected wildly different inVocal content to produce an IDENTICAL first frame, since inVocal gain is still 0 there');
+});
+
+test('MixStream startStemCrossfade substitutes silence for a stem that ends early instead of aborting the transition', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 10;
+    // outVocal only has 2 frames of real content -- the remaining 8 ticks
+    // must fall back to silence for that slot, not stall/abort the mix.
+    const outgoing = { vocal: stemSource(2000, 2), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames),
+    };
+    const plan = makeStemPlan(0.2);
+    mix.startStemCrossfade({ outgoing, incoming }, plan);
+
+    let promoted = false;
+    mix.on('trackend', (info) => { if (info?.promoted) promoted = true; });
+    const frames = await collectFrames(mix, fadeFrames);
+    assert.equal(frames.length, fadeFrames, 'expected the transition to run to completion despite the early-ending stem');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(promoted, true);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade rejects and destroys every source when one already carries an error', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 5), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // PcmSource.error is a read-only getter (backed by a real internal
+    // #fail() state machine) — a plain fake object stands in here, matching
+    // phase2.test.js's createPendingSource() convention for pre-armed error
+    // state.
+    const failed = new EventEmitter();
+    failed.ended = false;
+    failed.error = new Error('boom');
+    failed.read = () => null;
+    failed.destroy = () => { failed.removeAllListeners(); failed.ended = true; };
+    const destroyed = [];
+    const wrap = (source, label) => {
+      const originalDestroy = source.destroy.bind(source);
+      source.destroy = () => { destroyed.push(label); originalDestroy(); };
+      return source;
+    };
+    const outgoing = {
+      vocal: wrap(stemSource(2000, 1), 'outVocal'),
+      instrumental: wrap(stemSource(3000, 1), 'outInstrumental'),
+    };
+    const incoming = {
+      vocal: wrap(failed, 'inVocal'),
+      instrumental: wrap(stemSource(5000, 1), 'inInstrumental'),
+      full: wrap(stemSource(6000, 1), 'full'),
+    };
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, makeStemPlan(0.2));
+    assert.equal(ok, false);
+    assert.equal(mix.isCrossfading, false);
+    assert.deepEqual(
+      destroyed.sort(),
+      ['full', 'inInstrumental', 'inVocal', 'outInstrumental', 'outVocal'],
+      'expected every one of the 5 sources to be destroyed on rejection',
+    );
+  } finally {
+    mix.endMixer();
+  }
 });

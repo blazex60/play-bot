@@ -1201,6 +1201,8 @@ J-POP を中心に最低 15 transition。
 
 ## 22. Phase 8 候補 — Stem Mixing
 
+> **更新**: この節が候補として書いた内容は [`docs/mix-transition-phase8.md`](mix-transition-phase8.md) として実装された。以下は当時の設計メモとして残す。§23 の「stem mixing」非目標行も Phase 8 により上書きされる。
+
 Phase 7 完了後の別 Phase とする。
 
 Demucs を既に使用しているため、
