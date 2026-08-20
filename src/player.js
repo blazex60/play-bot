@@ -708,6 +708,14 @@ export class GuildPlayer {
     // processes alive for the rest of the adopted track.
     this.#clearPreparedOutgoingStems();
     this.#clearPreparedIncomingStems();
+    // Same reasoning as #onCrossfadePromoted()/#handleAfter()'s reset
+    // (Codex): a snap-adopted plain source is a THIRD way this (current,
+    // next) pair's transition attempt can conclude, alongside those two —
+    // an earlier failed stem-mix attempt for this exact pair must not
+    // leave it permanently downgraded for a later QUEUE-loop/duplicate
+    // recurrence just because THIS occurrence happened to resolve via
+    // snap-adoption instead of a crossfade promotion or a natural end.
+    this.#stemMixUnavailableKey = null;
     const outgoingTemp = this.#currentTempFile;
     this.#currentTempFile = this.#incomingTempFile;
     this.#incomingTempFile = null;
