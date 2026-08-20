@@ -770,7 +770,18 @@ export class MixStream extends Readable {
       while (this.#incomingStemFramesRead < expectedFrames && this.#readExact(this.#incoming, FRAME_BYTES)) {
         this.#incomingStemFramesRead += 1;
       }
-      this.#promoteStemIncoming();
+      // Only promote once #incoming has actually caught up — a decoder
+      // that's genuinely still lagging (not just "hadn't been read yet")
+      // can't be drained faster than it decodes, so the loop above may
+      // still exit short. Holding here instead of promoting behind is
+      // safe: gainForStemPosition() already clamps out/in gains to their
+      // terminal values past fadeSec, so continuing to mix the 4 stems for
+      // a few more ticks is audibly equivalent to the post-promotion
+      // full-mix source (inVocal/inInstrumental already at full gain,
+      // out* already silent) — just retry the catch-up next tick (Codex).
+      if (this.#incomingStemFramesRead >= expectedFrames) {
+        this.#promoteStemIncoming();
+      }
     }
     return mixed;
   }

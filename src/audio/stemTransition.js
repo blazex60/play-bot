@@ -89,9 +89,22 @@ export function planStemTransition(outgoing, incoming, options = {}) {
     stemAware: true,
   });
   if (!plan.eligible) return plan;
+  const stems = buildStemEnvelopes(outgoing, plan, options);
+  // Codex: when the outgoing vocal tail is long enough to need the whole
+  // (or more than the) overlap just to fade out, inVocalDelaySec clamps to
+  // fadeSec and inVocal's own fadeSec clamps to 0 — gainForStemPosition()
+  // then holds inVocal silent for the entire window and jumps it straight
+  // to full gain only on the last frame, right as promotion switches to
+  // incoming.full (already at its native volume there). That's a hard
+  // vocal onset, not a fade — the whole point of this plan. Reject rather
+  // than produce a degenerate envelope; the caller's existing ladder falls
+  // back to a plain crossfade for a pair like this.
+  if (!(stems.inVocal.fadeSec > 0)) {
+    return { mode: null, eligible: false, reasons: ['stem-mix-no-invocal-fade-room'] };
+  }
   return {
     ...plan,
     mode: 'stem-mix',
-    stems: buildStemEnvelopes(outgoing, plan, options),
+    stems,
   };
 }

@@ -42,6 +42,15 @@ const MAX_CROSSFADE_SEC = 6;
  * round-2). A fixed overlap-length guess (e.g. 20s) undercounts this.
  */
 const MAX_TRANSITION_LEAD_SEC = TAIL_WINDOW_SEC;
+// Phase 8: #ensureOutgoingStemPrep() seeks the outgoing stems to a FIXED
+// native exitStartSec once, at prepDue — #current itself keeps playing live
+// the whole time until actually taken. Normal jitter (CROSSFADE_ARM_INTERVAL_MS
+// polling) keeps that gap tiny; this tolerates a few ticks of it while still
+// catching the case where #takePreparedIncoming()'s await stretched
+// arbitrarily far (a still-downloading/normalizing incoming track), which
+// would otherwise start the outgoing stems from a position #current has
+// already played past (Codex).
+const OUTGOING_STEM_DRIFT_TOLERANCE_SEC = 0.5;
 const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
@@ -284,6 +293,19 @@ export class GuildPlayer {
   #preparedOutgoingStems = null;
   /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
   #preparedIncomingStems = null;
+  /**
+   * Phase 8 (Codex): memoizes a POSITIVE stem-cache lookup for the current
+   * (current,next) pair — #maybeStartCrossfade() re-runs the eligibility
+   * check on every CROSSFADE_ARM_INTERVAL_MS tick for up to the whole lead
+   * window, and getCachedStems() touches the entry's mtime on every hit, so
+   * without this a single transition attempt generates hundreds of
+   * redundant metadata writes once both sides are already cached. Only
+   * positive results are memoized — a miss must keep re-checking every
+   * tick, since background separation completing mid-window is the whole
+   * point of prepping this early, and a miss never touches mtime anyway.
+   * @type {{ key: string, outCachedStems: object, inCachedStems: object } | null}
+   */
+  #stemCacheHit = null;
 
   constructor({
     guildId,
@@ -1512,10 +1534,18 @@ export class GuildPlayer {
       let inCachedStems = null;
       let norm = null;
       if (rawPlan.mode !== 'beatmix') {
-        [outCachedStems, inCachedStems] = await Promise.all([
-          this.#getCachedStemsFn(current.videoId),
-          this.#getCachedStemsFn(next.videoId),
-        ]);
+        const stemCacheLookupKey = `${current.videoId ?? ''}:${next.videoId ?? ''}`;
+        if (this.#stemCacheHit?.key === stemCacheLookupKey) {
+          ({ outCachedStems, inCachedStems } = this.#stemCacheHit);
+        } else {
+          [outCachedStems, inCachedStems] = await Promise.all([
+            this.#getCachedStemsFn(current.videoId),
+            this.#getCachedStemsFn(next.videoId),
+          ]);
+          if (outCachedStems && inCachedStems) {
+            this.#stemCacheHit = { key: stemCacheLookupKey, outCachedStems, inCachedStems };
+          }
+        }
         if (outCachedStems && inCachedStems) {
           const stemPlan = this.#planStemTransitionFn(outAnalysis, inAnalysis, {
             outgoingPlaybackBpm,
@@ -1676,6 +1706,24 @@ export class GuildPlayer {
       let mixPlan = forcePlainCrossfade
         ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null }
         : norm.mixPlan;
+
+      // Phase 8 (Codex): the outgoing stems were seeked to a FIXED native
+      // exitStartSec back at prepDue and don't track #current's live
+      // position — the normal small overshoot past `startSec` here (one
+      // arm-tick's worth) is harmless and already tolerated by the
+      // non-stem-mix path too. What actually breaks alignment is the
+      // #takePreparedIncoming() await ABOVE stretching arbitrarily long (a
+      // still-downloading/normalizing incoming track) while #current keeps
+      // playing — so compare against the position snapshot taken before
+      // that await, not against `startSec` itself.
+      if (mixPlan.mode === 'stem-mix') {
+        const freshPositionSec = this.#mixStream?.positionSec ?? positionSec;
+        if (freshPositionSec - positionSec > OUTGOING_STEM_DRIFT_TOLERANCE_SEC) {
+          this.#clearPreparedOutgoingStems();
+          this.#clearPreparedIncomingStems();
+          mixPlan = { ...mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null };
+        }
+      }
 
       // Phase 8: take the two prepared stem pairs only now that we know a
       // plain crossfade isn't already forced (sourceHonorsPlan check above)
