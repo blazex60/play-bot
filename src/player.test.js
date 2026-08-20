@@ -1,10 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { AudioPlayerStatus, StreamType } from '@discordjs/voice'
+import { AudioPlayerStatus, NoSubscriberBehavior, StreamType } from '@discordjs/voice'
 import { createTrack } from './queue.js'
 import { triggerTrackEnd } from './player/playbackDrive.js'
 import { makePlayer, makeAudioPlayer, nextTurn } from './player/test-helpers.js'
-import { ANALYSIS_VERSION } from './audio/trackAnalysis.js'
+import {
+  ANALYSIS_VERSION,
+} from './audio/trackAnalysis.js'
+import {
+  MIXER_AUDIO_PLAYER_OPTIONS,
+  MIXER_AUDIO_RESOURCE_OPTIONS,
+  MIXER_MAX_MISSED_FRAMES,
+} from './player.js'
 
 // --- Phase 7B §8.4: session tempo bookkeeping. Phase 7D wires an actual
 // stretch (beatmix promotion) into it — see player.acceptance.test.js's
@@ -95,11 +102,29 @@ test('GuildPlayer.playNext plays the mixer resource as StreamType.Raw', async ()
   await player.playNext()
 
   assert.equal(audioPlayer.resource, resources[0])
-  assert.deepEqual(resources[0].options, {
-    inputType: StreamType.Raw,
-  })
+  assert.deepEqual(resources[0].options, MIXER_AUDIO_RESOURCE_OPTIONS)
 
   await player.stop()
+})
+
+test('GuildPlayer pipelines MixStream only after a PCM source is attached', async () => {
+  const { player, resources } = makePlayer()
+
+  assert.equal(resources.length, 0, 'constructor must not opus-pipeline an empty MixStream')
+  await player.playNext()
+  assert.equal(resources.length, 1)
+  assert.equal(resources[0].stream, player.mixStream)
+  assert.ok(player.mixStream.currentSource, 'opus pipeline must start after setCurrent')
+
+  await player.stop()
+})
+
+test('mixer AudioPlayer keeps playing through encoder hiccups without a ready subscriber', () => {
+  assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.noSubscriber, NoSubscriberBehavior.Play)
+  assert.equal(MIXER_AUDIO_PLAYER_OPTIONS.behaviors.maxMissedFrames, MIXER_MAX_MISSED_FRAMES)
+  assert.ok(MIXER_MAX_MISSED_FRAMES > 5)
+  assert.equal(MIXER_AUDIO_RESOURCE_OPTIONS.silencePaddingFrames, 0)
+  assert.equal(MIXER_AUDIO_RESOURCE_OPTIONS.inputType, StreamType.Raw)
 })
 
 test('GuildPlayer: playNext calls onTrackStart with the track videoId', async () => {
