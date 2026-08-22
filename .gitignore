@@ -7,6 +7,7 @@ __pycache__/
 progress.txt
 data/
 tmp/
+.claude/
 
 .omc
 .omo
