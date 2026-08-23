@@ -201,6 +201,16 @@ function entryInfo(plan, incomingAnalysis) {
   } else if (plan.mode === 'phrase-crossfade') {
     sec = plan.entrySec ?? 0;
     bar = plan.entryBarIndex ?? null;
+  } else if (plan.mode === 'crossfade') {
+    // Codex review (PR #43, round 6): a legacy (non-phrase, non-beatmix)
+    // `crossfade` plan can still carry a nonzero incomingOffsetSec (from
+    // the incoming track's headBeatOffsetSec) — MixStream.startCrossfade()
+    // actually discards that many seconds of incoming PCM before the
+    // overlap becomes audible (see normalizeTransitionPlan()'s legacy
+    // branch, which carries it straight into mixPlan.incomingOffsetSec).
+    // tail-fade's mixer path ignores this field entirely, so it correctly
+    // stays 0 there (the `else` default below, untouched).
+    sec = plan.incomingOffsetSec ?? 0;
   }
   return { sec, bar, firstVocalSec: incomingAnalysis?.firstVocalStartSec ?? null };
 }

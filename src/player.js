@@ -2068,17 +2068,20 @@ export class GuildPlayer {
           }
         }
       }
-      if (!norm) {
-        if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
-        norm = normalizeTransitionPlan(rawPlan);
-      }
-
       // Phase 9A: snapshot the ladder's decision (before any later downgrade
       // — TRACK loop mode / an incoming source that can't honor a seek or
       // stretch) into a log report. `selected`/`downgradedFrom` are
       // finalized right before the actual startCrossfade()/
       // startStemCrossfade() call below, once the real executed mode is
       // known — see the `modeDowngraded` flag set at each override site.
+      //
+      // Codex review (PR #43, round 6): built and stashed BEFORE the
+      // gapless/no-fade early return below (moved up from after it) — a
+      // 'gapless' rawPlan still means beatmix/stem-mix/phrase-crossfade
+      // were genuinely evaluated and rejected just now, and the eventual
+      // hard-handoff log (via #takeMatchingEvaluatedTransition()) should
+      // report those real rejection reasons instead of falling back to the
+      // generic "no candidate evaluation" stub for every gapless case.
       const plannedMode = stemPlan?.eligible ? 'stem-mix' : rawPlan.mode;
       const transitionPlanReport = buildTransitionPlanReport({
         outgoingTrack: current,
@@ -2106,6 +2109,12 @@ export class GuildPlayer {
       // so later in-place edits to transitionPlanReport itself (§ below)
       // can't retroactively change what was stashed for this tick.
       this.#stashLastEvaluatedTransition(stemCacheLookupKey, transitionPlanReport);
+
+      if (!norm) {
+        if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
+        norm = normalizeTransitionPlan(rawPlan);
+      }
+
       let modeDowngraded = false;
 
       // §2.3/§8.4: TRACK loop mode repeats the SAME track (`next === current`
@@ -2434,6 +2443,12 @@ export class GuildPlayer {
       // rejected attempt, then double-count the same real transition when a
       // later arm tick retries and succeeds.
       this.#logTransitionPlanFn(transitionPlanReport);
+      // Codex review (PR #43, round 6): this evaluation has now produced
+      // its own committed-transition log — clear the stash so a later
+      // recurrence of this exact pair (e.g. a short TRACK loop) can't have
+      // its own hard handoff replay THIS transition's candidates as if
+      // they were freshly evaluated for it.
+      this.#lastEvaluatedTransitionReport = null;
     } finally {
       this.#crossfadeArming = false;
     }
