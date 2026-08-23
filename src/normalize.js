@@ -121,16 +121,29 @@ export async function trimSilence(filePath, {
   detectMinSec = SILENCE_DETECT_MIN_SEC,
   spawnFn = spawnBuffered,
   probeDurationFn = probeDurationSec,
+  // Codex review (PR #44, P1): probeDurationFn's ffprobe calls previously
+  // always ran via duration.js's own module-level spawn, untracked by the
+  // queue's pause/kill machinery even when `spawnFn` above was overridden —
+  // an abort mid-probe left that ffprobe process running free, and once it
+  // finished, execution carried on into the next spawnFn-using step (the
+  // silencedetect ffmpeg call) as if nothing had happened. `probeSpawnFn` is
+  // the raw-ChildProcess-returning override (prefetchTrack() passes its own
+  // `spawnFn` straight through here — no spawnBuffered() wrapping needed,
+  // duration.js's probeDurationSec() does its own buffering), and `signal`
+  // is checked immediately after each probe below.
+  probeSpawnFn,
+  signal,
   minDurationSec = MIN_TRIMMED_DURATION_SEC,
 } = {}) {
   if (!filePath) return false
   const outPath = `${filePath}.silence-trim`
   const backupPath = `${filePath}.pre-silence-trim`
   try {
-    const beforeSec = await probeDurationFn(filePath).catch(() => null)
+    const beforeSec = await probeDurationFn(filePath, { spawnFn: probeSpawnFn }).catch(() => null)
     if (beforeSec == null) {
       throw new NormalizeError('source duration unknown; skipping silence trim')
     }
+    throwIfAborted(signal)
     // Move instead of copy: same rollback guarantee without duplicating the file.
     await rename(filePath, backupPath)
 
@@ -167,7 +180,8 @@ export async function trimSilence(filePath, {
       outPath,
     ])
     await access(outPath)
-    const afterSec = await probeDurationFn(outPath).catch(() => null)
+    const afterSec = await probeDurationFn(outPath, { spawnFn: probeSpawnFn }).catch(() => null)
+    throwIfAborted(signal)
     if (afterSec == null || afterSec < minDurationSec) {
       throw new NormalizeError(
         `silence trim produced unusable duration (${afterSec ?? 'unknown'}s)`,
@@ -200,7 +214,25 @@ function tempFilePath(track) {
   return path.join(TEMP_DIR, `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}-${safeTitle}`)
 }
 
-export async function prefetchTrack(track, { spawnFn } = {}) {
+// Codex review (PR #44, P1): a queue abort (e.g. a mixer underrun killing
+// this job) rejects whichever spawnFn-based call is in flight, but
+// trimSilence() deliberately swallows its OWN spawn failures (fail-soft —
+// "leave the original file untouched" per its own docstring) and returns
+// `false` rather than rejecting. Without an explicit check, prefetchTrack()
+// would sail on into the NEXT step's spawnFn call even though its own job
+// was already killed — and since analysisQueue.js's spawnEpoch guard only
+// kills spawns issued BEFORE a newer abort (not a stale continuation's
+// brand-new spawn issued AFTER its own abort), that new process would get
+// silently registered into whatever job happens to be running next,
+// consuming CPU/being paused-or-killed alongside unrelated work indefinitely.
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return
+  const err = new Error('prefetch aborted')
+  err.code = 'ANALYSIS_KILLED'
+  throw err
+}
+
+export async function prefetchTrack(track, { spawnFn, signal } = {}) {
   if (!isNormalizeDurationAllowed(track)) {
     throw new NormalizeDurationError(`track exceeds ${MAX_NORMALIZE_DURATION_SEC}s normalize limit`)
   }
@@ -208,6 +240,7 @@ export async function prefetchTrack(track, { spawnFn } = {}) {
   const filePath = tempFilePath(track)
   try {
     await downloadAudio(track.webpageUrl, filePath, { spawnFn })
+    throwIfAborted(signal)
     // Trim YouTube/source padding before loudnorm + MIX analysis so
     // remainingSec and crossfade sit on audible audio.
     //
@@ -224,7 +257,19 @@ export async function prefetchTrack(track, { spawnFn } = {}) {
     // what normal playback/analysis uses). Wrap it in the same
     // spawnBuffered() adapter downloadAudio()/analyzeLoudness() already use
     // internally, so trimSilence() sees the buffered shape it expects.
-    await trimSilence(filePath, spawnFn ? { spawnFn: (cmd, args) => spawnBuffered(cmd, args, spawnFn) } : undefined)
+    // Codex review (PR #44, P1, round 2): probeSpawnFn/signal thread
+    // trimSilence()'s duration probes onto this same tracked spawnFn/abort
+    // signal too — probeDurationSec()'s own contract is a RAW
+    // ChildProcess-returning spawn (it does its own buffering internally
+    // via spawnCapture()), unlike the buffered wrapper above, so `spawnFn`
+    // (not the wrapped closure) is passed straight through.
+    await trimSilence(filePath, spawnFn
+      ? { spawnFn: (cmd, args) => spawnBuffered(cmd, args, spawnFn), probeSpawnFn: spawnFn, signal }
+      : undefined)
+    // trimSilence() is fail-soft (catches its own spawn failures and
+    // returns `false`) — check explicitly rather than relying on it to
+    // have thrown, or an abort mid-trim would go unnoticed here.
+    throwIfAborted(signal)
     const measured = await analyzeLoudness(filePath, { spawnFn })
     return { filePath, measured }
   } catch (err) {

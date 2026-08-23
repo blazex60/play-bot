@@ -1920,6 +1920,52 @@ test('acceptance (mixer): a committed stem-mix transition emits exactly one [MIX
   }
 });
 
+test('acceptance (mixer): a natural gapless handoff whose evaluated rawPlan was already gapless is not reported as downgraded from itself (Codex review, PR #43, P2)', async () => {
+  // planTransition() returns mode:'gapless' outright when the outgoing
+  // analysis has very low confidence (0 < confidence < 0.2) and low vocal
+  // confidence — no beatmix/stem-mix/phrase-crossfade was ever eligible, so
+  // this pair's stashed report already has selected='gapless' before the
+  // hard handoff below even runs.
+  const lowConfidenceAnalysis = { version: ANALYSIS_VERSION, confidence: 0.1, vocalConfidence: 0.1, durationSec: 60 };
+  const logCalls = [];
+  // Under SHORT_TRACK_THRESHOLD_SEC (5s, src/player/playbackPolicy.js) so
+  // shouldReconnectRetry() does not replay this same track instead of
+  // advancing once triggerTrackEnd() fires below.
+  const { player, queue } = makePlayer({
+    trackDuration: 3,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 3, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => lowConfidenceAnalysis,
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.alloc(FRAME_BYTES))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3, videoId: 'vid-b' }));
+
+  try {
+    await player.playNext();
+    // Let at least one 200ms crossfade-arm tick run (and stash its
+    // evaluated, already-gapless report) before the track ends naturally.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    triggerTrackEnd({ mixStream: player.mixStream });
+    await waitMs(50);
+
+    assert.equal(logCalls.length, 1);
+    const report = logCalls[0];
+    assert.equal(report.selected, 'gapless');
+    assert.equal(report.downgradedFrom, null,
+      'a rawPlan that was already gapless must not be reported as downgraded from itself');
+    // Codex review (PR #43, round 8): entrySec===0 (this hard handoff's
+    // native start offset, the ordinary #playNextMixer path never honors a
+    // seek) does not mean bar 0 was actually detected/aligned — no bar
+    // alignment happened at all on this path.
+    assert.equal(report.entry.sec, 0);
+    assert.equal(report.entry.bar, null,
+      'entrySec===0 must not be reported as bar 0 — a hard handoff performs no bar alignment');
+  } finally {
+    await player.stop();
+  }
+});
+
 test('acceptance (mixer): logTransitionPlan still fires (with the real ladder\'s own selection) when no custom Fn is injected', async () => {
   const { player, queue } = makePlayer({ trackDuration: 3, framesPerTrack: 400 });
   queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3 }));
@@ -2107,6 +2153,62 @@ test('acceptance (mixer): concurrent arm ticks do not spawn duplicate stem sourc
     assert.equal(startedPlan.mode, 'stem-mix');
     assert.equal(stemSourceCalls.length, 4,
       `expected exactly 2 outgoing + 2 incoming stem sources despite concurrent arm ticks, got ${stemSourceCalls.length}`);
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): an arm tick whose queue advances out from under it (mid-analysis) does not stash a stale evaluation (Codex review, PR #43, P2)', async () => {
+  // Codex review (PR #43, round 8): #maybeStartCrossfade() awaits
+  // #getCachedAnalysis() (among other things) before stashing its
+  // evaluation for the (current, next) pair it captured at the very top of
+  // the tick. If the queue advances during that await (a skip, here — a
+  // snap handoff racing the same tick is the finding's original scenario,
+  // but any queue advance during the await exercises the same staleness
+  // window), the captured pair is stale by the time the stash would run.
+  // Delaying getTrackAnalysisFn for the CURRENT track (A) reliably parks an
+  // arm tick mid-await long enough to skip past it.
+  let releaseAnalysis;
+  let analysisRequested = false;
+  const logCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => {
+      if (videoId === 'vid-a') {
+        analysisRequested = true;
+        return new Promise((resolve) => { releaseAnalysis = () => resolve(null); });
+      }
+      return null;
+    },
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.alloc(FRAME_BYTES))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    await pollUntil(() => analysisRequested, { timeoutMs: 2000 });
+    // The arm tick evaluating A (current) / B (next) is now parked inside
+    // #getCachedAnalysis(current)'s await. Advance the queue out from
+    // under it before releasing that await.
+    await player.skip();
+    await nextTurn();
+    assert.equal(queue.current.videoId, 'vid-b', 'expected skip() to have advanced the queue while the tick was parked');
+
+    releaseAnalysis();
+    await waitMs(200); // let the parked tick resume and (correctly) bail out
+
+    assert.equal(startedPlan, null, 'the stale A/B evaluation must never reach a crossfade start');
+    assert.ok(
+      !logCalls.some((r) => r.from === 'Track A'),
+      'a report evaluated for the stale (A, B) pair must never be stashed/logged once A is no longer current',
+    );
   } finally {
     await player.stop();
   }
@@ -2337,6 +2439,68 @@ test('acceptance (mixer): a stem-mix pair marked unavailable gets a fresh attemp
     const vidACallsAfterSecondLap = stemSourceCalls.filter((c) => c.filePath.includes('vid-a')).length;
     assert.ok(vidACallsAfterSecondLap > vidACallsAfterFirstLap,
       'expected the recurring A→B pair to get a fresh stem-mix attempt on the second lap, not stay downgraded');
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): a LOW-priority stem prefetch rechecks the cache when its turn on the serial queue actually comes up, skipping the download on a hit (Codex review, PR #44, P2)', async () => {
+  // #ensureStemPrefetch() only observes a cache MISS once, when the pair
+  // first becomes next/next+1. If another guild (or an earlier HIGH job)
+  // separates the same track while this LOW job is still waiting behind
+  // other work on the shared serial queue, the recheck inside
+  // #runLowPriorityStemPrefetch()'s own enqueued callback must catch that
+  // and skip straight to returning the now-cached stems — never spending a
+  // full download/trim/loudness/staging pass on a track someone else
+  // already finished.
+  const cacheCallsPerVideo = new Map();
+  const stageCalls = [];
+  const separateCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    // stageTempFileCopyFn/separateTrackStemsFn are only ever called from
+    // the stem-specific pipeline (#scheduleAnalysis for HIGH,
+    // #runLowPriorityStemPrefetch for LOW) — unlike prefetchTrackFn, which
+    // the general upcoming-track audio prefetch also calls for C
+    // regardless of stem-cache state, so tracking calls to THESE two is
+    // what actually isolates "did the stem pipeline redo expensive work".
+    stageTempFileCopyFn: async (filePath) => {
+      stageCalls.push(filePath);
+      return `${filePath}.staged`;
+    },
+    getCachedStemsFn: async (videoId) => {
+      const calls = (cacheCallsPerVideo.get(videoId) ?? 0) + 1;
+      cacheCallsPerVideo.set(videoId, calls);
+      // vid-c: miss on #ensureStemPrefetch()'s first probe (so the LOW job
+      // gets queued), then a hit on every later recheck (simulating
+      // another guild finishing separation while this job waited).
+      if (videoId === 'vid-c' && calls >= 2) {
+        return { vocalPath: '/tmp/vid-c.vocal.wav', instrumentalPath: '/tmp/vid-c.instrumental.wav' };
+      }
+      return null;
+    },
+    separateTrackStemsFn: async (filePath, videoId) => {
+      separateCalls.push(videoId);
+      return { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => byIdReady(player, 'vid-c'));
+
+    assert.equal(byIdState(player, 'vid-c'), 'ready', 'expected the cache-hit recheck to still mark C ready');
+    assert.ok(!stageCalls.some((f) => f.includes('vid-c')),
+      'expected the recheck hit to skip staging C\'s downloaded file entirely — no separation work was ever going to run on it');
+    assert.ok(!separateCalls.includes('vid-c'),
+      'expected the recheck hit to skip separateTrackStemsFn for C entirely — the cached stems were returned directly');
   } finally {
     await player.stop();
   }
@@ -2858,6 +3022,7 @@ test('acceptance (mixer): a skip promoting C to next escalates its stem prefetch
 
 test('acceptance (mixer): a track removed from the queue is pruned from stem prefetch after its attempt settles', async () => {
   let resolveC;
+  let cCacheCalls = 0;
   const { player, queue } = makePlayer({
     trackDuration: 60,
     track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
@@ -2866,9 +3031,19 @@ test('acceptance (mixer): a track removed from the queue is pruned from stem pre
     prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
     stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
     getCachedStemsFn: async (videoId) => {
-      if (videoId === 'vid-c') {
+      // Codex review (PR #44, P2): #runLowPriorityStemPrefetch() now
+      // rechecks the cache itself once its job actually starts, a SECOND
+      // call for 'vid-c' beyond #ensureStemPrefetch()'s own initial probe.
+      // Only the first call should hang on the manually-resolved promise
+      // below (that's the one this test controls) — later calls answer
+      // immediately with a miss, or the second call would hang forever on
+      // a `resolveC` nothing calls again, wedging the real shared
+      // analysisQueue singleton for every later test in this file.
+      if (videoId === 'vid-c' && cCacheCalls === 0) {
+        cCacheCalls += 1;
         return new Promise((resolve) => { resolveC = resolve; });
       }
+      if (videoId === 'vid-c') cCacheCalls += 1;
       return null;
     },
     separateTrackStemsFn: async (filePath, videoId) => (
@@ -2954,4 +3129,33 @@ test('acceptance (mixer): a HIGH stem job killed by ANALYSIS_KILLED after a succ
   } finally {
     await player.stop();
   }
+});
+
+// --- Phase 9A round 4 (Codex review, PR #43): #pendingGaplessFrom staleness ---
+
+test('acceptance (mixer): stop() clears a pending gapless continuation so a later unrelated playNext does not misattribute it', async () => {
+  const logCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 3,
+    handleQueueExhausted: async () => true, // recommend mode: don't start another track
+    logTransitionPlanFn: (report) => logCalls.push(report),
+    logGaplessTransitionFn: (payload) => logCalls.push(payload),
+  });
+
+  await player.playNext();
+  triggerTrackEnd({ mixStream: player.mixStream });
+  await waitMs(20);
+  // Queue is empty and handleQueueExhausted returned true without adding a
+  // track — #pendingGaplessFrom is stashed for whenever playback resumes.
+
+  await player.stop();
+
+  // A later, wholly unrelated /play — nothing here should attribute back
+  // to the track that finished before stop().
+  queue.add(createTrack({ title: 'Track Z', webpageUrl: 'https://example.com/z', duration: 3 }));
+  await player.playNext();
+  await waitMs(20);
+
+  assert.equal(logCalls.length, 0, 'stop() must clear the stashed continuation, not let it leak into an unrelated later playNext');
+  await player.stop();
 });
