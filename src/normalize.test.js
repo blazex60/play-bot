@@ -209,3 +209,39 @@ test('prefetchTrack: stops before the next spawnFn-using step once signal.aborte
     // path would run inside prefetchTrack's catch block already.
   }
 })
+
+test('prefetchTrack: routes trimSilence\'s duration probe through the tracked spawnFn, and an abort noticed there stops before the next ffmpeg step (Codex review, PR #44, P1, round 2)', async () => {
+  // Previously trimSilence()'s probeDurationFn (duration.js's
+  // probeDurationSec) always used duration.js's own module-level spawn,
+  // untracked by the queue's pause/kill machinery even though this test's
+  // injected spawnFn covers every OTHER subprocess in the pipeline. An
+  // abort arriving mid-probe would leave that ffprobe process running free,
+  // and once it eventually finished on its own, trimSilence would sail on
+  // into the next ffmpeg step as if nothing had happened.
+  const calls = []
+  const signal = { aborted: false }
+  const spawnFn = (cmd, args = []) => {
+    calls.push(cmd)
+    const proc = new EventEmitter()
+    proc.stdout = new EventEmitter()
+    proc.stderr = new EventEmitter()
+    proc.kill = () => {}
+    queueMicrotask(() => {
+      if (cmd === 'ffprobe') {
+        proc.stdout.emit('data', '12.5')
+        signal.aborted = true // simulate the queue killing this job right as the probe finishes
+      }
+      proc.emit('close', 0)
+    })
+    return proc
+  }
+
+  const track = { title: 'Track', webpageUrl: 'https://example.com/watch?v=fake', duration: 60 }
+  await assert.rejects(
+    () => prefetchTrack(track, { spawnFn, signal }),
+    (err) => err.code === 'ANALYSIS_KILLED',
+  )
+  assert.ok(calls.includes('ffprobe'), 'expected the duration probe to run through the tracked spawnFn, not real ffprobe')
+  assert.ok(!calls.includes('ffmpeg'),
+    'expected trimSilence to stop before its silencedetect ffmpeg spawn once the probe-time abort was noticed')
+})

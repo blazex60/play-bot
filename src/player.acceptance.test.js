@@ -2342,6 +2342,68 @@ test('acceptance (mixer): a stem-mix pair marked unavailable gets a fresh attemp
   }
 });
 
+test('acceptance (mixer): a LOW-priority stem prefetch rechecks the cache when its turn on the serial queue actually comes up, skipping the download on a hit (Codex review, PR #44, P2)', async () => {
+  // #ensureStemPrefetch() only observes a cache MISS once, when the pair
+  // first becomes next/next+1. If another guild (or an earlier HIGH job)
+  // separates the same track while this LOW job is still waiting behind
+  // other work on the shared serial queue, the recheck inside
+  // #runLowPriorityStemPrefetch()'s own enqueued callback must catch that
+  // and skip straight to returning the now-cached stems — never spending a
+  // full download/trim/loudness/staging pass on a track someone else
+  // already finished.
+  const cacheCallsPerVideo = new Map();
+  const stageCalls = [];
+  const separateCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    // stageTempFileCopyFn/separateTrackStemsFn are only ever called from
+    // the stem-specific pipeline (#scheduleAnalysis for HIGH,
+    // #runLowPriorityStemPrefetch for LOW) — unlike prefetchTrackFn, which
+    // the general upcoming-track audio prefetch also calls for C
+    // regardless of stem-cache state, so tracking calls to THESE two is
+    // what actually isolates "did the stem pipeline redo expensive work".
+    stageTempFileCopyFn: async (filePath) => {
+      stageCalls.push(filePath);
+      return `${filePath}.staged`;
+    },
+    getCachedStemsFn: async (videoId) => {
+      const calls = (cacheCallsPerVideo.get(videoId) ?? 0) + 1;
+      cacheCallsPerVideo.set(videoId, calls);
+      // vid-c: miss on #ensureStemPrefetch()'s first probe (so the LOW job
+      // gets queued), then a hit on every later recheck (simulating
+      // another guild finishing separation while this job waited).
+      if (videoId === 'vid-c' && calls >= 2) {
+        return { vocalPath: '/tmp/vid-c.vocal.wav', instrumentalPath: '/tmp/vid-c.instrumental.wav' };
+      }
+      return null;
+    },
+    separateTrackStemsFn: async (filePath, videoId) => {
+      separateCalls.push(videoId);
+      return { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => byIdReady(player, 'vid-c'));
+
+    assert.equal(byIdState(player, 'vid-c'), 'ready', 'expected the cache-hit recheck to still mark C ready');
+    assert.ok(!stageCalls.some((f) => f.includes('vid-c')),
+      'expected the recheck hit to skip staging C\'s downloaded file entirely — no separation work was ever going to run on it');
+    assert.ok(!separateCalls.includes('vid-c'),
+      'expected the recheck hit to skip separateTrackStemsFn for C entirely — the cached stems were returned directly');
+  } finally {
+    await player.stop();
+  }
+});
+
 // --- Phase 9B (docs/mix-transition-phase9.md §4): stem prefetch ----------
 
 test('acceptance (mixer): stem prefetch tracks next=HIGH / next+1=LOW, and separates both on a cache miss', async () => {
@@ -2476,6 +2538,7 @@ test('acceptance (mixer): a skip promoting C to next escalates its stem prefetch
 
 test('acceptance (mixer): a track removed from the queue is pruned from stem prefetch after its attempt settles', async () => {
   let resolveC;
+  let cCacheCalls = 0;
   const { player, queue } = makePlayer({
     trackDuration: 60,
     track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
@@ -2484,9 +2547,19 @@ test('acceptance (mixer): a track removed from the queue is pruned from stem pre
     prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
     stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
     getCachedStemsFn: async (videoId) => {
-      if (videoId === 'vid-c') {
+      // Codex review (PR #44, P2): #runLowPriorityStemPrefetch() now
+      // rechecks the cache itself once its job actually starts, a SECOND
+      // call for 'vid-c' beyond #ensureStemPrefetch()'s own initial probe.
+      // Only the first call should hang on the manually-resolved promise
+      // below (that's the one this test controls) — later calls answer
+      // immediately with a miss, or the second call would hang forever on
+      // a `resolveC` nothing calls again, wedging the real shared
+      // analysisQueue singleton for every later test in this file.
+      if (videoId === 'vid-c' && cCacheCalls === 0) {
+        cCacheCalls += 1;
         return new Promise((resolve) => { resolveC = resolve; });
       }
+      if (videoId === 'vid-c') cCacheCalls += 1;
       return null;
     },
     separateTrackStemsFn: async (filePath, videoId) => (

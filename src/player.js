@@ -2634,6 +2634,17 @@ export class GuildPlayer {
   async #runLowPriorityStemPrefetch(track) {
     return this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
       throwIfAborted(signal);
+      // Codex review (PR #44, P2): recheck the stem cache now that this LOW
+      // job has actually reached the front of the (possibly minutes-long,
+      // serial) queue — #ensureStemPrefetch() only observed a miss back
+      // when this job was first enqueued. If another guild's playback or
+      // an earlier HIGH job separated this same track while this job
+      // waited, the full download/trim/loudness/staging pipeline below is
+      // pure waste; the real separateTrackStems() already rechecks the
+      // cache too, but only after all of that expensive work is done.
+      const alreadyCached = await this.#getCachedStemsFn(track.videoId).catch(() => null);
+      if (alreadyCached) return alreadyCached;
+      throwIfAborted(signal);
       // Codex review (PR #44, P1): without spawnFn, prefetchTrackFn's
       // default implementation (normalize.js's prefetchTrack) spawns
       // yt-dlp/ffmpeg via the module-level `spawn`, entirely untracked by
