@@ -1,4 +1,4 @@
-import { planBeatmixTransition, planPhraseCrossfade, comparableStemMixConfidence } from './beatmixTransition.js';
+import { planBeatmixTransition, planPhraseCrossfade, comparablePhraseCrossfadeConfidence } from './beatmixTransition.js';
 import { planStemTransition } from './stemTransition.js';
 import { planTransition } from './transition.js';
 
@@ -53,12 +53,14 @@ export function transitionModeBonus(mode) {
  * rejected plan's own `mode` is always null (see beatmixTransition.js's
  * `rejected()`) — the caller always knows which slot it's building.
  * `scoreOverride`, when given, replaces `plan.confidence` as the reported/
- * ranked `score` — used for stem-mix (see comparableStemMixConfidence()'s
- * docstring in beatmixTransition.js): the plan's own `confidence` reflects
- * stem-mix's own relaxed vocal-safety eligibility and stays correct for
- * that purpose, but isn't comparable to beatmix/phrase-crossfade's strict
- * scoring for cross-mode ranking or for a [MIX PLAN] log to explain a
- * beatmix-over-stem-mix selection without looking self-contradictory. */
+ * ranked `score` — used for phrase-crossfade (see
+ * comparablePhraseCrossfadeConfidence()'s docstring in beatmixTransition.js):
+ * tier 2's own `confidence` is just `phraseAlignment` (it never scores tempo
+ * sync or downbeat alignment at all), which isn't comparable to beatmix/
+ * stem-mix's six-term weighted confidence for cross-mode ranking. Stem-mix
+ * needs no override here — its pair SEARCH now ranks by the same strict
+ * scoring beatmix uses (see planBeatmixTransition()'s pairScore comment),
+ * so `plan.confidence` is already comparable. */
 function toCandidate(mode, plan, scoreOverride = null) {
   if (!plan?.eligible) {
     return { mode, eligible: false, reasons: plan?.reasons ?? ['unknown'] };
@@ -133,8 +135,8 @@ export function rankTransitionCandidates(outgoing, incoming, {
 
   const candidates = {
     beatmix: toCandidate('beatmix', beatmixPlan),
-    stemMix: toCandidate('stem-mix', stemMixPlan, comparableStemMixConfidence(stemMixPlan, outgoing)),
-    phraseCrossfade: toCandidate('phrase-crossfade', phraseCrossfadePlan),
+    stemMix: toCandidate('stem-mix', stemMixPlan),
+    phraseCrossfade: toCandidate('phrase-crossfade', phraseCrossfadePlan, comparablePhraseCrossfadeConfidence(phraseCrossfadePlan)),
   };
   const plans = {
     beatmix: beatmixPlan, stemMix: stemMixPlan, phraseCrossfade: phraseCrossfadePlan, legacy: legacyPlan,

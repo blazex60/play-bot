@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { rankTransitionCandidates, transitionModeBonus } from './transitionCandidates.js';
-import { comparableStemMixConfidence } from './beatmixTransition.js';
+import { comparablePhraseCrossfadeConfidence } from './beatmixTransition.js';
 
 function makeAnalysis({
   bpm = 120,
@@ -36,125 +36,93 @@ function makeAnalysis({
   };
 }
 
-// --- comparableStemMixConfidence (Codex review, PR #46, P2) ----------------
+// --- comparablePhraseCrossfadeConfidence (Codex review, PR #46, round 2) --
 //
-// planStemTransition() scores vocalSafety with the exit-side check relaxed
-// (stemAware: true in scoreTransitionPairDetail — see that function's own
-// comment) since a mid-vocal exit is genuinely safe once per-stem
-// separation handles the outgoing vocal's own fade-out schedule. That
-// relaxed score is correct for stem-mix's OWN eligibility, but comparing it
-// directly against beatmix/phrase-crossfade's strict scoring during ranking
-// meant stem-mix's score could only ever be >= a strict score for the same
-// pair — combined with §6.4's own bonus (+0.10 vs +0.05), stem-mix could
-// never lose to beatmix on quality, making the documented "unless clearly
-// lower quality" exception unreachable.
+// planPhraseCrossfade()'s own `confidence` is just `phraseAlignment` — tier 2
+// never scores tempo sync or downbeat alignment at all. Comparing that
+// directly against beatmix's six-term weighted confidence during ranking let
+// a clean phrase match (phraseAlignment: 1) beat a genuinely strong beatmix
+// candidate purely because tier 2's score isn't penalized for having no
+// tempo sync whatsoever — the exact thing beatmix's tempoCompatibility/
+// downbeatConfidence terms exist to credit.
 
-test('comparableStemMixConfidence: lowers the ranking score when the winning exit sits mid-vocal', () => {
-  const outgoing = { lastVocalEndSec: 5 };
-  const stemPlan = {
+test('comparablePhraseCrossfadeConfidence: charges for the missing tempoCompatibility/downbeatConfidence terms instead of excluding them', () => {
+  const phrasePlan = {
     eligible: true,
-    confidence: 0.9,
-    quality: { vocalSafety: 1.0, harmonicCompatibility: null },
-    outgoing: { exitStartSec: 1.0 }, // 4s before lastVocalEndSec -> exit is well inside the vocal
+    confidence: 1,
+    quality: {
+      phraseAlignment: 1, tempoCompatibility: null, vocalSafety: 1, downbeatConfidence: null,
+      harmonicCompatibility: null, energyContinuity: 1,
+    },
   };
-  const corrected = comparableStemMixConfidence(stemPlan, outgoing);
-  assert.ok(corrected < stemPlan.confidence,
-    `expected the mid-vocal exit to lower the comparable score below the relaxed confidence (${stemPlan.confidence}), got ${corrected}`);
+  const corrected = comparablePhraseCrossfadeConfidence(phrasePlan);
+  assert.ok(corrected < phrasePlan.confidence,
+    `expected the comparable score to be charged for the missing tempo/downbeat terms, got ${corrected} (raw confidence ${phrasePlan.confidence})`);
+  // total = (1*1 + 1*1 + 0*1 + 0*0.8 + 1*0.4) / (1+1+1+0.8+0.4) = 2.4/4.2
+  assert.ok(Math.abs(corrected - 2.4 / 4.2) < 1e-9, `expected the exact weighted value, got ${corrected}`);
 });
 
-test('comparableStemMixConfidence: leaves confidence untouched when the exit is already vocal-safe under strict rules too', () => {
-  const outgoing = { lastVocalEndSec: 5 };
-  const stemPlan = {
-    eligible: true,
-    confidence: 0.9,
-    quality: { vocalSafety: 1.0, harmonicCompatibility: null },
-    outgoing: { exitStartSec: 8.0 }, // well past lastVocalEndSec -> strict and relaxed agree
-  };
-  assert.equal(comparableStemMixConfidence(stemPlan, outgoing), stemPlan.confidence);
-});
-
-test('comparableStemMixConfidence: a non-eligible or malformed plan passes through unchanged', () => {
-  assert.equal(comparableStemMixConfidence({ eligible: false, confidence: 0.9 }, {}), 0.9);
-  assert.equal(comparableStemMixConfidence(null, {}), 0);
-  assert.equal(comparableStemMixConfidence({ eligible: true, confidence: 0.9 }, {}), 0.9); // no outgoing.exitStartSec
+test('comparablePhraseCrossfadeConfidence: a non-eligible or malformed plan passes through unchanged', () => {
+  assert.equal(comparablePhraseCrossfadeConfidence({ eligible: false, confidence: 0.9 }), 0.9);
+  assert.equal(comparablePhraseCrossfadeConfidence(null), 0);
 });
 
 // --- rankTransitionCandidates: the fix must actually change the winner ----
 
-test('rankTransitionCandidates: a clean beatmix candidate beats a stem-mix candidate whose only pair sits mid-vocal', () => {
+test('rankTransitionCandidates: a genuinely well-synced beatmix candidate beats a phrase-crossfade candidate whose confidence is inflated by skipping the tempo-sync penalty', () => {
   const outgoing = makeAnalysis({
     bpm: 120,
-    beatConfidence: 0.8,
-    downbeatConfidence: 0.7,
+    beatConfidence: 0.6,
+    downbeatConfidence: 0.5,
     durationSec: 200,
     lastVocalEndSec: 180,
     phrasesTail: [
-      { sec: 184, barIndex: 0, score: 0.6, reasons: ['bar-multiple-4'] },
+      { sec: 184, barIndex: 0, score: 1.0, reasons: ['bar-multiple'] },
     ],
   });
   const incoming = makeAnalysis({
-    bpm: 122,
-    headBpm: 122,
-    beatConfidence: 0.75,
-    downbeatConfidence: 0.65,
+    bpm: 124,
+    headBpm: 124,
+    beatConfidence: 0.55,
+    downbeatConfidence: 0.45,
     durationSec: 200,
     firstVocalStartSec: 15,
     phrasesHead: [
-      { sec: 4, barIndex: 0, score: 0.5, reasons: ['bar-multiple-4'] },
+      { sec: 4, barIndex: 0, score: 1.0, reasons: ['bar-multiple'] },
     ],
   });
 
-  // Real beatmix planning runs against the fixture above and is genuinely
-  // eligible with a solid (but not maxed) confidence. stemMix is DI-mocked
-  // (rankTransitionCandidates()'s existing planStemTransitionFn hook) to
-  // return a plan whose RELAXED confidence is deliberately higher than
-  // beatmix's — the exact shape that, pre-fix, always won on
-  // score + transitionModeBonus() alone — but whose winning exit sits well
-  // inside the outgoing track's vocal (exitStartSec 1.0s vs lastVocalEndSec
-  // 180s), which a strict (beatmix-comparable) scoring would rate poorly.
-  // beatmix's own confidence on this exact fixture is ~0.766 (rank ~0.816
-  // with its +0.05 bonus) — confirmed by direct computation. 0.85 is chosen
-  // so that, uncorrected, stem-mix's rank (0.85+0.10=0.95) clearly beats
-  // beatmix (reproducing the pre-fix bug), but once corrected for the
-  // mid-vocal exit (delta = 1.0 * VOCAL_SAFETY_WEIGHT / totalWeight(4.2)
-  // ≈ 0.238), its rank (~0.612+0.10=0.712) clearly loses.
-  const stemMixPlanFn = () => ({
-    mode: 'stem-mix',
-    eligible: true,
-    confidence: 0.85,
-    quality: {
-      phraseAlignment: 0.9, tempoCompatibility: 0.95, vocalSafety: 1.0,
-      downbeatConfidence: 0.9, harmonicCompatibility: null, energyContinuity: 0.9,
-    },
-    fadeSec: 8,
-    sync: { bars: 4 },
-    outgoing: { exitStartSec: 1.0 },
-    incoming: { entrySec: 4 },
-  });
-
+  // Real planning for both modes runs against this fixture. beatmix is
+  // genuinely eligible with a real confidence of ~0.772 (rank ~0.822 with
+  // its +0.05 bonus) — a slight tempo mismatch (120 vs 124 BPM) and modest
+  // downbeat confidence keep it below 1, exactly what its weighted-average
+  // scoring is supposed to do. phrase-crossfade shares the same clean phrase
+  // boundary (score 1.0 on both sides) so its raw confidence is exactly 1
+  // (rank 1.02 with its +0.02 bonus) — pre-fix, this always won despite
+  // never even attempting tempo sync. Confirmed by direct computation.
   const { candidates, selectedPlan, plans } = rankTransitionCandidates(outgoing, incoming, {
     outgoingPlaybackBpm: 120,
     tempoBackend: 'rubberband',
-    stemsAvailable: true,
-    planStemTransitionFn: stemMixPlanFn,
+    stemsAvailable: false,
   });
 
   assert.equal(candidates.beatmix.eligible, true, 'expected beatmix to be genuinely eligible on this fixture');
-  assert.equal(candidates.stemMix.eligible, true);
+  assert.equal(candidates.phraseCrossfade.eligible, true, 'expected phrase-crossfade to be genuinely eligible on this fixture');
   // The raw plan's own confidence must stay untouched — only the Candidate
   // struct's ranking/reporting `score` is corrected.
-  assert.equal(plans.stemMix.confidence, 0.85);
-  assert.ok(candidates.stemMix.score < 0.85,
-    `expected the reported/ranked stem-mix score to be corrected down from the relaxed confidence, got ${candidates.stemMix.score}`);
-  assert.ok(candidates.stemMix.score + 0.10 < candidates.beatmix.score + 0.05,
-    'sanity check: the corrected+bonus stem-mix rank must actually be lower than beatmix\'s, or this test would prove nothing');
-  // The actual point of this fix: beatmix must win once stem-mix's score is
-  // no longer artificially inflated by its relaxed exit-vocal scoring.
+  assert.equal(plans.phraseCrossfade.confidence, 1);
+  assert.ok(candidates.phraseCrossfade.score < 1,
+    `expected the reported/ranked phrase-crossfade score to be corrected down from the raw phraseAlignment-only confidence, got ${candidates.phraseCrossfade.score}`);
+  assert.ok(candidates.phraseCrossfade.score + 0.02 < candidates.beatmix.score + 0.05,
+    'sanity check: the corrected+bonus phrase-crossfade rank must actually be lower than beatmix\'s, or this test would prove nothing');
+  // The actual point of this fix: beatmix must win once phrase-crossfade's
+  // score is no longer artificially inflated by skipping the tempo/downbeat
+  // penalty entirely.
   assert.equal(selectedPlan.mode, 'beatmix',
-    `expected beatmix to win now that stem-mix's mid-vocal-exit pair is scored comparably — selected ${selectedPlan.mode} instead`);
+    `expected beatmix to win now that phrase-crossfade's missing tempo-sync terms are scored comparably — selected ${selectedPlan.mode} instead`);
 });
 
-test('rankTransitionCandidates: a genuinely high-quality stem-mix candidate still wins over beatmix (fix does not just always favor beatmix)', () => {
+test('rankTransitionCandidates: a genuinely high-quality phrase-crossfade candidate still wins over beatmix (fix does not just always favor beatmix)', () => {
   const outgoing = makeAnalysis({
     bpm: 120,
     beatConfidence: 0.8,
@@ -166,43 +134,63 @@ test('rankTransitionCandidates: a genuinely high-quality stem-mix candidate stil
     ],
   });
   const incoming = makeAnalysis({
-    bpm: 122,
-    headBpm: 122,
-    beatConfidence: 0.75,
-    downbeatConfidence: 0.65,
+    // No usable BPM at all on the incoming side -> beatmix can never be
+    // eligible (bpm-unavailable), leaving phrase-crossfade (which doesn't
+    // need tempo data) as the only real candidate — a genuine win, not an
+    // artifact of miscalibration.
+    bpm: null,
     durationSec: 200,
     firstVocalStartSec: 15,
     phrasesHead: [
       { sec: 4, barIndex: 0, score: 0.5, reasons: ['bar-multiple-4'] },
     ],
-  });
-
-  // Same overall quality as beatmix's own pair (exit at 184s, well past
-  // lastVocalEndSec 180s) — strict and relaxed scoring agree here, so the
-  // correction is a no-op and the §6.4 stem-mix preference bonus should
-  // still let it win a genuine near-tie.
-  const stemMixPlanFn = () => ({
-    mode: 'stem-mix',
-    eligible: true,
-    confidence: 0.85,
-    quality: {
-      phraseAlignment: 0.9, tempoCompatibility: 0.95, vocalSafety: 1.0,
-      downbeatConfidence: 0.9, harmonicCompatibility: null, energyContinuity: 0.9,
-    },
-    fadeSec: 8,
-    sync: { bars: 4 },
-    outgoing: { exitStartSec: 184 },
-    incoming: { entrySec: 4 },
   });
 
   const { candidates, selectedPlan } = rankTransitionCandidates(outgoing, incoming, {
     outgoingPlaybackBpm: 120,
     tempoBackend: 'rubberband',
+    stemsAvailable: false,
+  });
+
+  assert.equal(candidates.beatmix.eligible, false, 'expected beatmix to be ineligible (no incoming BPM) on this fixture');
+  assert.equal(candidates.phraseCrossfade.eligible, true);
+  assert.equal(selectedPlan.mode, 'phrase-crossfade');
+});
+
+// --- stem-mix: no ranking override, plan.confidence is used directly ------
+//
+// Codex review (PR #46, round 2): the earlier post-hoc comparableStemMixConfidence()
+// correction was removed once planBeatmixTransition()'s own pair SEARCH
+// started ranking stem-mix candidates by strict (non-relaxed) scoring (see
+// beatmixTransition.js's pairScore comment and its dedicated coverage in
+// beatmixTransition.test.js) — a stem-mix plan's `confidence` is already
+// cross-mode-comparable by the time it reaches the ranker, so toCandidate()
+// takes it verbatim, same as beatmix.
+
+test('rankTransitionCandidates: a stem-mix candidate wins on its own (uncorrected) confidence when it is genuinely the best candidate', () => {
+  const outgoing = makeAnalysis({ bpm: 120, beatConfidence: 0.5, downbeatConfidence: 0.4, durationSec: 200 });
+  const incoming = makeAnalysis({ bpm: null, durationSec: 200 }); // beatmix/phrase-crossfade both ineligible
+  const stemMixPlanFn = () => ({
+    mode: 'stem-mix',
+    eligible: true,
+    confidence: 0.9,
+    quality: {
+      phraseAlignment: 0.9, tempoCompatibility: 0.9, vocalSafety: 0.9,
+      downbeatConfidence: 0.9, harmonicCompatibility: null, energyContinuity: 0.9,
+    },
+    fadeSec: 8,
+    sync: { bars: 4 },
+    outgoing: { exitStartSec: 190 },
+    incoming: { entrySec: 4 },
+  });
+
+  const { candidates, selectedPlan, plans } = rankTransitionCandidates(outgoing, incoming, {
     stemsAvailable: true,
     planStemTransitionFn: stemMixPlanFn,
   });
 
-  assert.equal(candidates.stemMix.score, 0.85, 'a vocal-safe-under-strict-rules exit must not be corrected');
+  assert.equal(candidates.stemMix.eligible, true);
+  assert.equal(candidates.stemMix.score, plans.stemMix.confidence, 'expected no override — the plan\'s own confidence is used verbatim');
   assert.equal(selectedPlan.mode, 'stem-mix');
 });
 

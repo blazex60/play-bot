@@ -307,43 +307,36 @@ export function scoreTransitionPairDetailed(params) {
 }
 
 /**
- * Codex review (PR #46, Phase 9D §6.4): an eligible stem-mix plan's
- * `confidence` is computed with vocalSafety relaxed to entry-only
- * (scoreTransitionPairDetail's `stemAware: true` branch) — correct for
- * stem-mix's OWN eligibility (a mid-vocal exit really is safe once
- * per-stem separation handles the outgoing vocal tail on its own
- * schedule), but not comparable to beatmix/phrase-crossfade's strict
- * (min(exit, entry)) vocalSafety when RANKING across modes: for the same
- * underlying pair, the relaxed score can only be >= the strict score, so
- * stem-mix could never lose to beatmix on quality alone — combined with
- * §6.4's own +0.10 vs +0.05 preference bonus, this made the documented
- * "unless stem-mix quality is clearly lower" exception unreachable.
+ * Codex review (PR #46, Phase 9D §6.4, round 2): planPhraseCrossfade()'s
+ * `confidence` is just `phraseAlignment` (tier 2 never scores tempo sync or
+ * downbeat alignment at all) — not comparable to beatmix's six-term weighted
+ * confidence when RANKING across modes. A clean shared phrase boundary can
+ * report `phraseAlignment: 1` even with no tempo sync whatsoever, beating an
+ * otherwise-strong beatmix candidate that scores lower only because its
+ * tempoCompatibility/downbeatConfidence terms pull its weighted average down
+ * — the exact thing those terms exist to penalize.
  *
- * Recomputes the confidence of an ALREADY-ELIGIBLE stem-mix plan's winning
- * exit/entry pair as if vocalSafety had used the strict formula, for
- * ranking purposes only — the plan's own `confidence`/eligibility, its
- * reported `quality.vocalSafety`, and its actual fadeSec/entry/exit are
- * untouched. Delta-patches `confidence` rather than re-running the full
- * scorer (which would need the winning pair's raw phrase-boundary `.score`,
- * not exposed on the plan's `outgoing`/`incoming` sub-objects) — exact
- * given `totalWeight` is derivable from which terms scoreTransitionPairDetail()
- * unconditionally includes (harmonicCompatibility is the only conditional
- * one, and its presence/absence is already visible on `quality`).
+ * Recomputes a cross-mode-comparable score using the same weighted formula
+ * scoreTransitionPairDetail() uses, crediting phrase-crossfade's real
+ * phraseAlignment/vocalSafety/energyContinuity terms (already on
+ * `phrasePlan.quality`) but explicitly zero-crediting tempoCompatibility and
+ * downbeatConfidence — tier 2 structurally has neither, so a comparable
+ * score must charge for their absence rather than excluding them from the
+ * weighted average (excluding them is what inflated the score in the first
+ * place). harmonicCompatibility stays excluded from the weight entirely
+ * (tier 2 never even attempts it, unlike beatmix/stem-mix where a `null`
+ * specifically means "confidence didn't clear the threshold").
  */
-export function comparableStemMixConfidence(stemPlan, outgoing) {
-  if (!stemPlan?.eligible) return stemPlan?.confidence ?? 0;
-  const exitSec = stemPlan.outgoing?.exitStartSec;
-  if (!Number.isFinite(exitSec)) return stemPlan.confidence;
-  const relaxedVocalSafety = stemPlan.quality?.vocalSafety ?? 0;
-  const lastVocalEndSec = Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0;
-  const strictExitVocalSafety = clamp01((exitSec - lastVocalEndSec) / VOCAL_MARGIN_FULL_CREDIT_SEC);
-  const strictVocalSafety = Math.min(strictExitVocalSafety, relaxedVocalSafety);
-  if (strictVocalSafety >= relaxedVocalSafety) return stemPlan.confidence;
+export function comparablePhraseCrossfadeConfidence(phrasePlan) {
+  if (!phrasePlan?.eligible) return phrasePlan?.confidence ?? 0;
+  const q = phrasePlan.quality ?? {};
+  const total = (q.vocalSafety ?? 0) * VOCAL_SAFETY_WEIGHT
+    + (q.phraseAlignment ?? 0) * PHRASE_ALIGNMENT_WEIGHT
+    + (q.energyContinuity ?? 0) * ENERGY_CONTINUITY_WEIGHT;
+    // tempoCompatibility/downbeatConfidence contribute 0, not excluded.
   const totalWeight = VOCAL_SAFETY_WEIGHT + PHRASE_ALIGNMENT_WEIGHT + TEMPO_COMPATIBILITY_WEIGHT
-    + DOWNBEAT_CONFIDENCE_WEIGHT + ENERGY_CONTINUITY_WEIGHT
-    + (stemPlan.quality?.harmonicCompatibility != null ? HARMONIC_WEIGHT : 0);
-  const delta = (relaxedVocalSafety - strictVocalSafety) * VOCAL_SAFETY_WEIGHT;
-  return clamp01(stemPlan.confidence - delta / totalWeight);
+    + DOWNBEAT_CONFIDENCE_WEIGHT + ENERGY_CONTINUITY_WEIGHT;
+  return clamp01(total / totalWeight);
 }
 
 function rejected(reasons) {
@@ -505,7 +498,17 @@ export function planBeatmixTransition(outgoing, incoming, {
           || fadeSec > roomInIncomingPlayback + 1e-6
           || fadeSec > forwardSafePlayback + 1e-6
         ) continue;
-        const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware });
+        // Codex review (PR #46, round 2): rank pairs by the STRICT (non-
+        // relaxed) score even in stem-mix mode. `stemAware` only needs to
+        // widen which exits are ELIGIBLE (findExitCandidates() above already
+        // does that via requireExitVocalSafe:false) — it must not also make
+        // the search itself prefer a mid-vocal exit over an available
+        // vocal-safe one of similar quality. Ranking with the relaxed score
+        // here let the search settle on a mid-vocal-optimal pair before
+        // cross-mode ranking ever ran, which a post-hoc correction on just
+        // the single surviving winner (the previous fix) couldn't recover —
+        // a pair discarded during this search never comes back.
+        const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: false });
         if (!best || pairScore > best.pairScore) best = { exit, entry, bars, fadeSec, pairScore };
         break; // widest bar count that fits this pair is the one worth scoring
       }
