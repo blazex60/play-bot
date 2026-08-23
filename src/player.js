@@ -827,7 +827,7 @@ export class GuildPlayer {
     if (evaluated) {
       this.#logTransitionPlanFn(evaluated);
     } else {
-      this.#logGaplessTransitionFn({ outgoingTrack: current, incomingTrack: next });
+      this.#logGaplessTransitionFn({ outgoingTrack: current, incomingTrack: next }, { kind: 'snap-handoff' });
     }
 
     this.#preparedIncoming = null;
@@ -1199,10 +1199,12 @@ export class GuildPlayer {
     this.#clearCrossfadeArm();
     this.#clearPreparedIncoming();
     this.#queueRefill = null;
-    // Codex review (PR #43, round 4): an explicit stop must not leave a
-    // stashed gapless continuation around for a later, unrelated playNext()
-    // (e.g. a fresh /play in the same session) to pick up.
+    // Codex review (PR #43, round 4/5): an explicit stop must not leave a
+    // stashed gapless continuation OR evaluated-plan snapshot around for a
+    // later, unrelated playNext() (e.g. a fresh /play in the same session,
+    // possibly even the same video-id pair replayed) to pick up.
     this.#pendingGaplessFrom = null;
+    this.#lastEvaluatedTransitionReport = null;
     this.#analysisQ().noteUnderrunCleared(this);
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
@@ -2089,6 +2091,11 @@ export class GuildPlayer {
         outgoingStemsCached: Boolean(outCachedStems),
         incomingStemsCached: Boolean(inCachedStems),
         plannedMode,
+        // Codex review (PR #43, round 5): read directly off #sessionTempo
+        // rather than waiting for the local `outgoingTempoRatio` const
+        // further down — same instance field, same tick, nothing mutates
+        // it in between.
+        outgoingTempoRatio: this.#sessionTempo.tempoRatio ?? 1,
       });
       // Codex review (PR #43, round 4): stash a snapshot now, before this
       // tick's own downgrade/commit logic below mutates transitionPlanReport

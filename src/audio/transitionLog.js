@@ -101,6 +101,12 @@ export function buildTransitionPlanReport({
   outgoingStemsCached,
   incomingStemsCached,
   plannedMode,
+  // Codex review (PR #43, round 5): the outgoing session's tempo stretch
+  // ratio, so the legacy-plan exit fallback (a native-file position) can
+  // convert player.js's playback-domain fadeSec back to native seconds the
+  // same way #maybeStartCrossfade()'s own compensateDurationSec() call
+  // does — 1 (no stretch) when the caller doesn't pass one.
+  outgoingTempoRatio = 1,
 }) {
   const beatmixEligiblePlan = rawPlan.mode === 'beatmix' ? rawPlan : null;
   const beatmixNotEvaluatedReason = rawPlan.fallbackFrom?.[0] ?? 'unknown';
@@ -126,7 +132,7 @@ export function buildTransitionPlanReport({
   };
 
   const plannedSource = stemPlan?.eligible ? stemPlan : rawPlan;
-  const exit = exitInfo(plannedSource, outgoingAnalysis);
+  const exit = exitInfo(plannedSource, outgoingAnalysis, outgoingTempoRatio);
   const entry = entryInfo(plannedSource, incomingAnalysis);
 
   return {
@@ -154,7 +160,7 @@ function isInsideVocalGap(sec, vocalGaps) {
   return vocalGaps.some((gap) => sec >= gap.startSec && sec < gap.endSec);
 }
 
-function exitInfo(plan, outgoingAnalysis) {
+function exitInfo(plan, outgoingAnalysis, outgoingTempoRatio = 1) {
   let sec = null;
   let bar = null;
   if (plan.mode === 'beatmix' || plan.mode === 'stem-mix') {
@@ -166,12 +172,17 @@ function exitInfo(plan, outgoingAnalysis) {
   } else {
     // Codex review (PR #43): legacy plans (simple-fade/tail-fade/crossfade)
     // carry no exit timestamp of their own — player.js itself falls back to
-    // `durationSec - fadeSec` (see #maybeStartCrossfade's own `startSec`
+    // a tempo-compensated `durationSec - fadeSec * tempoRatio` (native-file
+    // seconds; see #maybeStartCrossfade's own `startSec`/`compensateDurationSec`
     // computation) when arming these. Mirror that same fallback here rather
     // than reporting a null exit for the common analysis-not-ready path.
+    // Round 5: the plain `fadeSec` subtraction (no ratio) was wrong for a
+    // chained beatmix→simple-fade where the outgoing source is stretched —
+    // fadeSec is a playback-domain duration, but this `sec` is native-domain.
+    const tempoRatio = Number.isFinite(outgoingTempoRatio) && outgoingTempoRatio > 0 ? outgoingTempoRatio : 1;
     sec = plan.startSec
       ?? (Number.isFinite(outgoingAnalysis?.durationSec) && Number.isFinite(plan.fadeSec)
-        ? Math.max(0, outgoingAnalysis.durationSec - plan.fadeSec)
+        ? Math.max(0, outgoingAnalysis.durationSec - plan.fadeSec * tempoRatio)
         : null);
   }
   const lastVocalEndSec = outgoingAnalysis?.lastVocalEndSec;
@@ -271,17 +282,25 @@ export function logTransitionPlan(report, { debug = process.env.MIX_DEBUG === 't
  * abbreviated `[MIX PLAN]` line under MIX_DEBUG (no candidate/exit/entry
  * detail exists to print for this path).
  * @param {{ outgoingTrack?: {title?: string}, incomingTrack?: {title?: string} }} tracks
- * @param {{ debug?: boolean, logger?: { log: Function } }} [options]
+ * @param {{ debug?: boolean, logger?: { log: Function }, kind?: 'snap-handoff'|'hard-handoff' }} [options]
+ *   `kind` (Codex review, PR #43 round 5): the two call sites in player.js
+ *   are genuinely different events — `#onSnapHandoff()`'s successful adopt
+ *   (a prepared source winning the race to EOF) vs. `#playNextMixer()`'s
+ *   fallback (no prepared source existed, or it was rejected). Defaults to
+ *   'hard-handoff' since that is the more general/common case.
  */
-export function logGaplessTransition({ outgoingTrack, incomingTrack } = {}, { debug = process.env.MIX_DEBUG === 'true', logger = console } = {}) {
+export function logGaplessTransition({ outgoingTrack, incomingTrack } = {}, { debug = process.env.MIX_DEBUG === 'true', logger = console, kind = 'hard-handoff' } = {}) {
   recordTransition({ selected: 'gapless', stemCache: {} });
   if (!debug) return;
+  const description = kind === 'snap-handoff'
+    ? '(natural snap handoff — a prepared incoming source won the race to EOF; no candidate evaluation, no crossfade plan)'
+    : '(hard handoff — no prepared source was available/accepted at EOF; no candidate evaluation, no crossfade plan)';
   logger.log([
     '[MIX PLAN]',
     `from="${outgoingTrack?.title ?? 'unknown'}"`,
     `to="${incomingTrack?.title ?? 'unknown'}"`,
     '',
     'selected=gapless',
-    '(natural snap handoff — no candidate evaluation, no crossfade plan)',
+    description,
   ].join('\n'));
 }

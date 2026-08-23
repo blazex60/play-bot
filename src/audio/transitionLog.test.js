@@ -267,6 +267,27 @@ test('buildTransitionPlanReport: legacy plan (simple-fade/tail-fade/crossfade) w
   assert.equal(report.exit.sec, 196);
 });
 
+test('buildTransitionPlanReport: legacy plan exit fallback accounts for a stretched outgoing tempo (Codex review, PR #43 round 5)', () => {
+  const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
+  const report = buildTransitionPlanReport({
+    outgoingTrack,
+    incomingTrack,
+    outgoingAnalysis: { durationSec: 200 },
+    incomingAnalysis: {},
+    rawPlan,
+    stemPlan: null,
+    stemCacheAttempted: false,
+    outgoingStemsCached: false,
+    incomingStemsCached: false,
+    plannedMode: 'simple-fade',
+    // A chained beatmix -> simple-fade: the outgoing source is playing back
+    // 10% faster than native, so fadeSec (a playback-domain duration) must
+    // be scaled up before subtracting from the native-domain duration.
+    outgoingTempoRatio: 1.1,
+  });
+  assert.equal(report.exit.sec, 200 - 4 * 1.1);
+});
+
 test('buildTransitionPlanReport: legacy plan exit stays null when neither startSec nor duration is known', () => {
   const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
   const report = buildTransitionPlanReport({
@@ -303,6 +324,18 @@ test('logGaplessTransition: prints an abbreviated [MIX PLAN] block only when deb
   assert.equal(calls.length, 1);
   assert.match(calls[0], /\[MIX PLAN\]/);
   assert.match(calls[0], /selected=gapless/);
+});
+
+test('logGaplessTransition: kind distinguishes a snap handoff from the generic hard-handoff default (Codex review, PR #43 round 5)', () => {
+  const calls = [];
+  const logger = { log: (msg) => calls.push(msg) };
+
+  logGaplessTransition({ outgoingTrack, incomingTrack }, { debug: true, logger, kind: 'snap-handoff' });
+  assert.match(calls[0], /snap handoff/);
+
+  logGaplessTransition({ outgoingTrack, incomingTrack }, { debug: true, logger });
+  assert.match(calls[1], /hard handoff/);
+  assert.doesNotMatch(calls[1], /snap handoff/);
 });
 
 // --- formatTransitionPlanLog -----------------------------------------------
