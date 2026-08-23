@@ -27,6 +27,7 @@ import { getAnalysisQueue } from './audio/analysisQueue.js';
 import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
 import { planStemTransition } from './audio/stemTransition.js';
 import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition } from './audio/transitionLog.js';
+import { StemPreparationState, StemPrefetchPriority, StemPrefetchTracker } from './audio/stemPrefetch.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
@@ -395,6 +396,19 @@ export class GuildPlayer {
    * @type {string | null}
    */
   #stemMixUnavailableKey = null;
+  /**
+   * Phase 9B (docs/mix-transition-phase9.md §4): per-videoId prefetch
+   * bookkeeping for next (HIGH) / next+1 (LOW), driven from
+   * #prefetchUpcoming(). Purely observational for the HIGH lane (B already
+   * gets a real download+separate pass from Phase 8's own
+   * #ensureFullPrefetch()/#scheduleAnalysis() pipeline regardless of this
+   * tracker's existence); for the LOW lane (C) it also drives the actual
+   * dispatch, since nothing else in the pipeline keeps C's audio around
+   * long enough for Demucs — see #ensureStemPrefetch()/#runLowPriorityStemPrefetch().
+   */
+  #stemPrefetchTracker = new StemPrefetchTracker();
+  /** Dedup guard for #runLowPriorityStemPrefetch() — same rationale as #scheduledAnalysisTokens, but keyed by videoId presence only since this path has no killed-job/stale-token race to guard against (it never gets restarted mid-flight, only skipped while already in the Set). */
+  #lowPriorityStemPrefetch = new Set();
 
   constructor({
     guildId,
@@ -1034,6 +1048,17 @@ export class GuildPlayer {
     return this.#sessionTempo;
   }
 
+  /**
+   * Phase 9B (docs/mix-transition-phase9.md §4): read-only snapshot of the
+   * stem prefetch tracker, for tests/observability. Not consumed by any
+   * playback decision — transition mode selection stays exactly what it
+   * was (that's Phase 9D's job), this only reports what #prefetchUpcoming()
+   * has learned so far about next/next+1's stem-separation progress.
+   */
+  get stemPrefetchStatus() {
+    return this.#stemPrefetchTracker.snapshot();
+  }
+
   #resetSessionTempoFor(track) {
     // Fast path only: #analysisCache is rarely populated synchronously by
     // the time a track becomes current (analysis is normally scheduled/
@@ -1372,9 +1397,31 @@ export class GuildPlayer {
         // the queue already decided to cancel (e.g. a mixer underrun
         // killed this job right as #runAnalysis finished).
         if (!signal?.aborted && stagedPath) {
-          await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
-            console.warn('[GuildPlayer] stem separation failed:', err.message);
-          });
+          await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).then(
+            (stems) => {
+              // Phase 9B: this is the one place that actually learns when a
+              // HIGH-priority (B) stem prefetch finishes — #ensureStemPrefetch()
+              // itself only re-polls getCachedStemsFn() on the NEXT
+              // #prefetchUpcoming() checkpoint, which for B may not come
+              // again before it becomes the current track and drops out of
+              // that method's purview entirely. Only touches the tracker if
+              // this videoId is actually being tracked (#ensureStemPrefetch()
+              // was called for it) — #scheduleAnalysis() runs for every
+              // normalized track, current (A) included, and A must stay
+              // untouched by this (§4.2: 9B doesn't change #ensureOutgoingStemPrep()'s
+              // existing treatment of A).
+              if (this.#stemPrefetchTracker.get(track.videoId)) {
+                if (stems) this.#stemPrefetchTracker.markReady(track.videoId);
+                else this.#stemPrefetchTracker.markFailed(track.videoId);
+              }
+            },
+            (err) => {
+              console.warn('[GuildPlayer] stem separation failed:', err.message);
+              if (this.#stemPrefetchTracker.get(track.videoId)) {
+                this.#stemPrefetchTracker.markFailed(track.videoId);
+              }
+            },
+          );
         }
         return analysis;
       } finally {
@@ -2367,6 +2414,147 @@ export class GuildPlayer {
         this.#ensureAnalysisPrefetch(track);
       }
     }
+
+    // Phase 9B (docs/mix-transition-phase9.md §4.2): next (B) gets HIGH
+    // stem prefetch, next+1 (C) gets LOW. next+2 (D) and beyond stay
+    // untouched by this — only the two loops above (full prefetch for the
+    // track that's about to become current, lightweight BPM/phrase
+    // lookahead for the rest) apply to them, exactly as before Phase 9B.
+    const second = upcoming[1];
+    if (first && isNormalizeDurationAllowed(first)) {
+      this.#ensureStemPrefetch(first, StemPrefetchPriority.HIGH);
+    }
+    if (second && isNormalizeDurationAllowed(second)) {
+      this.#ensureStemPrefetch(second, StemPrefetchPriority.LOW);
+    }
+    this.#stemPrefetchTracker.prune(upcoming.map((t) => t?.videoId).filter(Boolean));
+  }
+
+  /**
+   * Phase 9B (docs/mix-transition-phase9.md §4): registers/refreshes this
+   * videoId's stem-prefetch bookkeeping and, on a cache miss, makes sure
+   * the actual separation work is (or gets) dispatched.
+   *
+   * HIGH (B, next): purely observational beyond registering intent — B
+   * already gets a full download+normalize+analyze pass for real playback
+   * prep (#ensureFullPrefetch() -> #scheduleAnalysis(), Phase 8's existing
+   * pipeline), which itself ends by calling separateTrackStemsFn(). This
+   * piggybacks on that pipeline's own dedup (#prefetchEntries by key,
+   * #scheduledAnalysisTokens by videoId, stemCache.js's own per-videoId
+   * in-flight map) instead of opening a second, redundant download path
+   * for the same file — so this method never itself calls
+   * #prefetchTrackFn for a HIGH-priority track.
+   *
+   * LOW (C, next+1): drives the download + staged-copy + separation
+   * directly via #runLowPriorityStemPrefetch(), because nothing else in
+   * the existing pipeline keeps C's audio around long enough for Demucs —
+   * #ensureAnalysisPrefetch()'s own lookahead deletes its temp file the
+   * instant BPM/phrase analysis finishes (by design, phase8.md §21: running
+   * full-track Demucs against an unconfirmed 2-3-tracks-ahead candidate was
+   * judged disproportionate — Phase 9B narrows that specifically to next+1).
+   * This is independent of the BPM-analysis cache: a track can have
+   * analysis cached from an earlier play while still missing its Demucs
+   * stems, so #ensureAnalysisPrefetch()'s own persisted-analysis
+   * short-circuit must not also gate stem prefetch.
+   *
+   * Either way, dispatch happens only after #getCachedStemsFn() confirms a
+   * miss — a cache HIT just marks the entry READY (sticky, like
+   * #stemCacheHit's own "only positive results are memoized" — a MISS
+   * keeps getting re-checked on every #prefetchUpcoming() call, since
+   * background separation completing mid-window is the whole point).
+   * Nothing here is awaited by #maybeStartCrossfade() or anything else on
+   * the realtime playback path — every call this method makes is
+   * fire-and-forget from that path's perspective (§5.4 "Playback Safety",
+   * in spirit — the dedicated pausable priority queue itself is Phase 9C's
+   * job).
+   */
+  #ensureStemPrefetch(track, priority) {
+    const videoId = track?.videoId;
+    if (!videoId) return;
+
+    const entry = this.#stemPrefetchTracker.queue(videoId, priority);
+    if (entry.state === StemPreparationState.READY) return;
+
+    this.#getCachedStemsFn(videoId).then((cached) => {
+      if (cached) {
+        this.#stemPrefetchTracker.markReady(videoId);
+        return;
+      }
+
+      if (entry.priority === StemPrefetchPriority.HIGH) {
+        const key = this.#prefetchKey(track);
+        const prefetchEntry = key ? this.#prefetchEntries.get(key) : null;
+        if (prefetchEntry?.kind === 'full' && prefetchEntry.track === track) {
+          this.#stemPrefetchTracker.markProcessing(videoId);
+          prefetchEntry.promise.then((result) => {
+            // A resolved value only means the DOWNLOAD/normalize step
+            // succeeded — separation itself runs asynchronously afterward
+            // inside #scheduleAnalysis()'s own analysisQueue job, which
+            // has no promise this method can await. The next
+            // #prefetchUpcoming() tick's getCachedStemsFn() probe (above)
+            // is what actually detects real separation completion; this
+            // only catches the one failure mode visible from here.
+            if (result?.error) this.#stemPrefetchTracker.markFailed(videoId);
+          });
+        }
+        return;
+      }
+
+      if (this.#lowPriorityStemPrefetch.has(videoId)) return;
+      this.#lowPriorityStemPrefetch.add(videoId);
+      this.#stemPrefetchTracker.markProcessing(videoId);
+      this.#runLowPriorityStemPrefetch(track)
+        .then((stems) => {
+          if (stems) this.#stemPrefetchTracker.markReady(videoId);
+          else this.#stemPrefetchTracker.markFailed(videoId);
+        })
+        .catch((err) => {
+          if (err?.code === 'ANALYSIS_KILLED') {
+            console.warn('[GuildPlayer] low-priority stem prefetch yielded to mixer:', err.message);
+          } else {
+            console.warn('[GuildPlayer] low-priority stem prefetch failed:', err.message);
+          }
+          this.#stemPrefetchTracker.markFailed(videoId);
+        })
+        .finally(() => this.#lowPriorityStemPrefetch.delete(videoId));
+    }).catch((err) => {
+      console.warn('[GuildPlayer] stem prefetch cache check failed:', err.message);
+    });
+  }
+
+  /**
+   * Phase 9B: LOW-priority stem prefetch for next+1 (C). Mirrors
+   * #scheduleAnalysis()'s own staged-copy dance (stage an independent copy
+   * before separation so unrelated cleanup elsewhere can't delete the file
+   * mid-Demucs-run, docs/mix-transition-phase8.md Step 8.5) but owns its
+   * own short-lived download via #prefetchTrackFn, since — unlike A/B —
+   * nothing else in the pipeline downloads C's audio at all outside this
+   * method. Routed through the shared analysisQueue (not a bare spawn) so
+   * a mixer underrun can still SIGSTOP/kill it exactly like every other
+   * analysis/separation job (§5.4 "Playback Safety" in spirit, even though
+   * the dedicated priority-lane queue itself is Phase 9C's job).
+   */
+  async #runLowPriorityStemPrefetch(track) {
+    return this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
+      throwIfAborted(signal);
+      const downloaded = await this.#prefetchTrackFn(track);
+      try {
+        throwIfAborted(signal);
+        const stagedPath = await this.#stageTempFileCopyFn(downloaded.filePath).catch((err) => {
+          console.warn('[GuildPlayer] failed to stage file for low-priority stem prefetch:', err.message);
+          return null;
+        });
+        if (!stagedPath) return null;
+        throwIfAborted(signal);
+        try {
+          return await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal });
+        } finally {
+          cleanupTempFile(stagedPath).catch(() => {});
+        }
+      } finally {
+        await cleanupTempFile(downloaded.filePath);
+      }
+    });
   }
 
   #ensureFullPrefetch(track) {

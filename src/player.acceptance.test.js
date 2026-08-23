@@ -1522,6 +1522,15 @@ test('acceptance (mixer): persistent analysis cache skips Demucs lookahead', asy
       prefetchCalls += 1;
       return { filePath: `/tmp/musicbot-prefetch-${prefetchCalls}`, measured: {} };
     },
+    // Phase 9B (docs/mix-transition-phase9.md §4): a cached BPM/phrase
+    // analysis does NOT imply cached stems — #ensureStemPrefetch() checks
+    // getCachedStemsFn() independently of #ensureAnalysisPrefetch()'s own
+    // persisted-analysis short-circuit, since a track can have analysis
+    // from a previous play while still missing its Demucs separation.
+    // Reporting a stem-cache HIT here keeps this test's original,
+    // unrelated assertion (the BPM-analysis-only lookahead must not
+    // redownload when analysis is cached) isolated from that new lookup.
+    getCachedStemsFn: async () => ({ vocalPath: '/tmp/vocal.wav', instrumentalPath: '/tmp/instrumental.wav' }),
     createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
   });
   queue.add(createTrack({
@@ -2328,6 +2337,192 @@ test('acceptance (mixer): a stem-mix pair marked unavailable gets a fresh attemp
     const vidACallsAfterSecondLap = stemSourceCalls.filter((c) => c.filePath.includes('vid-a')).length;
     assert.ok(vidACallsAfterSecondLap > vidACallsAfterFirstLap,
       'expected the recurring A→B pair to get a fresh stem-mix attempt on the second lap, not stay downgraded');
+  } finally {
+    await player.stop();
+  }
+});
+
+// --- Phase 9B (docs/mix-transition-phase9.md §4): stem prefetch ----------
+
+test('acceptance (mixer): stem prefetch tracks next=HIGH / next+1=LOW, and separates both on a cache miss', async () => {
+  const stemCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async () => null, // always a miss, so real separation dispatches
+    separateTrackStemsFn: async (filePath, videoId) => {
+      stemCalls.push(videoId);
+      return { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+  queue.add(createTrack({ title: 'Track D', webpageUrl: 'https://example.com/d', duration: 60, videoId: 'vid-d' }));
+
+  try {
+    await player.playNext();
+
+    await pollUntil(() => stemCalls.includes('vid-b') && stemCalls.includes('vid-c'));
+    assert.ok(stemCalls.includes('vid-b'), 'expected next (B) to be separated');
+    assert.ok(stemCalls.includes('vid-c'), 'expected next+1 (C) to also be separated (§4.2 LOW lane)');
+    assert.ok(!stemCalls.includes('vid-a'), 'the current track (A) is not this method\'s concern (Phase 8 owns it)');
+    assert.ok(!stemCalls.includes('vid-d'), 'next+2 (D) must stay untouched by stem prefetch');
+
+    const byId = Object.fromEntries(player.stemPrefetchStatus.map((e) => [e.videoId, e]));
+    assert.equal(byId['vid-b']?.priority, 'high');
+    assert.equal(byId['vid-c']?.priority, 'low');
+    assert.equal(byId['vid-d'], undefined, 'next+2 must not be tracked at all');
+
+    await pollUntil(() => byIdReady(player, 'vid-b') && byIdReady(player, 'vid-c'));
+    assert.equal(byIdState(player, 'vid-b'), 'ready');
+    assert.equal(byIdState(player, 'vid-c'), 'ready');
+  } finally {
+    await player.stop();
+  }
+});
+
+function byIdState(player, videoId) {
+  return player.stemPrefetchStatus.find((e) => e.videoId === videoId)?.state ?? null;
+}
+
+function byIdReady(player, videoId) {
+  return byIdState(player, videoId) === 'ready';
+}
+
+test('acceptance (mixer): a stem-cache hit marks next/next+1 READY without a redundant separation call', async () => {
+  const stemCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async (videoId) => ({
+      vocalPath: `/tmp/${videoId}.vocal.wav`,
+      instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+    }),
+    separateTrackStemsFn: async (filePath, videoId) => {
+      stemCalls.push(videoId);
+      return { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => byIdReady(player, 'vid-b') && byIdReady(player, 'vid-c'));
+
+    assert.equal(byIdState(player, 'vid-b'), 'ready');
+    assert.equal(byIdState(player, 'vid-c'), 'ready');
+    assert.equal(stemCalls.filter((id) => id === 'vid-c').length, 0,
+      'a stem-cache HIT for C must not also trigger the LOW-priority separation pipeline');
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): a skip promoting C to next escalates its stem prefetch priority to HIGH', async () => {
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async () => null,
+    separateTrackStemsFn: async (filePath, videoId) => (
+      { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` }
+    ),
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => player.stemPrefetchStatus.some((e) => e.videoId === 'vid-c'));
+    assert.equal(
+      player.stemPrefetchStatus.find((e) => e.videoId === 'vid-c')?.priority,
+      'low',
+      'expected C to start out LOW while B is still next',
+    );
+
+    // player.skip() (not triggerTrackEnd) so #forceSkip bypasses the
+    // reconnect-retry grace window (RECONNECT_GRACE_MS) entirely — this
+    // promotion shifts C from next+1 to next, and #prefetchUpcoming()
+    // re-runs as part of it.
+    await player.skip();
+    await nextTurn();
+    assert.equal(queue.current.videoId, 'vid-b');
+
+    await pollUntil(() => player.stemPrefetchStatus.find((e) => e.videoId === 'vid-c')?.priority === 'high');
+    assert.equal(
+      player.stemPrefetchStatus.find((e) => e.videoId === 'vid-c')?.priority,
+      'high',
+      'expected C to be escalated to HIGH once it became next',
+    );
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): a track removed from the queue is pruned from stem prefetch after its attempt settles', async () => {
+  let resolveC;
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async (videoId) => {
+      if (videoId === 'vid-c') {
+        return new Promise((resolve) => { resolveC = resolve; });
+      }
+      return null;
+    },
+    separateTrackStemsFn: async (filePath, videoId) => (
+      { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` }
+    ),
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => resolveC != null); // C's cache check has started (dispatched from #ensureStemPrefetch)
+    assert.ok(player.stemPrefetchStatus.some((e) => e.videoId === 'vid-c'), 'expected C to be tracked while still next+1');
+
+    // Remove C from the queue entirely (an unrelated /remove-style
+    // mutation, bypassing the player — see queue.js's removeUpcoming())
+    // while its cache check is still pending.
+    queue.removeUpcoming(1);
+    assert.deepEqual(queue.upcoming().map((t) => t.videoId), ['vid-b']);
+
+    resolveC(null); // the pending getCachedStemsFn() call for C finally resolves (a miss)
+    await nextTurn();
+    await pollUntil(() => byIdState(player, 'vid-c') != null && byIdState(player, 'vid-c') !== 'processing');
+    assert.equal(byIdState(player, 'vid-c'), 'ready', 'the LOW pipeline dispatched before removal still completes (no cancellation API)');
+
+    // The next #prefetchUpcoming() checkpoint (B being promoted to current)
+    // prunes it, now that it has reached a terminal state and is no longer
+    // in the active window. player.skip() bypasses the reconnect-retry
+    // grace window so this promotion happens immediately.
+    await player.skip();
+    await nextTurn();
+    assert.ok(
+      !player.stemPrefetchStatus.some((e) => e.videoId === 'vid-c'),
+      'expected the stale entry to be pruned once it left the active window and reached a terminal state',
+    );
   } finally {
     await player.stop();
   }
