@@ -306,39 +306,6 @@ export function scoreTransitionPairDetailed(params) {
   return scoreTransitionPairDetail(params);
 }
 
-/**
- * Codex review (PR #46, Phase 9D §6.4, round 2): planPhraseCrossfade()'s
- * `confidence` is just `phraseAlignment` (tier 2 never scores tempo sync or
- * downbeat alignment at all) — not comparable to beatmix's six-term weighted
- * confidence when RANKING across modes. A clean shared phrase boundary can
- * report `phraseAlignment: 1` even with no tempo sync whatsoever, beating an
- * otherwise-strong beatmix candidate that scores lower only because its
- * tempoCompatibility/downbeatConfidence terms pull its weighted average down
- * — the exact thing those terms exist to penalize.
- *
- * Recomputes a cross-mode-comparable score using the same weighted formula
- * scoreTransitionPairDetail() uses, crediting phrase-crossfade's real
- * phraseAlignment/vocalSafety/energyContinuity terms (already on
- * `phrasePlan.quality`) but explicitly zero-crediting tempoCompatibility and
- * downbeatConfidence — tier 2 structurally has neither, so a comparable
- * score must charge for their absence rather than excluding them from the
- * weighted average (excluding them is what inflated the score in the first
- * place). harmonicCompatibility stays excluded from the weight entirely
- * (tier 2 never even attempts it, unlike beatmix/stem-mix where a `null`
- * specifically means "confidence didn't clear the threshold").
- */
-export function comparablePhraseCrossfadeConfidence(phrasePlan) {
-  if (!phrasePlan?.eligible) return phrasePlan?.confidence ?? 0;
-  const q = phrasePlan.quality ?? {};
-  const total = (q.vocalSafety ?? 0) * VOCAL_SAFETY_WEIGHT
-    + (q.phraseAlignment ?? 0) * PHRASE_ALIGNMENT_WEIGHT
-    + (q.energyContinuity ?? 0) * ENERGY_CONTINUITY_WEIGHT;
-    // tempoCompatibility/downbeatConfidence contribute 0, not excluded.
-  const totalWeight = VOCAL_SAFETY_WEIGHT + PHRASE_ALIGNMENT_WEIGHT + TEMPO_COMPATIBILITY_WEIGHT
-    + DOWNBEAT_CONFIDENCE_WEIGHT + ENERGY_CONTINUITY_WEIGHT;
-  return clamp01(total / totalWeight);
-}
-
 function rejected(reasons) {
   return { mode: null, eligible: false, reasons };
 }
@@ -616,6 +583,18 @@ export function planPhraseCrossfade(outgoing, incoming, {
   // duration, forward vocal-free room) is tightest. Incoming stays in
   // native seconds (tier 2 never stretches it); outgoing room is converted
   // like tier 1's.
+  // Codex review (PR #46, round 3, P2): rank candidate pairs by the same
+  // comparable score used for cross-mode ranking (vocalSafety/phraseAlignment/
+  // energyContinuity, with tempoCompatibility/downbeatConfidence charged as
+  // 0 — tier 2 structurally has neither), not by raw phraseAlignment alone.
+  // Ranking by phraseAlignment let the search settle on a pair with a
+  // clean-but-vocal-adjacent boundary before any later calibration could
+  // ever see a genuinely safer/better-rounded alternative it had already
+  // discarded — the same class of bug fixed for stem-mix's own pair search
+  // (see planBeatmixTransition()'s pairScore comment). vocalSafety/
+  // energyContinuity are computed per-candidate here (previously only for
+  // the winner, after the fact) since they now drive which pair wins, not
+  // just what gets reported about it afterward.
   let best = null;
   for (const exit of exitCandidates) {
     const roomAfterExit = (durationSec - exit.sec) / outgoingRatio;
@@ -625,38 +604,38 @@ export function planPhraseCrossfade(outgoing, incoming, {
       const fadeSec = Math.min(maxOverlapSec, roomAfterExit, roomInIncoming, forwardSafe);
       if (fadeSec < minOverlapSec) continue;
       const phraseAlignment = clamp01(((exit.score ?? 0) + (entry.score ?? 0)) / 2);
-      if (!best || phraseAlignment > best.phraseAlignment) best = { exit, entry, fadeSec, phraseAlignment };
+      const entryVocalSafety = clamp01(entryVocalMargin(incoming, entry.sec) / VOCAL_MARGIN_FULL_CREDIT_SEC);
+      const exitVocalSafety = clamp01(
+        (exit.sec - (Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0)) / VOCAL_MARGIN_FULL_CREDIT_SEC,
+      );
+      const vocalSafety = Math.min(exitVocalSafety, entryVocalSafety);
+      const energy = energyContinuity(exit, entry);
+      const rankTotal = vocalSafety * VOCAL_SAFETY_WEIGHT
+        + phraseAlignment * PHRASE_ALIGNMENT_WEIGHT
+        + energy * ENERGY_CONTINUITY_WEIGHT;
+      const rankWeight = VOCAL_SAFETY_WEIGHT + PHRASE_ALIGNMENT_WEIGHT + TEMPO_COMPATIBILITY_WEIGHT
+        + DOWNBEAT_CONFIDENCE_WEIGHT + ENERGY_CONTINUITY_WEIGHT;
+      const rankScore = clamp01(rankTotal / rankWeight);
+      if (!best || rankScore > best.rankScore) {
+        best = {
+          exit, entry, fadeSec, phraseAlignment, vocalSafety, energy, rankScore,
+        };
+      }
     }
   }
   if (!best) return rejected(['no-overlap-fit']);
 
-  // Phase 9D (docs/mix-transition-phase9.md §6.3): tier 2 has no tempo sync
-  // or downbeat-grid requirement (its whole point is to still work when
-  // those aren't available), and doesn't score harmonic compatibility at
-  // all — those three quality sub-terms stay null (never fabricated) rather
-  // than a misleading 0. vocalSafety/energyContinuity ARE meaningful here
-  // (this tier's candidate search enforces the same vocal-safe windows
-  // beatmix does) and are computed the same way beatmix's scorer does, from
-  // the same winning exit/entry pair.
-  const entryMargin = entryVocalMargin(incoming, best.entry.sec);
-  const entryVocalSafety = clamp01(entryMargin / VOCAL_MARGIN_FULL_CREDIT_SEC);
-  const exitVocalSafety = clamp01(
-    (best.exit.sec - (Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0)) / VOCAL_MARGIN_FULL_CREDIT_SEC,
-  );
-  const vocalSafety = Math.min(exitVocalSafety, entryVocalSafety);
-  const energy = energyContinuity(best.exit, best.entry);
-
   return {
     mode: 'phrase-crossfade',
     eligible: true,
-    confidence: Number(best.phraseAlignment.toFixed(3)),
+    confidence: Number(best.rankScore.toFixed(3)),
     quality: {
       phraseAlignment: Number(best.phraseAlignment.toFixed(3)),
       tempoCompatibility: null,
-      vocalSafety: Number(vocalSafety.toFixed(3)),
+      vocalSafety: Number(best.vocalSafety.toFixed(3)),
       downbeatConfidence: null,
       harmonicCompatibility: null,
-      energyContinuity: Number(energy.toFixed(3)),
+      energyContinuity: Number(best.energy.toFixed(3)),
     },
     fadeSec: best.fadeSec,
     startSec: best.exit.sec,

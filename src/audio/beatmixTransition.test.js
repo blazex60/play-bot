@@ -931,3 +931,34 @@ test('planBeatmixTransition({stemAware:true}) ranks candidate exit pairs by the 
   assert.equal(plan.outgoing.exitStartSec, 152,
     `expected the search to prefer the vocal-safe exit (152) over the higher-phrase-score mid-vocal one (100) under strict ranking, got ${plan.outgoing.exitStartSec}`);
 });
+
+// --- phrase-crossfade pair-search ranking (Codex review, PR #46, round 3) -
+//
+// findExitCandidates()'s default vocal-safe filter is a bare `sec >=
+// lastVocalEndSec` check — it says nothing about HOW FAR past the vocal
+// boundary a candidate sits, so two candidates can both be "vocal safe" by
+// the filter while one has almost no margin (exitVocalSafety near 0) and
+// the other has full margin (exitVocalSafety at its cap). The search must
+// not let a higher raw phraseAlignment alone win over a pair with
+// meaningfully better vocal safety margin.
+
+test('planPhraseCrossfade ranks candidate pairs by the full comparable score, not raw phraseAlignment alone', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: 150,
+    phrasesTail: [
+      { sec: 150, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }, // right at the vocal boundary, high phrase score
+      { sec: 154, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }, // full vocal-safety margin, lower phrase score
+    ],
+  });
+  const incoming = makeAnalysis({
+    firstVocalStartSec: 30,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+  });
+
+  const plan = planPhraseCrossfade(outgoing, incoming);
+
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.startSec, 154,
+    `expected the search to prefer the fuller-margin exit (154) over the higher-phrase-score boundary-hugging one (150) under comparable ranking, got ${plan.startSec}`);
+});

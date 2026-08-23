@@ -1,7 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { rankTransitionCandidates, transitionModeBonus } from './transitionCandidates.js';
-import { comparablePhraseCrossfadeConfidence } from './beatmixTransition.js';
 
 function makeAnalysis({
   bpm = 120,
@@ -36,38 +35,20 @@ function makeAnalysis({
   };
 }
 
-// --- comparablePhraseCrossfadeConfidence (Codex review, PR #46, round 2) --
-//
-// planPhraseCrossfade()'s own `confidence` is just `phraseAlignment` — tier 2
-// never scores tempo sync or downbeat alignment at all. Comparing that
-// directly against beatmix's six-term weighted confidence during ranking let
-// a clean phrase match (phraseAlignment: 1) beat a genuinely strong beatmix
-// candidate purely because tier 2's score isn't penalized for having no
-// tempo sync whatsoever — the exact thing beatmix's tempoCompatibility/
-// downbeatConfidence terms exist to credit.
-
-test('comparablePhraseCrossfadeConfidence: charges for the missing tempoCompatibility/downbeatConfidence terms instead of excluding them', () => {
-  const phrasePlan = {
-    eligible: true,
-    confidence: 1,
-    quality: {
-      phraseAlignment: 1, tempoCompatibility: null, vocalSafety: 1, downbeatConfidence: null,
-      harmonicCompatibility: null, energyContinuity: 1,
-    },
-  };
-  const corrected = comparablePhraseCrossfadeConfidence(phrasePlan);
-  assert.ok(corrected < phrasePlan.confidence,
-    `expected the comparable score to be charged for the missing tempo/downbeat terms, got ${corrected} (raw confidence ${phrasePlan.confidence})`);
-  // total = (1*1 + 1*1 + 0*1 + 0*0.8 + 1*0.4) / (1+1+1+0.8+0.4) = 2.4/4.2
-  assert.ok(Math.abs(corrected - 2.4 / 4.2) < 1e-9, `expected the exact weighted value, got ${corrected}`);
-});
-
-test('comparablePhraseCrossfadeConfidence: a non-eligible or malformed plan passes through unchanged', () => {
-  assert.equal(comparablePhraseCrossfadeConfidence({ eligible: false, confidence: 0.9 }), 0.9);
-  assert.equal(comparablePhraseCrossfadeConfidence(null), 0);
-});
-
 // --- rankTransitionCandidates: the fix must actually change the winner ----
+//
+// planPhraseCrossfade()'s own `confidence` used to be just `phraseAlignment`
+// — tier 2 never scores tempo sync or downbeat alignment at all. Comparing
+// that directly against beatmix's six-term weighted confidence during
+// ranking let a clean phrase match (phraseAlignment: 1) beat a genuinely
+// strong beatmix candidate purely because tier 2's score wasn't penalized
+// for having no tempo sync whatsoever — the exact thing beatmix's
+// tempoCompatibility/downbeatConfidence terms exist to credit.
+// planPhraseCrossfade() now computes its own `confidence` as the full
+// weighted comparable score directly (charging 0, not excluding, for the
+// tempoCompatibility/downbeatConfidence terms it structurally lacks), so
+// there is no separate post-hoc correction to unit-test here anymore — see
+// beatmixTransition.test.js for direct coverage of the search itself.
 
 test('rankTransitionCandidates: a genuinely well-synced beatmix candidate beats a phrase-crossfade candidate whose confidence is inflated by skipping the tempo-sync penalty', () => {
   const outgoing = makeAnalysis({
@@ -97,9 +78,12 @@ test('rankTransitionCandidates: a genuinely well-synced beatmix candidate beats 
   // its +0.05 bonus) — a slight tempo mismatch (120 vs 124 BPM) and modest
   // downbeat confidence keep it below 1, exactly what its weighted-average
   // scoring is supposed to do. phrase-crossfade shares the same clean phrase
-  // boundary (score 1.0 on both sides) so its raw confidence is exactly 1
-  // (rank 1.02 with its +0.02 bonus) — pre-fix, this always won despite
-  // never even attempting tempo sync. Confirmed by direct computation.
+  // boundary (score 1.0 on both sides), but its own confidence is now the
+  // full weighted comparable score — ~0.571 (rank ~0.591 with its +0.02
+  // bonus), charged for having no tempo/downbeat terms at all — rather than
+  // the pre-fix raw phraseAlignment of 1 (rank 1.02), which always won
+  // despite never even attempting tempo sync. Confirmed by direct
+  // computation.
   const { candidates, selectedPlan, plans } = rankTransitionCandidates(outgoing, incoming, {
     outgoingPlaybackBpm: 120,
     tempoBackend: 'rubberband',
@@ -108,11 +92,11 @@ test('rankTransitionCandidates: a genuinely well-synced beatmix candidate beats 
 
   assert.equal(candidates.beatmix.eligible, true, 'expected beatmix to be genuinely eligible on this fixture');
   assert.equal(candidates.phraseCrossfade.eligible, true, 'expected phrase-crossfade to be genuinely eligible on this fixture');
-  // The raw plan's own confidence must stay untouched — only the Candidate
-  // struct's ranking/reporting `score` is corrected.
-  assert.equal(plans.phraseCrossfade.confidence, 1);
+  // No override — the Candidate struct's score is the plan's own confidence,
+  // which is already comparable by the time it reaches the ranker.
+  assert.equal(candidates.phraseCrossfade.score, plans.phraseCrossfade.confidence);
   assert.ok(candidates.phraseCrossfade.score < 1,
-    `expected the reported/ranked phrase-crossfade score to be corrected down from the raw phraseAlignment-only confidence, got ${candidates.phraseCrossfade.score}`);
+    `expected phrase-crossfade's own confidence to be charged for its missing tempo/downbeat terms, got ${candidates.phraseCrossfade.score}`);
   assert.ok(candidates.phraseCrossfade.score + 0.02 < candidates.beatmix.score + 0.05,
     'sanity check: the corrected+bonus phrase-crossfade rank must actually be lower than beatmix\'s, or this test would prove nothing');
   // The actual point of this fix: beatmix must win once phrase-crossfade's

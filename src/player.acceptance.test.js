@@ -2088,6 +2088,53 @@ test('acceptance (mixer): a memoized stem-cache hit that is evicted before prep 
   }
 });
 
+test('acceptance (mixer): a positive stem-cache hit on one side is memoized independently of the other side still missing (Codex review, PR #46, round 3, P2)', async () => {
+  // Codex: the memo used to require BOTH sides to hit before caching
+  // anything — a very common transient state (one side, usually outgoing,
+  // separated earlier; the other's separation still in flight) got zero
+  // benefit and re-probed BOTH sides (including the already-cached one)
+  // on every ~200ms arm tick for as long as the other side stayed missing.
+  // vid-a (outgoing) is a HIT from the very first call; vid-b (incoming)
+  // stays a MISS for several arm ticks. Only vid-b's call count should keep
+  // climbing — vid-a's should stay pinned at 1 once memoized.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  const callsPerVideo = new Map();
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => {
+      callsPerVideo.set(videoId, (callsPerVideo.get(videoId) ?? 0) + 1);
+      if (videoId === 'vid-a') {
+        return { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+      }
+      return null; // vid-b (incoming): stays a miss for the whole test
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  try {
+    await player.playNext();
+    // Several 200ms arm ticks' worth of real time, well past the first probe.
+    for (let i = 0; i < 3; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 220));
+    }
+
+    assert.equal(callsPerVideo.get('vid-a'), 1,
+      `expected the outgoing (already-cached) side to be probed once and then memoized, got ${callsPerVideo.get('vid-a')} calls`);
+    assert.ok((callsPerVideo.get('vid-b') ?? 0) > 1,
+      `expected the incoming (still-missing) side to keep being re-probed every tick, got ${callsPerVideo.get('vid-b')} calls`);
+  } finally {
+    await player.stop();
+  }
+});
+
 test('acceptance (mixer): concurrent arm ticks do not spawn duplicate stem sources while a prep revalidation is in flight', async () => {
   // Codex: #ensureOutgoingStemPrep()/#ensureIncomingStemPrep()'s cache
   // revalidation (added for the memo-eviction fix above) is async, and the
