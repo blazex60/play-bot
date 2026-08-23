@@ -476,10 +476,28 @@ export function planBeatmixTransition(outgoing, incoming, {
     return rejected(['marginal-tempo-low-confidence']);
   }
 
+  // Phase 9D (docs/mix-transition-phase9.md §6.3): the Candidate Ranker
+  // needs the winning pair's full quality breakdown, not just its weighted
+  // total (`best.pairScore`, which the search loop above used via
+  // scoreTransitionPair() for speed — recomputing the detail on every
+  // exit/entry/bars combination would be wasted work when only the winner's
+  // breakdown is ever surfaced). One extra call here, on the winner alone.
+  const quality = scoreTransitionPairDetail({
+    outgoing, incoming, exit: best.exit, entry: best.entry, targetBpm, match, stemAware,
+  });
+
   return {
     mode: 'beatmix',
     eligible: true,
     confidence: best.pairScore,
+    quality: {
+      phraseAlignment: quality.phraseAlignment,
+      tempoCompatibility: quality.tempoCompatibility,
+      vocalSafety: quality.vocalSafety,
+      downbeatConfidence: quality.downbeatConfidence,
+      harmonicCompatibility: quality.harmonicCompatibility,
+      energyContinuity: quality.energyContinuity,
+    },
     targetBpm,
     fadeSec: best.fadeSec,
     outgoing: {
@@ -569,10 +587,34 @@ export function planPhraseCrossfade(outgoing, incoming, {
   }
   if (!best) return rejected(['no-overlap-fit']);
 
+  // Phase 9D (docs/mix-transition-phase9.md §6.3): tier 2 has no tempo sync
+  // or downbeat-grid requirement (its whole point is to still work when
+  // those aren't available), and doesn't score harmonic compatibility at
+  // all — those three quality sub-terms stay null (never fabricated) rather
+  // than a misleading 0. vocalSafety/energyContinuity ARE meaningful here
+  // (this tier's candidate search enforces the same vocal-safe windows
+  // beatmix does) and are computed the same way beatmix's scorer does, from
+  // the same winning exit/entry pair.
+  const entryMargin = entryVocalMargin(incoming, best.entry.sec);
+  const entryVocalSafety = clamp01(entryMargin / VOCAL_MARGIN_FULL_CREDIT_SEC);
+  const exitVocalSafety = clamp01(
+    (best.exit.sec - (Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0)) / VOCAL_MARGIN_FULL_CREDIT_SEC,
+  );
+  const vocalSafety = Math.min(exitVocalSafety, entryVocalSafety);
+  const energy = energyContinuity(best.exit, best.entry);
+
   return {
     mode: 'phrase-crossfade',
     eligible: true,
     confidence: Number(best.phraseAlignment.toFixed(3)),
+    quality: {
+      phraseAlignment: Number(best.phraseAlignment.toFixed(3)),
+      tempoCompatibility: null,
+      vocalSafety: Number(vocalSafety.toFixed(3)),
+      downbeatConfidence: null,
+      harmonicCompatibility: null,
+      energyContinuity: Number(energy.toFixed(3)),
+    },
     fadeSec: best.fadeSec,
     startSec: best.exit.sec,
     curve: 'equal-power',
@@ -593,7 +635,14 @@ export function planPhraseCrossfade(outgoing, incoming, {
 /**
  * The full §16 fallback ladder: beatmix -> phrase-crossfade -> the existing
  * (untouched) planTransition() for crossfade/tail-fade/simple-fade/gapless.
- * Not called from player.js yet — see the module docstring.
+ *
+ * Phase 9D (docs/mix-transition-phase9.md §6): player.js no longer calls
+ * this — #maybeStartCrossfade() evaluates beatmix/stem-mix/phrase-crossfade
+ * as independent candidates via src/audio/transitionCandidates.js's
+ * rankTransitionCandidates() and picks a winner by score, rather than
+ * taking whichever tier is eligible first. This function (and its own
+ * waterfall-shaped tests) is kept exactly as it was — still a fully-built,
+ * correct standalone planner, just no longer the one driving live playback.
  */
 export function planBeatSyncedTransition(outgoing, incoming, options = {}) {
   const beatmix = planBeatmixTransition(outgoing, incoming, options);
