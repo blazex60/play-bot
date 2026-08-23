@@ -823,7 +823,7 @@ export class GuildPlayer {
     // Codex review (PR #43, round 4): prefer a fresh evaluation of this
     // exact pair over the generic stub, same reasoning as #playNextMixer's
     // own gapless log site.
-    const evaluated = this.#takeMatchingEvaluatedTransition(current, next);
+    const evaluated = this.#takeMatchingEvaluatedTransition(current, next, entrySec);
     if (evaluated) {
       this.#logTransitionPlanFn(evaluated);
     } else {
@@ -2594,7 +2594,21 @@ export class GuildPlayer {
    * stub at the call site). Consumes the stash either way so a later,
    * different hard handoff can't accidentally reuse it.
    */
-  #takeMatchingEvaluatedTransition(outgoingTrack, incomingTrack) {
+  /**
+   * @param {number} [entrySec] Codex review (PR #43, round 6): the
+   *   planned/evaluated candidate's own entry (possibly a nonzero,
+   *   downbeat-aligned seek) never actually got applied — this hard
+   *   handoff starts the incoming source at whatever native offset it
+   *   really started at (0 for a plain playNext(), or #onSnapHandoff's own
+   *   already-computed `entrySec` when it honored a prepared seek).
+   *   Overwrite the report's entry with that real value so the log
+   *   describes what was executed, not what was planned. Exit is cleared
+   *   to unknown (null) rather than kept at the planned candidate's
+   *   exit point — the outgoing track actually ran to its own natural
+   *   EOF here, not the planned exit, and neither call site has that
+   *   native EOF timestamp on hand to report precisely.
+   */
+  #takeMatchingEvaluatedTransition(outgoingTrack, incomingTrack, entrySec = 0) {
     const stashed = this.#lastEvaluatedTransitionReport;
     this.#lastEvaluatedTransitionReport = null;
     if (!stashed) return null;
@@ -2604,6 +2618,11 @@ export class GuildPlayer {
     const { report } = stashed;
     report.downgradedFrom = report.selected;
     report.selected = 'gapless';
+    report.entry.sec = entrySec;
+    report.entry.bar = entrySec === 0 ? 0 : null;
+    report.exit.sec = null;
+    report.exit.bar = null;
+    report.exit.vocalActive = null;
     return report;
   }
 
