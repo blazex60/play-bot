@@ -81,6 +81,8 @@ export function makePlayer({
   getCachedStemsFn,
   planStemTransitionFn,
   createFileSourceFn,
+  logTransitionPlanFn,
+  logGaplessTransitionFn,
   pcmWaitTimeoutMs,
   connection,
 } = {}) {
@@ -114,6 +116,8 @@ export function makePlayer({
     getCachedStemsFn,
     planStemTransitionFn,
     createFileSourceFn,
+    logTransitionPlanFn,
+    logGaplessTransitionFn,
     pcmWaitTimeoutMs,
     connection: connection ?? {
       subscribe(subscribedPlayer) {

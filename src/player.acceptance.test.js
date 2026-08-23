@@ -949,6 +949,7 @@ test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgr
     analysisSource: 'demucs',
   };
 
+  const logCalls = [];
   const { player, queue } = makePlayer({
     trackDuration: 8,
     track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
@@ -963,6 +964,7 @@ test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgr
       if (track.videoId === 'vid-b') source.tempoHonored = false;
       return source;
     },
+    logTransitionPlanFn: (report) => logCalls.push(report),
   });
   queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
 
@@ -979,6 +981,15 @@ test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgr
     false,
     'expected baseSwap to be stripped once the incoming source could not honor the plan\'s selected entry point',
   );
+  // Codex review (PR #43): the [MIX PLAN] report's entry must reflect the
+  // entry actually applied (0, since the source fell back to native
+  // position 0), not the originally planned nonzero phrase-boundary entry.
+  assert.equal(logCalls.length, 1);
+  assert.equal(logCalls[0].entry.sec, 0);
+  // Codex review round 2: native offset 0 isn't necessarily bar 0 (the
+  // downgraded transition no longer uses the original bar candidate at
+  // all) — bar is reported as unknown, not asserted.
+  assert.equal(logCalls[0].entry.bar, null);
 
   await player.stop();
 });
@@ -1849,6 +1860,123 @@ test('acceptance (mixer): stem-mix transition is chosen when both sides have cac
   }
 });
 
+// --- Phase 9A (docs/mix-transition-phase9.md §3): transition observability ---
+
+test('acceptance (mixer): a committed stem-mix transition emits exactly one [MIX PLAN] report, selected=stem-mix', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  const logCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => ({
+      vocalPath: `/tmp/${videoId}.vocal.wav`,
+      instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+    }),
+    createFileSourceFn: () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 60; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.ok(startedPlan, 'expected a crossfade to have armed');
+    assert.equal(startedPlan.mode, 'stem-mix');
+    // Exactly one report for the one committed transition — not one per
+    // ~200ms arm-tick re-evaluation that led up to it.
+    assert.equal(logCalls.length, 1);
+    const report = logCalls[0];
+    assert.equal(report.from, 'Track A');
+    assert.equal(report.to, 'Track B');
+    assert.equal(report.selected, 'stem-mix');
+    assert.equal(report.downgradedFrom, null);
+    assert.equal(report.candidates.stemMix.eligible, true);
+    assert.deepEqual(report.stemCache, { outgoing: 'hit', incoming: 'hit' });
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): a natural gapless handoff whose evaluated rawPlan was already gapless is not reported as downgraded from itself (Codex review, PR #43, P2)', async () => {
+  // planTransition() returns mode:'gapless' outright when the outgoing
+  // analysis has very low confidence (0 < confidence < 0.2) and low vocal
+  // confidence — no beatmix/stem-mix/phrase-crossfade was ever eligible, so
+  // this pair's stashed report already has selected='gapless' before the
+  // hard handoff below even runs.
+  const lowConfidenceAnalysis = { version: ANALYSIS_VERSION, confidence: 0.1, vocalConfidence: 0.1, durationSec: 60 };
+  const logCalls = [];
+  // Under SHORT_TRACK_THRESHOLD_SEC (5s, src/player/playbackPolicy.js) so
+  // shouldReconnectRetry() does not replay this same track instead of
+  // advancing once triggerTrackEnd() fires below.
+  const { player, queue } = makePlayer({
+    trackDuration: 3,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 3, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => lowConfidenceAnalysis,
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.alloc(FRAME_BYTES))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3, videoId: 'vid-b' }));
+
+  try {
+    await player.playNext();
+    // Let at least one 200ms crossfade-arm tick run (and stash its
+    // evaluated, already-gapless report) before the track ends naturally.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    triggerTrackEnd({ mixStream: player.mixStream });
+    await waitMs(50);
+
+    assert.equal(logCalls.length, 1);
+    const report = logCalls[0];
+    assert.equal(report.selected, 'gapless');
+    assert.equal(report.downgradedFrom, null,
+      'a rawPlan that was already gapless must not be reported as downgraded from itself');
+    // Codex review (PR #43, round 8): entrySec===0 (this hard handoff's
+    // native start offset, the ordinary #playNextMixer path never honors a
+    // seek) does not mean bar 0 was actually detected/aligned — no bar
+    // alignment happened at all on this path.
+    assert.equal(report.entry.sec, 0);
+    assert.equal(report.entry.bar, null,
+      'entrySec===0 must not be reported as bar 0 — a hard handoff performs no bar alignment');
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): logTransitionPlan still fires (with the real ladder\'s own selection) when no custom Fn is injected', async () => {
+  const { player, queue } = makePlayer({ trackDuration: 3, framesPerTrack: 400 });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3 }));
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 60; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // No assertion beyond "did not throw" — this exercises the real
+    // (non-injected) logTransitionPlan()/buildTransitionPlanReport() wiring
+    // end-to-end with only fallbackAnalysis()-grade analysis available
+    // (no bpm/vocal data), which every earlier acceptance test in this file
+    // bypasses via a custom getTrackAnalysisFn/logTransitionPlanFn.
+  } finally {
+    await player.stop();
+  }
+});
+
 test('acceptance (mixer): stem-mix is skipped (falls back to the existing ladder) when stems are not cached', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   new Int16Array(frame.buffer).fill(4000);
@@ -2016,6 +2144,62 @@ test('acceptance (mixer): concurrent arm ticks do not spawn duplicate stem sourc
     assert.equal(startedPlan.mode, 'stem-mix');
     assert.equal(stemSourceCalls.length, 4,
       `expected exactly 2 outgoing + 2 incoming stem sources despite concurrent arm ticks, got ${stemSourceCalls.length}`);
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): an arm tick whose queue advances out from under it (mid-analysis) does not stash a stale evaluation (Codex review, PR #43, P2)', async () => {
+  // Codex review (PR #43, round 8): #maybeStartCrossfade() awaits
+  // #getCachedAnalysis() (among other things) before stashing its
+  // evaluation for the (current, next) pair it captured at the very top of
+  // the tick. If the queue advances during that await (a skip, here — a
+  // snap handoff racing the same tick is the finding's original scenario,
+  // but any queue advance during the await exercises the same staleness
+  // window), the captured pair is stale by the time the stash would run.
+  // Delaying getTrackAnalysisFn for the CURRENT track (A) reliably parks an
+  // arm tick mid-await long enough to skip past it.
+  let releaseAnalysis;
+  let analysisRequested = false;
+  const logCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => {
+      if (videoId === 'vid-a') {
+        analysisRequested = true;
+        return new Promise((resolve) => { releaseAnalysis = () => resolve(null); });
+      }
+      return null;
+    },
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.alloc(FRAME_BYTES))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    await pollUntil(() => analysisRequested, { timeoutMs: 2000 });
+    // The arm tick evaluating A (current) / B (next) is now parked inside
+    // #getCachedAnalysis(current)'s await. Advance the queue out from
+    // under it before releasing that await.
+    await player.skip();
+    await nextTurn();
+    assert.equal(queue.current.videoId, 'vid-b', 'expected skip() to have advanced the queue while the tick was parked');
+
+    releaseAnalysis();
+    await waitMs(200); // let the parked tick resume and (correctly) bail out
+
+    assert.equal(startedPlan, null, 'the stale A/B evaluation must never reach a crossfade start');
+    assert.ok(
+      !logCalls.some((r) => r.from === 'Track A'),
+      'a report evaluated for the stale (A, B) pair must never be stashed/logged once A is no longer current',
+    );
   } finally {
     await player.stop();
   }
@@ -2249,4 +2433,33 @@ test('acceptance (mixer): a stem-mix pair marked unavailable gets a fresh attemp
   } finally {
     await player.stop();
   }
+});
+
+// --- Phase 9A round 4 (Codex review, PR #43): #pendingGaplessFrom staleness ---
+
+test('acceptance (mixer): stop() clears a pending gapless continuation so a later unrelated playNext does not misattribute it', async () => {
+  const logCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 3,
+    handleQueueExhausted: async () => true, // recommend mode: don't start another track
+    logTransitionPlanFn: (report) => logCalls.push(report),
+    logGaplessTransitionFn: (payload) => logCalls.push(payload),
+  });
+
+  await player.playNext();
+  triggerTrackEnd({ mixStream: player.mixStream });
+  await waitMs(20);
+  // Queue is empty and handleQueueExhausted returned true without adding a
+  // track — #pendingGaplessFrom is stashed for whenever playback resumes.
+
+  await player.stop();
+
+  // A later, wholly unrelated /play — nothing here should attribute back
+  // to the track that finished before stop().
+  queue.add(createTrack({ title: 'Track Z', webpageUrl: 'https://example.com/z', duration: 3 }));
+  await player.playNext();
+  await waitMs(20);
+
+  assert.equal(logCalls.length, 0, 'stop() must clear the stashed continuation, not let it leak into an unrelated later playNext');
+  await player.stop();
 });
