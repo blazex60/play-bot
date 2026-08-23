@@ -911,8 +911,14 @@ test('acceptance (mixer): incoming prep for a beatmix plan starts relative to th
   };
   const incomingAnalysis = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
-    firstVocalStartSec: 5.0,
+    // Codex review (PR #48, round 1): bumped from 8s/firstVocalStartSec 5.0
+    // (forwardSafe 4.8s) — below the new 8s (4-bar) floor, so this used to
+    // silently fall through to phrase-crossfade despite the assertion below
+    // still passing (both modes seek the incoming source to the same entry
+    // candidate). 30s of forward-safe room comfortably clears the minimum
+    // tier so this test genuinely exercises beatmix-specific prep again.
+    durationSec: 60,
+    firstVocalStartSec: 30.0,
     headVocalGaps: [],
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -935,7 +941,7 @@ test('acceptance (mixer): incoming prep for a beatmix plan starts relative to th
       return PcmSource.fromBuffers(Array.from({ length: 2500 }, () => Buffer.from(frame)));
     },
   });
-  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
 
   await player.playNext();
   // No frames read at all — positionSec is still 0. Give the arm timer a
@@ -1177,11 +1183,18 @@ test('acceptance (mixer): TRACK loop mode restarts from the beginning, not the b
 
   // Same track's analysis serves as both outgoing (tail exit) and incoming
   // (head entry) — a real head-phrase candidate sits well into the file.
+  // Codex review (PR #48, round 1): widened from durationSec 8/
+  // firstVocalStartSec 5.0 (tail exit at 1.0 left only 7s of room, and head
+  // entry at 3.0 only left 2s forward to firstVocalStartSec — both below the
+  // new 8s/4-bar floor). Room now comfortably clears the minimum tier on
+  // both the tail-exit and head-entry side, so this test still genuinely
+  // exercises the beatmix TRACK-loop path rather than silently falling
+  // through to phrase-crossfade.
   const analysis = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
+    durationSec: 60,
     lastVocalEndSec: 1.0,
-    firstVocalStartSec: 5.0,
+    firstVocalStartSec: 30.0,
     headVocalGaps: [],
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -1197,8 +1210,8 @@ test('acceptance (mixer): TRACK loop mode restarts from the beginning, not the b
   };
 
   const { player, queue } = makePlayer({
-    trackDuration: 8,
-    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
     getTrackAnalysisFn: async () => analysis,
     analyzeTrackFileFn: null,
     probeTempoBackendFn: async () => 'rubberband',
@@ -1281,15 +1294,21 @@ test('acceptance (mixer): re-prepping the same incoming track for a beatmix plan
   try {
     await spawnBuffered('ffmpeg', [
       '-y', '-hide_banner', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=8',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=60',
       filePath,
     ]);
 
     let prefetchCalls = 0;
     let startedPlan = null;
+    // Codex review (PR #48, round 1): widened from durationSec 8/
+    // firstVocalStartSec 5.0 (tail exit at 1.0 left 7s of room, entry at 0.2
+    // left only 4.8s forward to firstVocalStartSec — both below the new 8s/
+    // 4-bar floor). The generated fixture file above is widened to match
+    // (60s), so the real normalize/decode pipeline this test exercises still
+    // sees a track that actually contains the analysis's claimed duration.
     const outgoingAnalysis = {
       version: ANALYSIS_VERSION,
-      durationSec: 8,
+      durationSec: 60,
       lastVocalEndSec: 1.0,
       vocalConfidence: 0.85,
       confidence: 0.8,
@@ -1301,8 +1320,8 @@ test('acceptance (mixer): re-prepping the same incoming track for a beatmix plan
     };
     const incomingAnalysis = {
       version: ANALYSIS_VERSION,
-      durationSec: 8,
-      firstVocalStartSec: 5.0,
+      durationSec: 60,
+      firstVocalStartSec: 30.0,
       headVocalGaps: [],
       vocalConfidence: 0.85,
       confidence: 0.8,
@@ -1320,7 +1339,7 @@ test('acceptance (mixer): re-prepping the same incoming track for a beatmix plan
     // normalize/prefetch pipeline this test needs to exercise.
     const audioPlayer = makeAudioPlayer();
     const queue = new GuildQueue();
-    queue.add(createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }));
+    queue.add(createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }));
     const player = new GuildPlayer({
       guildId: 'guild-1',
       queue,
@@ -1340,7 +1359,7 @@ test('acceptance (mixer): re-prepping the same incoming track for a beatmix plan
       resolveAudioStreamFn(url) { return { url }; },
       createAudioResourceFn(stream, options) { return { stream, options, playStream: { destroy() {} } }; },
     });
-    queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+    queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
 
     player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
 

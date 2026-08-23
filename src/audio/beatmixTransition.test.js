@@ -283,19 +283,22 @@ test('planBeatmixTransition builds a full TransitionPlan v2 for a clean, compati
   assert.equal(plan.targetBpm, 120); // session tempo: incoming stretches to outgoing's BPM
   assert.equal(plan.outgoing.exitStartSec, 184);
   assert.equal(plan.incoming.entrySec, 4);
-  // Phase 9E (docs/mix-transition-phase9.md §7.2): the sweep now starts at
+  // Phase 9E (docs/mix-transition-phase9.md §7.2): the search now starts at
   // MIX_BARS.preferred (8, not the pre-9E 4) — but this fixture's incoming
   // entry only has ~11.2 playback seconds of forward vocal-free room before
-  // firstVocalStartSec (15), so 8/7/6 bars (16/14/12s) don't fit and 5 bars
-  // (10s) is the widest that does. See the dedicated
-  // "reaches the new preferred 8-bar tier" test below for a fixture with
-  // enough forward room to actually land on 8.
-  assert.equal(plan.sync.bars, 5);
+  // firstVocalStartSec (15), so 8 bars (16s) doesn't fit. Codex review
+  // (PR #48, round 1): the search is now restricted to the configured tiers
+  // themselves (16/8/4), not a dense sweep that could land on an
+  // unadvertised in-between width like 5 — so this falls all the way to
+  // MIX_BARS.minimum (4 bars, 8s), the next tier down, rather than 5. See
+  // the dedicated "reaches the new preferred 8-bar tier" test below for a
+  // fixture with enough forward room to actually land on 8.
+  assert.equal(plan.sync.bars, MIX_BARS.minimum);
   assert.equal(plan.sync.beatsPerBar, 4);
   assert.ok(Math.abs(plan.incoming.tempoRatio - 120 / 122) < 1e-9);
   assert.match(plan.incoming.tempoFilter, /^rubberband=tempo=0\.9836$/);
   assert.ok(plan.confidence > 0.5 && plan.confidence <= 1);
-  assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * 5) < 1e-6);
+  assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * MIX_BARS.minimum) < 1e-6);
 });
 
 test('planBeatmixTransition rejects when BPM is unavailable on either side', () => {
@@ -924,6 +927,12 @@ function longMixZoneTracks({
   incomingDownbeatConfidence = 0.9,
   outgoingVocalConfidence = 0.9,
   incomingVocalConfidence = 0.9,
+  // Codex review (PR #48, round 1): the extended tier now ALSO gates on the
+  // winning pair's own phraseAlignment (not just track-wide downbeatGrid
+  // confidence) — defaults well above EXTENDED_PHRASE_CONFIDENCE_MIN (0.7)
+  // so the track-wide-confidence-specific tests below aren't accidentally
+  // exercising this newer, orthogonal gate instead of the one they name.
+  phraseScore = 0.9,
 } = {}) {
   const outgoing = makeAnalysis({
     bpm: 120,
@@ -932,7 +941,7 @@ function longMixZoneTracks({
     vocalConfidence: outgoingVocalConfidence,
     durationSec: 260,
     lastVocalEndSec: 200, // irrelevant once requireExitVocalSafe:false, but a real reading either way
-    phrasesTail: [{ sec: 200, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], // 60s of native room after exit
+    phrasesTail: [{ sec: 200, barIndex: 0, score: phraseScore, reasons: ['bar-multiple'] }], // 60s of native room after exit
   });
   const incoming = makeAnalysis({
     bpm: 120,
@@ -941,7 +950,7 @@ function longMixZoneTracks({
     vocalConfidence: incomingVocalConfidence,
     durationSec: 260,
     firstVocalStartSec: 240, // irrelevant once requireEntryForwardSafe:false
-    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], // ~256s of room after entry
+    phrasesHead: [{ sec: 4, barIndex: 0, score: phraseScore, reasons: ['bar-multiple'] }], // ~256s of room after entry
   });
   return { outgoing, incoming };
 }
@@ -957,6 +966,20 @@ test('planBeatmixTransition reaches the extended 16-bar tier when stemAware, phr
   assert.equal(plan.eligible, true);
   assert.equal(plan.sync.bars, MIX_BARS.extended);
   assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * MIX_BARS.extended) < 1e-6);
+});
+
+test('planBeatmixTransition falls back to the preferred tier when the winning pair\'s OWN phraseAlignment is weak, even with high track-wide downbeat confidence (Codex review, PR #48, round 1)', () => {
+  // extendedTierEligible()'s "phrase confidence high" gate only sees
+  // downbeatGrid.confidence — a track-wide grid-quality reading, not
+  // whether any particular candidate pair actually has strong phrase-
+  // boundary evidence. A pair built from bare downbeats (score 0, no real
+  // structural/vocal-boundary reasons) can still exist on a track whose
+  // overall grid confidence is high. This must not reach 16 bars.
+  const { outgoing, incoming } = longMixZoneTracks({ phraseScore: 0.2 });
+  const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred,
+    `expected a weak-phraseAlignment pair to fall back to the preferred (8-bar) tier despite high track-wide confidence, got ${plan.sync.bars} bars`);
 });
 
 test('planBeatmixTransition never reaches the extended tier without stemAware, even with ample room and high confidence', () => {
@@ -999,11 +1022,14 @@ test('planBeatmixTransition falls back to the preferred 8-bar tier when the voca
   assert.equal(plan.sync.bars, MIX_BARS.preferred);
 });
 
-test('planBeatmixTransition degrades from the extended tier down through the dense sweep when 16 bars does not fit but a lower count does', () => {
+test('planBeatmixTransition degrades from the extended tier down to the next configured tier when 16 bars does not fit but 8 does', () => {
   // Same eligibility as the "reaches 16" test above, but room after the
-  // exit is capped so only 10 bars (20s) fit, not 16 (32s) or higher — the
-  // search must still land on the best FITTING count, not reject outright
-  // just because the extended tier's own ceiling doesn't fit.
+  // exit is capped so only 20s fits — enough for 8 bars (16s) but not the
+  // full 16 (32s). Codex review (PR #48, round 1): tierBars now restricts
+  // the search to the three NAMED tiers only (16/8/4), not a dense sweep
+  // that could land on an unadvertised width like 10 bars — so this must
+  // land on exactly 8, the next configured tier down, not the widest
+  // arbitrary bar count that happens to fit.
   const { incoming } = longMixZoneTracks();
   const outgoing = makeAnalysis({
     bpm: 120,
@@ -1012,11 +1038,11 @@ test('planBeatmixTransition degrades from the extended tier down through the den
     vocalConfidence: 0.9,
     durationSec: 220,
     lastVocalEndSec: 200,
-    phrasesTail: [{ sec: 200, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], // 20s of native room after exit
+    phrasesTail: [{ sec: 200, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }], // 20s of native room after exit
   });
   const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
   assert.equal(plan.eligible, true);
-  assert.equal(plan.sync.bars, 10);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred);
 });
 
 test('extendedTierEligible-equivalent gate is symmetric: low confidence on the OUTGOING side alone also blocks the extended tier', () => {

@@ -1796,3 +1796,15 @@ fallback                  no-overlap-fit → planBeatSyncedTransition()/
 - [ ] 16 bars（extended tier）到達の acceptance レベル専用テスト（上記未決事項参照、次フェーズ以降で追加を推奨）
 - [ ] 16 bars Mix Zone の実運用での聴感評価（上記未決事項参照）
 - [ ] TAIL_WINDOW_SEC(45s) を超える低テンポでの extended tier 到達率の実測（Phase 9F のスコープ、上記未決事項参照）
+
+### 追記: Codex レビュー対応（PR #48, round 1）
+
+初回実装後の Codex レビューで、16-bar (extended) tier のゲーティングと bar 数探索そのものに関わる4件の指摘が見つかった。いずれも「16-bar tier がトラック全体の統計だけで開いてしまい、実際に選ばれる exit/entry ペア自身の品質を見ていない」という同じ根の問題に起因する。
+
+- **P1: 探索がバー数を1刻みで密に走査していた** — `extendedTierEligible()` が真のとき `startBars = 16` から `bars -= 1` の単一降順ループで `minOverlapSec` まで密に走査していたため、§7.2 が定める「16 → 8 → 4」という3段の名前付きティアではなく、その間の任意の整数バー数（15, 14, 13, ...）にも着地しうる実装になっていた。`tierBars = [...new Set([startBars, overlapBars, minOverlapBars])].filter((bars) => bars <= startBars && bars >= minOverlapBars).sort((a, b) => b - a)` を導入し、探索対象を3つの名前付きティアのみに制限した。
+- **P1: 16-bar tier がペア自身の phrase 品質を見ずに開いていた** — `extendedTierEligible()` はトラック全体の `downbeatGrid.confidence`/`vocalConfidence` を見るプレフィルタに過ぎず、実際に勝つ exit/entry ペア自身の phrase alignment を見ていなかった。トラック全体では高信頼度でも、たまたま選ばれた候補ペアの phrase 境界自体は弱いことがありうる。`tierBars` ループ内、`bars === MIX_BARS.extended` のときだけ `clamp01(((exit.score ?? 0) + (entry.score ?? 0)) / 2) >= EXTENDED_PHRASE_CONFIDENCE_MIN` を追加で要求し、満たさない場合はそのペアを rejectするのではなく次の（より狭い）ティアにフォールスルーするようにした。
+  - テスト: `longMixZoneTracks({ phraseScore: 0.2 })` で、トラック全体の downbeat/vocal confidence は高いが実際に選ばれるペアの phrase score が弱いフィクスチャを用意し、`plan.sync.bars === MIX_BARS.preferred`（8）に落ちることを確認するテストを追加した。
+- **P2: `inVocal.fadeSec > 0` の閾値が甘すぎた** — `stemTransition.js` の `planStemTransition()` は inVocal のフェードが技術的に非ゼロでありさえすれば受理していたが、outgoing vocal tail が長い場合、数百ミリ秒未満の「フェードと呼べないほぼ即座のオンセット」でも通過してしまっていた。`MIN_MEANINGFUL_INVOCAL_FADE_SEC = 0.5`（秒）を追加し、`stems.inVocal.fadeSec >= MIN_MEANINGFUL_INVOCAL_FADE_SEC` を要求するよう変更した（満たさない場合は `stem-mix-no-invocal-fade-room` で reject、既存の非stemフォールバックに委ねる）。全バーティア共通の閾値であり、extended tier 専用ではない。
+  - テスト: `stemTransition.test.js` に、outgoing vocal tail が長く inVocal のフェード窓がほぼゼロになるフィクスチャ（`lastVocalEndSec: 173.7`、exit=158, preferred/8-bar tier）を追加し、`eligible: false` / `reasons: ['stem-mix-no-invocal-fade-room']` を確認した。
+- **P2: 新しい bar floor（4-bar/8秒）に対して既存 acceptance フィクスチャが未較正だった** — 旧 `MIN_OVERLAP_BARS`（2-bar/4秒相当）を前提にした一部の `player.acceptance.test.js` フィクスチャは、新しい 4-bar/8秒の最低ラインを下回る room しか持たず、テスト自身は `mode` を明示的に assert していなかったため、beatmix ではなく静かに phrase-crossfade にフォールスルーしても pass し続けていた——つまり beatmix 固有の経路を実際には検証していなかった。3箇所（"incoming prep for a beatmix plan starts relative to the selected exit point", "TRACK loop mode restarts from the beginning", "re-prepping the same incoming track for a beatmix plan reuses the already-downloaded file"）の `durationSec`/`firstVocalStartSec`/トラック `duration`（および ffmpeg で生成する実音声ファイルの長さ）を、各テストの本来の検証意図・アサーションを変えないまま新しい床を余裕を持って超えるよう広げた。
+- テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した（748件中 740 pass / 4 fail / 4 skip）。

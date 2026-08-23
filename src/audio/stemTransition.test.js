@@ -56,6 +56,20 @@ test('planStemTransition accepts a mid-vocal outgoing exit that plain planBeatmi
   assert.equal(stemPlan.outgoing.exitStartSec, 158);
 });
 
+test('planStemTransition rejects a technically-nonzero but near-instant inVocal fade (Codex review, PR #48, round 1)', () => {
+  // richOutgoing()/richIncoming() land this pair on the preferred (8-bar,
+  // 16s) tier. lastVocalEndSec is set so the outgoing vocal tail leaves
+  // only a sliver of a second for inVocal to fade in (well below
+  // MIN_MEANINGFUL_INVOCAL_FADE_SEC) — a technically-nonzero fade the OLD
+  // `> 0` check would have accepted as eligible.
+  const outgoing = richOutgoing({ lastVocalEndSec: 173.7 }); // exit at 158, 15.7s of native vocal tail remains
+  const incoming = richIncoming();
+
+  const stemPlan = planStemTransition(outgoing, incoming);
+  assert.equal(stemPlan.eligible, false);
+  assert.deepEqual(stemPlan.reasons, ['stem-mix-no-invocal-fade-room']);
+});
+
 test('planStemTransition still requires everything plain beatmix requires except the outgoing vocal-safety window', () => {
   // Tempo/downbeat/meter gating must be untouched — stem-mix only widens
   // the vocal-clash axis, never weakens tempo sync (docs/mix-transition-

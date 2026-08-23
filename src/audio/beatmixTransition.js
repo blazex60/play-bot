@@ -394,7 +394,12 @@ function rejected(reasons) {
  * Phase 9E (docs/mix-transition-phase9.md §7.2): the three extended-tier
  * (16-bar) gates, evaluated up front — the bar search loop's own starting
  * point depends on this, so it can't wait for a winning exit/entry pair the
- * way per-pair scoring does.
+ * way per-pair scoring does. This is a coarse, TRACK-WIDE prefilter only:
+ * it decides whether the search is even allowed to START looking at 16
+ * bars, not whether any particular candidate pair actually deserves it —
+ * see the per-pair `pairPhraseAlignment` check in the search loop below
+ * (Codex review, PR #48, round 1) for the pair-specific reinforcement of
+ * the "phrase confidence high" gate.
  *
  * - phrase confidence high: EXTENDED_PHRASE_CONFIDENCE_MIN, see its
  *   docstring.
@@ -556,15 +561,16 @@ export function planBeatmixTransition(outgoing, incoming, {
   const durationSec = outgoing.durationSec;
   const incomingDurationSec = Number.isFinite(incoming.durationSec) ? incoming.durationSec : Infinity;
 
-  // Phase 9E (docs/mix-transition-phase9.md §7.2): "search order 16 -> 8 ->
-  // 4 -> fallback" is realized as one dense sweep (unchanged in shape from
-  // pre-9E) that simply starts higher when extendedTierEligible() clears —
-  // 16,15,...,4 instead of 8,7,...,4 — rather than a separate discrete pass
-  // per named tier. The per-pair loop below already tries every bar count
-  // down to minOverlapBars and keeps the best-scoring fit across all of
-  // them, so a sweep starting at 16 naturally passes through (and can still
-  // land on) 8 or 4 for a pair that doesn't have room for the full 16.
+  // Codex review (PR #48, round 1): "search order 16 -> 8 -> 4 -> fallback"
+  // (§7.2) names three specific tiers, not every integer bar count between
+  // them — a dense sweep could land on an unadvertised width like 15 or 10
+  // bars. tierBars restricts the per-pair loop below to just the
+  // configured stops that are both reachable (<= startBars) and above the
+  // hard floor (>= minOverlapBars), widest first.
   const startBars = extendedTierEligible(outgoing, incoming, stemAware) ? MIX_BARS.extended : overlapBars;
+  const tierBars = [...new Set([startBars, overlapBars, minOverlapBars])]
+    .filter((bars) => bars <= startBars && bars >= minOverlapBars)
+    .sort((a, b) => b - a);
 
   let best = null;
   for (const exit of exitCandidates) {
@@ -582,13 +588,28 @@ export function planBeatmixTransition(outgoing, incoming, {
       const forwardSafePlayback = requireEntryForwardSafe
         ? entryForwardSafeSec(incoming, entry.sec) / match.ratio
         : Infinity;
-      for (let bars = startBars; bars >= minOverlapBars; bars -= 1) {
+      for (const bars of tierBars) {
         const fadeSec = barSec * bars;
         if (
           fadeSec > roomAfterExitPlayback + 1e-6
           || fadeSec > roomInIncomingPlayback + 1e-6
           || fadeSec > forwardSafePlayback + 1e-6
         ) continue;
+        // Codex review (PR #48, round 1): the extended (16-bar) tier's own
+        // eligibility gate (extendedTierEligible(), above) only sees
+        // TRACK-WIDE proxies (downbeatGrid.confidence, vocalConfidence) —
+        // it has no idea yet which exit/entry pair will actually win. A
+        // pair with a strong grid but only a weak/default phrase score
+        // (buildPhraseCandidates() scores phrase alignment separately from
+        // downbeat-grid confidence) could still reach 16 bars on a track
+        // whose overall phrase confidence is high. Gate the 16-bar
+        // candidacy on THIS pair's own phraseAlignment specifically; a pair
+        // that fails this falls through to the next (narrower) tier in
+        // tierBars instead of being rejected outright.
+        if (bars === MIX_BARS.extended) {
+          const pairPhraseAlignment = clamp01(((exit.score ?? 0) + (entry.score ?? 0)) / 2);
+          if (pairPhraseAlignment < EXTENDED_PHRASE_CONFIDENCE_MIN) continue;
+        }
         // Codex review (PR #46, round 2): rank pairs by the STRICT (non-
         // relaxed) score even in stem-mix mode. `stemAware` only needs to
         // widen which exits are ELIGIBLE (findExitCandidates() above already

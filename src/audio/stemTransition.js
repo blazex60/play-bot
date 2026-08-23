@@ -7,6 +7,18 @@ import { planBeatmixTransition } from './beatmixTransition.js';
  * rounding edge. Provisional — see the doc's 未決事項.
  */
 export const DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC = 0.2;
+/**
+ * Codex review (PR #48, round 1): the minimum inVocal.fadeSec that still
+ * reads as an actual fade rather than a near-instant onset. The previous
+ * check only rejected an EXACTLY zero fade — a long outgoing vocal tail
+ * (e.g. ending just before the overlap window closes) can leave inVocal
+ * with a few tenths of a second, technically nonzero but audibly
+ * indistinguishable from a hard cut once gainForStemPosition() ramps it.
+ * Applies uniformly across all bar tiers (not just the Phase 9E extended
+ * one) — any tier's stem-mix plan can produce a too-short fade given the
+ * right vocal-tail timing, not only 16-bar ones.
+ */
+export const MIN_MEANINGFUL_INVOCAL_FADE_SEC = 0.5;
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
@@ -90,16 +102,18 @@ export function planStemTransition(outgoing, incoming, options = {}) {
   });
   if (!plan.eligible) return plan;
   const stems = buildStemEnvelopes(outgoing, plan, options);
-  // Codex: when the outgoing vocal tail is long enough to need the whole
-  // (or more than the) overlap just to fade out, inVocalDelaySec clamps to
-  // fadeSec and inVocal's own fadeSec clamps to 0 — gainForStemPosition()
-  // then holds inVocal silent for the entire window and jumps it straight
-  // to full gain only on the last frame, right as promotion switches to
-  // incoming.full (already at its native volume there). That's a hard
-  // vocal onset, not a fade — the whole point of this plan. Reject rather
-  // than produce a degenerate envelope; the caller's existing ladder falls
-  // back to a plain crossfade for a pair like this.
-  if (!(stems.inVocal.fadeSec > 0)) {
+  // Codex (round 1) / Codex review (PR #48, round 1): when the outgoing
+  // vocal tail is long enough to need most or all of the overlap just to
+  // fade out, inVocalDelaySec clamps toward fadeSec and inVocal's own
+  // fadeSec shrinks toward 0 — gainForStemPosition() then holds inVocal
+  // silent for nearly the entire window and ramps it up over a sliver of a
+  // second right as promotion switches to incoming.full (already at its
+  // native volume there). That reads as a hard vocal onset, not a fade,
+  // even when the fade window is technically nonzero — the whole point of
+  // this plan is a genuine fade. Reject rather than produce a degenerate
+  // envelope; the caller's existing ladder falls back to a plain crossfade
+  // for a pair like this.
+  if (!(stems.inVocal.fadeSec >= MIN_MEANINGFUL_INVOCAL_FADE_SEC)) {
     return { mode: null, eligible: false, reasons: ['stem-mix-no-invocal-fade-room'] };
   }
   return {
