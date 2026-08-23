@@ -1274,6 +1274,13 @@ export class GuildPlayer {
     // other dropCurrent() call sites — a /skip landing mid-underrun must
     // not leave this player's stem-queue pause source stuck forever.
     this.#stemQ().noteUnderrunCleared(this);
+    // Codex review (PR #43, round 10): a skip abandons whatever pair was
+    // just evaluated/stashed for the skipped track, same reasoning as
+    // stop()'s own clear above — without this, a later recurrence of the
+    // same pair within the 30s freshness window (e.g. QUEUE loop) could
+    // attribute a stale evaluation to a hard handoff that never actually
+    // evaluated it.
+    this.#lastEvaluatedTransitionReport = null;
   }
 
   /**
@@ -2904,6 +2911,17 @@ export class GuildPlayer {
   async #runLowPriorityStemPrefetch(track) {
     return this.#stemQ().enqueue(async ({ spawnNice, signal } = {}) => {
       throwIfAborted(signal);
+      // Codex review (PR #44, P2): recheck the stem cache now that this LOW
+      // job has actually reached the front of the (possibly minutes-long,
+      // serial) queue — #ensureStemPrefetch() only observed a miss back
+      // when this job was first enqueued. If another guild's playback or
+      // an earlier HIGH job separated this same track while this job
+      // waited, the full download/trim/loudness/staging pipeline below is
+      // pure waste; the real separateTrackStems() already rechecks the
+      // cache too, but only after all of that expensive work is done.
+      const alreadyCached = await this.#getCachedStemsFn(track.videoId).catch(() => null);
+      if (alreadyCached) return alreadyCached;
+      throwIfAborted(signal);
       // Codex review (PR #44, P1): without spawnFn, prefetchTrackFn's
       // default implementation (normalize.js's prefetchTrack) spawns
       // yt-dlp/ffmpeg via the module-level `spawn`, entirely untracked by
@@ -2911,7 +2929,7 @@ export class GuildPlayer {
       // download would have nothing to actually SIGSTOP. Passing spawnNice
       // routes those subprocesses through the same register()/children Set
       // every other job in this queue already uses.
-      const downloaded = await this.#prefetchTrackFn(track, { spawnFn: spawnNice });
+      const downloaded = await this.#prefetchTrackFn(track, { spawnFn: spawnNice, signal });
       try {
         throwIfAborted(signal);
         const stagedPath = await this.#stageTempFileCopyFn(downloaded.filePath).catch((err) => {

@@ -1025,3 +1025,47 @@ test('extendedTierEligible-equivalent gate is symmetric: low confidence on the O
   assert.equal(plan.eligible, true);
   assert.equal(plan.sync.bars, MIX_BARS.preferred);
 });
+
+// --- stem-mix pair-search ranking (Codex review, PR #46, round 2) ---------
+//
+// The eligibility relaxation (requireExitVocalSafe:false) makes a mid-vocal
+// exit a valid CANDIDATE — it must not also make the pair SEARCH itself
+// prefer that candidate over an available vocal-safe one of otherwise
+// similar quality, just because a higher phrase-boundary score happened to
+// land on it. Only vocalSafety differs between stemAware:true/false scoring
+// (§6.3) — this fixture gives the mid-vocal exit a better phrase score than
+// the vocal-safe alternative so the two scoring modes disagree about which
+// pair should win.
+
+test('planBeatmixTransition({stemAware:true}) ranks candidate exit pairs by the strict (non-relaxed) score, not the relaxed one', () => {
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 150,
+    phrasesTail: [
+      { sec: 100, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }, // deep mid-vocal, high phrase score
+      { sec: 152, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }, // vocal-safe, lower phrase score
+    ],
+  });
+  const incoming = makeAnalysis({
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    firstVocalStartSec: 30,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+  });
+
+  const plan = planBeatmixTransition(outgoing, incoming, {
+    requireExitVocalSafe: false,
+    requireEntryForwardSafe: false,
+    stemAware: true,
+  });
+
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.outgoing.exitStartSec, 152,
+    `expected the search to prefer the vocal-safe exit (152) over the higher-phrase-score mid-vocal one (100) under strict ranking, got ${plan.outgoing.exitStartSec}`);
+});
