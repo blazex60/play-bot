@@ -4,6 +4,7 @@ import {
   findExitCandidates,
   findEntryCandidates,
   scoreTransitionPair,
+  scoreTransitionPairDetailed,
   planBeatmixTransition,
   planPhraseCrossfade,
   planBeatSyncedTransition,
@@ -181,6 +182,59 @@ test('scoreTransitionPair adds a harmonic bonus only when both sides clear the c
     exit, entry, targetBpm: 120,
   });
   assert.ok(withHarmonic > withoutHarmonic);
+});
+
+// --- scoreTransitionPairDetailed (Phase 9D §6.3: Candidate quality sub-terms) ---
+
+test('scoreTransitionPairDetailed().total matches scoreTransitionPair() exactly for the same inputs', () => {
+  // scoreTransitionPair() is now a thin wrapper around the same computation
+  // scoreTransitionPairDetailed() exposes — same rounding, same call
+  // signature — so every existing caller/test treating it as "the score, a
+  // number" must see no behavior change from this refactor.
+  const outgoing = makeAnalysis({ downbeatConfidence: 0.7 });
+  const incoming = makeAnalysis({ downbeatConfidence: 0.7 });
+  const exit = { sec: 190, score: 0.5 };
+  const entry = { sec: 5, score: 0.5 };
+  const params = { outgoing, incoming, exit, entry, targetBpm: 121 };
+  assert.equal(scoreTransitionPairDetailed(params).total, scoreTransitionPair(params));
+});
+
+test('scoreTransitionPairDetailed() reports harmonicCompatibility as null (not 0) when confidence does not clear the threshold on both sides', () => {
+  // §9.2 "key match is never required": harmonicCompatibility must
+  // distinguish "not scored at all" (null) from "scored and it was bad"
+  // (a low number close to 0) — the Candidate struct in §6.3 relies on
+  // this to avoid fabricating a harmonic quality reading that was never
+  // actually computed.
+  const base = { downbeatGrid: { confidence: 0.6 }, lastVocalEndSec: 0, firstVocalStartSec: null };
+  const exit = { sec: 190, score: 0.5 };
+  const entry = { sec: 5, score: 0.5 };
+  const belowThreshold = scoreTransitionPairDetailed({
+    outgoing: { ...base, harmonicConfidence: 0.2, tailKey: '8B' },
+    incoming: { ...base, harmonicConfidence: 0.2, headKey: '8B' },
+    exit, entry, targetBpm: 120,
+  });
+  assert.equal(belowThreshold.harmonicCompatibility, null);
+
+  const aboveThreshold = scoreTransitionPairDetailed({
+    outgoing: { ...base, harmonicConfidence: 0.9, tailKey: '8B' },
+    incoming: { ...base, harmonicConfidence: 0.9, headKey: '8B' },
+    exit, entry, targetBpm: 120,
+  });
+  assert.ok(typeof aboveThreshold.harmonicCompatibility === 'number');
+  assert.ok(aboveThreshold.harmonicCompatibility >= 0 && aboveThreshold.harmonicCompatibility <= 1);
+});
+
+test('scoreTransitionPairDetailed() returns every §6.3 quality sub-term as a finite 0..1 number', () => {
+  const outgoing = makeAnalysis({ downbeatConfidence: 0.7 });
+  const incoming = makeAnalysis({ downbeatConfidence: 0.7 });
+  const exit = { sec: 190, score: 0.5 };
+  const entry = { sec: 5, score: 0.5 };
+  const detail = scoreTransitionPairDetailed({ outgoing, incoming, exit, entry, targetBpm: 121 });
+  for (const key of ['phraseAlignment', 'tempoCompatibility', 'vocalSafety', 'downbeatConfidence', 'energyContinuity']) {
+    assert.ok(Number.isFinite(detail[key]), `expected ${key} to be a finite number, got ${detail[key]}`);
+    assert.ok(detail[key] >= 0 && detail[key] <= 1, `expected ${key} to be in 0..1, got ${detail[key]}`);
+  }
+  assert.ok(Number.isFinite(detail.total) && detail.total >= 0 && detail.total <= 1);
 });
 
 // --- planBeatmixTransition -----------------------------------------------------

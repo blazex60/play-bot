@@ -205,8 +205,29 @@ export function findEntryCandidates(incoming) {
  * §10 transitionScore, normalized to 0..1 so it doubles as the resulting
  * plan's `confidence`. Key compatibility is scored when available but never
  * gates eligibility (§9.2: "キー一致は必須条件にしない").
+ *
+ * Phase 9D (docs/mix-transition-phase9.md §6.3): this used to compute and
+ * discard every sub-term, returning only the weighted total. The Candidate
+ * struct now needs those sub-terms (`quality.phraseAlignment`/
+ * `tempoCompatibility`/etc.) for observability, so the actual math moved
+ * into scoreTransitionPairDetail() below; this function is now a thin
+ * wrapper that keeps returning exactly the same scalar it always did (same
+ * rounding, same call signature) — every existing caller/test that treats
+ * this as "the score, a number" is unaffected.
  */
-export function scoreTransitionPair({
+export function scoreTransitionPair(params) {
+  return scoreTransitionPairDetail(params).total;
+}
+
+/**
+ * Phase 9D: same computation as scoreTransitionPair(), but returns every
+ * weighted sub-term alongside the total — this is what planBeatmixTransition()
+ * uses to populate a winning pair's `quality` object (§6.3). Not exported
+ * under a "public API" expectation beyond that internal use (see
+ * scoreTransitionPairDetailed() for the exported wrapper tests/other
+ * modules should use if they need the breakdown directly).
+ */
+function scoreTransitionPairDetail({
   outgoing, incoming, exit, entry, targetBpm, match = null, stemAware = false,
 }) {
   // Phase 8: a stem-mix candidate's outgoing exit is allowed to sit mid-
@@ -247,15 +268,42 @@ export function scoreTransitionPair({
 
   const harmonicOk = (outgoing?.harmonicConfidence ?? 0) >= HARMONIC_CONFIDENCE_MIN
     && (incoming?.harmonicConfidence ?? 0) >= HARMONIC_CONFIDENCE_MIN;
+  let harmonicCompatibility = null;
   if (harmonicOk) {
     const dist = camelotDistance(outgoing?.tailKey, incoming?.headKey);
     if (dist != null) {
-      total += clamp01(1 - dist / MAX_CAMELOT_DISTANCE) * HARMONIC_WEIGHT;
+      harmonicCompatibility = clamp01(1 - dist / MAX_CAMELOT_DISTANCE);
+      total += harmonicCompatibility * HARMONIC_WEIGHT;
       totalWeight += HARMONIC_WEIGHT;
     }
   }
 
-  return Number(clamp01(total / totalWeight).toFixed(3));
+  return {
+    total: Number(clamp01(total / totalWeight).toFixed(3)),
+    phraseAlignment: Number(phraseAlignment.toFixed(3)),
+    tempoCompatibility: Number(tempoCompatibility.toFixed(3)),
+    vocalSafety: Number(vocalSafety.toFixed(3)),
+    downbeatConfidence: Number(downbeatConfidence.toFixed(3)),
+    // null (not 0) when harmonic confidence didn't clear the threshold on
+    // both sides — §9.2's "key match is never required" means "we didn't
+    // score this at all" is a different fact than "we scored it and it was
+    // bad", and the Candidate struct (§6.3) must keep that distinction
+    // rather than fabricating a 0.
+    harmonicCompatibility,
+    energyContinuity: Number(energy.toFixed(3)),
+  };
+}
+
+/**
+ * Phase 9D (docs/mix-transition-phase9.md §6.3): the same breakdown
+ * scoreTransitionPairDetail() computes internally, exposed for anything
+ * outside this module that wants the sub-terms directly rather than reading
+ * them back off a winning plan's `.quality` (tests, mainly — planBeatmixTransition()
+ * itself is the only production caller, and it already gets the breakdown
+ * from the internal function without going through this export).
+ */
+export function scoreTransitionPairDetailed(params) {
+  return scoreTransitionPairDetail(params);
 }
 
 function rejected(reasons) {
