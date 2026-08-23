@@ -267,6 +267,27 @@ test('buildTransitionPlanReport: legacy plan (simple-fade/tail-fade/crossfade) w
   assert.equal(report.exit.sec, 196);
 });
 
+test('buildTransitionPlanReport: legacy plan exit fallback accounts for a stretched outgoing tempo (Codex review, PR #43 round 5)', () => {
+  const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
+  const report = buildTransitionPlanReport({
+    outgoingTrack,
+    incomingTrack,
+    outgoingAnalysis: { durationSec: 200 },
+    incomingAnalysis: {},
+    rawPlan,
+    stemPlan: null,
+    stemCacheAttempted: false,
+    outgoingStemsCached: false,
+    incomingStemsCached: false,
+    plannedMode: 'simple-fade',
+    // A chained beatmix -> simple-fade: the outgoing source is playing back
+    // 10% faster than native, so fadeSec (a playback-domain duration) must
+    // be scaled up before subtracting from the native-domain duration.
+    outgoingTempoRatio: 1.1,
+  });
+  assert.equal(report.exit.sec, 200 - 4 * 1.1);
+});
+
 test('buildTransitionPlanReport: legacy plan exit stays null when neither startSec nor duration is known', () => {
   const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
   const report = buildTransitionPlanReport({
@@ -305,6 +326,18 @@ test('logGaplessTransition: prints an abbreviated [MIX PLAN] block only when deb
   assert.match(calls[0], /selected=gapless/);
 });
 
+test('logGaplessTransition: kind distinguishes a snap handoff from the generic hard-handoff default (Codex review, PR #43 round 5)', () => {
+  const calls = [];
+  const logger = { log: (msg) => calls.push(msg) };
+
+  logGaplessTransition({ outgoingTrack, incomingTrack }, { debug: true, logger, kind: 'snap-handoff' });
+  assert.match(calls[0], /snap handoff/);
+
+  logGaplessTransition({ outgoingTrack, incomingTrack }, { debug: true, logger });
+  assert.match(calls[1], /hard handoff/);
+  assert.doesNotMatch(calls[1], /snap handoff/);
+});
+
 // --- formatTransitionPlanLog -----------------------------------------------
 
 test('formatTransitionPlanLog: renders the §3.2 shape with from/to/selected and every candidate block', () => {
@@ -333,6 +366,43 @@ test('formatTransitionPlanLog: renders the §3.2 shape with from/to/selected and
   assert.match(text, /stemCache:\n {2}outgoing=HIT\n {2}incoming=HIT/);
   assert.match(text, /exit:\n {2}sec=183\.20\n {2}bar=92\n {2}vocalActive=true/);
   assert.match(text, /entry:\n {2}sec=0\.00\n {2}bar=0\n {2}firstVocalSec=12\.40/);
+});
+
+test('formatTransitionPlanLog: escapes an untrusted track title instead of interpolating it raw (Codex review, PR #43, P2)', () => {
+  // Track titles come from yt-dlp/YouTube metadata and are not trusted — a
+  // title containing a quote and a newline could otherwise forge fields or
+  // fake an additional [MIX PLAN] block in the MIX_DEBUG log output.
+  const maliciousTitle = 'x"\nselected=stem-mix';
+  const report = buildTransitionPlanReport({
+    outgoingTrack: { title: maliciousTitle },
+    incomingTrack,
+    outgoingAnalysis: { lastVocalEndSec: 190 },
+    incomingAnalysis: { firstVocalStartSec: 12.4 },
+    rawPlan: beatmixPlan(),
+    stemPlan: null,
+    stemCacheAttempted: false,
+    outgoingStemsCached: false,
+    incomingStemsCached: false,
+    plannedMode: 'beatmix',
+  });
+  report.selected = 'beatmix';
+  report.downgradedFrom = null;
+
+  const text = formatTransitionPlanLog(report);
+  const fromLine = text.split('\n')[1];
+  assert.equal(fromLine, `from=${JSON.stringify(maliciousTitle)}`);
+  // The escaped title must not introduce a real, unescaped newline that a
+  // naive line-by-line log reader would treat as a new field/entry.
+  assert.doesNotMatch(fromLine, /\n/);
+});
+
+test('logGaplessTransition: escapes an untrusted track title the same way (Codex review, PR #43, P2)', () => {
+  const maliciousTitle = 'y"\nselected=gapless';
+  const calls = [];
+  const logger = { log: (msg) => calls.push(msg) };
+  logGaplessTransition({ outgoingTrack: { title: maliciousTitle }, incomingTrack }, { debug: true, logger });
+  const fromLine = calls[0].split('\n')[1];
+  assert.equal(fromLine, `from=${JSON.stringify(maliciousTitle)}`);
 });
 
 test('formatTransitionPlanLog: an ineligible candidate prints its reason, not bars/fadeSec/score', () => {

@@ -1538,6 +1538,10 @@ Stem/EQ Automation
 - `stemPlan` を再選択の巻き戻し（TRACK ループで stem-mix → `rawPlan` 再導出）が発生し、かつ再導出後の実際のモードが `'phrase-crossfade'` になるごく稀なケースでは、`normalizeTransitionPlan()` が phrase-crossfade を `mixPlan.mode: 'crossfade'` へ平坦化するため、最終 `selected` は `'phrase-crossfade'` ではなく `'crossfade'` と報告される（`modeDowngraded` 経由で `mixPlan.mode` をそのまま採用しているため）。通常経路（TRACK ループでない）では発生しない。
 - 実音源・実 Discord セッションでの「10〜20曲連続再生してログだけで説明できるか」（§3.4 の完了条件そのもの）は、Phase 7A 以来のこのエージェント環境の制約により検証できていない。ユニットテスト（`transitionMetrics.test.js`/`transitionLog.test.js`/`player.acceptance.test.js` の新規ケース）でロジックの正しさは確認済み。
 - Web UI への表示（§3 冒頭で触れられている「必要なら」の部分）は実装していない。`getTransitionMetrics()` は現状 Bot process 内でしか読めない — Web process への配線（`botApi.js` 経由の internal API 追加）は本 PR のスコープ外。
+- Codex レビュー round 9 で見つかった以下3件は、いずれも純粋な observability（ログ/metrics）にのみ影響し実際の再生挙動には影響しないこと、および本 PR が既に9ラウンドのレビューを経ていることから、このラウンドでは対応を見送った（各スレッドへの返信にも同じ理由を記載）:
+  - **TRACK ループで stem-mix → plain crossfade へ再選択された際、`exit` フィールドが古い（stem plan 時点の）スナップショットのまま** — `entry` は既に `pendingEntrySec` で再結線済みだが、`exit` の同様の再結線には `transitionLog.js` の private な `exitInfo()` を export し、「stem plan からのダウングレードの場合のみ」という `modeDowngraded` より狭い条件で呼び直す必要がある。
+  - **private video などで B の起動に失敗し B→C へ再試行した場合、A→C という実際に起きた継続が `totalTransitions`/ログのどちらにも記録されない** — `resolvedGaplessFrom`（起源トラック A）を、失敗した B の呼び出しをまたいで C の呼び出しまで保持するよう `playNext()` の再試行チェーンを変更する必要がある。
+  - **`incomingerror`（`startCrossfade()` が一度 true を返した後、実際の昇格前に incoming ストリームが失敗するケース）で、既にカウント済みの遷移が再試行成功時に二重カウントされうる** — 昇格確認まで記録を遅らせるか、`transitionMetrics.js` に rollback API を追加する必要があり、いずれも単一ファイル内には収まらない変更。
 
 ### 完了条件（§3.4/§17 9A 相当）
 
