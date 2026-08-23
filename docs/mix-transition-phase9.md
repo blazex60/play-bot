@@ -1512,3 +1512,36 @@ Stem/EQ Automation
 ```
 
 までを完成させる。
+
+---
+
+## 実装ノート (Phase 9A)
+
+§3 の Transition Observability を実装した。プレイバック挙動・fallback ladder の判定ロジック自体は一切変更していない — 既存の判定結果を後から説明可能にする、純粋な観測レイヤーとして追加した。
+
+### 実装箇所
+
+- `src/audio/transitionMetrics.js`（新規）: プロセス内 in-memory アキュムレータ。`recordTransition({selected, stemCache})` / `getTransitionMetrics()` / `resetTransitionMetrics()`（テスト専用）。§3.3 の例と同じキー命名（`stemMix`/`beatmix`/`phraseCrossfade`/`crossfade`/`tailFade`、モード文字列 `'stem-mix'` 等の camelCase 変換）。永続化なし（DB テーブル追加なし — Bot process は SQLite を開かない、CLAUDE.md）。
+- `src/audio/transitionLog.js`（新規）: `buildTransitionPlanReport()`（生の plan オブジェクト群から §3.2 相当の構造化 report を組み立てる純関数）、`formatTransitionPlanLog()`（`[MIX PLAN]` テキストブロックへの整形）、`logTransitionPlan()`（`recordTransition()` を常時呼び、`MIX_DEBUG=true` のときだけ `formatTransitionPlanLog()` の出力を `console.log`）。判定ロジックは一切含まない — beatmixTransition.js/stemTransition.js/transition.js が既に下した決定を後から記述するだけ。
+- `src/player.js` の `#maybeStartCrossfade()`: 既存の fallback ladder（`rawPlan = planBeatSyncedTransition(...)` → 条件付き `stemPlan = planStemTransitionFn(...)`）の判定が確定した直後に `buildTransitionPlanReport()` でレポートのスナップショットを取り（`plannedMode`）、TRACK ループ再選択・`forcePlainCrossfade`（incoming source が seek/tempo stretch を実際には適用できなかったケース）による事後ダウングレードを `modeDowngraded` フラグで追跡。実際に `startCrossfade()`/`startStemCrossfade()` を呼ぶ直前（＝ transition が実際にコミットされる、tick ごとではなく transition ごとに一度だけ通る地点）で `report.selected`/`report.downgradedFrom` を確定し `#logTransitionPlanFn(report)` を呼ぶ。テスト用に `logTransitionPlanFn`（既定値 `logTransitionPlan`）を他の Fn 群（`getCachedStemsFn`/`planStemTransitionFn` 等）と同じ DI パターンでコンストラクタに追加した。
+
+### §3.2 ログ形状との対応
+
+- `beatmix`/`stemMix`/`phraseCrossfade` の各候補ブロックは、既存 ladder が実際に評価した結果だけを報告する。`planBeatSyncedTransition()` は tier 1（beatmix）が eligible ならその時点で return し tier 2（phrase-crossfade）を評価しない — この短絡を再現するため、beatmix が勝った場合 `phraseCrossfade`/`stemMix` は `eligible=false, reason=not-evaluated-beatmix-selected` と報告する（§3.2 の例のように 3 候補が常に揃って埋まっているわけではない）。同様に stem-mix はキャッシュ未ヒットや `#stemMixUnavailableKey` によるスキップ時は `reason=stem-cache-miss` 等、実際にスキップされた理由をそのまま出す。これは 3 候補を常に独立評価する設計（Phase 9D の対象）を先取りしないための意図的な選択 — `planBeatmixTransition()`/`planPhraseCrossfade()` を観測目的だけのために二重に呼び出すことも、キャッシュチェックを余分に増やすこともしていない。
+- `exit`/`entry` は ladder が最初に選んだ plan（`stemPlan` が eligible ならそれ、でなければ `rawPlan`）のスナップショットから取る。`bar` フィールドは beatmix/stem-mix の `exitBarIndex`/`entryBarIndex`、phrase-crossfade の同名フィールドから拾う（legacy crossfade/tail-fade/simple-fade には小節概念がないため `bar=null`）。`vocalActive`/`firstVocalSec` は outgoing/incoming の解析結果からその場で算出する。
+- `stemCache` は実際に fs チェックが走った場合のみ `HIT`/`MISS`、走っていなければ（beatmix 勝利 or `#stemMixUnavailableKey`）`null`（ログ上は `UNKNOWN`）。metrics 側もチェックが走った回だけ `outgoingHit`/`outgoingMiss`/`incomingHit`/`incomingMiss` を加算する。
+- `MIX_DEBUG` は既存の boolean env パターン（`src/web/server/config.js` の `DEMO_LOGIN_ENABLED`、`env.FOO === 'true'`）に合わせ `process.env.MIX_DEBUG === 'true'` で判定する。§19 で言及されていたが実装されていなかったフラグを、このドキュメントの記述通りに新規導入した。
+
+### 未決事項 / 既知の制約
+
+- TRACK ループモード（`next === current`）で stem-mix/beatmix が plain crossfade へ再選択された場合、`report.selected`/`downgradedFrom` は正しく更新されるが、`exit`/`entry` の `sec`/`bar` は最初のスナップショット（ダウングレード前の plan）のまま — 特に TRACK ループは常に `entrySec` を 0 へ強制するため、レポート上の `entry.sec` が実際の再生開始位置（0）と食い違う。頻度の低いエッジケース（同一曲ループ）であり、完全な追従には plan 再構築のたびにレポートも作り直す必要があるため、このラウンドでは対応を見送った。
+- `stemPlan` を再選択の巻き戻し（TRACK ループで stem-mix → `rawPlan` 再導出）が発生し、かつ再導出後の実際のモードが `'phrase-crossfade'` になるごく稀なケースでは、`normalizeTransitionPlan()` が phrase-crossfade を `mixPlan.mode: 'crossfade'` へ平坦化するため、最終 `selected` は `'phrase-crossfade'` ではなく `'crossfade'` と報告される（`modeDowngraded` 経由で `mixPlan.mode` をそのまま採用しているため）。通常経路（TRACK ループでない）では発生しない。
+- 実音源・実 Discord セッションでの「10〜20曲連続再生してログだけで説明できるか」（§3.4 の完了条件そのもの）は、Phase 7A 以来のこのエージェント環境の制約により検証できていない。ユニットテスト（`transitionMetrics.test.js`/`transitionLog.test.js`/`player.acceptance.test.js` の新規ケース）でロジックの正しさは確認済み。
+- Web UI への表示（§3 冒頭で触れられている「必要なら」の部分）は実装していない。`getTransitionMetrics()` は現状 Bot process 内でしか読めない — Web process への配線（`botApi.js` 経由の internal API 追加）は本 PR のスコープ外。
+
+### 完了条件（§3.4/§17 9A 相当）
+
+- [x] `[MIX PLAN]` ログ（`MIX_DEBUG=true` 時）に `from`/`to`/`selected`/`beatmix`/`stemMix`/`phraseCrossfade`/`stemCache`/`exit`/`entry` が揃って出力される
+- [x] metrics アキュムレータ（`totalTransitions`/`selected.*`/`stemCache.*`）が `MIX_DEBUG` の値に関わらず常時更新される
+- [x] 既存の fallback ladder / 実際に選ばれる transition mode / フェード曲線は無変更（`bun run test:server` で Phase 6-8 の既存テストが1件も変わらず通過）
+- [ ] 実音源・実運用セッションでの「ログだけで全 transition の理由を説明できる」検証（上記未決事項参照 — このエージェント環境では実施不可）

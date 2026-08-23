@@ -1849,6 +1849,77 @@ test('acceptance (mixer): stem-mix transition is chosen when both sides have cac
   }
 });
 
+// --- Phase 9A (docs/mix-transition-phase9.md §3): transition observability ---
+
+test('acceptance (mixer): a committed stem-mix transition emits exactly one [MIX PLAN] report, selected=stem-mix', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  const logCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => ({
+      vocalPath: `/tmp/${videoId}.vocal.wav`,
+      instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+    }),
+    createFileSourceFn: () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 60; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.ok(startedPlan, 'expected a crossfade to have armed');
+    assert.equal(startedPlan.mode, 'stem-mix');
+    // Exactly one report for the one committed transition — not one per
+    // ~200ms arm-tick re-evaluation that led up to it.
+    assert.equal(logCalls.length, 1);
+    const report = logCalls[0];
+    assert.equal(report.from, 'Track A');
+    assert.equal(report.to, 'Track B');
+    assert.equal(report.selected, 'stem-mix');
+    assert.equal(report.downgradedFrom, null);
+    assert.equal(report.candidates.stemMix.eligible, true);
+    assert.deepEqual(report.stemCache, { outgoing: 'hit', incoming: 'hit' });
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): logTransitionPlan still fires (with the real ladder\'s own selection) when no custom Fn is injected', async () => {
+  const { player, queue } = makePlayer({ trackDuration: 3, framesPerTrack: 400 });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3 }));
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 60; i += 1) {
+      player.mixStream.read(FRAME_BYTES);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // No assertion beyond "did not throw" — this exercises the real
+    // (non-injected) logTransitionPlan()/buildTransitionPlanReport() wiring
+    // end-to-end with only fallbackAnalysis()-grade analysis available
+    // (no bpm/vocal data), which every earlier acceptance test in this file
+    // bypasses via a custom getTrackAnalysisFn/logTransitionPlanFn.
+  } finally {
+    await player.stop();
+  }
+});
+
 test('acceptance (mixer): stem-mix is skipped (falls back to the existing ladder) when stems are not cached', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   new Int16Array(frame.buffer).fill(4000);

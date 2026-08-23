@@ -26,6 +26,7 @@ import { LoopMode } from './queue.js';
 import { getAnalysisQueue } from './audio/analysisQueue.js';
 import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
 import { planStemTransition } from './audio/stemTransition.js';
+import { buildTransitionPlanReport, logTransitionPlan } from './audio/transitionLog.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
@@ -348,6 +349,8 @@ export class GuildPlayer {
   #separateTrackStemsFn;
   #getCachedStemsFn;
   #planStemTransitionFn;
+  /** Phase 9A (docs/mix-transition-phase9.md §3): test-only override — see logTransitionPlan()'s own docstring for the always-on-metrics/MIX_DEBUG-gated-log split. */
+  #logTransitionPlanFn;
   /** Test-only override — the two stem-prep methods call createFileSource() directly (they bypass #createPcmSource entirely, since stem WAVs need no download/normalize/loudnorm pass), so a dedicated injection point mirrors this file's existing DI convention for every other real-process spawn. */
   #createFileSourceFn;
   /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
@@ -425,6 +428,7 @@ export class GuildPlayer {
     getCachedStemsFn = getCachedStems,
     planStemTransitionFn = planStemTransition,
     createFileSourceFn = createFileSource,
+    logTransitionPlanFn = logTransitionPlan,
     pcmWaitTimeoutMs = PCM_WAIT_TIMEOUT_MS,
   }) {
     this.#guildId = guildId;
@@ -450,6 +454,7 @@ export class GuildPlayer {
     this.#getCachedStemsFn = getCachedStemsFn;
     this.#planStemTransitionFn = planStemTransitionFn;
     this.#createFileSourceFn = createFileSourceFn;
+    this.#logTransitionPlanFn = logTransitionPlanFn;
     this.#pcmWaitTimeoutMs = Number.isFinite(pcmWaitTimeoutMs)
       ? pcmWaitTimeoutMs
       : PCM_WAIT_TIMEOUT_MS;
@@ -1907,8 +1912,15 @@ export class GuildPlayer {
       let outCachedStems = null;
       let inCachedStems = null;
       let norm = null;
+      let stemPlan = null;
       const stemCacheLookupKey = `${current.videoId ?? ''}:${next.videoId ?? ''}`;
-      if (rawPlan.mode !== 'beatmix' && this.#stemMixUnavailableKey !== stemCacheLookupKey) {
+      // Phase 9A (docs/mix-transition-phase9.md §3): whether the stem-cache
+      // lookup below actually ran this tick — distinguishes a genuine
+      // HIT/MISS from "never checked" (beatmix already won, or this pair is
+      // marked #stemMixUnavailableKey) for the [MIX PLAN] log/metrics built
+      // further down. Read-only bookkeeping; does not affect selection.
+      const stemCacheAttempted = rawPlan.mode !== 'beatmix' && this.#stemMixUnavailableKey !== stemCacheLookupKey;
+      if (stemCacheAttempted) {
         if (this.#stemCacheHit?.key === stemCacheLookupKey) {
           ({ outCachedStems, inCachedStems } = this.#stemCacheHit);
         } else {
@@ -1921,7 +1933,7 @@ export class GuildPlayer {
           }
         }
         if (outCachedStems && inCachedStems) {
-          const stemPlan = this.#planStemTransitionFn(outAnalysis, inAnalysis, {
+          stemPlan = this.#planStemTransitionFn(outAnalysis, inAnalysis, {
             outgoingPlaybackBpm,
             tempoBackend,
             maxOverlapSec: MAX_CROSSFADE_SEC,
@@ -1935,6 +1947,27 @@ export class GuildPlayer {
         if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
         norm = normalizeTransitionPlan(rawPlan);
       }
+
+      // Phase 9A: snapshot the ladder's decision (before any later downgrade
+      // — TRACK loop mode / an incoming source that can't honor a seek or
+      // stretch) into a log report. `selected`/`downgradedFrom` are
+      // finalized right before the actual startCrossfade()/
+      // startStemCrossfade() call below, once the real executed mode is
+      // known — see the `modeDowngraded` flag set at each override site.
+      const plannedMode = stemPlan?.eligible ? 'stem-mix' : rawPlan.mode;
+      const transitionPlanReport = buildTransitionPlanReport({
+        outgoingTrack: current,
+        incomingTrack: next,
+        outgoingAnalysis: outAnalysis,
+        incomingAnalysis: inAnalysis,
+        rawPlan,
+        stemPlan,
+        stemCacheAttempted,
+        outgoingStemsCached: Boolean(outCachedStems),
+        incomingStemsCached: Boolean(inCachedStems),
+        plannedMode,
+      });
+      let modeDowngraded = false;
 
       // §2.3/§8.4: TRACK loop mode repeats the SAME track (`next === current`
       // above) — planBeatSyncedTransition still picks a head-window entry
@@ -1960,6 +1993,10 @@ export class GuildPlayer {
           // already performs safely for non-stem plans.
           if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
           norm = normalizeTransitionPlan(rawPlan);
+          // Phase 9A: the mode actually used just changed away from the
+          // planned 'stem-mix' — see transitionPlanReport's finalization
+          // below.
+          modeDowngraded = true;
         }
         norm.entrySec = 0;
         norm.tempoFilter = null;
@@ -1968,6 +2005,7 @@ export class GuildPlayer {
           norm.mixPlan = {
             ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null,
           };
+          modeDowngraded = true;
         }
       }
 
@@ -2114,6 +2152,14 @@ export class GuildPlayer {
           await this.#cleanupIncomingTempFile();
           return;
         }
+        // Phase 9A: reached only for beatmix/phrase-crossfade (stem-mix
+        // returned above) — both lose their planned entry/EQ treatment here
+        // (baseSwap forced false, sync/eq/stems nulled below), which is
+        // exactly the "downgraded" case the [MIX PLAN] log is meant to
+        // surface, even though phrase-crossfade's mixPlan.mode was already
+        // the string 'crossfade' before AND after this (normalizeTransitionPlan
+        // flattens it regardless of forcePlainCrossfade).
+        modeDowngraded = true;
       }
       let mixPlan = forcePlainCrossfade
         ? { ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null }
@@ -2185,6 +2231,16 @@ export class GuildPlayer {
           return;
         }
       }
+
+      // Phase 9A (docs/mix-transition-phase9.md §3): finalize and emit the
+      // [MIX PLAN] report now that mixPlan reflects everything that could
+      // still change the actually-executed mode (TRACK loop re-derivation,
+      // forcePlainCrossfade) — every earlier `return` above this point was
+      // an abort (retry next arm tick, not a committed transition), so this
+      // is reached exactly once per real transition, not once per tick.
+      transitionPlanReport.selected = modeDowngraded ? mixPlan.mode : plannedMode;
+      transitionPlanReport.downgradedFrom = modeDowngraded ? plannedMode : null;
+      this.#logTransitionPlanFn(transitionPlanReport);
 
       // Set promotion state BEFORE calling startCrossfade()/
       // startStemCrossfade(): if the outgoing source is already at EOF, the
