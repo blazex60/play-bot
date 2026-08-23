@@ -1560,12 +1560,21 @@ export class GuildPlayer {
           const stemJobPriority = this.#stemPrefetchTracker.get(track.videoId)?.priority === StemPrefetchPriority.HIGH
             ? 'high'
             : 'normal';
-          // Codex review (PR #45, P2): retryStemKillAfterCleanup defers the
-          // actual retry call to the .finally() below — #scheduleAnalysis()'s
-          // #scheduledAnalysisTokens dedup guard would otherwise see this
-          // attempt's own (not-yet-released) token and no-op the retry.
-          let retryStemKillAfterCleanup = false;
-          this.#stemQ().enqueue(async ({ spawnNice: stemSpawnNice, signal: stemSignal } = {}) => {
+          // Codex review (PR #45, P2, round 2): retry directly from THIS
+          // staged copy instead of re-staging from `filePath` via a fresh
+          // #scheduleAnalysis(track, filePath) call — by the time a
+          // stem-queue-level kill happens, `filePath` (the original
+          // normalized file) may already be gone via track promotion/end
+          // cleanup, since the split stem queue can now hold this job
+          // independently for minutes. `runSeparation` is recursive so the
+          // one retry it allows reuses the exact same still-on-disk staged
+          // file rather than depending on anything that could have been
+          // cleaned up in between. Cleanup of `stagedPath` and release of
+          // this attempt's #scheduledAnalysisTokens entry are decoupled:
+          // the former only happens once every attempt (original + at most
+          // one retry) has truly settled, the latter happens exactly once
+          // regardless of how many attempts ran.
+          const runSeparation = (allowRetry) => this.#stemQ().enqueue(async ({ spawnNice: stemSpawnNice, signal: stemSignal } = {}) => {
             if (stemSignal?.aborted) return null;
             return this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: stemSpawnNice, signal: stemSignal });
           }, { priority: stemJobPriority }).then(
@@ -1601,18 +1610,17 @@ export class GuildPlayer {
               // never reached for this kind of kill. Same bounded-once-per-
               // videoId retry as that outer catch.
               if (
-                err?.code === 'ANALYSIS_KILLED'
+                allowRetry
+                && err?.code === 'ANALYSIS_KILLED'
                 && this.#stemPrefetchTracker.get(track.videoId)
                 && !this.#stemPrefetchRetriedAfterKill.has(track.videoId)
               ) {
                 this.#stemPrefetchRetriedAfterKill.add(track.videoId);
-                retryStemKillAfterCleanup = true;
+                return runSeparation(false);
               }
             },
-          ).finally(() => {
-            finishAnalysisAttempt(stagedPath);
-            if (retryStemKillAfterCleanup) this.#scheduleAnalysis(track, filePath);
-          });
+          );
+          runSeparation(true).finally(() => finishAnalysisAttempt(stagedPath));
           return analysis;
         } else if (this.#stemPrefetchTracker.get(track.videoId)) {
           // Codex review (PR #44, carried into Phase 9C's stem-queue
