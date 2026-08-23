@@ -4,9 +4,9 @@ import { recordTransition } from './transitionMetrics.js';
  * Phase 9A (docs/mix-transition-phase9.md §3): transition observability.
  * This module is pure presentation/bookkeeping — it does not decide
  * anything about which transition mode gets used (that judgment stays in
- * beatmixTransition.js/stemTransition.js/transition.js, called from
- * player.js's existing fallback ladder). It only describes, after the fact,
- * a decision player.js already made.
+ * src/audio/transitionCandidates.js's rankTransitionCandidates(), called
+ * from player.js). It only describes, after the fact, a decision player.js
+ * already made.
  */
 
 function num(n, digits = 2) {
@@ -28,76 +28,53 @@ function escapeLogTitle(title) {
 }
 
 /**
- * Reduce a beatmix-shaped plan (`planBeatmixTransition()`/`planStemTransition()`
- * output) to the §3.2 candidate fields. `mode` is the plan's own `mode`
- * string ('beatmix' or 'stem-mix') — pass the plan only when it's the one
- * actually produced for that slot; pass null with a reason string when the
- * slot was never evaluated at all (short-circuited by the fallback ladder),
- * which is itself useful observability distinct from "evaluated and
- * rejected".
+ * Reduce a §6.3 Candidate struct (rankTransitionCandidates()'s
+ * `candidates.beatmix`/`.stemMix`/`.phraseCrossfade` — see
+ * src/audio/transitionCandidates.js) to the §3.2 report fields.
  */
-function barredCandidate(plan, notEvaluatedReason) {
-  if (!plan) return { eligible: false, reason: notEvaluatedReason };
-  if (plan.eligible) {
-    return {
-      eligible: true,
-      bars: plan.sync?.bars ?? null,
-      fadeSec: plan.fadeSec,
-      score: plan.confidence,
-    };
-  }
-  return { eligible: false, reason: plan.reasons?.[0] ?? 'unknown' };
-}
-
-/**
- * Same idea as barredCandidate() for planPhraseCrossfade()'s plan shape,
- * which has no bar/downbeat concept (tier 2 never requires a beat grid).
- */
-function phraseCandidate(eligiblePlan, rejectedReason, notEvaluatedReason) {
-  if (eligiblePlan) {
-    return {
-      eligible: true,
-      fadeSec: eligiblePlan.fadeSec,
-      score: eligiblePlan.confidence,
-    };
-  }
-  if (rejectedReason !== undefined) return { eligible: false, reason: rejectedReason ?? 'unknown' };
-  return { eligible: false, reason: notEvaluatedReason };
+function candidateToReportShape(candidate) {
+  if (!candidate?.eligible) return { eligible: false, reason: candidate?.reasons?.[0] ?? 'unknown' };
+  return {
+    eligible: true,
+    bars: candidate.bars ?? null,
+    fadeSec: candidate.fadeSec,
+    score: candidate.score,
+  };
 }
 
 /**
  * Build the observability payload for one transition decision.
  *
- * `rawPlan` is planBeatSyncedTransition()'s return value (the §16 ladder:
- * beatmix -> phrase-crossfade -> legacy planTransition()). `stemPlan` is
- * player.js's independent planStemTransition() attempt (Phase 8), or null
- * when it was never attempted (beatmix already won, or the pair is marked
- * `#stemMixUnavailableKey`, or the stem cache lookup itself was never run).
- *
- * Only beatmix/phrase-crossfade's OWN eligibility is read from rawPlan —
- * this never calls planBeatmixTransition()/planPhraseCrossfade() a second
- * time. When rawPlan.mode === 'beatmix', tier 2 was short-circuited by the
- * ladder (see beatmixTransition.js's planBeatSyncedTransition()) and
- * genuinely was not evaluated; that is reported as such rather than
- * guessed at.
+ * Phase 9D (docs/mix-transition-phase9.md §6): beatmix/stem-mix/phrase-
+ * crossfade are evaluated independently by rankTransitionCandidates()
+ * (src/audio/transitionCandidates.js) rather than a waterfall — `candidates`
+ * carries their real, independently-computed eligibility straight from
+ * there. This function does no planning itself; it only formats what the
+ * ranker already decided, plus the stem-cache HIT/MISS bookkeeping (an
+ * async fs lookup the ranker itself never performs — see player.js's
+ * #maybeStartCrossfade()).
  *
  * @param {object} params
  * @param {{title:string}} params.outgoingTrack
  * @param {{title:string}} params.incomingTrack
  * @param {object} params.outgoingAnalysis
  * @param {object} params.incomingAnalysis
- * @param {object} params.rawPlan
- * @param {object|null} params.stemPlan
+ * @param {{beatmix:object, stemMix:object, phraseCrossfade:object}} params.candidates
+ *   rankTransitionCandidates()'s `candidates` — §6.3 Candidate structs.
  * @param {boolean} params.stemCacheAttempted whether the stem-cache lookup
- *   actually ran this tick (false when short-circuited by beatmix already
- *   winning, or by `#stemMixUnavailableKey`).
+ *   actually ran this tick (false when the pair is marked
+ *   `#stemMixUnavailableKey`, or stem-mix could never be eligible anyway —
+ *   see player.js's `mightBeatmix` precheck).
  * @param {boolean} params.outgoingStemsCached
  * @param {boolean} params.incomingStemsCached
- * @param {string} params.plannedMode the ladder's initial choice
- *   ('stem-mix' when stemPlan is eligible, else rawPlan.mode) — before any
- *   later downgrade (TRACK loop mode / an incoming source that couldn't
- *   honor a seek+stretch). player.js fills in `.selected`/`.downgradedFrom`
- *   itself once the final, actually-executed mode is known.
+ * @param {string} params.plannedMode the ranker's initial winner
+ *   (`selectedPlan.mode`) before any later downgrade (TRACK loop mode / an
+ *   incoming source that couldn't honor a seek+stretch). player.js fills in
+ *   `.selected`/`.downgradedFrom` itself once the final, actually-executed
+ *   mode is known.
+ * @param {object} params.selectedPlan the ranker's winning raw plan (any of
+ *   beatmix/stem-mix/phrase-crossfade/legacy shape) — used for exit/entry
+ *   reporting the same way the pre-Phase-9D `plannedSource` was.
  * @returns {object} the structured report — pass to logTransitionPlan().
  */
 export function buildTransitionPlanReport({
@@ -105,12 +82,12 @@ export function buildTransitionPlanReport({
   incomingTrack,
   outgoingAnalysis,
   incomingAnalysis,
-  rawPlan,
-  stemPlan,
+  candidates,
   stemCacheAttempted,
   outgoingStemsCached,
   incomingStemsCached,
   plannedMode,
+  selectedPlan,
   // Codex review (PR #43, round 5): the outgoing session's tempo stretch
   // ratio, so the legacy-plan exit fallback (a native-file position) can
   // convert player.js's playback-domain fadeSec back to native seconds the
@@ -118,22 +95,16 @@ export function buildTransitionPlanReport({
   // does — 1 (no stretch) when the caller doesn't pass one.
   outgoingTempoRatio = 1,
 }) {
-  const beatmixEligiblePlan = rawPlan.mode === 'beatmix' ? rawPlan : null;
-  const beatmixNotEvaluatedReason = rawPlan.fallbackFrom?.[0] ?? 'unknown';
-  const beatmix = barredCandidate(beatmixEligiblePlan, beatmixNotEvaluatedReason);
-
-  const phraseEligiblePlan = rawPlan.mode === 'phrase-crossfade' ? rawPlan : null;
-  const phraseCrossfade = rawPlan.mode === 'beatmix'
-    ? phraseCandidate(null, undefined, 'not-evaluated-beatmix-selected')
-    : phraseCandidate(phraseEligiblePlan, rawPlan.fallbackFrom?.[1] ?? 'unknown');
+  const beatmix = candidateToReportShape(candidates.beatmix);
+  const phraseCrossfade = candidateToReportShape(candidates.phraseCrossfade);
 
   let stemMix;
   if (!stemCacheAttempted) {
-    stemMix = { eligible: false, reason: rawPlan.mode === 'beatmix' ? 'not-evaluated-beatmix-selected' : 'not-evaluated-stem-mix-unavailable' };
+    stemMix = { eligible: false, reason: 'not-evaluated-stem-mix-unavailable' };
   } else if (!(outgoingStemsCached && incomingStemsCached)) {
     stemMix = { eligible: false, reason: 'stem-cache-miss' };
   } else {
-    stemMix = barredCandidate(stemPlan, 'unknown');
+    stemMix = candidateToReportShape(candidates.stemMix);
   }
 
   const stemCache = {
@@ -141,9 +112,8 @@ export function buildTransitionPlanReport({
     incoming: stemCacheAttempted ? (incomingStemsCached ? 'hit' : 'miss') : null,
   };
 
-  const plannedSource = stemPlan?.eligible ? stemPlan : rawPlan;
-  const exit = exitInfo(plannedSource, outgoingAnalysis, outgoingTempoRatio);
-  const entry = entryInfo(plannedSource, incomingAnalysis);
+  const exit = exitInfo(selectedPlan, outgoingAnalysis, outgoingTempoRatio);
+  const entry = entryInfo(selectedPlan, incomingAnalysis);
 
   return {
     from: outgoingTrack?.title ?? null,

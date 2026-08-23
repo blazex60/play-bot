@@ -1685,3 +1685,46 @@ round 2 で見つかった追加の1件（P2）:
 - [x] どのトラックが解析/分離されるか、いつされるか、どの transition mode が選ばれるかは無変更（rebase 後の最終計測: `bun run test:server` で Phase 6-9B の既存テストが1件も変わらず通過、711件中703件 pass / 4件 fail は ffmpeg 未インストールによる既知の `silenceTrim.test.js` の失敗のみ、4件 skip も既知）
 - [ ] 「Demucs実行中でもBPM/phrase解析がブロックされない」の実音源・実運用計測（構造的な検証は完了、上記未決事項参照）
 - [ ] 「incoming stem cache hit rate >= 90%」の実測（上記未決事項参照、Phase 9B から持ち越しの既知の制約）
+
+## 実装ノート (Phase 9D)
+
+§6 の Candidate Ranker を実装した。§6.1 の waterfall（`planBeatSyncedTransition()` が beatmix→phrase-crossfade→legacy の順に評価し、tier 1 が eligible ならその場で return — tier 2/3 は評価すらされない。stem-mix は `player.js` 側で「beatmix が勝たなかった場合のみ」試す bolt-on）を、§6.2 が求める「4 モードすべてを独立候補として評価し、Candidate Ranker が勝者を選ぶ」形に置き換えた。
+
+### 実装箇所
+
+- `src/audio/beatmixTransition.js`:
+  - `planBeatmixTransition()` の eligible な返り値に `quality`（§6.3 の6項目オブジェクト）を追加した。既存の `scoreTransitionPairDetail()`（Phase 9D 前段の commit 39bf91d で既に抽出済み）を勝者の exit/entry ペアに対して1回だけ追加で呼び出すだけで、探索ループ自体（`scoreTransitionPair()` を使った比較）は変更していない。
+  - `planPhraseCrossfade()` にも同様に `quality` を追加した。ただし tier 2 はテンポ同期もダウンビートグリッドも harmonic 判定も一切行わないため、`tempoCompatibility`/`downbeatConfidence`/`harmonicCompatibility` は（§6.3 の `harmonicCompatibility` が既に確立していた原則どおり）`0` ではなく `null` にしている — 「評価して低かった」と「評価自体をしていない」を区別するため。`vocalSafety`/`energyContinuity` は beatmix と同じ式を、tier 2 が選んだ実際の exit/entry ペアに対して計算している。
+  - `planBeatSyncedTransition()`（§16 waterfall 本体）自体は**完全に無変更** — 関数もその既存テスト（`beatmixTransition.test.js` の waterfall セクション）もそのまま残した。`player.js` がこの関数を呼ばなくなっただけで、単体の正しい waterfall プランナーとしては引き続き存在する。理由: 既存テストの「tier 1 が勝てば tier 2 は評価しない」という waterfall 前提のアサーションを、意味のない形で壊さないため。
+- `src/audio/transitionCandidates.js`（新規）: Candidate Ranker 本体。
+  - `transitionModeBonus(mode)`: §6.4 の表をそのまま実装（stem-mix +0.10 / beatmix +0.05 / phrase-crossfade +0.02 / それ以外 0）。
+  - `rankTransitionCandidates(outgoing, incoming, options)`: `planBeatmixTransition()` / `planPhraseCrossfade()` / `planStemTransitionFn()`（デフォルトは `planStemTransition()`、`player.js` の `#planStemTransitionFn` DI と同じ差し替え口）/ `planTransition()`（legacy）を**それぞれ独立に**呼ぶ。stem-mix だけは呼び出し元が渡す `stemsAvailable`（両側のキャッシュ hit を確認済みかどうか）でゲートする — ネットワーク/ディスクを叩くキャッシュ確認自体は非同期なので、この関数は Phase 7C の `planBeatSyncedTransition()` と同じく同期のままにし、キャッシュ確認は呼び出し元（`player.js`）の責務として残した。beatmix/stem-mix/phrase-crossfade の3つを `score + transitionModeBonus(mode)` の argmax で比較し、勝者を `selectedPlan` として返す。
+  - legacy（`planTransition()`）は§6.2 の図には候補として描かれているが、**スコアでは競合させていない** — legacy には beatmix/stem-mix/phrase-crossfade のような品質モデルがなく（`confidence` は単に `outgoing.confidence` の生値で、遷移の相性スコアではない）、これを他の3つと同じ土俵でスコア比較すると、無関係に高い `confidence` を持つ legacy が本来 beatmix 等が選ばれるべき場面で誤って勝ってしまうリスクがある。beatmix/stem-mix/phrase-crossfade が1つも eligible でない場合にのみ legacy を選ぶ、という Phase 9D 以前の waterfall の最下段の挙動をそのまま保持している（意図的なスコープ判断 — 下記「未決事項」参照）。
+  - `bestNonStemPlan`: stem-mix を除いた3候補（beatmix/phrase-crossfade/legacy）だけで同じ argmax を行った結果も一緒に返す。stem-mix の exitStartSec/entrySec は vocal-safety を緩和して選ばれている（stem 別のフェード envelope があって初めて安全）ため、TRACK ループ再選択で stem-mix が使えなくなった場合の再プランは、stem-mix 自身の window を流用せずこちらから行う必要がある（§8 由来の既存制約、下記参照）。
+- `src/audio/transitionLog.js`: `buildTransitionPlanReport()` のシグネチャを `rawPlan`/`stemPlan` から `candidates`（`rankTransitionCandidates()` の `candidates.beatmix`/`.stemMix`/`.phraseCrossfade`、§6.3 Candidate 構造そのもの）+ `selectedPlan` に変更した。従来 `barredCandidate()`/`phraseCandidate()` が担っていた「waterfall のどの段まで評価が進んだか」の推測（`rawPlan.mode === 'beatmix'` なら tier 2/stem-mix は `not-evaluated-beatmix-selected`）は完全に不要になった — 各候補は独立評価の結果を **常に** 直接持っているため、単純に整形するだけの `candidateToReportShape()` に置き換えている。`not-evaluated-*` の reason は「stem-mix のキャッシュ確認自体が走らなかった」ケース（`#stemMixUnavailableKey` によるスキップ、または `mightBeatmix` 前提チェックで最初から不可能と分かっている場合）専用の `not-evaluated-stem-mix-unavailable` 1本に統合した。
+- `src/player.js` `#maybeStartCrossfade()`:
+  - `planBeatSyncedTransition()` の呼び出しを `rankTransitionCandidates()` に置き換えた。
+  - stem キャッシュの確認（`getCachedStemsFn()`）を、従来の「`rawPlan.mode !== 'beatmix'`（＝ beatmix が勝っていない）」というゲートから外し、「`mightBeatmix`（＝そもそも両側に BPM がある）かつ `#stemMixUnavailableKey` に一致しない」というゲートに変更した。beatmix が eligible かどうかに関わらず常に確認する（§6.2 の独立評価の要請どおり）が、BPM が無く beatmix/stem-mix のどちらも原理的に成立し得ないことが既に分かっている pair では、200ms ごとの arm tick で無駄な fs アクセスを繰り返さないよう従来どおりスキップする（純粋なパフォーマンス最適化で、独立評価の意味論には影響しない）。
+  - TRACK ループ再選択（`next === current`）で stem-mix プランを捨てて再プランする箇所は、従来の `rawPlan`（waterfall の非 stem-mix 結果）の代わりに `rankTransitionCandidates()` が返す `bestNonStemPlan` を使うよう変更した。
+  - それ以外（prepDue/readyToFade のゲート、`forcePlainCrossfade` によるダウングレード、`#stemMixUnavailableKey` の設定箇所など）は無変更。
+- テスト:
+  - `src/audio/transitionLog.test.js`: `buildTransitionPlanReport()` の新シグネチャに合わせて全面的に書き直した。「beatmix が勝ったので phrase-crossfade/stem-mix は not-evaluated」という waterfall 前提のテストは、「phrase-crossfade は独立評価されて real reject reason を返す」「stem-mix はキャッシュ未確認なら not-evaluated-stem-mix-unavailable」というテストに置き換えている。アサーションの意味そのもの（HIT/MISS の扱い、vocalActive の判定、legacy exit のフォールバック計算など）は変更していない。
+  - `src/audio/beatmixTransition.js`/`src/audio/stemTransition.js` の既存テストは無変更のまま全件パス（`quality` フィールドの追加は既存の `deepEqual` アサーションと衝突しない — reject 系のテストは `plan.reasons` の部分一致のみを見ており、eligible 系のテストは個別フィールドの `assert.equal` のみで全体 `deepEqual` を使っていないことを確認済み）。
+  - `src/player.acceptance.test.js` は無変更。Phase 8 由来の stem-mix 系テスト（`stemFixtures()` を使うもの全て）は、フィクスチャの outgoing 側 exit 候補が意図的に vocal 区間の途中にあり、beatmix 側の `requireExitVocalSafe` を素で満たせないよう作られている — 独立評価に変えても beatmix は真に ineligible のままなので、stem-mix が勝つという既存の期待どおりの結果になる。beatmix と stem-mix が両方 eligible になる（かつ stem preference bonus の実際の勝敗が試される）フィクスチャは既存テストに存在しないことをコードリーディングで確認した。
+
+### 未決事項 / 既知の制約
+
+- **legacy はスコア競合の対象外**: 上述のとおり、legacy（`planTransition()`）は §6.2 の図には4番目の候補として描かれているが、実装では「beatmix/stem-mix/phrase-crossfade が1つも eligible でないときのみ選ばれる」という waterfall 最下段のセマンティクスのまま据え置いた。理由は上記「実装箇所」参照。将来的に legacy にも意味のある品質モデル（例えば `outgoing.confidence` ではなく実際の遷移相性を反映したスコア）を与えられるなら、`transitionModeBonus()` の `default: 0` と合わせて4候補を完全に対等競合させることもできるはずだが、これは Phase 9D のスコープ外と判断した。
+- **stem preference bonus (§6.4) を実際に検証する新規フィクスチャは追加していない**: beatmix と stem-mix が両方 eligible になり、bonus 差（+0.10 vs +0.05）がタイブレークとして効く、という具体的なシナリオへのユニットテストは今回追加していない（`rankTransitionCandidates()` の argmax ロジック自体は単純な比較なので正しさに高い自信はあるが、実際の分析値でどちらが勝つかは未検証）。理由: 既存の `stemFixtures()` は意図的に beatmix を ineligible にしており、beatmix 側を eligible にしつつ stem-mix 側も eligible にする現実的な数値のフィクスチャを新規に作る必要があるが、テスト全体の実行時間（`player.acceptance.test.js` 1本で約40秒）を踏まえてこのセッションでは見送った。次フェーズ以降で `transitionCandidates.js` の単体テストとして追加することを推奨する。
+- **`mightBeatmix` ゲートは stem-mix の独立評価をわずかに妥協している**: 純粋な §6.2 の要請どおりなら、beatmix が原理的に不可能な pair でも stem-mix のキャッシュ確認自体は独立に行うべきだが、BPM が無ければ `planStemTransition()`（内部で `planBeatmixTransition()` の BPM ゲートを再利用している）も必ず reject するため、確認しても意味がない。200ms ごとの arm tick で無駄な fs アクセスを避けるための意図的な最適化であり、実際の eligibility 判定結果には影響しない。
+- **実測評価は未実施**: Phase 9A/9B/9C のノートが繰り返し書いている制約と同じく、stem preference bonus が実際の楽曲でどの程度 stem-mix を選ばせるようになるか（そしてそれが聴感上望ましいか）は実音源・実運用での確認が必要で、本エージェント環境では実施できない。
+
+### 完了条件（§6 相当）
+
+- [x] beatmix / stem-mix / phrase-crossfade が独立候補として評価される（一方が eligible でも他方の評価をスキップしない）
+- [x] Candidate 構造（§6.3: `mode`/`eligible`/`score`/`quality`/`fadeSec`/`bars`）を実装し、`quality` の6項目（`phraseAlignment`/`tempoCompatibility`/`vocalSafety`/`downbeatConfidence`/`harmonicCompatibility`/`energyContinuity`）を各モードから返す
+- [x] `transitionModeBonus()`（§6.4）を実装し、`rankTransitionCandidates()` のスコア比較に適用した
+- [x] stem preference: stem-mix と beatmix が両方 eligible な場合、bonus によりタイ・僅差では stem-mix が優先され、品質差が大きい場合は beatmix が選ばれ得る（argmax(`score + bonus`) の自然な帰結。上記未決事項のとおり、この具体的なタイブレーク挙動を検証する専用テストは未追加）
+- [x] `[MIX PLAN]` レポート（§3.2）が独立評価を正しく反映する（beatmix が勝っても phrase-crossfade/stem-mix は実際の評価結果を報告する。stem-mix が「未評価」なのは、キャッシュ未確認 or BPM無しで原理的に不可能な場合のみ）
+- [x] 既存の Phase 7-9C の挙動が変わっていないことをテストで確認: `bun run test:server` で 729件中 721 pass / 4 fail（`silenceTrim.test.js` の ffmpeg 未インストールによる既知の失敗のみ、Phase 9A/9B/9C のノートに書かれているものと同一）/ 4 skip
+- [ ] stem preference bonus の実運用での聴感評価（上記未決事項参照）
