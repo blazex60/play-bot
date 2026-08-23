@@ -1189,6 +1189,13 @@ export class GuildPlayer {
     this.#forceSkip = true;
     this.#abortSourceAudioWait();
     this.#mixStream?.dropCurrent();
+    // Codex review (PR #43, round 10): a skip abandons whatever pair was
+    // just evaluated/stashed for the skipped track, same reasoning as
+    // stop()'s own clear above — without this, a later recurrence of the
+    // same pair within the 30s freshness window (e.g. QUEUE loop) could
+    // attribute a stale evaluation to a hard handoff that never actually
+    // evaluated it.
+    this.#lastEvaluatedTransitionReport = null;
   }
 
   async stop() {
