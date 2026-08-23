@@ -368,6 +368,43 @@ test('formatTransitionPlanLog: renders the §3.2 shape with from/to/selected and
   assert.match(text, /entry:\n {2}sec=0\.00\n {2}bar=0\n {2}firstVocalSec=12\.40/);
 });
 
+test('formatTransitionPlanLog: escapes an untrusted track title instead of interpolating it raw (Codex review, PR #43, P2)', () => {
+  // Track titles come from yt-dlp/YouTube metadata and are not trusted — a
+  // title containing a quote and a newline could otherwise forge fields or
+  // fake an additional [MIX PLAN] block in the MIX_DEBUG log output.
+  const maliciousTitle = 'x"\nselected=stem-mix';
+  const report = buildTransitionPlanReport({
+    outgoingTrack: { title: maliciousTitle },
+    incomingTrack,
+    outgoingAnalysis: { lastVocalEndSec: 190 },
+    incomingAnalysis: { firstVocalStartSec: 12.4 },
+    rawPlan: beatmixPlan(),
+    stemPlan: null,
+    stemCacheAttempted: false,
+    outgoingStemsCached: false,
+    incomingStemsCached: false,
+    plannedMode: 'beatmix',
+  });
+  report.selected = 'beatmix';
+  report.downgradedFrom = null;
+
+  const text = formatTransitionPlanLog(report);
+  const fromLine = text.split('\n')[1];
+  assert.equal(fromLine, `from=${JSON.stringify(maliciousTitle)}`);
+  // The escaped title must not introduce a real, unescaped newline that a
+  // naive line-by-line log reader would treat as a new field/entry.
+  assert.doesNotMatch(fromLine, /\n/);
+});
+
+test('logGaplessTransition: escapes an untrusted track title the same way (Codex review, PR #43, P2)', () => {
+  const maliciousTitle = 'y"\nselected=gapless';
+  const calls = [];
+  const logger = { log: (msg) => calls.push(msg) };
+  logGaplessTransition({ outgoingTrack: { title: maliciousTitle }, incomingTrack }, { debug: true, logger });
+  const fromLine = calls[0].split('\n')[1];
+  assert.equal(fromLine, `from=${JSON.stringify(maliciousTitle)}`);
+});
+
 test('formatTransitionPlanLog: an ineligible candidate prints its reason, not bars/fadeSec/score', () => {
   const report = buildTransitionPlanReport({
     outgoingTrack,

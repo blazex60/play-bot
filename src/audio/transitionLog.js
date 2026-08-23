@@ -17,6 +17,16 @@ function fmtBool(b) {
   return b == null ? 'null' : String(b);
 }
 
+// Codex review (PR #43, round 7): track titles come from yt-dlp/YouTube
+// metadata and are not trusted — a title containing a quote or newline,
+// interpolated raw into `from="..."`, could forge fields or fake an
+// additional `[MIX PLAN]` entry in the MIX_DEBUG log output. JSON.stringify
+// produces a properly quoted, escaped representation (quotes, backslashes,
+// newlines all escaped) while staying readable in a log line.
+function escapeLogTitle(title) {
+  return title == null ? 'unknown' : JSON.stringify(String(title));
+}
+
 /**
  * Reduce a beatmix-shaped plan (`planBeatmixTransition()`/`planStemTransition()`
  * output) to the §3.2 candidate fields. `mode` is the plan's own `mode`
@@ -231,8 +241,8 @@ function formatCandidate(name, candidate) {
 export function formatTransitionPlanLog(report) {
   const lines = [
     '[MIX PLAN]',
-    `from="${report.from ?? 'unknown'}"`,
-    `to="${report.to ?? 'unknown'}"`,
+    `from=${escapeLogTitle(report.from)}`,
+    `to=${escapeLogTitle(report.to)}`,
     '',
     `selected=${report.selected ?? 'unknown'}`,
   ];
@@ -307,8 +317,8 @@ export function logGaplessTransition({ outgoingTrack, incomingTrack } = {}, { de
     : '(hard handoff — no prepared source was available/accepted at EOF; no candidate evaluation, no crossfade plan)';
   logger.log([
     '[MIX PLAN]',
-    `from="${outgoingTrack?.title ?? 'unknown'}"`,
-    `to="${incomingTrack?.title ?? 'unknown'}"`,
+    `from=${escapeLogTitle(outgoingTrack?.title)}`,
+    `to=${escapeLogTitle(incomingTrack?.title)}`,
     '',
     'selected=gapless',
     description,

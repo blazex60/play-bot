@@ -2616,7 +2616,13 @@ export class GuildPlayer {
     const pairKey = `${outgoingTrack?.videoId ?? ''}:${incomingTrack?.videoId ?? ''}`;
     if (stashed.pairKey !== pairKey) return null;
     const { report } = stashed;
-    report.downgradedFrom = report.selected;
+    // Codex review (PR #43, round 7): a stashed report whose evaluated
+    // rawPlan was already 'gapless' (no beatmix/stem-mix/phrase-crossfade
+    // eligible) reaches this same hard-handoff path — selected is already
+    // 'gapless' here, so setting downgradedFrom would falsely claim a
+    // downgrade that never happened. Only record one when the mode
+    // actually changed.
+    if (report.selected !== 'gapless') report.downgradedFrom = report.selected;
     report.selected = 'gapless';
     report.entry.sec = entrySec;
     report.entry.bar = entrySec === 0 ? 0 : null;

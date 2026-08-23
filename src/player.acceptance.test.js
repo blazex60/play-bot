@@ -1911,6 +1911,45 @@ test('acceptance (mixer): a committed stem-mix transition emits exactly one [MIX
   }
 });
 
+test('acceptance (mixer): a natural gapless handoff whose evaluated rawPlan was already gapless is not reported as downgraded from itself (Codex review, PR #43, P2)', async () => {
+  // planTransition() returns mode:'gapless' outright when the outgoing
+  // analysis has very low confidence (0 < confidence < 0.2) and low vocal
+  // confidence — no beatmix/stem-mix/phrase-crossfade was ever eligible, so
+  // this pair's stashed report already has selected='gapless' before the
+  // hard handoff below even runs.
+  const lowConfidenceAnalysis = { version: ANALYSIS_VERSION, confidence: 0.1, vocalConfidence: 0.1, durationSec: 60 };
+  const logCalls = [];
+  // Under SHORT_TRACK_THRESHOLD_SEC (5s, src/player/playbackPolicy.js) so
+  // shouldReconnectRetry() does not replay this same track instead of
+  // advancing once triggerTrackEnd() fires below.
+  const { player, queue } = makePlayer({
+    trackDuration: 3,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 3, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => lowConfidenceAnalysis,
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.alloc(FRAME_BYTES))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3, videoId: 'vid-b' }));
+
+  try {
+    await player.playNext();
+    // Let at least one 200ms crossfade-arm tick run (and stash its
+    // evaluated, already-gapless report) before the track ends naturally.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    triggerTrackEnd({ mixStream: player.mixStream });
+    await waitMs(50);
+
+    assert.equal(logCalls.length, 1);
+    const report = logCalls[0];
+    assert.equal(report.selected, 'gapless');
+    assert.equal(report.downgradedFrom, null,
+      'a rawPlan that was already gapless must not be reported as downgraded from itself');
+  } finally {
+    await player.stop();
+  }
+});
+
 test('acceptance (mixer): logTransitionPlan still fires (with the real ladder\'s own selection) when no custom Fn is injected', async () => {
   const { player, queue } = makePlayer({ trackDuration: 3, framesPerTrack: 400 });
   queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 3 }));
