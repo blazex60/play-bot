@@ -23,9 +23,14 @@ const LOUDNORM_TARGET = 'I=-16:TP=-1.5:LRA=11'
 export class NormalizeError extends Error {}
 export class NormalizeDurationError extends NormalizeError {}
 
-function spawnBuffered(cmd, args) {
+// Codex review (PR #44): accepts an optional spawnFn override so callers
+// running inside the analysis queue's pausable lane (see
+// analysisQueue.js's spawnNice) can make these subprocesses actually
+// pause/kill-able under CPU pressure, instead of always spawning an
+// untracked child via the module-level `spawn` regardless of caller.
+function spawnBuffered(cmd, args, spawnFn = spawn) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args)
+    const proc = spawnFn(cmd, args)
     let stdout = ''
     let stderr = ''
     proc.stdout.on('data', data => { stdout += data })
@@ -83,23 +88,23 @@ export function isNormalizeDurationAllowed(track) {
 
 export const canNormalizeTrack = isNormalizeDurationAllowed
 
-export async function downloadAudio(url, destPath) {
+export async function downloadAudio(url, destPath, { spawnFn } = {}) {
   await mkdir(path.dirname(destPath), { recursive: true })
   await spawnBuffered('yt-dlp', buildYtdlpArgs(
     '-f', YTDLP_AUDIO_FORMAT,
     '--no-playlist',
     '-o', destPath,
     url,
-  ))
+  ), spawnFn)
 }
 
-export async function analyzeLoudness(filePath) {
+export async function analyzeLoudness(filePath, { spawnFn } = {}) {
   const { stderr } = await spawnBuffered('ffmpeg', [
     '-i', filePath,
     '-af', `loudnorm=${LOUDNORM_TARGET}:print_format=json`,
     '-f', 'null',
     '-',
-  ])
+  ], spawnFn)
   return parseLoudnormJson(stderr)
 }
 
@@ -116,16 +121,29 @@ export async function trimSilence(filePath, {
   detectMinSec = SILENCE_DETECT_MIN_SEC,
   spawnFn = spawnBuffered,
   probeDurationFn = probeDurationSec,
+  // Codex review (PR #44, P1): probeDurationFn's ffprobe calls previously
+  // always ran via duration.js's own module-level spawn, untracked by the
+  // queue's pause/kill machinery even when `spawnFn` above was overridden —
+  // an abort mid-probe left that ffprobe process running free, and once it
+  // finished, execution carried on into the next spawnFn-using step (the
+  // silencedetect ffmpeg call) as if nothing had happened. `probeSpawnFn` is
+  // the raw-ChildProcess-returning override (prefetchTrack() passes its own
+  // `spawnFn` straight through here — no spawnBuffered() wrapping needed,
+  // duration.js's probeDurationSec() does its own buffering), and `signal`
+  // is checked immediately after each probe below.
+  probeSpawnFn,
+  signal,
   minDurationSec = MIN_TRIMMED_DURATION_SEC,
 } = {}) {
   if (!filePath) return false
   const outPath = `${filePath}.silence-trim`
   const backupPath = `${filePath}.pre-silence-trim`
   try {
-    const beforeSec = await probeDurationFn(filePath).catch(() => null)
+    const beforeSec = await probeDurationFn(filePath, { spawnFn: probeSpawnFn }).catch(() => null)
     if (beforeSec == null) {
       throw new NormalizeError('source duration unknown; skipping silence trim')
     }
+    throwIfAborted(signal)
     // Move instead of copy: same rollback guarantee without duplicating the file.
     await rename(filePath, backupPath)
 
@@ -162,7 +180,8 @@ export async function trimSilence(filePath, {
       outPath,
     ])
     await access(outPath)
-    const afterSec = await probeDurationFn(outPath).catch(() => null)
+    const afterSec = await probeDurationFn(outPath, { spawnFn: probeSpawnFn }).catch(() => null)
+    throwIfAborted(signal)
     if (afterSec == null || afterSec < minDurationSec) {
       throw new NormalizeError(
         `silence trim produced unusable duration (${afterSec ?? 'unknown'}s)`,
@@ -195,18 +214,63 @@ function tempFilePath(track) {
   return path.join(TEMP_DIR, `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}-${safeTitle}`)
 }
 
-export async function prefetchTrack(track) {
+// Codex review (PR #44, P1): a queue abort (e.g. a mixer underrun killing
+// this job) rejects whichever spawnFn-based call is in flight, but
+// trimSilence() deliberately swallows its OWN spawn failures (fail-soft —
+// "leave the original file untouched" per its own docstring) and returns
+// `false` rather than rejecting. Without an explicit check, prefetchTrack()
+// would sail on into the NEXT step's spawnFn call even though its own job
+// was already killed — and since analysisQueue.js's spawnEpoch guard only
+// kills spawns issued BEFORE a newer abort (not a stale continuation's
+// brand-new spawn issued AFTER its own abort), that new process would get
+// silently registered into whatever job happens to be running next,
+// consuming CPU/being paused-or-killed alongside unrelated work indefinitely.
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return
+  const err = new Error('prefetch aborted')
+  err.code = 'ANALYSIS_KILLED'
+  throw err
+}
+
+export async function prefetchTrack(track, { spawnFn, signal } = {}) {
   if (!isNormalizeDurationAllowed(track)) {
     throw new NormalizeDurationError(`track exceeds ${MAX_NORMALIZE_DURATION_SEC}s normalize limit`)
   }
 
   const filePath = tempFilePath(track)
   try {
-    await downloadAudio(track.webpageUrl, filePath)
+    await downloadAudio(track.webpageUrl, filePath, { spawnFn })
+    throwIfAborted(signal)
     // Trim YouTube/source padding before loudnorm + MIX analysis so
     // remainingSec and crossfade sit on audible audio.
-    await trimSilence(filePath)
-    const measured = await analyzeLoudness(filePath)
+    //
+    // Codex review (PR #44, P1): trimSilence()'s `spawnFn` contract is
+    // DIFFERENT from downloadAudio()/analyzeLoudness()'s — it expects a
+    // function that returns a Promise<{stdout, stderr}> (buffered output),
+    // matching spawnBuffered()'s own shape, because trimSilence() reads
+    // `detect.stderr` as an already-collected string. `spawnFn` here (e.g.
+    // analysisQueue.js's spawnNice) instead returns a raw ChildProcess
+    // synchronously — passing it straight through made `detect.stderr` a
+    // stream object, not text, so silencedetect's log was never actually
+    // parsed and every LOW-priority-prefetched track silently skipped
+    // trimming (stems would be built from untrimmed audio, offset from
+    // what normal playback/analysis uses). Wrap it in the same
+    // spawnBuffered() adapter downloadAudio()/analyzeLoudness() already use
+    // internally, so trimSilence() sees the buffered shape it expects.
+    // Codex review (PR #44, P1, round 2): probeSpawnFn/signal thread
+    // trimSilence()'s duration probes onto this same tracked spawnFn/abort
+    // signal too — probeDurationSec()'s own contract is a RAW
+    // ChildProcess-returning spawn (it does its own buffering internally
+    // via spawnCapture()), unlike the buffered wrapper above, so `spawnFn`
+    // (not the wrapped closure) is passed straight through.
+    await trimSilence(filePath, spawnFn
+      ? { spawnFn: (cmd, args) => spawnBuffered(cmd, args, spawnFn), probeSpawnFn: spawnFn, signal }
+      : undefined)
+    // trimSilence() is fail-soft (catches its own spawn failures and
+    // returns `false`) — check explicitly rather than relying on it to
+    // have thrown, or an abort mid-trim would go unnoticed here.
+    throwIfAborted(signal)
+    const measured = await analyzeLoudness(filePath, { spawnFn })
     return { filePath, measured }
   } catch (err) {
     await cleanupTempFile(filePath)

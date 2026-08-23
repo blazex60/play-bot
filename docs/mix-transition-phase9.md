@@ -1549,3 +1549,139 @@ Stem/EQ Automation
 - [x] metrics アキュムレータ（`totalTransitions`/`selected.*`/`stemCache.*`）が `MIX_DEBUG` の値に関わらず常時更新される
 - [x] 既存の fallback ladder / 実際に選ばれる transition mode / フェード曲線は無変更（`bun run test:server` で Phase 6-8 の既存テストが1件も変わらず通過）
 - [ ] 実音源・実運用セッションでの「ログだけで全 transition の理由を説明できる」検証（上記未決事項参照 — このエージェント環境では実施不可）
+
+## 実装ノート (Phase 9B)
+
+§4 の Stem Prefetch を実装した。§4.1 が説明する問題（stem 分離が遷移直前まで間に合わない）そのものの解決手段——B（next）を HIGH、C（next+1）を LOW 優先度で先読みする——を配線した。§5（Phase 9C: 専用 pausable キューへの分離）には一切手を付けていない。transition mode の選択ロジック（Phase 9D の対象）も無変更 — 本 PR が変えるのは「`getCachedStems()` がいつ HIT を返すようになるか」だけで、「どの mode が選ばれるか」の判定には触れていない。
+
+### 実装箇所
+
+- `src/audio/stemPrefetch.js`（新規）: §4.3 の `StemPreparationState`（`NONE`/`QUEUED`/`PROCESSING`/`READY`/`FAILED`、指定の値そのまま）と `StemPrefetchPriority`（`HIGH`/`LOW`）、および `StemPrefetchTracker` クラス。videoId をキーに `{videoId, priority, state, queuedAt, startedAt, completedAt}`（§4.3 そのまま）を保持する、純粋な in-memory bookkeeping のみのクラス — ファイルシステムにも子プロセスにも一切触れない。`queue()`/`markProcessing()`/`markReady()`/`markFailed()`/`get()`/`prune()`/`counts()`/`snapshot()` を公開する。§5 の `RealtimeAnalysisQueue`/`StemPreparationQueue` のような実スケジューラは持たない（意図的 — Phase 9C の対象）。
+- `src/player.js` の `#prefetchUpcoming()`: 既存の `upcoming = queue.upcoming().slice(0,3)`（TRACK ループ時は `[current]`）から `first`（B）/`second`（C）を取り出し、`isNormalizeDurationAllowed()` を満たす場合のみ `#ensureStemPrefetch(first, HIGH)` / `#ensureStemPrefetch(second, LOW)` を呼ぶ。呼び出し末尾で `#stemPrefetchTracker.prune(upcoming の videoId 一覧)` を実行し、ウィンドウから外れた古いエントリを回収する。D（next+2）以降は既存の `#ensureAnalysisPrefetch()`（BPM/phrase の軽量先読みのみ）の対象のままで、本 PR での変更なし — §4.2 の「D → 未処理」をそのまま維持している。
+- `#ensureStemPrefetch(track, priority)`（新規）: HIGH と LOW で経路が異なる。
+  - **HIGH（B）**: 純粋に観測用。B は既に Phase 8 の `#ensureFullPrefetch()` → `#scheduleAnalysis()` パイプラインでフルダウンロード・normalize・解析・`separateTrackStemsFn()` 呼び出しまで一式が走る（Phase 9B 以前から）。この経路をそのまま利用し、`#prefetchEntries` の `kind:'full'` エントリに相乗りするだけで、`#prefetchTrackFn` を独自に呼ぶことは一切しない — 同じファイルに対する二重ダウンロード経路を新設しないため。
+  - **LOW（C）**: 既存パイプラインでは C の音声を Demucs にかけるまで手元に残す仕組みが無かった（`#ensureAnalysisPrefetch()` は BPM 解析が終わった瞬間に一時ファイルを削除する）。そのため `#runLowPriorityStemPrefetch()`（新規）を追加し、`#prefetchTrackFn` → `#stageTempFileCopyFn` → `#separateTrackStemsFn` という、`#scheduleAnalysis()` と同型の staged-copy パターンを C 専用に独立実行する。`this.#analysisQ().enqueue()` を通す（`spawnNice`/`signal` を受け取る）ことで、mixer underrun 時の SIGSTOP/kill が他の解析ジョブと同様に効く（§5.4 の精神を、専用キューを作らずに満たす）。
+  - どちらの経路も **`getCachedStemsFn()` のミス確定後にのみ** dispatch する。HIT なら即 `markReady()` して return（`#stemCacheHit` の「positive result のみ memoize」と同じ思想）。
+- `#scheduleAnalysis()`: `separateTrackStemsFn()` 呼び出し後に `.then/.catch` を追加し、そのvideoId が `#stemPrefetchTracker` に登録されている場合のみ `markReady()`/`markFailed()` する。これが無いと、HIGH（B）の完了は「次に `#ensureStemPrefetch()` が同じ videoId を再チェックするタイミング」でしか分からず、B が実際に current に昇格した時点で「next/next+1 のみを見る」`#ensureStemPrefetch()` の対象から外れてしまうため、実運用では PROCESSING のまま観測上停止するケースが起きうる（テストで実際に踏んだ — 後述）。現在の CURRENT トラック（A）は `#ensureStemPrefetch()` から一度も登録されないため、この hook は A の bookkeeping を新設しない（`this.#stemPrefetchTracker.get(videoId)` が null を返す）。
+- `GuildPlayer#stemPrefetchStatus`（新規 getter）: `#stemPrefetchTracker.snapshot()` を返すだけの読み取り専用プロパティ。テスト/観測用で、どの playback 判断にも使われない。
+
+### §4.2 の図との対応
+
+```text
+A (current) → 変更なし（#ensureOutgoingStemPrep() は Phase 8 のまま）
+B (next)    → #ensureStemPrefetch(first, HIGH)
+C (next+1)  → #ensureStemPrefetch(second, LOW)
+D (next+2)  → 未処理（#ensureAnalysisPrefetch() の軽量パスのみ、Phase 9B 以前と同一）
+```
+
+### §5.4 Playback Safety との関係（精神のみ）
+
+専用 pausable キュー自体は Phase 9C の担当だが、「stem 準備が realtime playback をブロック/遅延させてはならない」という要求は今回も守っている。
+
+- `#ensureStemPrefetch()`/`#runLowPriorityStemPrefetch()` はどちらも `#prefetchUpcoming()`（track 開始/昇格時にのみ呼ばれる）からしか呼ばれず、戻り値を誰も `await` しない — fire-and-forget。`#maybeStartCrossfade()` など realtime 判断側のコードパスからは一切参照されない。
+- LOW（C）の実処理は `this.#analysisQ().enqueue()` 経由なので、既存の `noteUnderrun()`/SIGSTOP・`MAX_PAUSES` 超過時の kill が Phase 8 以前と全く同じ形で効く。専用レーン分割（§5.2/§5.3）が無いため「B の HIGH ジョブが C の LOW ジョブを優先して先に実行される」保証はまだ無く、実際の順序は「呼び出し順で `enqueue()` に積まれた順」（FIFO）でしかない — これは意図的な簡略化で、タスクの指示どおり「call order を最小限の priority 表現とする」を採用した。
+
+### 未決事項 / 既知の制約
+
+- **HIGH（B）の READY 検出は 2 経路の組み合わせに依存する**: (1) `#scheduleAnalysis()` からの直接コールバック（上記）と (2) 次回 `#ensureStemPrefetch()` 呼び出し時の `getCachedStemsFn()` 再チェック。(1) を追加する前は、テスト（`getCachedStemsFn` が常に MISS を返す stub のケース）で B が `processing` のまま止まる回帰を実際に踏んだ。(1) を追加したことで実運用（`getCachedStemsFn`/`separateTrackStemsFn` が同じ実ファイルシステムを参照する本番経路）では解決しているはずだが、「本 GuildPlayer インスタンス以外が同じ videoId を分離した」ケース（他ギルドの GuildPlayer が先に同じ曲を再生していた等）は (2) の再チェックだけが頼りで、次の `#prefetchUpcoming()` チェックポイントまで `processing` 表示のまま残りうる。observability 専用の値であり、どの playback 判断にも使われないため実害はないが、正確なリアルタイム状態ではない。
+- **優先度は「どちらが先に `enqueue()` されるか」以上の意味を持たない**: §5.3 が要求する「StemPreparationQueue の中で HIGH が LOW より先に処理される」という保証は、専用キューが無い現状では作れない。B と C がほぼ同時に MISS 判定された場合、どちらの Demucs ジョブが先に走るかは実装の呼び出し順（`#prefetchUpcoming()` 内で B → C の順に呼んでいる）に依存する、弱い保証でしかない。
+- **C（LOW）はフルダウンロード＋normalize を伴う**: 既存の `#ensureAnalysisPrefetch()`（軽量 BPM 解析のみ、完了後すぐ削除）とは別に、`#runLowPriorityStemPrefetch()` が独自にダウンロードする。同じ動画を「BPM 解析用」と「stem 分離用」で二重にダウンロードしうる（キャッシュされた解析結果があっても、stem キャッシュが無ければ stem 用ダウンロードは走る — 逆に BPM 解析キャッシュが無くても stem キャッシュがあれば stem 用ダウンロードは走らない、の非対称）。1 曲分の帯域/CPU コストが増える意図的なトレードオフ — 「B と同じ full-prefetch 経路に C も乗せる」案も検討したが、`player.acceptance.test.js`「persistent analysis cache skips Demucs lookahead」テストが確認している既存の保証（BPM 解析キャッシュが HIT の場合、2〜3 曲先の lookahead はダウンロードしない）と衝突するため採用しなかった — stem キャッシュの有無は BPM 解析キャッシュの有無と独立でなければならないため。
+- **キャンセル API が無い**: §4 の指示どおり、in-flight の Demucs 実行を途中で止める仕組みは実装していない。次track が変わっても（reorder/skip/remove）、既に dispatch 済みの分離ジョブはそのまま完走 or 失敗するまで走り続ける。`StemPrefetchTracker.prune()` は QUEUED/PROCESSING のエントリを能動的に消さず、terminal state（READY/FAILED）に達してから、かつアクティブウィンドウ外になった場合にのみ回収する — この設計はテストで検証済み（`stemPrefetch.test.js`）。
+- **`incoming stem cache hit rate >= 90%`（§5.5、Phase 9C の完了条件として書かれているが、9B が実際に動かす数値）は実音源・実運用セッションでの計測が必要な指標であり、このエージェント環境では検証できない** — phase7.md/phase8.md が随所で書いている制約と同じ（実音声ファイルでの Demucs 実行・実 Discord VC 接続はこの環境では行えない）。ユニットテスト（`stemPrefetch.test.js`、`player.acceptance.test.js` の新規ケース）は「HIGH/LOW それぞれが正しいタイミングで dispatch される」「cache HIT なら再ダウンロードしない」「優先度が正しく昇格する」「stale なエントリが正しく pruning される」ことを DI モックで確認しているが、実際の hit rate 改善そのものは未検証・未達成として報告する。
+
+### 完了条件（§17 9B / §5.5 相当）
+
+- [x] §17 9B: 「通常の連続再生で next track の stem が transition 前に完成する」— B は Phase 8 の既存フルプリフェッチ経路で、C は本 PR の LOW パイプラインで、どちらも `getCachedStemsFn()` が MISS の間だけ分離が dispatch される（ユニットテストで確認）
+- [x] next（B）= HIGH、next+1（C）= LOW の優先度ラベリングが `StemPrefetchTracker` に記録され、next が繰り上がった場合に LOW→HIGH へ昇格する
+- [x] next+2（D）以降は §4.2 のとおり本 PR の対象外のまま（stem prefetch は一切トリガーされない）
+- [x] `bun run test:server` で Phase 6-9A の既存テストが1件変わらず通過（1件だけ、Phase 9B 追加前後で意味が変わった `player.acceptance.test.js` の既存テストに `getCachedStemsFn` の stub を追加 — 詳細は下記「テストへの変更」参照。ロジック側の変更は無し）
+- [x] realtime playback 経路（`#maybeStartCrossfade()` 等）から prefetch 呼び出しが一切 `await` されない（fire-and-forget であることをコードレビュー・テストの両方で確認）
+- [ ] `incoming stem cache hit rate >= 90%`（§5.5）— 実運用計測が必要で本エージェント環境では未検証（上記未決事項参照）
+
+### テストへの変更
+
+- `player.acceptance.test.js`「persistent analysis cache skips Demucs lookahead」に `getCachedStemsFn` の HIT スタブを追加した。このテストは元々「BPM 解析キャッシュが HIT の場合、lookahead は再ダウンロードしない」ことだけを検証していたが、Phase 9B が C にも独立した stem-cache チェックを追加したことで、`getCachedStemsFn` を明示的にスタブしない限り（デフォルトの実 `getCachedStems()` は当然 MISS を返す）C 用の LOW パイプラインが余分な `prefetchTrackFn` 呼び出しを発生させ、このテストの `prefetchCalls === 1` アサーションと衝突していた。stem キャッシュを HIT に固定することで、テストの本来の意図（BPM 解析キャッシュの効果測定）と Phase 9B の新しい次元（stem キャッシュの有無）を分離した。
+
+### 追記: Codex レビュー対応（PR #44）
+
+初回実装後のレビューで見つかった実バグ3件を修正した（コミット ee3e54e）:
+
+- **P1: LOW プリフェッチのサブプロセスが実際には pausable でなかった** — `#runLowPriorityStemPrefetch()` は `this.#analysisQ().enqueue()` 経由で動くため一見 pausable に見えるが、実体の `#prefetchTrackFn`（本番実装は `normalize.js` の `prefetchTrack()`）は yt-dlp/ffmpeg をモジュールレベルの `spawn` で直接起動しており、`spawnNice`/`signal` を一切受け取っていなかった。そのため mixer underrun 時に `noteUnderrun()` が SIGSTOP しようとしても、対象の子プロセスがキューの `children` Set に登録されておらず何も止まらない — LOW プリフェッチが実際に PCM underrun / Discord audio drop を引き起こしうる本物のバグだった。`downloadAudio()`/`analyzeLoudness()` に `trimSilence()` と同型の `spawnFn` オプションを追加し、`prefetchTrack()` → `#runLowPriorityStemPrefetch()` まで `spawnNice` を貫通させて修正した。
+- **QUEUE ループ境界での prefetch 欠落** — `GuildQueue.upcoming()` はループ境界で wrap しないため、最後の曲では B・C ともに prefetch 対象が存在せず、最後から2番目の曲では C（wrap 後の先頭）が LOW 対象から漏れていた。`GuildQueue.wrappedUpcoming()`（新規）を追加し、QUEUE ループ時のみ `next()` と同じ wrap 挙動を再現する。
+- **HIGH エントリが PROCESSING のまま止まる経路** — `#scheduleAnalysis()` 内で、staging 失敗・abort・`#runAnalysis()` 自体の reject など「`separateTrackStemsFn()` に到達する前に終了する」経路では、既存の markReady/markFailed 呼び出しが一度も実行されず、`StemPrefetchTracker` のエントリが PROCESSING のまま永久に残っていた（`prune()` は QUEUED/PROCESSING を意図的に回収しないため）。該当する早期リターン・catch 節すべてに `markFailed()` を追加し、次回チェックポイントでの再試行を可能にした。
+
+以下2件は今回のラウンドでは対応せず、既知の制限として残す（上記スレッドへの返信にも記載）:
+
+- **キュー変更（move/remove/optimize/shuffle）時に prefetch ウィンドウが即再計算されない** — `botApi.js`/`queueEditorInteractions.js` 側の変更が必要な cross-file な変更であり、staleness も「次の `#prefetchUpcoming()` チェックポイントまで」に有界なため優先度を下げた。
+- **HIGH（B）が LOW（C）より先に dispatch される保証がない** — 上の「優先度は enqueue() 順以上の意味を持たない」の節で述べた通り、これは専用 priority queue（Phase 9C, §5.2/§5.3）そのものが解決すべき課題であり、9B の場当たり的な修正では本質的な解決にならないと判断した。Phase 9C で対応する。
+
+## 実装ノート (Phase 9C)
+
+§5 の Analysis Queue 分離を実装した。§5.1 が説明する問題（BPM/phrase/vocal 解析とフルトラック Demucs が単一 FIFO を共有し、後者が前者を長時間ブロックしうる — docs/mix-transition-phase8.md §9 の既知の未決事項）そのものを解消する、純粋なインフラ/スケジューリング変更。**どのトラックが解析されるか・いつ解析されるか・どの transition mode が選ばれるかは一切変更していない** — 変えたのは「フルトラック Demucs をどのキューインスタンスで実行するか」だけ。
+
+### 実装箇所
+
+- `src/audio/analysisQueue.js`: `createAnalysisQueue()` ファクトリ自体は変更なし（同じ closure 構造・同じ dedup/pause/kill machinery）。ここに以下を追加した。
+  - `getStemPreparationQueue()`（新規）: `getAnalysisQueue()` と対になる、もう一つの `createAnalysisQueue()` インスタンスを保持するモジュール内シングルトン。`getAnalysisQueue()` は無変更（既存の呼び出し元・既存のテストへの影響ゼロ）。
+  - `setStemPreparationQueueForTest()`（新規）: `setAnalysisQueueForTest()` と対称なテスト専用オーバーライド。
+  - `queue.pause(source)` / `queue.resume(source)`（新規、返り値オブジェクトに追加）: §5.4 の `StemQueue.pause()` に対応する、明示的な一時停止/再開コマンド。`noteUnderrun()`/`noteUnderrunCleared()` の debounce 付き自動シグナルとは別の入口だが、内部実装は同じ `underrunSources` Set・同じ `pauseCount`/`maxPauses`/`maxStoppedMs` kill-timeout machinery を共有する（`applyPause()` という共通ヘルパーに切り出した — `noteUnderrun()` はこれを debounce 判定の後に呼び、`pause()` は即座に呼ぶ、という違いだけ）。`resume()` は `noteUnderrunCleared()` そのもの（別 API 名で同じ関数を指すだけ）。CPU pressure 検出そのもの（自動トリガー）は実装していない — タスクの指示どおり、pause/resume という「能力」だけを追加した。
+- `src/player.js`:
+  - `#stemQueue` フィールド + コンストラクタの `stemQueue = null` DI パラメータ + `#stemQ()` ヘルパー（`this.#stemQueue ?? getStemPreparationQueue()`）を、既存の `#analysisQueue`/`#analysisQ()` と全く同じパターンで追加した。
+  - `#initMixerPipeline()` の `mixStream.on('underrun', ...)`: 既存の `this.#analysisQ().noteUnderrun(this)` に加えて `this.#stemQ().noteUnderrun(this)` を追加。`underrunClear` も対称に `this.#stemQ().noteUnderrunCleared(this)` を追加。§5.4 が要求する「Demucs 実行中の CPU pressure を realtime underrun から連動して緩和する」配線はこれだけ — 新しい自動検知トリガーは発明していない。`stop()` にも同様に `this.#stemQ().resume(this)`（`noteUnderrunCleared()` の別名）を追加し（既存の `#analysisQ().noteUnderrunCleared(this)` と対称）、停止したギルドが stem キューを他ギルド分も含めて pause させたままにしないようにした。
+    - **Codex レビュー (PR #45, round 1) で修正**: 初回実装はここで即時の `pause(this)`/`resume(this)` を使っていたが、生の mixer underrun イベントは瞬間的な単発スタックを何度も発火しうる（jittery）ため、それぞれが `pauseCount` に即座にカウントされ `MAX_PAUSES` を超えて長時間実行中の Demucs ジョブが誤って kill される問題があった。realtime queue 側と同じ debounce 付き `noteUnderrun()`/`noteUnderrunCleared()` 経由に統一済み（詳細は下記「追記」参照）。`pause()`/`resume()` 自体は §5.4 の明示的コマンドとして引き続き公開されているが、この自動配線からは外れている。
+  - `#scheduleAnalysis()`: 元は「BPM/phrase 解析 → 分離」を単一の `this.#analysisQ().enqueue(...)` ジョブ内で直列に実行していた。これを、BPM/phrase 解析部分は引き続き `this.#analysisQ().enqueue(...)`（realtime queue）で行い、`!signal?.aborted && stagedPath` の分岐に入った時点で `this.#stemQ().enqueue(...)`（stem queue）へ分離ジョブを **await せず** 発火するよう変更した。「await しない」がここでの本質的な変更点 — 分離を待ってしまうと realtime queue のジョブが Demucs の完走まで `running=true` のままになり、次に並んでいる別トラックの BPM/phrase ジョブを事実上ブロックしてしまう（§5.1 が解決しようとしている問題をキュー分割後も再現してしまう）。段階的な変更:
+    - staged copy の cleanup と `#scheduledAnalysisTokens` の解放（既存の finally 相当）は `finishAnalysisAttempt()` という共有ヘルパーに切り出し、「分離を dispatch しない」経路（abort 済み or staged copy 無し）と「分離を stem queue の job に投げた」経路のどちらか一方から、必ず一度だけ呼ばれるようにした（後者は stem queue job 自身の `.finally()` から呼ぶ — realtime job 自身の finally ではない、そこが今回の分割の核心）。
+    - `!signal?.aborted` のチェックは realtime job 自身の signal のまま（分離を dispatch するかどうかの判断はそのまま realtime queue 側の abort 状態を見る）。stem queue 側の job にも独立した `stemSignal?.aborted` チェックを追加している（stem queue 自身が pause/kill された場合に defensive に効く）。
+    - Phase 9B の HIGH（B）検出用コールバック（`#stemPrefetchTracker.markReady()`/`markFailed()`）はそのまま、stem queue 側の `.then(success, error)` に移設しただけ — ロジック自体は無変更。
+  - `#runLowPriorityStemPrefetch()`（Phase 9B の LOW/C 経路）: ジョブ全体（download + stage + Demucs）を `this.#analysisQ().enqueue(...)` から `this.#stemQ().enqueue(...)` に丸ごと差し替えた。このジョブは download を含めて「C の stem を用意する」以外の目的を持たないため、分割はせず全体を stem queue に移した。
+  - `#ensureAnalysisPrefetch()`（D 以降の軽量 BPM lookahead、Demucs なし）は無変更 — 引き続き `this.#analysisQ()`。
+- `src/player/test-helpers.js`: `makePlayer()` に `analysisQueue`/`stemQueue` の DI パススルーを追加（既存の他の `xxxFn` オプションと同じパターン）。
+
+### §5.2/§5.3 の構成との対応
+
+```text
+RealtimeAnalysisQueue  = getAnalysisQueue()       — 無変更のシングルトン
+  ├─ BPM / downbeat / phrase / key                — #scheduleAnalysis() の解析部分、#ensureAnalysisPrefetch()
+  └─ vocal activity
+
+StemPreparationQueue   = getStemPreparationQueue() — 新規シングルトン、concurrency=1（createAnalysisQueue() は元々シリアル）
+  └─ full-track Demucs
+      ├─ outgoing (A, Phase 8)                    — #scheduleAnalysis() の分離ステップ
+      ├─ next (B, HIGH, Phase 9B)                 — 同上（B は #scheduleAnalysis() に相乗り、9B のノート参照）
+      └─ next+1 (C, LOW, Phase 9B)                — #runLowPriorityStemPrefetch()
+```
+
+### 未決事項 / 既知の制約
+
+- **CPU pressure 検出は未実装**: タスクの指示どおり、`StemQueue.pause()`/`resume()` という能力のみ実装し、それを自動的に呼び出す CPU 監視は実装していない。唯一の自動トリガーは realtime queue 自身の underrun イベント（既存の `noteUnderrun()`/`noteUnderrunCleared()` と同じ mixStream イベント）で、これは §5.4 の例示どおり「Demucs 実行中に実際に underrun が起きている」ケースへの対応であり、それ以外の CPU 負荷（他プロセス起因など）は関知しない。
+- **キュー内の優先度は Codex レビュー（PR #45 round 1）で実装済み**（下記「追記」参照）: `StemPreparationQueue.enqueue(fn, { priority: 'high' })` は、まだ実行が始まっていない pending な非 HIGH ジョブより手前に挿入される。ただし **既に実行中の LOW ジョブへの真のプリエンプション（横取り）は未実装** — concurrency=1 のため、HIGH ジョブが到着した時点で既に走っている LOW の Demucs 実行はそのまま完走を待つ。これは意図的なスコープ限定であり、バグではない（下記「追記」参照）。
+- **`#scheduleAnalysis()` の分離ステップは fire-and-forget になった**: 9C 以前は `#scheduleAnalysis()` の返り値 Promise が分離の完了まで resolve/reject しなかったが、9C 以降は BPM/phrase 解析が終わった時点で resolve する（分離は別ジョブとして stem queue 上で並行に進む）。`#scheduleAnalysis()` の返り値を誰も awai/consume していないこと（fire-and-forget 呼び出しのみ）をコードリーディングで確認済みだが、将来誰かがこの返り値に依存するコードを追加する場合はこの変更点に注意が必要。
+- **§5.5 の完了条件の検証範囲**:
+  - 「Demucs実行中でもBPM/phrase解析がブロックされない」は **構造的にのみ** 検証できる、かつ検証済み: `RealtimeAnalysisQueue`/`StemPreparationQueue` は `createAnalysisQueue()` の完全に独立した closure インスタンスであり（`jobs`/`running`/`paused` 等の状態を一切共有しない）、FIFO の意味で一方が他方の前に割り込むことは構造上不可能。ユニットテスト（`analysisQueue.test.js`「pausing one queue instance never touches a separate instance」）と player 統合テスト（`player.acceptance.test.js` の Phase 9C セクション、stem queue mock への enqueue 回数と realtime queue mock への enqueue 回数を独立に計測）の両方で確認した。ただし「実際の Demucs 実行の重さ（CPU 時間）が本当に BPM/phrase 解析のレイテンシに影響しないか」という実測（実音源・実 CPU 負荷下でのタイミング計測）はこのエージェント環境では実施できない — phase7/8/9A/9B のノートが繰り返し書いている同じ制約。
+  - 「incoming stem cache hit rate >= 90%」は Phase 9B のノートに書かれていたとおり実運用計測が必要な指標で、9C 側の変更（どのキューが実行するか）はこの数値そのものには影響しない設計（同じ dedup・同じキャッシュチェックロジック、実行順序と並行性のみ変更）と考えられるが、これも実音源・実 Discord セッションでの計測が必要であり本エージェント環境では検証できない。
+
+### 追記: Codex レビュー対応（PR #45）
+
+round 1 で見つかった5件（P1×2, P2×3）を修正した:
+
+- **P1: HIGH（B）が pending な LOW（C）より先に dispatch される保証がなかった** — `createAnalysisQueue()`（`analysisQueue.js`、`RealtimeAnalysisQueue`/`StemPreparationQueue` 共通のファクトリ）の `enqueue(fn, options)` に `{ priority: 'high' }` を追加。`jobs` 配列の中で、まだ実行が始まっていない非 HIGH ジョブより手前に挿入する（HIGH 同士の相対順序は維持）。`#scheduleAnalysis()`（B の HIGH パス）は `#stemPrefetchTracker` が HIGH と記録している videoId のときだけ `priority: 'high'` を渡し、`#runLowPriorityStemPrefetch()`（C の LOW パス）は常に `priority: 'low'`（内部的には非 high 扱い）。**既に実行中のジョブへの真のプリエンプションは実装していない** — concurrency=1 で「今動いている LOW を止めて HIGH を先に走らせる」ことは、この修正より大きなアーキテクチャ変更になるため意図的に見送った。
+- **P2: アイドル中に `pause()` された stem queue が、次に始まるジョブに反映されなかった** — `pump()` が新しいジョブの開始時に無条件で `paused`/`stoppedAt`/`underrunSince` をリセットしていたため、「ジョブが動いていない間に届いた pause 信号」が次のジョブの開始と同時に握りつぶされていた。`underrunSources`（pause の理由を保持する Set）が空でない場合は、新しいジョブは最初から paused 状態で始まる（`register()` は `paused===true` の時点で spawn された子プロセスを即 SIGSTOP する、既存の挙動をそのまま利用）ように変更。
+- **P2: mixer の生の underrun イベントが stem queue の即時 `pause()` に直結していた** — 一瞬のアンダーラン数回で `pauseCount` が `MAX_PAUSES` を超えて長時間実行中の Demucs ジョブが kill されてしまう問題。realtime queue 側と同じ debounce 付き `noteUnderrun()`/`noteUnderrunCleared()` 経由に統一した（`pause()`/`resume()` は明示的コマンドとして引き続き公開されたまま、今回の自動配線からは外した）。
+- **P1: 通常の再生停止経路で、このプレイヤーの pause source が stem queue に残り続けることがあった** — `stop()` からしか `#stemQ().resume(this)` を呼んでいなかったが、`#onDisconnect()` を直接呼ぶ経路（キュー枯渇でハンドラ未設定など）や、`MixStream.dropCurrent()`（`underrunClear` を発火しない）を経由する4箇所（audioPlayer の `'error'`、mixStream の `'sourceerror'`、`skip()`、watchdog のストール検知）が未カバーだった。新設の `#disconnect()` ラッパー（既存の全 `#onDisconnect()` 呼び出し箇所をこれに置換）と、4箇所の `dropCurrent()` 直後への明示的な `noteUnderrunCleared(this)` 追加で解消。
+- **P2: stem queue 自身に kill された HIGH 分離ジョブが、恒久的な失敗として扱われていた** — `#scheduleAnalysis()` 内の realtime job 自身の `ANALYSIS_KILLED` は外側の `.catch()` で1回だけ再試行する既存ロジックがあったが、realtime job は分離を dispatch した時点で即 resolve する（await しない設計、上記参照）ため、stem queue 側で **後から** kill された場合はその外側 catch を素通りしてしまい、再試行が一切効かなかった。同じ「videoId ごとに1回だけ」の bound を共有する形で、stem queue 側の reject ハンドラにも同型の再試行を追加。
+
+round 2 で見つかった追加の1件（P2）:
+
+- **P2: 上記の stem-queue-level kill 再試行が、既に削除済みかもしれない `filePath` から再ステージしようとしていた** — 初回実装は `this.#scheduleAnalysis(track, filePath)` を再度呼ぶことで再試行していたが、stem queue は今やこのジョブを独立に何分も保持しうるため、再試行の時点で `filePath`（正規化済み元ファイル）はトラックの昇格/終了に伴う既存クリーンアップで既に削除されている可能性がある（`stageTempFileCopyFn` からの ENOENT で再ステージが失敗し、次の遷移のための stem を永久に失う）。修正: `#scheduleAnalysis()` を再度呼ぶのではなく、既にディスク上にある `stagedPath`（今回の kill された試行がまさに使っていたもの）を再利用する再帰的な `runSeparation()` ヘルパーに変更。`stagedPath` の cleanup と `#scheduledAnalysisTokens` の解放は、初回・再試行を含む全ての試行が完全に完了してから一度だけ行うようにした。
+
+### 完了条件（§5.5/§17 9C 相当）
+
+- [x] `RealtimeAnalysisQueue`（`getAnalysisQueue()`、無変更）と `StemPreparationQueue`（`getStemPreparationQueue()`、新規）が独立したシングルトンとして存在する
+- [x] `StemPreparationQueue` の concurrency は 1（`createAnalysisQueue()` の既存のシリアル FIFO 実装をそのまま利用）
+- [x] `StemQueue.pause()`/`resume()`（§5.4）が実装され、realtime queue の underrun イベントから連動して呼ばれる（自動 CPU 監視トリガーは対象外、上記未決事項参照)
+- [x] Phase 8 の outgoing-track 分離（`#scheduleAnalysis()`）と Phase 9B の next/next+1 分離（同経路 + `#runLowPriorityStemPrefetch()`）が両方とも `StemPreparationQueue` 経由になった。BPM/downbeat/phrase/key/vocal-activity は `RealtimeAnalysisQueue` のまま
+- [x] `StemPreparationQueue` 内で HIGH（B）が pending な LOW（C）より先に dispatch される（Codex レビュー round 1、上記「追記」参照）。既に実行中のジョブへの真のプリエンプションのみ対象外（意図的なスコープ限定）
+- [x] 既存の dedup（`#scheduledAnalysisTokens`）・underrun pause/kill・nice-level spawn は両キューインスタンスで維持（`createAnalysisQueue()` 自体を変更せず、2 個目のインスタンスとして再利用したため自動的に満たされる）
+- [x] どのトラックが解析/分離されるか、いつされるか、どの transition mode が選ばれるかは無変更（rebase 後の最終計測: `bun run test:server` で Phase 6-9B の既存テストが1件も変わらず通過、711件中703件 pass / 4件 fail は ffmpeg 未インストールによる既知の `silenceTrim.test.js` の失敗のみ、4件 skip も既知）
+- [ ] 「Demucs実行中でもBPM/phrase解析がブロックされない」の実音源・実運用計測（構造的な検証は完了、上記未決事項参照）
+- [ ] 「incoming stem cache hit rate >= 90%」の実測（上記未決事項参照、Phase 9B から持ち越しの既知の制約）

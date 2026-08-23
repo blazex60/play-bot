@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { GuildQueue, createTrack, trackIdentity } from './queue.js'
+import { GuildQueue, createTrack, trackIdentity, LoopMode } from './queue.js'
 
 test('createTrack: videoId/channel/requestedById default to null when omitted', () => {
   const track = createTrack({ title: 'A', webpageUrl: 'https://example.com/a', duration: 60, requestedBy: 'user' })
@@ -159,4 +159,44 @@ test('reorderUpcomingIfUnchanged: applies when snapshot still matches', () => {
   const snapshot = queue.upcoming().map(trackIdentity)
   assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot), true)
   assert.deepEqual(queue.upcoming().map((t) => t.title), ['C', 'A', 'B'])
+})
+
+// --- wrappedUpcoming (Codex review, PR #44) ---------------------------------
+
+test('wrappedUpcoming: same as upcoming() when there is no loop or the window is already satisfied', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C', 'D'])
+  assert.equal(queue.loopMode, LoopMode.OFF)
+  assert.deepEqual(queue.wrappedUpcoming(3).map((t) => t.title), ['A', 'B', 'C'])
+})
+
+test('wrappedUpcoming: QUEUE loop mode wraps to the front once upcoming() runs out, mirroring next()', () => {
+  const queue = makeQueueWithUpcoming(['A', 'B', 'C'])
+  queue.loopMode = LoopMode.QUEUE
+  // On the last track (C): upcoming() is [] but next() really does wrap to A.
+  queue.next()
+  queue.next()
+  assert.equal(queue.current.title, 'C')
+  assert.deepEqual(queue.wrappedUpcoming(3).map((t) => t.title), ['A', 'B'])
+
+  // On the penultimate track (B): upcoming() is [C], next+1 should wrap to A.
+  const queue2 = makeQueueWithUpcoming(['A', 'B', 'C'])
+  queue2.loopMode = LoopMode.QUEUE
+  queue2.next()
+  assert.equal(queue2.current.title, 'B')
+  assert.deepEqual(queue2.wrappedUpcoming(3).map((t) => t.title), ['C', 'A'])
+})
+
+test('wrappedUpcoming: never re-includes the current track (stops before a full lap)', () => {
+  const queue = makeQueueWithUpcoming(['A', 'B'])
+  queue.loopMode = LoopMode.QUEUE
+  queue.next()
+  assert.equal(queue.current.title, 'B')
+  // Only one other track exists (A); must not loop back around to B itself.
+  assert.deepEqual(queue.wrappedUpcoming(3).map((t) => t.title), ['A'])
+})
+
+test('wrappedUpcoming: a single-track QUEUE-loop queue returns [] just like upcoming() does', () => {
+  const queue = makeQueueWithUpcoming(['A'])
+  queue.loopMode = LoopMode.QUEUE
+  assert.deepEqual(queue.wrappedUpcoming(3), [])
 })
