@@ -986,7 +986,10 @@ test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgr
   // position 0), not the originally planned nonzero phrase-boundary entry.
   assert.equal(logCalls.length, 1);
   assert.equal(logCalls[0].entry.sec, 0);
-  assert.equal(logCalls[0].entry.bar, 0);
+  // Codex review round 2: native offset 0 isn't necessarily bar 0 (the
+  // downgraded transition no longer uses the original bar candidate at
+  // all) — bar is reported as unknown, not asserted.
+  assert.equal(logCalls[0].entry.bar, null);
 
   await player.stop();
 });

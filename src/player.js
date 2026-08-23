@@ -1211,6 +1211,16 @@ export class GuildPlayer {
       if (handled !== false) return;
       await this.#onDisconnect();
     } else {
+      // Codex review (PR #43): a "hard handoff" — no crossfade was armed AND
+      // #onSnapHandoff() either never ran or its prepared source was missing/
+      // rejected — still advances the queue to a real next track here, and
+      // never touches any of the other two transition-logging call sites.
+      // Only log the natural case: forceSkip/reconnect-retry already
+      // returned above, so !shouldForceAdvance means this wasn't an
+      // error-forced skip either.
+      if (!shouldForceAdvance) {
+        this.#logGaplessTransitionFn({ outgoingTrack: finishedTrack, incomingTrack: nextTrack });
+      }
       await this.playNext();
     }
   }
@@ -2260,7 +2270,12 @@ export class GuildPlayer {
       // used.
       if (transitionPlanReport.entry.sec !== pendingEntrySec) {
         transitionPlanReport.entry.sec = pendingEntrySec;
-        transitionPlanReport.entry.bar = pendingEntrySec === 0 ? 0 : null;
+        // Codex review (PR #43, round 2): native offset 0 is not necessarily
+        // bar 0 — the file's first detected downbeat can sit later, and a
+        // downgraded plain transition no longer uses the original bar
+        // candidate at all. Report bar as unknown rather than asserting an
+        // alignment that was never actually executed.
+        transitionPlanReport.entry.bar = null;
       }
 
       // Set promotion state BEFORE calling startCrossfade()/
