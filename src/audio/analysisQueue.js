@@ -48,8 +48,34 @@ export function createAnalysisQueue({
   let stoppedAt = 0;
   let underrunSince = null;
   let spawnEpoch = 0;
+  let stopTimeoutHandle = null;
   const underrunSources = new Set();
   const ANON_UNDERRUN = Symbol('analysis-underrun');
+
+  // Codex review (PR #45, round 4, P2): applyPause()'s own maxStoppedMs
+  // check only runs when applyPause() is called AGAIN — noteUnderrun()'s
+  // debounced path naturally re-invokes it as long as the mixer keeps
+  // reporting the underrun, but the explicit pauseQueue() command (§5.4) is
+  // edge-triggered: one call, then (normally) one matching resume. If the
+  // resume never comes — the caller/monitor disappears, or a bug drops the
+  // matching noteUnderrunCleared() — the paused job's SIGSTOP'd children
+  // would otherwise stay stopped forever with nothing left to notice.
+  // Arming a real timer here makes the kill-after-maxStoppedMs guarantee
+  // hold regardless of whether anything ever calls applyPause() again.
+  function armStopTimeout() {
+    clearStopTimeout();
+    stopTimeoutHandle = setTimeout(() => {
+      stopTimeoutHandle = null;
+      if (paused && stoppedAt) killCurrent(new Error('analysis stopped too long during underrun'));
+    }, maxStoppedMs);
+  }
+
+  function clearStopTimeout() {
+    if (stopTimeoutHandle != null) {
+      clearTimeout(stopTimeoutHandle);
+      stopTimeoutHandle = null;
+    }
+  }
 
   function childPids() {
     return [...children].filter((proc) => proc.pid && !proc.killed);
@@ -77,6 +103,7 @@ export function createAnalysisQueue({
     paused = false;
     stoppedAt = 0;
     underrunSince = null;
+    clearStopTimeout();
     const reject = currentReject;
     const abort = currentAbort;
     currentReject = null;
@@ -150,9 +177,11 @@ export function createAnalysisQueue({
       paused = false;
       stoppedAt = 0;
       underrunSince = null;
+      clearStopTimeout();
     } else if (!paused) {
       paused = true;
       stoppedAt = clock();
+      armStopTimeout();
     }
     currentReject = job.reject;
     const abortController = new AbortController();
@@ -220,6 +249,7 @@ export function createAnalysisQueue({
     paused = true;
     stoppedAt = now;
     signalChildren('SIGSTOP');
+    armStopTimeout();
   }
 
   function noteUnderrun(source = ANON_UNDERRUN) {
@@ -238,6 +268,7 @@ export function createAnalysisQueue({
     if (!paused) return;
     paused = false;
     stoppedAt = 0;
+    clearStopTimeout();
     signalChildren('SIGCONT');
   }
 

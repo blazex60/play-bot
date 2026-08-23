@@ -2975,6 +2975,81 @@ test('acceptance (mixer): a stem-cache hit marks next/next+1 READY without a red
   }
 });
 
+test('acceptance (mixer): a READY entry is not sticky — a later cache eviction is re-detected the next time the pair is re-probed (Codex review, PR #44, round 3, P2)', async () => {
+  // pruneStemCache() (src/audio/stemCache.js) can evict a previously
+  // separated pair's files under the shared cache's size cap, driven by
+  // unrelated guilds' separations — nothing tells this tracker that its
+  // READY entry has gone stale. #ensureStemPrefetch() used to skip its own
+  // getCachedStemsFn() probe entirely once an entry reached READY, so a
+  // pair evicted while still sitting in the next/next+1 window would report
+  // READY forever and never regenerate.
+  //
+  // A second #prefetchUpcoming() checkpoint over the SAME still-queued B/C
+  // pair (here: calling playNext() again without anything actually
+  // advancing) is what gives C's already-READY entry a second
+  // #ensureStemPrefetch() probe while it's still un-pruned (prune() only
+  // drops entries once they leave the next/next+1 window entirely) — the
+  // cache answers MISS this time, simulating eviction.
+  let cacheCallsForC = 0;
+  let separateCallsForC = 0;
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async (videoId) => {
+      if (videoId !== 'vid-c') return null;
+      cacheCallsForC += 1;
+      if (cacheCallsForC === 1) {
+        return { vocalPath: '/tmp/vid-c.vocal.wav', instrumentalPath: '/tmp/vid-c.instrumental.wav' };
+      }
+      return null; // every later probe: evicted
+    },
+    separateTrackStemsFn: async (filePath, videoId) => {
+      if (videoId === 'vid-c') separateCallsForC += 1;
+      return { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => byIdReady(player, 'vid-c'));
+    assert.equal(byIdState(player, 'vid-c'), 'ready', 'expected the initial cache hit to mark C ready while still next+1');
+    assert.equal(cacheCallsForC, 1);
+    const readyEntry = player.stemPrefetchStatus.find((e) => e.videoId === 'vid-c');
+    assert.equal(readyEntry.startedAt, null, 'sanity check: no separation ran yet — the cache hit alone marked it ready');
+
+    // Nothing in the queue advances — this only re-runs the same
+    // #prefetchUpcoming() checkpoint over the same still-next/next+1 B/C
+    // pair, so any recovery observed below can only come from
+    // #ensureStemPrefetch() itself noticing the now-evicted cache, not from
+    // Phase 8's independent full-prefetch pipeline (which only ever fires
+    // once per track, when it first becomes `next`).
+    await player.playNext();
+    await nextTurn();
+
+    const recoveredSeparation = await pollUntil(() => separateCallsForC >= 1, { timeoutMs: 3000 });
+    assert.ok(recoveredSeparation,
+      'expected a fresh separateTrackStemsFn call for C once the stale cache hit was detected as a miss');
+    assert.ok(cacheCallsForC >= 2,
+      'expected #ensureStemPrefetch to re-probe the cache for C even though it was already marked ready — READY must not be sticky');
+
+    const recoveredReady = await pollUntil(() => byIdReady(player, 'vid-c'), { timeoutMs: 5000 });
+    assert.ok(recoveredReady,
+      'expected C to recover back to ready via a fresh separation, not stay stuck reporting stale ready');
+    const finalEntry = player.stemPrefetchStatus.find((e) => e.videoId === 'vid-c');
+    assert.notEqual(finalEntry.startedAt, null,
+      'expected a genuine re-separation (startedAt stamped) rather than the original stale ready being left untouched');
+  } finally {
+    await player.stop();
+  }
+});
+
 test('acceptance (mixer): a skip promoting C to next escalates its stem prefetch priority to HIGH', async () => {
   const { player, queue } = makePlayer({
     trackDuration: 60,

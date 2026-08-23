@@ -2827,10 +2827,13 @@ export class GuildPlayer {
    * short-circuit must not also gate stem prefetch.
    *
    * Either way, dispatch happens only after #getCachedStemsFn() confirms a
-   * miss — a cache HIT just marks the entry READY (sticky, like
-   * #stemCacheHit's own "only positive results are memoized" — a MISS
-   * keeps getting re-checked on every #prefetchUpcoming() call, since
-   * background separation completing mid-window is the whole point).
+   * miss — a cache HIT just (re-)marks the entry READY. Unlike
+   * #stemCacheHit's own "only positive results are memoized", READY is
+   * NOT sticky here: every #prefetchUpcoming() call re-probes the cache
+   * regardless of the entry's current state (background separation
+   * completing mid-window is the whole point for a MISS, and a previously
+   * cached pair can be evicted later by pruneStemCache() — see the Codex
+   * review note at this method's cache-probe call site).
    * Nothing here is awaited by #maybeStartCrossfade() or anything else on
    * the realtime playback path — every call this method makes is
    * fire-and-forget from that path's perspective (§5.4 "Playback Safety",
@@ -2842,8 +2845,20 @@ export class GuildPlayer {
     if (!videoId) return;
 
     const entry = this.#stemPrefetchTracker.queue(videoId, priority);
-    if (entry.state === StemPreparationState.READY) return;
-
+    // Codex review (PR #44, round 3, P2): READY used to be treated as
+    // permanently sticky (an early return here, skipping the cache probe
+    // below entirely) — but stemCache.js's pruneStemCache() can evict a
+    // previously-separated pair's files later (LRU eviction once the shared
+    // 2GB cache fills, driven by unrelated guilds' separations), and nothing
+    // ever told this tracker its READY entry had gone stale. The real
+    // transition path re-`access()`s the files at take time and falls back
+    // safely when they're gone, so eviction was never a playback bug — but
+    // this prefetch status would stay stuck reporting READY forever for
+    // that pair, never re-dispatching a fresh separation. Falling through
+    // to the same getCachedStemsFn() probe every MISS entry already gets
+    // re-checks READY entries too; a HIT just re-confirms READY (no-op), a
+    // MISS now correctly falls into the same HIGH/LOW re-dispatch logic
+    // below that a fresh MISS uses.
     this.#getCachedStemsFn(videoId).then((cached) => {
       if (cached) {
         this.#stemPrefetchTracker.markReady(videoId);
