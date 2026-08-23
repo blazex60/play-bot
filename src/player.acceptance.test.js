@@ -2332,3 +2332,32 @@ test('acceptance (mixer): a stem-mix pair marked unavailable gets a fresh attemp
     await player.stop();
   }
 });
+
+// --- Phase 9A round 4 (Codex review, PR #43): #pendingGaplessFrom staleness ---
+
+test('acceptance (mixer): stop() clears a pending gapless continuation so a later unrelated playNext does not misattribute it', async () => {
+  const logCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 3,
+    handleQueueExhausted: async () => true, // recommend mode: don't start another track
+    logTransitionPlanFn: (report) => logCalls.push(report),
+    logGaplessTransitionFn: (payload) => logCalls.push(payload),
+  });
+
+  await player.playNext();
+  triggerTrackEnd({ mixStream: player.mixStream });
+  await waitMs(20);
+  // Queue is empty and handleQueueExhausted returned true without adding a
+  // track — #pendingGaplessFrom is stashed for whenever playback resumes.
+
+  await player.stop();
+
+  // A later, wholly unrelated /play — nothing here should attribute back
+  // to the track that finished before stop().
+  queue.add(createTrack({ title: 'Track Z', webpageUrl: 'https://example.com/z', duration: 3 }));
+  await player.playNext();
+  await waitMs(20);
+
+  assert.equal(logCalls.length, 0, 'stop() must clear the stashed continuation, not let it leak into an unrelated later playNext');
+  await player.stop();
+});

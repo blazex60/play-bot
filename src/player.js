@@ -58,6 +58,19 @@ const OUTGOING_STEM_DRIFT_TOLERANCE_SEC = 0.5;
 const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 const WATCHDOG_STALL_THRESHOLD = 30_000;
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
+// Codex review (PR #43, round 4): #pendingGaplessFrom is stashed instance
+// state that can outlive the specific autoplay continuation it was meant
+// for (e.g. recommend-mode returns `true` without immediately starting a
+// track) — bound its validity to a short window so a much-later, unrelated
+// playNext() call (a fresh /play after the player sat idle) can't
+// misattribute a stale gapless transition.
+const PENDING_GAPLESS_MAX_AGE_MS = 30_000;
+// Codex review (PR #43, round 4): how stale a #lastEvaluatedTransitionReport
+// entry can be and still be trusted to describe the hard handoff that just
+// happened for the same pair — bounds reusing a genuinely old evaluation
+// from several tracks/minutes ago in the rare case a (current, next)
+// videoId pair repeats (e.g. QUEUE-loop wraparound).
+const LAST_EVALUATED_TRANSITION_MAX_AGE_MS = 30_000;
 /**
  * Default AudioPlayer.maxMissedFrames is 5 (100 ms of null opus reads), after
  * which stop() destroy()s the session MixStream. ffmpeg/yt-dlp hiccups are
@@ -363,8 +376,30 @@ export class GuildPlayer {
    * #playNextMixer). Anything else in the meantime (e.g. a user /skip
    * racing the autoplay fetch) would misattribute this — accepted as a
    * low-impact, debug-log-only edge case, same as other documented races.
+   *
+   * Codex review (PR #43, round 4): also cleared by stop() and bounded by
+   * PENDING_GAPLESS_MAX_AGE_MS — recommend-mode exhaustion can return
+   * `true` without starting another track for a while, and without either
+   * guard a much-later, wholly unrelated playNext() (e.g. a fresh /play
+   * after the player sat idle) would consume this stale stash and corrupt
+   * the always-on totalTransitions/selected.gapless metrics, not just the
+   * debug log.
+   * @type {{ track: object, setAt: number } | null}
    */
   #pendingGaplessFrom = null;
+  /**
+   * Codex review (PR #43, round 4): the most recent real (fadeSec > 0)
+   * [MIX PLAN] evaluation for a (current, next) pair, kept around so that
+   * IF this exact pair later falls through to a hard handoff (prep raced
+   * EOF, or the source failed to start), the eventual gapless log can
+   * report what was actually evaluated/missed instead of the generic
+   * "no candidate evaluation" stub — see #stashLastEvaluatedTransition()/
+   * #takeMatchingEvaluatedTransition(). Not read by anything on the
+   * playback-decision path; purely for the two logGaplessTransitionFn call
+   * sites' diagnostic output.
+   * @type {{ pairKey: string, report: object, evaluatedAt: number } | null}
+   */
+  #lastEvaluatedTransitionReport = null;
   /** Test-only override — the two stem-prep methods call createFileSource() directly (they bypass #createPcmSource entirely, since stem WAVs need no download/normalize/loudnorm pass), so a dedicated injection point mirrors this file's existing DI convention for every other real-process spawn. */
   #createFileSourceFn;
   /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
@@ -541,8 +576,10 @@ export class GuildPlayer {
       await this.#onDisconnect();
       return;
     }
-    const resolvedGaplessFrom = gaplessFrom ?? this.#pendingGaplessFrom;
+    const pending = this.#pendingGaplessFrom;
     this.#pendingGaplessFrom = null;
+    const pendingStillFresh = pending && Date.now() - pending.setAt < PENDING_GAPLESS_MAX_AGE_MS;
+    const resolvedGaplessFrom = gaplessFrom ?? (pendingStillFresh ? pending.track : null);
     await this.#playNextMixer(track, { gaplessFrom: resolvedGaplessFrom });
   }
 
@@ -624,7 +661,16 @@ export class GuildPlayer {
     // method (PCM/source-audio-wait errors above) never reaches here and is
     // correctly never counted as a committed transition.
     if (gaplessFrom) {
-      this.#logGaplessTransitionFn({ outgoingTrack: gaplessFrom, incomingTrack: track });
+      // Codex review (PR #43, round 4): prefer a fresh evaluation of this
+      // exact pair from #maybeStartCrossfade() (the plan that was actually
+      // in flight when prep raced EOF) over the generic gapless stub, so
+      // the log reflects what was really evaluated/missed.
+      const evaluated = this.#takeMatchingEvaluatedTransition(gaplessFrom, track);
+      if (evaluated) {
+        this.#logTransitionPlanFn(evaluated);
+      } else {
+        this.#logGaplessTransitionFn({ outgoingTrack: gaplessFrom, incomingTrack: track });
+      }
     }
     this.#resetSessionTempoFor(track);
     // Attach the opus pipeline only after PCM has arrived so the encoder's
@@ -774,7 +820,15 @@ export class GuildPlayer {
     // candidate evaluation runs on this path (a prepared source simply won
     // the race to EOF), so record it separately or `totalTransitions`
     // undercounts real playback and `selected.gapless` never populates.
-    this.#logGaplessTransitionFn({ outgoingTrack: current, incomingTrack: next });
+    // Codex review (PR #43, round 4): prefer a fresh evaluation of this
+    // exact pair over the generic stub, same reasoning as #playNextMixer's
+    // own gapless log site.
+    const evaluated = this.#takeMatchingEvaluatedTransition(current, next);
+    if (evaluated) {
+      this.#logTransitionPlanFn(evaluated);
+    } else {
+      this.#logGaplessTransitionFn({ outgoingTrack: current, incomingTrack: next });
+    }
 
     this.#preparedIncoming = null;
     // A stem-mix attempt could have been prepping in parallel with this
@@ -1145,6 +1199,10 @@ export class GuildPlayer {
     this.#clearCrossfadeArm();
     this.#clearPreparedIncoming();
     this.#queueRefill = null;
+    // Codex review (PR #43, round 4): an explicit stop must not leave a
+    // stashed gapless continuation around for a later, unrelated playNext()
+    // (e.g. a fresh /play in the same session) to pick up.
+    this.#pendingGaplessFrom = null;
     this.#analysisQ().noteUnderrunCleared(this);
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
@@ -1247,7 +1305,7 @@ export class GuildPlayer {
       // #pendingGaplessFrom's docstring) and logs only once its source
       // actually starts, same "natural, non-error" guard as the branch below.
       if (!shouldForceAdvance) {
-        this.#pendingGaplessFrom = finishedTrack;
+        this.#pendingGaplessFrom = { track: finishedTrack, setAt: Date.now() };
       }
       const handled = await this.#startQueueRefill(finishedTrack);
       // null = another round already owns the autoplay lock; do not disconnect.
@@ -2032,6 +2090,15 @@ export class GuildPlayer {
         incomingStemsCached: Boolean(inCachedStems),
         plannedMode,
       });
+      // Codex review (PR #43, round 4): stash a snapshot now, before this
+      // tick's own downgrade/commit logic below mutates transitionPlanReport
+      // in place — a hard handoff for this exact pair later (prep raced
+      // EOF, or the source failed to start) can then report what was
+      // actually evaluated instead of a generic "no candidate" stub. Own
+      // copies of the mutable nested objects (entry/candidates/stemCache)
+      // so later in-place edits to transitionPlanReport itself (§ below)
+      // can't retroactively change what was stashed for this tick.
+      this.#stashLastEvaluatedTransition(stemCacheLookupKey, transitionPlanReport);
       let modeDowngraded = false;
 
       // §2.3/§8.4: TRACK loop mode repeats the SAME track (`next === current`
@@ -2473,6 +2540,49 @@ export class GuildPlayer {
 
   #queueRefillKey(track) {
     return track?.videoId || track?.webpageUrl || track || null;
+  }
+
+  /**
+   * Codex review (PR #43, round 4): own copies of the mutable nested
+   * objects — #maybeStartCrossfade() mutates `transitionPlanReport.entry`/
+   * `.selected`/`.downgradedFrom` in place further down the SAME tick this
+   * report was built on (for the normal committed-transition log), and
+   * that must never retroactively change what this stash reports for a
+   * later, unrelated hard handoff.
+   */
+  #stashLastEvaluatedTransition(pairKey, report) {
+    this.#lastEvaluatedTransitionReport = {
+      pairKey,
+      evaluatedAt: Date.now(),
+      report: {
+        ...report,
+        candidates: { ...report.candidates },
+        stemCache: { ...report.stemCache },
+        exit: report.exit ? { ...report.exit } : report.exit,
+        entry: report.entry ? { ...report.entry } : report.entry,
+      },
+    };
+  }
+
+  /**
+   * Codex review (PR #43, round 4): returns a fresh stashed evaluation for
+   * this exact (outgoing, incoming) pair, re-labeled as the gapless hard
+   * handoff that's actually being logged — or null if nothing fresh was
+   * evaluated for this pair (falls back to the generic logGaplessTransition
+   * stub at the call site). Consumes the stash either way so a later,
+   * different hard handoff can't accidentally reuse it.
+   */
+  #takeMatchingEvaluatedTransition(outgoingTrack, incomingTrack) {
+    const stashed = this.#lastEvaluatedTransitionReport;
+    this.#lastEvaluatedTransitionReport = null;
+    if (!stashed) return null;
+    if (Date.now() - stashed.evaluatedAt >= LAST_EVALUATED_TRANSITION_MAX_AGE_MS) return null;
+    const pairKey = `${outgoingTrack?.videoId ?? ''}:${incomingTrack?.videoId ?? ''}`;
+    if (stashed.pairKey !== pairKey) return null;
+    const { report } = stashed;
+    report.downgradedFrom = report.selected;
+    report.selected = 'gapless';
+    return report;
   }
 
   #startQueueRefill(track) {
