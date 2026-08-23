@@ -23,9 +23,14 @@ const LOUDNORM_TARGET = 'I=-16:TP=-1.5:LRA=11'
 export class NormalizeError extends Error {}
 export class NormalizeDurationError extends NormalizeError {}
 
-function spawnBuffered(cmd, args) {
+// Codex review (PR #44): accepts an optional spawnFn override so callers
+// running inside the analysis queue's pausable lane (see
+// analysisQueue.js's spawnNice) can make these subprocesses actually
+// pause/kill-able under CPU pressure, instead of always spawning an
+// untracked child via the module-level `spawn` regardless of caller.
+function spawnBuffered(cmd, args, spawnFn = spawn) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args)
+    const proc = spawnFn(cmd, args)
     let stdout = ''
     let stderr = ''
     proc.stdout.on('data', data => { stdout += data })
@@ -83,23 +88,23 @@ export function isNormalizeDurationAllowed(track) {
 
 export const canNormalizeTrack = isNormalizeDurationAllowed
 
-export async function downloadAudio(url, destPath) {
+export async function downloadAudio(url, destPath, { spawnFn } = {}) {
   await mkdir(path.dirname(destPath), { recursive: true })
   await spawnBuffered('yt-dlp', buildYtdlpArgs(
     '-f', YTDLP_AUDIO_FORMAT,
     '--no-playlist',
     '-o', destPath,
     url,
-  ))
+  ), spawnFn)
 }
 
-export async function analyzeLoudness(filePath) {
+export async function analyzeLoudness(filePath, { spawnFn } = {}) {
   const { stderr } = await spawnBuffered('ffmpeg', [
     '-i', filePath,
     '-af', `loudnorm=${LOUDNORM_TARGET}:print_format=json`,
     '-f', 'null',
     '-',
-  ])
+  ], spawnFn)
   return parseLoudnormJson(stderr)
 }
 
@@ -195,18 +200,18 @@ function tempFilePath(track) {
   return path.join(TEMP_DIR, `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}-${safeTitle}`)
 }
 
-export async function prefetchTrack(track) {
+export async function prefetchTrack(track, { spawnFn } = {}) {
   if (!isNormalizeDurationAllowed(track)) {
     throw new NormalizeDurationError(`track exceeds ${MAX_NORMALIZE_DURATION_SEC}s normalize limit`)
   }
 
   const filePath = tempFilePath(track)
   try {
-    await downloadAudio(track.webpageUrl, filePath)
+    await downloadAudio(track.webpageUrl, filePath, { spawnFn })
     // Trim YouTube/source padding before loudnorm + MIX analysis so
     // remainingSec and crossfade sit on audible audio.
-    await trimSilence(filePath)
-    const measured = await analyzeLoudness(filePath)
+    await trimSilence(filePath, spawnFn ? { spawnFn } : undefined)
+    const measured = await analyzeLoudness(filePath, { spawnFn })
     return { filePath, measured }
   } catch (err) {
     await cleanupTempFile(filePath)

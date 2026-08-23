@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { mkdir, writeFile, readFile, rm, access } from 'node:fs/promises'
 import {
   MAX_NORMALIZE_DURATION_SEC,
@@ -8,8 +9,29 @@ import {
   parseLoudnormJson,
   stageTempFileCopy,
   cleanupTempFile,
+  downloadAudio,
+  analyzeLoudness,
   TEMP_DIR,
 } from './normalize.js'
+
+/** Mirrors stemCache.test.js's fakeSpawn shape (an EventEmitter-based fake child process). */
+function fakeSpawn({ stderr = '', fails = false } = {}) {
+  const calls = []
+  const spawnFn = (cmd, args = []) => {
+    calls.push({ cmd, args })
+    const proc = new EventEmitter()
+    proc.stdout = new EventEmitter()
+    proc.stderr = new EventEmitter()
+    proc.kill = () => {}
+    queueMicrotask(() => {
+      if (stderr) proc.stderr.emit('data', stderr)
+      proc.emit('close', fails ? 1 : 0)
+    })
+    return proc
+  }
+  spawnFn.calls = calls
+  return spawnFn
+}
 
 test('parseLoudnormJson: ffmpeg stderr末尾のJSONをパースする', () => {
   const measured = parseLoudnormJson(`
@@ -96,4 +118,56 @@ test('stageTempFileCopy: 独立したコピーを作成し、元ファイル削�
     if (staged) await cleanupTempFile(staged)
     await rm(original, { force: true })
   }
+})
+
+// --- Codex review (PR #44, P1): downloadAudio/analyzeLoudness spawnFn threading ---
+//
+// Without this, prefetchTrack()'s subprocesses always spawn via the
+// module-level `spawn`, untracked by analysisQueue's pause/kill machinery —
+// a caller running inside the queue (Phase 9B's low-priority stem prefetch)
+// couldn't actually pause them under a mixer underrun despite believing it
+// could. These verify the override is honored, not real yt-dlp/ffmpeg
+// behavior (ffmpeg isn't installed in this sandbox, a known limitation).
+
+test('downloadAudio: honors a custom spawnFn instead of always using node:child_process spawn', async () => {
+  const dest = `${TEMP_DIR}/spawnfn-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const spawnFn = fakeSpawn()
+  try {
+    await downloadAudio('https://example.com/watch?v=fake', dest, { spawnFn })
+    assert.equal(spawnFn.calls.length, 1)
+    assert.equal(spawnFn.calls[0].cmd, 'yt-dlp')
+  } finally {
+    await rm(dest, { force: true })
+  }
+})
+
+test('downloadAudio: a spawnFn failure surfaces as a rejection, not a silent success', async () => {
+  const dest = `${TEMP_DIR}/spawnfn-test-fail-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const spawnFn = fakeSpawn({ fails: true })
+  try {
+    await assert.rejects(() => downloadAudio('https://example.com/watch?v=fake', dest, { spawnFn }))
+  } finally {
+    await rm(dest, { force: true })
+  }
+})
+
+test('analyzeLoudness: honors a custom spawnFn and parses its stderr', async () => {
+  const loudnormJson = JSON.stringify({
+    input_i: '-20.0', input_tp: '-2.0', input_lra: '5.0', input_thresh: '-30.0', target_offset: '0.5',
+  })
+  const spawnFn = fakeSpawn({ stderr: `some ffmpeg preamble\n${loudnormJson}\n` })
+  const measured = await analyzeLoudness('/tmp/does-not-need-to-exist.wav', { spawnFn })
+  assert.equal(spawnFn.calls.length, 1)
+  assert.equal(spawnFn.calls[0].cmd, 'ffmpeg')
+  assert.equal(measured.measured_I, '-20.0')
+})
+
+test('downloadAudio/analyzeLoudness: default to real node:child_process spawn when no override is given', () => {
+  // Not exercised end-to-end (no ffmpeg/yt-dlp in this sandbox) — just
+  // confirms the optional-param default doesn't throw synchronously before
+  // even attempting to spawn, i.e. existing callers (#ensureFullPrefetch's
+  // plain prefetchTrackFn(track) call, with no options object at all)
+  // remain unaffected by this signature change.
+  assert.doesNotThrow(() => { downloadAudio('https://example.com', '/tmp/unused-dest').catch(() => {}) })
+  assert.doesNotThrow(() => { analyzeLoudness('/tmp/unused.wav').catch(() => {}) })
 })

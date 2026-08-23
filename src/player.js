@@ -1466,6 +1466,16 @@ export class GuildPlayer {
               }
             },
           );
+        } else if (this.#stemPrefetchTracker.get(track.videoId)) {
+          // Codex review (PR #44): staging failed (stagedPath null), or
+          // this job was aborted before separation was even attempted —
+          // either way it's exiting without ever calling
+          // separateTrackStemsFn, so the markReady/markFailed pair above
+          // never runs. Mark it failed here instead of leaving the tracked
+          // entry stuck reporting PROCESSING forever (prune() deliberately
+          // never collects a PROCESSING/QUEUED entry) — a later
+          // #prefetchUpcoming() checkpoint will retry it.
+          this.#stemPrefetchTracker.markFailed(track.videoId);
         }
         return analysis;
       } finally {
@@ -1485,6 +1495,14 @@ export class GuildPlayer {
       // enqueue() itself rejects without ever invoking that callback.
       if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
         this.#scheduledAnalysisTokens.delete(track.videoId);
+      }
+      // Codex review (PR #44): #lookupPersistentAnalysis()/#runAnalysis()
+      // throwing (including an ANALYSIS_KILLED abort) before ever reaching
+      // the separation step above means neither markReady/markFailed branch
+      // there ran either — same "don't leave it stuck at PROCESSING
+      // forever" reasoning.
+      if (this.#stemPrefetchTracker.get(track.videoId)) {
+        this.#stemPrefetchTracker.markFailed(track.videoId);
       }
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
@@ -2440,9 +2458,14 @@ export class GuildPlayer {
   }
 
   #prefetchUpcoming() {
+    // Codex review (PR #44): wrappedUpcoming() (not upcoming().slice()) so
+    // QUEUE loop mode's last track still gets a HIGH stem-prefetch/full
+    // prefetch pass and the penultimate track still gets its LOW/lookahead
+    // pass, instead of both silently missing lookahead right at the loop
+    // boundary even though next() really does wrap there.
     const upcoming = this.#queue.loopMode === LoopMode.TRACK
       ? (this.#queue.current ? [this.#queue.current] : [])
-      : this.#queue.upcoming().slice(0, 3);
+      : this.#queue.wrappedUpcoming(3);
 
     const keep = new Set(upcoming.map((t) => this.#prefetchKey(t)).filter(Boolean));
     for (const key of [...this.#prefetchEntries.keys()]) {
@@ -2581,7 +2604,14 @@ export class GuildPlayer {
   async #runLowPriorityStemPrefetch(track) {
     return this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
       throwIfAborted(signal);
-      const downloaded = await this.#prefetchTrackFn(track);
+      // Codex review (PR #44, P1): without spawnFn, prefetchTrackFn's
+      // default implementation (normalize.js's prefetchTrack) spawns
+      // yt-dlp/ffmpeg via the module-level `spawn`, entirely untracked by
+      // this queue's pause/kill machinery — a mixer underrun during this
+      // download would have nothing to actually SIGSTOP. Passing spawnNice
+      // routes those subprocesses through the same register()/children Set
+      // every other job in this queue already uses.
+      const downloaded = await this.#prefetchTrackFn(track, { spawnFn: spawnNice });
       try {
         throwIfAborted(signal);
         const stagedPath = await this.#stageTempFileCopyFn(downloaded.filePath).catch((err) => {
