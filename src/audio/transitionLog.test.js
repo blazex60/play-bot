@@ -4,6 +4,7 @@ import {
   buildTransitionPlanReport,
   formatTransitionPlanLog,
   logTransitionPlan,
+  logGaplessTransition,
 } from './transitionLog.js';
 import { getTransitionMetrics, resetTransitionMetrics } from './transitionMetrics.js';
 
@@ -207,6 +208,101 @@ test('buildTransitionPlanReport: exit.vocalActive is null when vocal analysis is
     plannedMode: 'beatmix',
   });
   assert.equal(report.exit.vocalActive, null);
+});
+
+test('buildTransitionPlanReport: exit.vocalActive is false when the exit point falls inside a recorded vocal gap, even though a later vocal exists (Codex review, PR #43)', () => {
+  const rawPlan = beatmixPlan({ exitStartSec: 100 });
+  const report = buildTransitionPlanReport({
+    outgoingTrack,
+    incomingTrack,
+    outgoingAnalysis: {
+      lastVocalEndSec: 190, // a later vocal phrase exists...
+      vocalGaps: [{ startSec: 95, endSec: 110 }], // ...but the exit sits inside a silent gap
+    },
+    incomingAnalysis: {},
+    rawPlan,
+    stemPlan: null,
+    stemCacheAttempted: false,
+    outgoingStemsCached: false,
+    incomingStemsCached: false,
+    plannedMode: 'beatmix',
+  });
+  assert.equal(report.exit.vocalActive, false);
+});
+
+test('buildTransitionPlanReport: exit.vocalActive stays true when the exit is outside every recorded vocal gap', () => {
+  const rawPlan = beatmixPlan({ exitStartSec: 100 });
+  const report = buildTransitionPlanReport({
+    outgoingTrack,
+    incomingTrack,
+    outgoingAnalysis: {
+      lastVocalEndSec: 190,
+      vocalGaps: [{ startSec: 40, endSec: 50 }],
+    },
+    incomingAnalysis: {},
+    rawPlan,
+    stemPlan: null,
+    stemCacheAttempted: false,
+    outgoingStemsCached: false,
+    incomingStemsCached: false,
+    plannedMode: 'beatmix',
+  });
+  assert.equal(report.exit.vocalActive, true);
+});
+
+test('buildTransitionPlanReport: legacy plan (simple-fade/tail-fade/crossfade) with no startSec falls back to duration - fadeSec instead of reporting null (Codex review, PR #43)', () => {
+  const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
+  const report = buildTransitionPlanReport({
+    outgoingTrack,
+    incomingTrack,
+    outgoingAnalysis: { durationSec: 200 },
+    incomingAnalysis: {},
+    rawPlan,
+    stemPlan: null,
+    stemCacheAttempted: false,
+    outgoingStemsCached: false,
+    incomingStemsCached: false,
+    plannedMode: 'simple-fade',
+  });
+  assert.equal(report.exit.sec, 196);
+});
+
+test('buildTransitionPlanReport: legacy plan exit stays null when neither startSec nor duration is known', () => {
+  const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
+  const report = buildTransitionPlanReport({
+    outgoingTrack,
+    incomingTrack,
+    outgoingAnalysis: {},
+    incomingAnalysis: {},
+    rawPlan,
+    stemPlan: null,
+    stemCacheAttempted: false,
+    outgoingStemsCached: false,
+    incomingStemsCached: false,
+    plannedMode: 'simple-fade',
+  });
+  assert.equal(report.exit.sec, null);
+});
+
+// --- logGaplessTransition ----------------------------------------------------
+
+test('logGaplessTransition: always records a "gapless" metrics entry, regardless of MIX_DEBUG', () => {
+  logGaplessTransition({ outgoingTrack, incomingTrack }, { debug: false });
+  const metrics = getTransitionMetrics();
+  assert.equal(metrics.totalTransitions, 1);
+  assert.equal(metrics.selected.gapless, 1);
+});
+
+test('logGaplessTransition: prints an abbreviated [MIX PLAN] block only when debug is true', () => {
+  const calls = [];
+  const logger = { log: (msg) => calls.push(msg) };
+  logGaplessTransition({ outgoingTrack, incomingTrack }, { debug: false, logger });
+  assert.equal(calls.length, 0);
+
+  logGaplessTransition({ outgoingTrack, incomingTrack }, { debug: true, logger });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /\[MIX PLAN\]/);
+  assert.match(calls[0], /selected=gapless/);
 });
 
 // --- formatTransitionPlanLog -----------------------------------------------

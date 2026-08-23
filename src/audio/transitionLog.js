@@ -141,6 +141,19 @@ export function buildTransitionPlanReport({
   };
 }
 
+/**
+ * Codex review (PR #43): `lastVocalEndSec > sec` alone only proves *some*
+ * later vocal exists — the exit itself can sit inside a `vocalGaps` window
+ * (silence between phrases), where treating it as "vocal active" mislabels
+ * why a transition was selected. An exit sec inside a recorded gap counts
+ * as inactive even when a later vocal phrase would still make
+ * `lastVocalEndSec > sec` true.
+ */
+function isInsideVocalGap(sec, vocalGaps) {
+  if (!Array.isArray(vocalGaps) || sec == null) return false;
+  return vocalGaps.some((gap) => sec >= gap.startSec && sec < gap.endSec);
+}
+
 function exitInfo(plan, outgoingAnalysis) {
   let sec = null;
   let bar = null;
@@ -151,10 +164,20 @@ function exitInfo(plan, outgoingAnalysis) {
     sec = plan.startSec ?? null;
     bar = plan.exitBarIndex ?? null;
   } else {
-    sec = plan.startSec ?? null;
+    // Codex review (PR #43): legacy plans (simple-fade/tail-fade/crossfade)
+    // carry no exit timestamp of their own — player.js itself falls back to
+    // `durationSec - fadeSec` (see #maybeStartCrossfade's own `startSec`
+    // computation) when arming these. Mirror that same fallback here rather
+    // than reporting a null exit for the common analysis-not-ready path.
+    sec = plan.startSec
+      ?? (Number.isFinite(outgoingAnalysis?.durationSec) && Number.isFinite(plan.fadeSec)
+        ? Math.max(0, outgoingAnalysis.durationSec - plan.fadeSec)
+        : null);
   }
   const lastVocalEndSec = outgoingAnalysis?.lastVocalEndSec;
-  const vocalActive = Number.isFinite(lastVocalEndSec) && sec != null ? lastVocalEndSec > sec : null;
+  const vocalActive = Number.isFinite(lastVocalEndSec) && sec != null
+    ? lastVocalEndSec > sec && !isInsideVocalGap(sec, outgoingAnalysis?.vocalGaps)
+    : null;
   return { sec, bar, vocalActive };
 }
 
@@ -234,4 +257,31 @@ export function logTransitionPlan(report, { debug = process.env.MIX_DEBUG === 't
   recordTransition({ selected: report.selected, stemCache: report.stemCache });
   if (!debug) return;
   logger.log(formatTransitionPlanLog(report));
+}
+
+/**
+ * Codex review (PR #43): a "snap handoff" (`#onSnapHandoff()` in player.js —
+ * a prepared incoming source naturally winning the race to EOF, outside the
+ * crossfade arm/plan machinery entirely) is a real, committed track handoff
+ * that never goes through buildTransitionPlanReport()/logTransitionPlan()
+ * above — no candidate evaluation happens there at all, so there is no plan
+ * to build a full report from. Without this, `totalTransitions` undercounts
+ * real playback and the `selected.gapless` bucket is never populated.
+ * Records the same always-on metrics entry as logTransitionPlan(), plus an
+ * abbreviated `[MIX PLAN]` line under MIX_DEBUG (no candidate/exit/entry
+ * detail exists to print for this path).
+ * @param {{ outgoingTrack?: {title?: string}, incomingTrack?: {title?: string} }} tracks
+ * @param {{ debug?: boolean, logger?: { log: Function } }} [options]
+ */
+export function logGaplessTransition({ outgoingTrack, incomingTrack } = {}, { debug = process.env.MIX_DEBUG === 'true', logger = console } = {}) {
+  recordTransition({ selected: 'gapless', stemCache: {} });
+  if (!debug) return;
+  logger.log([
+    '[MIX PLAN]',
+    `from="${outgoingTrack?.title ?? 'unknown'}"`,
+    `to="${incomingTrack?.title ?? 'unknown'}"`,
+    '',
+    'selected=gapless',
+    '(natural snap handoff — no candidate evaluation, no crossfade plan)',
+  ].join('\n'));
 }

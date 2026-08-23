@@ -949,6 +949,7 @@ test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgr
     analysisSource: 'demucs',
   };
 
+  const logCalls = [];
   const { player, queue } = makePlayer({
     trackDuration: 8,
     track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
@@ -963,6 +964,7 @@ test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgr
       if (track.videoId === 'vid-b') source.tempoHonored = false;
       return source;
     },
+    logTransitionPlanFn: (report) => logCalls.push(report),
   });
   queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
 
@@ -979,6 +981,12 @@ test('acceptance (mixer): a phrase-crossfade with an unhonored entry seek downgr
     false,
     'expected baseSwap to be stripped once the incoming source could not honor the plan\'s selected entry point',
   );
+  // Codex review (PR #43): the [MIX PLAN] report's entry must reflect the
+  // entry actually applied (0, since the source fell back to native
+  // position 0), not the originally planned nonzero phrase-boundary entry.
+  assert.equal(logCalls.length, 1);
+  assert.equal(logCalls[0].entry.sec, 0);
+  assert.equal(logCalls[0].entry.bar, 0);
 
   await player.stop();
 });

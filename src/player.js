@@ -26,7 +26,7 @@ import { LoopMode } from './queue.js';
 import { getAnalysisQueue } from './audio/analysisQueue.js';
 import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
 import { planStemTransition } from './audio/stemTransition.js';
-import { buildTransitionPlanReport, logTransitionPlan } from './audio/transitionLog.js';
+import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition } from './audio/transitionLog.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
@@ -351,6 +351,8 @@ export class GuildPlayer {
   #planStemTransitionFn;
   /** Phase 9A (docs/mix-transition-phase9.md §3): test-only override — see logTransitionPlan()'s own docstring for the always-on-metrics/MIX_DEBUG-gated-log split. */
   #logTransitionPlanFn;
+  /** Phase 9A (Codex review, PR #43): test-only override — see logGaplessTransition()'s own docstring for why the snap-handoff path needs a separate, report-less logging entry point. */
+  #logGaplessTransitionFn;
   /** Test-only override — the two stem-prep methods call createFileSource() directly (they bypass #createPcmSource entirely, since stem WAVs need no download/normalize/loudnorm pass), so a dedicated injection point mirrors this file's existing DI convention for every other real-process spawn. */
   #createFileSourceFn;
   /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
@@ -429,6 +431,7 @@ export class GuildPlayer {
     planStemTransitionFn = planStemTransition,
     createFileSourceFn = createFileSource,
     logTransitionPlanFn = logTransitionPlan,
+    logGaplessTransitionFn = logGaplessTransition,
     pcmWaitTimeoutMs = PCM_WAIT_TIMEOUT_MS,
   }) {
     this.#guildId = guildId;
@@ -455,6 +458,7 @@ export class GuildPlayer {
     this.#planStemTransitionFn = planStemTransitionFn;
     this.#createFileSourceFn = createFileSourceFn;
     this.#logTransitionPlanFn = logTransitionPlanFn;
+    this.#logGaplessTransitionFn = logGaplessTransitionFn;
     this.#pcmWaitTimeoutMs = Number.isFinite(pcmWaitTimeoutMs)
       ? pcmWaitTimeoutMs
       : PCM_WAIT_TIMEOUT_MS;
@@ -730,6 +734,13 @@ export class GuildPlayer {
       await this.#cleanupIncomingTempFile();
       return;
     }
+
+    // Codex review (PR #43): this is a real, committed track handoff that
+    // never touches #maybeStartCrossfade()'s own [MIX PLAN] report/log — no
+    // candidate evaluation runs on this path (a prepared source simply won
+    // the race to EOF), so record it separately or `totalTransitions`
+    // undercounts real playback and `selected.gapless` never populates.
+    this.#logGaplessTransitionFn({ outgoingTrack: current, incomingTrack: next });
 
     this.#preparedIncoming = null;
     // A stem-mix attempt could have been prepping in parallel with this
@@ -2232,15 +2243,25 @@ export class GuildPlayer {
         }
       }
 
-      // Phase 9A (docs/mix-transition-phase9.md §3): finalize and emit the
-      // [MIX PLAN] report now that mixPlan reflects everything that could
-      // still change the actually-executed mode (TRACK loop re-derivation,
+      // Phase 9A (docs/mix-transition-phase9.md §3): finalize the [MIX PLAN]
+      // report now that mixPlan reflects everything that could still change
+      // the actually-executed mode (TRACK loop re-derivation,
       // forcePlainCrossfade) — every earlier `return` above this point was
       // an abort (retry next arm tick, not a committed transition), so this
       // is reached exactly once per real transition, not once per tick.
       transitionPlanReport.selected = modeDowngraded ? mixPlan.mode : plannedMode;
       transitionPlanReport.downgradedFrom = modeDowngraded ? plannedMode : null;
-      this.#logTransitionPlanFn(transitionPlanReport);
+      // Codex review (PR #43): entry was built from the ORIGINAL plan
+      // (norm.entrySec at report-build time). `pendingEntrySec` above is the
+      // entry actually applied to the promoted source (forced to 0 when
+      // !sourceHonorsPlan, same as the TRACK-loop-mode override earlier) —
+      // reconcile the report to that before logging so a downgraded
+      // transition's log doesn't describe an entry point the audio never
+      // used.
+      if (transitionPlanReport.entry.sec !== pendingEntrySec) {
+        transitionPlanReport.entry.sec = pendingEntrySec;
+        transitionPlanReport.entry.bar = pendingEntrySec === 0 ? 0 : null;
+      }
 
       // Set promotion state BEFORE calling startCrossfade()/
       // startStemCrossfade(): if the outgoing source is already at EOF, the
@@ -2272,6 +2293,14 @@ export class GuildPlayer {
         await this.#cleanupIncomingTempFile();
         return;
       }
+      // Codex review (PR #43): only record/log once the mixer has actually
+      // accepted this transition — startCrossfade()/startStemCrossfade() can
+      // still reject (e.g. a prepared source already errored) after every
+      // check above passed, and the `if (!started)` branch above returns
+      // without starting anything. Logging before this point would count a
+      // rejected attempt, then double-count the same real transition when a
+      // later arm tick retries and succeeds.
+      this.#logTransitionPlanFn(transitionPlanReport);
     } finally {
       this.#crossfadeArming = false;
     }
