@@ -2527,3 +2527,49 @@ test('acceptance (mixer): a track removed from the queue is pruned from stem pre
     await player.stop();
   }
 });
+
+test('acceptance (mixer): a HIGH stem job killed by ANALYSIS_KILLED after a successful download gets retried once (Codex review, PR #44)', async () => {
+  // #ensureFullPrefetch()'s own .then() calls #scheduleAnalysis() exactly
+  // once, right when B's download resolves. If that one attempt gets
+  // preempted (ANALYSIS_KILLED — a real-time-pressure abort, e.g. a mixer
+  // underrun), nothing else would ever retry it without the fix — the
+  // tracker would stay FAILED forever even though the download itself
+  // succeeded and B is still next. A clean `null` from separateTrackStemsFn
+  // (a genuine "no separable stems" outcome, exercised by the older Phase 8
+  // "stem separation input is staged..." tests) must NOT be retried —
+  // that's still a one-shot attempt.
+  let analyzeCallsForB = 0;
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async (filePath, { videoId } = {}) => {
+      if (videoId === 'vid-b') {
+        analyzeCallsForB += 1;
+        if (analyzeCallsForB === 1) {
+          const err = new Error('simulated ANALYSIS_KILLED preemption');
+          err.code = 'ANALYSIS_KILLED';
+          throw err;
+        }
+      }
+      return null;
+    },
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async () => null,
+    separateTrackStemsFn: async (filePath, videoId) => (
+      { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` }
+    ),
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => byIdState(player, 'vid-b') === 'ready', { timeoutMs: 5000 });
+    assert.equal(byIdState(player, 'vid-b'), 'ready');
+    assert.ok(analyzeCallsForB >= 2, 'expected a retried analysis/separation attempt after the ANALYSIS_KILLED preemption');
+  } finally {
+    await player.stop();
+  }
+});

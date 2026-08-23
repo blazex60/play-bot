@@ -210,7 +210,21 @@ export async function prefetchTrack(track, { spawnFn } = {}) {
     await downloadAudio(track.webpageUrl, filePath, { spawnFn })
     // Trim YouTube/source padding before loudnorm + MIX analysis so
     // remainingSec and crossfade sit on audible audio.
-    await trimSilence(filePath, spawnFn ? { spawnFn } : undefined)
+    //
+    // Codex review (PR #44, P1): trimSilence()'s `spawnFn` contract is
+    // DIFFERENT from downloadAudio()/analyzeLoudness()'s — it expects a
+    // function that returns a Promise<{stdout, stderr}> (buffered output),
+    // matching spawnBuffered()'s own shape, because trimSilence() reads
+    // `detect.stderr` as an already-collected string. `spawnFn` here (e.g.
+    // analysisQueue.js's spawnNice) instead returns a raw ChildProcess
+    // synchronously — passing it straight through made `detect.stderr` a
+    // stream object, not text, so silencedetect's log was never actually
+    // parsed and every LOW-priority-prefetched track silently skipped
+    // trimming (stems would be built from untrimmed audio, offset from
+    // what normal playback/analysis uses). Wrap it in the same
+    // spawnBuffered() adapter downloadAudio()/analyzeLoudness() already use
+    // internally, so trimSilence() sees the buffered shape it expects.
+    await trimSilence(filePath, spawnFn ? { spawnFn: (cmd, args) => spawnBuffered(cmd, args, spawnFn) } : undefined)
     const measured = await analyzeLoudness(filePath, { spawnFn })
     return { filePath, measured }
   } catch (err) {
