@@ -84,6 +84,8 @@ export function makePlayer({
   logTransitionPlanFn,
   pcmWaitTimeoutMs,
   connection,
+  analysisQueue,
+  stemQueue,
 } = {}) {
   const queue = new GuildQueue();
   queue.add(track ?? createTrack({
@@ -117,6 +119,8 @@ export function makePlayer({
     createFileSourceFn,
     logTransitionPlanFn,
     pcmWaitTimeoutMs,
+    analysisQueue,
+    stemQueue,
     connection: connection ?? {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer);

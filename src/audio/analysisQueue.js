@@ -11,11 +11,22 @@ const THREAD_ENV = {
 };
 
 let defaultQueue = null;
+let defaultStemQueue = null;
 
 /**
  * Process-wide serial queue for MIX analysis (Demucs / aubio / ffmpeg).
  * MixStream underruns pause the current child via SIGSTOP so the mixer
  * keeps 20ms frames; the job is killed if pauses keep happening.
+ *
+ * Phase 9C (docs/mix-transition-phase9.md §5): this factory is shared by
+ * two independent singletons — getAnalysisQueue() (BPM/downbeat/phrase/key/
+ * vocal-activity — kept fast/responsive) and getStemPreparationQueue()
+ * (full-track Demucs only, concurrency 1 like today). Each call to this
+ * factory returns its own fully independent closure over `jobs`/`children`/
+ * `paused`/etc, so a long-running Demucs job enqueued on one instance can
+ * never sit in front of — or share pause/kill state with — a job enqueued
+ * on the other. Callers get two lanes by holding two separate instances,
+ * not by this factory branching on a "kind" flag.
  */
 export function createAnalysisQueue({
   spawnFn = spawn,
@@ -178,6 +189,64 @@ export function createAnalysisQueue({
     }
   }
 
+  // Shared by the debounced noteUnderrun() pause path and the immediate
+  // pause()/resume() commands below — both ultimately just SIGSTOP the
+  // current job's children and arm the same maxStoppedMs kill timeout.
+  function applyPause(now) {
+    if (paused) {
+      if (stoppedAt && now - stoppedAt >= maxStoppedMs) {
+        killCurrent(new Error('analysis stopped too long during underrun'));
+      }
+      return;
+    }
+    pauseCount += 1;
+    if (pauseCount > maxPauses) {
+      killCurrent(new Error('analysis paused too many times during underrun'));
+      return;
+    }
+    paused = true;
+    stoppedAt = now;
+    signalChildren('SIGSTOP');
+  }
+
+  function noteUnderrun(source = ANON_UNDERRUN) {
+    if (!running) return;
+    underrunSources.add(source);
+    const now = clock();
+    if (underrunSince == null) underrunSince = now;
+    if (now - underrunSince < pauseAfterUnderrunMs) return;
+    applyPause(now);
+  }
+
+  function noteUnderrunCleared(source = ANON_UNDERRUN) {
+    underrunSources.delete(source);
+    if (underrunSources.size > 0) return;
+    underrunSince = null;
+    if (!paused) return;
+    paused = false;
+    stoppedAt = 0;
+    signalChildren('SIGCONT');
+  }
+
+  // §5.4 "Playback Safety": an explicit pause/resume pair, distinct from
+  // noteUnderrun()'s own debounced signal. Intended for a direct command
+  // ("pause this queue now") rather than a raw, possibly-jittery underrun
+  // signal — e.g. wiring the realtime queue's own underrun event to also
+  // pause the stem-preparation queue (player.js), or any future
+  // CPU-pressure monitor. Shares `underrunSources`/pause/kill state with
+  // noteUnderrun()/noteUnderrunCleared() (both are just reasons this
+  // queue's current job is held), so a source added via one is only ever
+  // cleared via the matching call with the same source token, from either
+  // API. No new automatic trigger is added here — callers decide when to
+  // invoke it.
+  function pauseQueue(source = ANON_UNDERRUN) {
+    underrunSources.add(source);
+    if (!running) return;
+    const now = clock();
+    if (underrunSince == null) underrunSince = now;
+    applyPause(now);
+  }
+
   return {
     get pending() {
       return jobs.length;
@@ -199,44 +268,22 @@ export function createAnalysisQueue({
         pump();
       });
     },
-    noteUnderrun(source = ANON_UNDERRUN) {
-      if (!running) return;
-      underrunSources.add(source);
-      const now = clock();
-      if (underrunSince == null) underrunSince = now;
-      if (now - underrunSince < pauseAfterUnderrunMs) return;
-
-      if (paused) {
-        if (stoppedAt && now - stoppedAt >= maxStoppedMs) {
-          killCurrent(new Error('analysis stopped too long during underrun'));
-        }
-        return;
-      }
-
-      pauseCount += 1;
-      if (pauseCount > maxPauses) {
-        killCurrent(new Error('analysis paused too many times during underrun'));
-        return;
-      }
-      paused = true;
-      stoppedAt = now;
-      signalChildren('SIGSTOP');
-    },
-    noteUnderrunCleared(source = ANON_UNDERRUN) {
-      underrunSources.delete(source);
-      if (underrunSources.size > 0) return;
-      underrunSince = null;
-      if (!paused) return;
-      paused = false;
-      stoppedAt = 0;
-      signalChildren('SIGCONT');
-    },
+    noteUnderrun,
+    noteUnderrunCleared,
+    pause: pauseQueue,
+    resume: noteUnderrunCleared,
     kill(reason) {
       killCurrent(reason);
     },
   };
 }
 
+/**
+ * RealtimeAnalysisQueue (docs/mix-transition-phase9.md §5.2): BPM,
+ * downbeat, phrase, key, and vocal-activity analysis. Unchanged from
+ * pre-Phase-9C behavior — same singleton, same createAnalysisQueue()
+ * defaults.
+ */
 export function getAnalysisQueue() {
   if (!defaultQueue) {
     defaultQueue = createAnalysisQueue();
@@ -244,7 +291,28 @@ export function getAnalysisQueue() {
   return defaultQueue;
 }
 
-/** Test-only: replace or clear the process-wide queue. */
+/**
+ * StemPreparationQueue (docs/mix-transition-phase9.md §5.2/§5.3):
+ * full-track Demucs separation only, for both the Phase 8 outgoing-track
+ * pass and the Phase 9B next/next+1 prefetch. A completely separate
+ * createAnalysisQueue() instance from getAnalysisQueue() — its own serial
+ * FIFO (concurrency 1, per §5.3), its own pause/kill state — so a
+ * long-running Demucs job here can never sit in front of, or get paused/
+ * killed alongside, a realtime BPM/phrase job on the other queue.
+ */
+export function getStemPreparationQueue() {
+  if (!defaultStemQueue) {
+    defaultStemQueue = createAnalysisQueue();
+  }
+  return defaultStemQueue;
+}
+
+/** Test-only: replace or clear the process-wide realtime analysis queue. */
 export function setAnalysisQueueForTest(queue) {
   defaultQueue = queue;
+}
+
+/** Test-only: replace or clear the process-wide stem-preparation queue. */
+export function setStemPreparationQueueForTest(queue) {
+  defaultStemQueue = queue;
 }

@@ -23,7 +23,7 @@ import { probeDurationSec } from './audio/duration.js';
 import { createSessionTempoState, resetSessionTempo, probeTempoBackend, compensateDurationSec, buildTempoFilter } from './audio/tempo.js';
 import { TAIL_WINDOW_SEC } from './audio/vocalActivity.js';
 import { LoopMode } from './queue.js';
-import { getAnalysisQueue } from './audio/analysisQueue.js';
+import { getAnalysisQueue, getStemPreparationQueue } from './audio/analysisQueue.js';
 import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
 import { planStemTransition } from './audio/stemTransition.js';
 import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition } from './audio/transitionLog.js';
@@ -343,6 +343,17 @@ export class GuildPlayer {
   #putTrackAnalysisFn;
   #analyzeTrackFileFn;
   #analysisQueue;
+  /**
+   * Phase 9C (docs/mix-transition-phase9.md §5): dedicated pausable serial
+   * queue for full-track Demucs only (Phase 8's outgoing-track separation
+   * and Phase 9B's next/next+1 prefetch), kept separate from
+   * #analysisQueue so a long-running Demucs job can never sit in front of
+   * (or share pause/kill state with) realtime BPM/downbeat/phrase/key/
+   * vocal-activity analysis for an unrelated track. Same DI convention as
+   * #analysisQueue: null falls back to the process-wide
+   * getStemPreparationQueue() singleton via #stemQ().
+   */
+  #stemQueue;
   /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
   #queueRefill = null;
   #prefetchTrackFn;
@@ -449,6 +460,7 @@ export class GuildPlayer {
     putTrackAnalysisFn = null,
     analyzeTrackFileFn = analyzeTrackFile,
     analysisQueue = null,
+    stemQueue = null,
     prefetchTrackFn = prefetchTrack,
     probeTempoBackendFn = probeTempoBackend,
     stageTempFileCopyFn = stageTempFileCopy,
@@ -476,6 +488,7 @@ export class GuildPlayer {
     this.#putTrackAnalysisFn = putTrackAnalysisFn;
     this.#analyzeTrackFileFn = analyzeTrackFileFn;
     this.#analysisQueue = analysisQueue;
+    this.#stemQueue = stemQueue;
     this.#prefetchTrackFn = prefetchTrackFn;
     this.#probeTempoBackendFn = probeTempoBackendFn;
     this.#stageTempFileCopyFn = stageTempFileCopyFn;
@@ -725,14 +738,26 @@ export class GuildPlayer {
     });
     this.#mixStream.on('underrun', () => {
       this.#analysisQ().noteUnderrun(this);
+      // Phase 9C §5.4 "Playback Safety": a Demucs job actively running
+      // during a live mixer underrun is exactly the CPU pressure the
+      // stem-preparation queue's pause() exists to relieve — forward the
+      // same underrun signal to it. This is the only automatic trigger for
+      // StemQueue.pause(); no separate CPU-monitoring signal exists yet.
+      this.#stemQ().pause(this);
     });
     this.#mixStream.on('underrunClear', () => {
       this.#analysisQ().noteUnderrunCleared(this);
+      this.#stemQ().resume(this);
     });
   }
 
   #analysisQ() {
     return this.#analysisQueue ?? getAnalysisQueue();
+  }
+
+  /** Phase 9C (docs/mix-transition-phase9.md §5): the dedicated StemPreparationQueue — see #stemQueue's own docstring. */
+  #stemQ() {
+    return this.#stemQueue ?? getStemPreparationQueue();
   }
 
   async #onSnapHandoff(adopt) {
@@ -1171,6 +1196,10 @@ export class GuildPlayer {
     this.#clearPreparedIncoming();
     this.#queueRefill = null;
     this.#analysisQ().noteUnderrunCleared(this);
+    // Symmetric with the underrunClear wiring above (#initMixerPipeline) —
+    // release this player's pause source on the stem queue too, so a
+    // stopped guild never leaves it stuck paused for other guilds.
+    this.#stemQ().resume(this);
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
@@ -1402,24 +1431,44 @@ export class GuildPlayer {
     // filePath for stem separation NOW, before this job is even enqueued —
     // several unrelated call sites (track promotion/stop/skip/prefetch
     // discard) can delete filePath at any point once this method returns,
-    // including the entire time this job sits waiting its turn on the
-    // shared analysisQueue (which a single full-track Demucs job can
-    // occupy for minutes — docs/mix-transition-phase8.md §9). Copying
-    // later, e.g. as the first statement inside the enqueued callback,
-    // would already be too late in exactly that scenario. Best-effort: if
-    // staging fails, separation for this track is simply skipped below.
+    // including the entire time this job sits waiting its turn on a shared
+    // queue (which a single full-track Demucs job can occupy for minutes —
+    // docs/mix-transition-phase8.md §9, mitigated but not eliminated by
+    // Phase 9C's queue split below). Copying later, e.g. as the first
+    // statement inside the enqueued callback, would already be too late in
+    // exactly that scenario. Best-effort: if staging fails, separation for
+    // this track is simply skipped below.
     const stagedPathPromise = this.#stageTempFileCopyFn(filePath).catch((err) => {
       console.warn('[GuildPlayer] failed to stage file for stem separation:', err.message);
       return null;
     });
+
+    // Phase 9C (docs/mix-transition-phase9.md §5): releases
+    // #scheduledAnalysisTokens's dedup guard and cleans up the staged
+    // copy. Whichever branch below actually owns the staged file's
+    // lifetime for this attempt — "no separation dispatched" (aborted, or
+    // staging itself failed) vs. "separation dispatched on the stem
+    // queue" — calls this exactly once, so the guard/cleanup logic isn't
+    // duplicated per branch. Same compare-and-delete rationale as before
+    // the split (Codex): analysisQueue.kill()/noteUnderrun() rejects via
+    // Promise.race() the instant a job is killed, possibly before this
+    // ever runs; if a newer attempt for this videoId already replaced the
+    // token in that gap, leave it alone.
+    const finishAnalysisAttempt = (stagedPath) => {
+      if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
+      if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
+        this.#scheduledAnalysisTokens.delete(track.videoId);
+      }
+    };
+
     this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
       // CodeRabbit (PR #39 round-15): the staged copy must be cleaned up
-      // whether THIS job succeeds, fails at any step, or is cancelled —
+      // whether analysis succeeds, fails at any step, or is cancelled —
       // #lookupPersistentAnalysis()/#runAnalysis() rejecting (including an
-      // ANALYSIS_KILLED abort) must not skip cleanup just because it
-      // happens before the separation step below. The try/finally wraps
-      // the whole callback, not just the separation call, so every exit
-      // path removes it regardless of outcome.
+      // ANALYSIS_KILLED abort) must not skip cleanup. The try/catch below
+      // routes every exit path through finishAnalysisAttempt() exactly
+      // once (either here, on failure/no-dispatch, or later inside the
+      // stem-queue job's own .finally() once separation settles).
       //
       // Codex (PR #39 round-17): #runAnalysis() itself must also read from
       // the staged copy, not the original filePath — the whole reason
@@ -1438,10 +1487,23 @@ export class GuildPlayer {
         // stem-mix eligible, the existing beatmix/phrase-crossfade/legacy
         // ladder is untouched either way.
         // Skip rather than start a many-minute Demucs run against a job
-        // the queue already decided to cancel (e.g. a mixer underrun
-        // killed this job right as #runAnalysis finished).
+        // the (realtime) queue already decided to cancel (e.g. a mixer
+        // underrun killed this job right as #runAnalysis finished).
         if (!signal?.aborted && stagedPath) {
-          await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).then(
+          // Phase 9C (docs/mix-transition-phase9.md §5): dispatch the
+          // heavy full-track Demucs step on the dedicated
+          // StemPreparationQueue instead of this (realtime) queue —
+          // deliberately NOT awaited here. Awaiting would keep this
+          // realtime job "running" for as long as Demucs takes, blocking
+          // BPM/downbeat/phrase/key/vocal-activity analysis for the next
+          // queued track behind it — exactly the §9 problem this phase
+          // fixes. The stem job's own .finally() below owns
+          // cleanup/token-release for this attempt once separation
+          // actually settles; this realtime job returns immediately.
+          this.#stemQ().enqueue(async ({ spawnNice: stemSpawnNice, signal: stemSignal } = {}) => {
+            if (stemSignal?.aborted) return null;
+            return this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: stemSpawnNice, signal: stemSignal });
+          }).then(
             (stems) => {
               // Phase 9B: this is the one place that actually learns when a
               // HIGH-priority (B) stem prefetch finishes — #ensureStemPrefetch()
@@ -1465,29 +1527,25 @@ export class GuildPlayer {
                 this.#stemPrefetchTracker.markFailed(track.videoId);
               }
             },
-          );
+          ).finally(() => finishAnalysisAttempt(stagedPath));
+          return analysis;
         } else if (this.#stemPrefetchTracker.get(track.videoId)) {
-          // Codex review (PR #44): staging failed (stagedPath null), or
-          // this job was aborted before separation was even attempted —
-          // either way it's exiting without ever calling
-          // separateTrackStemsFn, so the markReady/markFailed pair above
-          // never runs. Mark it failed here instead of leaving the tracked
-          // entry stuck reporting PROCESSING forever (prune() deliberately
-          // never collects a PROCESSING/QUEUED entry) — a later
+          // Codex review (PR #44, carried into Phase 9C's stem-queue
+          // restructure): staging failed (stagedPath null), or this job
+          // was aborted before separation was even attempted — either way
+          // it's exiting without ever reaching the stem-queue dispatch
+          // above, so the markReady/markFailed pair there never runs. Mark
+          // it failed here instead of leaving the tracked entry stuck
+          // reporting PROCESSING forever (prune() deliberately never
+          // collects a PROCESSING/QUEUED entry) — a later
           // #prefetchUpcoming() checkpoint will retry it.
           this.#stemPrefetchTracker.markFailed(track.videoId);
         }
+        finishAnalysisAttempt(stagedPath);
         return analysis;
-      } finally {
-        if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
-        // Compare-and-delete: analysisQueue.kill()/noteUnderrun() rejects
-        // via Promise.race() the instant a job is killed, well before this
-        // callback's own finally can run (Codex). If a newer attempt for
-        // this same videoId already replaced our entry in that gap, its
-        // token won't match ours — leave it alone.
-        if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
-          this.#scheduledAnalysisTokens.delete(track.videoId);
-        }
+      } catch (err) {
+        finishAnalysisAttempt(stagedPath);
+        throw err;
       }
     }).catch((err) => {
       // Belt-and-suspenders: the finally above already removes this on
@@ -2596,13 +2654,20 @@ export class GuildPlayer {
    * mid-Demucs-run, docs/mix-transition-phase8.md Step 8.5) but owns its
    * own short-lived download via #prefetchTrackFn, since — unlike A/B —
    * nothing else in the pipeline downloads C's audio at all outside this
-   * method. Routed through the shared analysisQueue (not a bare spawn) so
-   * a mixer underrun can still SIGSTOP/kill it exactly like every other
-   * analysis/separation job (§5.4 "Playback Safety" in spirit, even though
-   * the dedicated priority-lane queue itself is Phase 9C's job).
+   * method.
+   *
+   * Phase 9C (docs/mix-transition-phase9.md §5): routed through the
+   * dedicated StemPreparationQueue (#stemQ()), not the realtime analysis
+   * queue — this whole job (download + stage + Demucs) exists only to
+   * prepare C's stems, same as #scheduleAnalysis()'s own separation step,
+   * so it belongs on the same lane and must not be able to sit in front of
+   * an unrelated track's BPM/phrase job. A mixer underrun still
+   * SIGSTOPs/kills it exactly like every other queued job (§5.4 "Playback
+   * Safety") — now via the stem queue's own pause/kill state, forwarded
+   * from the realtime queue's underrun event (see #initMixerPipeline()).
    */
   async #runLowPriorityStemPrefetch(track) {
-    return this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
+    return this.#stemQ().enqueue(async ({ spawnNice, signal } = {}) => {
       throwIfAborted(signal);
       // Codex review (PR #44, P1): without spawnFn, prefetchTrackFn's
       // default implementation (normalize.js's prefetchTrack) spawns

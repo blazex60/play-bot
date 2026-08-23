@@ -2386,6 +2386,169 @@ test('acceptance (mixer): stem prefetch tracks next=HIGH / next+1=LOW, and separ
   }
 });
 
+// --- Phase 9C (docs/mix-transition-phase9.md §5): dedicated stem queue ---
+
+test('acceptance (mixer): #scheduleAnalysis() runs BPM/phrase analysis on the injected realtime queue but dispatches its stem-separation step on the injected stem queue (Phase 9C §5)', async () => {
+  // Same "current track has no videoId, so #scheduleAnalysis() only ever
+  // fires for the prefetched NEXT track" setup as the pre-existing
+  // "stem separation input is staged..." test above — #createPcmSourceFn
+  // is overridden (as in every acceptance test in this file), which
+  // bypasses the real #createPcmSource()'s own #scheduleAnalysis() call
+  // for whichever track is actually current. Routing #scheduleAnalysis()'s
+  // separation step onto the stem queue is exercised the same way that
+  // test exercises #scheduleAnalysis() at all: via #ensureFullPrefetch()
+  // prefetching Track B ahead of playback.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const originalFilePath = '/tmp/musicbot-original-vid-9c';
+  const stagedFilePath = '/tmp/musicbot-staged-vid-9c';
+  const realtimeEnqueues = [];
+  const stemEnqueues = [];
+  const separateCalls = [];
+  const analysis = {
+    version: ANALYSIS_VERSION, durationSec: 60, lastVocalEndSec: 50, vocalConfidence: 0.85, confidence: 0.8,
+  };
+  const realtimeQueue = {
+    enqueue: (fn) => {
+      realtimeEnqueues.push('enqueue');
+      return Promise.resolve().then(() => fn({ spawnNice: () => {}, signal: undefined }));
+    },
+    noteUnderrun() {},
+    noteUnderrunCleared() {},
+    kill() {},
+  };
+  const stemQueue = {
+    enqueue: (fn) => {
+      stemEnqueues.push('enqueue');
+      return Promise.resolve().then(() => fn({ spawnNice: () => {}, signal: undefined }));
+    },
+    pause() {},
+    resume() {},
+    kill() {},
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => analysis,
+    prefetchTrackFn: async () => ({ filePath: originalFilePath, measured: {} }),
+    stageTempFileCopyFn: async () => stagedFilePath,
+    separateTrackStemsFn: async (filePath, videoId) => {
+      separateCalls.push({ filePath, videoId });
+      return { vocalPath: '/tmp/v.wav', instrumentalPath: '/tmp/i.wav' };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+    analysisQueue: realtimeQueue,
+    stemQueue,
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => separateCalls.length > 0);
+
+    assert.equal(realtimeEnqueues.length, 1, 'expected exactly one realtime-queue job (BPM/phrase analysis)');
+    assert.equal(stemEnqueues.length, 1, 'expected exactly one stem-queue job (the Demucs separation step)');
+    assert.equal(separateCalls.length, 1);
+    assert.equal(separateCalls[0].filePath, stagedFilePath, 'separation must still receive the staged copy, unchanged from before the queue split');
+    assert.equal(separateCalls[0].videoId, 'vid-b');
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): Phase 9C — next=HIGH (B) and next+1=LOW (C) stem prefetch both dispatch separation on the injected stem queue, never the injected realtime analysis queue', async () => {
+  const realtimeEnqueues = [];
+  const stemEnqueues = [];
+  const stemCalls = [];
+  const realtimeQueue = {
+    enqueue: (fn) => {
+      realtimeEnqueues.push('enqueue');
+      return Promise.resolve().then(() => fn({ spawnNice: () => {}, signal: undefined }));
+    },
+    noteUnderrun() {},
+    noteUnderrunCleared() {},
+    kill() {},
+  };
+  const stemQueue = {
+    enqueue: (fn) => {
+      stemEnqueues.push('enqueue');
+      return Promise.resolve().then(() => fn({ spawnNice: () => {}, signal: undefined }));
+    },
+    pause() {},
+    resume() {},
+    kill() {},
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-9c-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async () => null, // always a miss, so real separation dispatches
+    separateTrackStemsFn: async (filePath, videoId) => {
+      stemCalls.push(videoId);
+      return { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+    analysisQueue: realtimeQueue,
+    stemQueue,
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => stemCalls.includes('vid-b') && stemCalls.includes('vid-c'));
+
+    assert.ok(stemCalls.includes('vid-b'), 'next (B, HIGH — piggybacks on #scheduleAnalysis) must separate via the stem queue');
+    assert.ok(stemCalls.includes('vid-c'), 'next+1 (C, LOW — #runLowPriorityStemPrefetch) must separate via the stem queue');
+    assert.equal(stemEnqueues.length, stemCalls.length,
+      'expected every separateTrackStemsFn() call to have happened inside exactly one stem-queue job — none dispatched directly, none via the realtime queue');
+    // B's HIGH lane piggybacks on #scheduleAnalysis(), which still runs its
+    // BPM/phrase analysis step on the realtime queue — only the Demucs step
+    // moved. C's LOW lane (#runLowPriorityStemPrefetch) has no analysis
+    // step at all, so it contributes nothing here either way. The real
+    // assertion is the equality above: every actual separation call landed
+    // on the stem queue, none on the realtime one.
+    assert.ok(realtimeEnqueues.length >= 1, 'expected B\'s piggybacked #scheduleAnalysis() BPM/phrase step to still use the realtime queue');
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): Phase 9C — a mixer underrun pauses the dedicated stem queue via pause(), independent of the realtime queue\'s own noteUnderrun(), and underrunClear resumes both', async () => {
+  const realtimeCalls = [];
+  const stemCalls = [];
+  const realtimeQueue = {
+    enqueue: (fn) => fn({ spawnNice: () => {}, signal: undefined }),
+    noteUnderrun(source) { realtimeCalls.push(['noteUnderrun', source]); },
+    noteUnderrunCleared(source) { realtimeCalls.push(['noteUnderrunCleared', source]); },
+    kill() {},
+  };
+  const stemQueue = {
+    enqueue: (fn) => fn({ spawnNice: () => {}, signal: undefined }),
+    pause(source) { stemCalls.push(['pause', source]); },
+    resume(source) { stemCalls.push(['resume', source]); },
+    kill() {},
+  };
+  const { player } = makePlayer({ analysisQueue: realtimeQueue, stemQueue });
+
+  player.mixStream.emit('underrun');
+  assert.equal(realtimeCalls.filter(([name]) => name === 'noteUnderrun').length, 1,
+    'expected the realtime queue to receive its own debounced noteUnderrun() signal');
+  assert.equal(stemCalls.filter(([name]) => name === 'pause').length, 1,
+    'expected the mixer underrun to also immediately pause() the dedicated stem-preparation queue (§5.4 "Playback Safety")');
+  assert.equal(stemCalls.some(([name]) => name === 'noteUnderrun'), false,
+    'the stem queue must be paused via its own pause() API, not by calling the realtime-only noteUnderrun()');
+
+  player.mixStream.emit('underrunClear');
+  assert.equal(realtimeCalls.filter(([name]) => name === 'noteUnderrunCleared').length, 1);
+  assert.equal(stemCalls.filter(([name]) => name === 'resume').length, 1,
+    'expected underrunClear to resume() the stem queue too');
+
+  await player.stop();
+});
+
 function byIdState(player, videoId) {
   return player.stemPrefetchStatus.find((e) => e.videoId === videoId)?.state ?? null;
 }

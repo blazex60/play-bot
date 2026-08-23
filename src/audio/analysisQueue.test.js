@@ -1,7 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createAnalysisQueue } from './analysisQueue.js';
+import {
+  createAnalysisQueue,
+  getAnalysisQueue,
+  getStemPreparationQueue,
+  setAnalysisQueueForTest,
+  setStemPreparationQueueForTest,
+} from './analysisQueue.js';
 
 function fakeProc() {
   const proc = new EventEmitter();
@@ -112,6 +118,156 @@ test('queue.kill() SIGKILLs a subprocess spawned via spawnNice, even without the
   await assert.rejects(job, (err) => err.code === 'ANALYSIS_KILLED');
   assert.equal(spawnedProc.killed, true, 'the spawned child must be killed even though the job never checked signal');
   assert.equal(spawnedProc.lastSignal, 'SIGKILL');
+});
+
+// --- Phase 9C (docs/mix-transition-phase9.md §5): dedicated stem queue ---
+
+test('getAnalysisQueue() and getStemPreparationQueue() are independent singletons (§5.2)', () => {
+  setAnalysisQueueForTest(null);
+  setStemPreparationQueueForTest(null);
+  try {
+    const realtime = getAnalysisQueue();
+    const stem = getStemPreparationQueue();
+    assert.notEqual(realtime, stem, 'the realtime and stem-preparation queues must be two separate instances');
+    assert.equal(getAnalysisQueue(), realtime, 'getAnalysisQueue() keeps returning the same singleton on repeat calls');
+    assert.equal(getStemPreparationQueue(), stem, 'getStemPreparationQueue() keeps returning the same singleton on repeat calls');
+  } finally {
+    setAnalysisQueueForTest(null);
+    setStemPreparationQueueForTest(null);
+  }
+});
+
+test('setStemPreparationQueueForTest overrides only the stem singleton, leaving getAnalysisQueue() untouched', () => {
+  setAnalysisQueueForTest(null);
+  setStemPreparationQueueForTest(null);
+  try {
+    const originalRealtime = getAnalysisQueue();
+    const fakeStem = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
+    setStemPreparationQueueForTest(fakeStem);
+    assert.equal(getStemPreparationQueue(), fakeStem);
+    assert.equal(getAnalysisQueue(), originalRealtime,
+      'overriding the stem-preparation queue must not disturb the realtime analysis queue singleton');
+  } finally {
+    setAnalysisQueueForTest(null);
+    setStemPreparationQueueForTest(null);
+  }
+});
+
+test('queue.pause()/resume() apply immediately, unlike noteUnderrun()\'s debounced pause (§5.4 "Playback Safety")', async () => {
+  let continued = 0;
+  const originalKill = process.kill;
+  const queue = createAnalysisQueue({
+    useNice: false,
+    spawnFn: () => fakeProc(),
+    // A debounce window far longer than this test runs for: if pause()
+    // routed through the same debounced path as noteUnderrun(), isPaused
+    // would still be false by the time we assert on it.
+    pauseAfterUnderrunMs: 10_000,
+  });
+  process.kill = (pid, sig) => {
+    if (sig === 'SIGCONT') continued += 1;
+  };
+  try {
+    const job = queue.enqueue(({ spawnNice }) => {
+      spawnNice('ffmpeg', ['-i', 'in.wav']); // registers a child so SIGSTOP/SIGCONT have something to signal
+      return new Promise(() => {});
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5)); // let the job actually start and spawn (running=true)
+    assert.equal(queue.isPaused, false);
+
+    queue.pause('cpu-pressure');
+    assert.equal(queue.isPaused, true, 'pause() must apply immediately, without waiting for pauseAfterUnderrunMs');
+
+    queue.resume('cpu-pressure');
+    assert.equal(queue.isPaused, false);
+    assert.equal(continued, 1, 'resume() must SIGCONT the paused child');
+
+    queue.kill('test cleanup');
+    await assert.rejects(job, (err) => err.code === 'ANALYSIS_KILLED');
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test('queue.pause() eventually kills a stuck job through the same maxStoppedMs timeout noteUnderrun() uses', async () => {
+  let now = 1000;
+  const queue = createAnalysisQueue({
+    useNice: false,
+    spawnFn: () => fakeProc(),
+    maxStoppedMs: 15,
+    clock: () => now,
+  });
+  const job = queue.enqueue(() => new Promise(() => {}));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  queue.pause('cpu-pressure');
+  assert.equal(queue.isPaused, true);
+  now = 1020; // past maxStoppedMs since the pause was applied
+  queue.pause('cpu-pressure'); // re-signals the still-paused source; must notice the timeout and kill
+
+  await assert.rejects(job, (err) => err.code === 'ANALYSIS_KILLED');
+});
+
+test('queue.pause() and noteUnderrun() share pause bookkeeping: the queue stays paused until every source clears', async () => {
+  let now = 1000;
+  let continued = 0;
+  const originalKill = process.kill;
+  const queue = createAnalysisQueue({
+    useNice: false,
+    spawnFn: () => fakeProc(),
+    pauseAfterUnderrunMs: 10,
+    clock: () => now,
+  });
+  process.kill = (pid, sig) => {
+    if (sig === 'SIGCONT') continued += 1;
+  };
+  try {
+    const job = queue.enqueue(({ spawnNice }) => {
+      spawnNice('ffmpeg', ['-i', 'in.wav']);
+      return new Promise(() => {});
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const underrunSource = { id: 'mixer-underrun' };
+    queue.noteUnderrun(underrunSource);
+    now = 1020;
+    queue.noteUnderrun(underrunSource); // clears the debounce window, actually pauses
+    assert.equal(queue.isPaused, true);
+
+    queue.pause('cpu-pressure'); // a second, independent pause source
+    assert.equal(queue.isPaused, true);
+
+    queue.noteUnderrunCleared(underrunSource);
+    assert.equal(queue.isPaused, true, 'must stay paused — the explicit pause() source has not cleared yet');
+    assert.equal(continued, 0);
+
+    queue.resume('cpu-pressure');
+    assert.equal(queue.isPaused, false, 'clearing the last remaining pause source must resume the queue');
+    assert.equal(continued, 1);
+
+    queue.kill('test cleanup');
+    await assert.rejects(job, (err) => err.code === 'ANALYSIS_KILLED');
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
+test('pausing one queue instance never touches a separate instance from the same factory (two independent lanes, §5.2)', async () => {
+  const realtime = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
+  const stem = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
+  const realtimeJob = realtime.enqueue(() => new Promise(() => {}));
+  const stemJob = stem.enqueue(() => new Promise(() => {}));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  stem.pause('cpu-pressure');
+  assert.equal(stem.isPaused, true);
+  assert.equal(realtime.isPaused, false,
+    'pausing the stem-preparation queue must not pause the realtime queue — a heavy Demucs job on one lane cannot block the other');
+
+  realtime.kill('test cleanup');
+  stem.kill('test cleanup');
+  await assert.rejects(realtimeJob, (err) => err.code === 'ANALYSIS_KILLED');
+  await assert.rejects(stemJob, (err) => err.code === 'ANALYSIS_KILLED');
 });
 
 test('killed analysis callback does not commit after abort', async () => {

@@ -1610,3 +1610,58 @@ D (next+2)  → 未処理（#ensureAnalysisPrefetch() の軽量パスのみ、Ph
 
 - **キュー変更（move/remove/optimize/shuffle）時に prefetch ウィンドウが即再計算されない** — `botApi.js`/`queueEditorInteractions.js` 側の変更が必要な cross-file な変更であり、staleness も「次の `#prefetchUpcoming()` チェックポイントまで」に有界なため優先度を下げた。
 - **HIGH（B）が LOW（C）より先に dispatch される保証がない** — 上の「優先度は enqueue() 順以上の意味を持たない」の節で述べた通り、これは専用 priority queue（Phase 9C, §5.2/§5.3）そのものが解決すべき課題であり、9B の場当たり的な修正では本質的な解決にならないと判断した。Phase 9C で対応する。
+
+## 実装ノート (Phase 9C)
+
+§5 の Analysis Queue 分離を実装した。§5.1 が説明する問題（BPM/phrase/vocal 解析とフルトラック Demucs が単一 FIFO を共有し、後者が前者を長時間ブロックしうる — docs/mix-transition-phase8.md §9 の既知の未決事項）そのものを解消する、純粋なインフラ/スケジューリング変更。**どのトラックが解析されるか・いつ解析されるか・どの transition mode が選ばれるかは一切変更していない** — 変えたのは「フルトラック Demucs をどのキューインスタンスで実行するか」だけ。
+
+### 実装箇所
+
+- `src/audio/analysisQueue.js`: `createAnalysisQueue()` ファクトリ自体は変更なし（同じ closure 構造・同じ dedup/pause/kill machinery）。ここに以下を追加した。
+  - `getStemPreparationQueue()`（新規）: `getAnalysisQueue()` と対になる、もう一つの `createAnalysisQueue()` インスタンスを保持するモジュール内シングルトン。`getAnalysisQueue()` は無変更（既存の呼び出し元・既存のテストへの影響ゼロ）。
+  - `setStemPreparationQueueForTest()`（新規）: `setAnalysisQueueForTest()` と対称なテスト専用オーバーライド。
+  - `queue.pause(source)` / `queue.resume(source)`（新規、返り値オブジェクトに追加）: §5.4 の `StemQueue.pause()` に対応する、明示的な一時停止/再開コマンド。`noteUnderrun()`/`noteUnderrunCleared()` の debounce 付き自動シグナルとは別の入口だが、内部実装は同じ `underrunSources` Set・同じ `pauseCount`/`maxPauses`/`maxStoppedMs` kill-timeout machinery を共有する（`applyPause()` という共通ヘルパーに切り出した — `noteUnderrun()` はこれを debounce 判定の後に呼び、`pause()` は即座に呼ぶ、という違いだけ）。`resume()` は `noteUnderrunCleared()` そのもの（別 API 名で同じ関数を指すだけ）。CPU pressure 検出そのもの（自動トリガー）は実装していない — タスクの指示どおり、pause/resume という「能力」だけを追加した。
+- `src/player.js`:
+  - `#stemQueue` フィールド + コンストラクタの `stemQueue = null` DI パラメータ + `#stemQ()` ヘルパー（`this.#stemQueue ?? getStemPreparationQueue()`）を、既存の `#analysisQueue`/`#analysisQ()` と全く同じパターンで追加した。
+  - `#initMixerPipeline()` の `mixStream.on('underrun', ...)`: 既存の `this.#analysisQ().noteUnderrun(this)` に加えて `this.#stemQ().pause(this)` を追加。`underrunClear` も対称に `this.#stemQ().resume(this)` を追加。§5.4 が要求する「Demucs 実行中の CPU pressure を realtime underrun から連動して緩和する」配線はこれだけ — 新しい自動検知トリガーは発明していない。`stop()` にも同様に `this.#stemQ().resume(this)` を追加し（既存の `#analysisQ().noteUnderrunCleared(this)` と対称）、停止したギルドが stem キューを他ギルド分も含めて pause させたままにしないようにした。
+  - `#scheduleAnalysis()`: 元は「BPM/phrase 解析 → 分離」を単一の `this.#analysisQ().enqueue(...)` ジョブ内で直列に実行していた。これを、BPM/phrase 解析部分は引き続き `this.#analysisQ().enqueue(...)`（realtime queue）で行い、`!signal?.aborted && stagedPath` の分岐に入った時点で `this.#stemQ().enqueue(...)`（stem queue）へ分離ジョブを **await せず** 発火するよう変更した。「await しない」がここでの本質的な変更点 — 分離を待ってしまうと realtime queue のジョブが Demucs の完走まで `running=true` のままになり、次に並んでいる別トラックの BPM/phrase ジョブを事実上ブロックしてしまう（§5.1 が解決しようとしている問題をキュー分割後も再現してしまう）。段階的な変更:
+    - staged copy の cleanup と `#scheduledAnalysisTokens` の解放（既存の finally 相当）は `finishAnalysisAttempt()` という共有ヘルパーに切り出し、「分離を dispatch しない」経路（abort 済み or staged copy 無し）と「分離を stem queue の job に投げた」経路のどちらか一方から、必ず一度だけ呼ばれるようにした（後者は stem queue job 自身の `.finally()` から呼ぶ — realtime job 自身の finally ではない、そこが今回の分割の核心）。
+    - `!signal?.aborted` のチェックは realtime job 自身の signal のまま（分離を dispatch するかどうかの判断はそのまま realtime queue 側の abort 状態を見る）。stem queue 側の job にも独立した `stemSignal?.aborted` チェックを追加している（stem queue 自身が pause/kill された場合に defensive に効く）。
+    - Phase 9B の HIGH（B）検出用コールバック（`#stemPrefetchTracker.markReady()`/`markFailed()`）はそのまま、stem queue 側の `.then(success, error)` に移設しただけ — ロジック自体は無変更。
+  - `#runLowPriorityStemPrefetch()`（Phase 9B の LOW/C 経路）: ジョブ全体（download + stage + Demucs）を `this.#analysisQ().enqueue(...)` から `this.#stemQ().enqueue(...)` に丸ごと差し替えた。このジョブは download を含めて「C の stem を用意する」以外の目的を持たないため、分割はせず全体を stem queue に移した。
+  - `#ensureAnalysisPrefetch()`（D 以降の軽量 BPM lookahead、Demucs なし）は無変更 — 引き続き `this.#analysisQ()`。
+- `src/player/test-helpers.js`: `makePlayer()` に `analysisQueue`/`stemQueue` の DI パススルーを追加（既存の他の `xxxFn` オプションと同じパターン）。
+
+### §5.2/§5.3 の構成との対応
+
+```text
+RealtimeAnalysisQueue  = getAnalysisQueue()       — 無変更のシングルトン
+  ├─ BPM / downbeat / phrase / key                — #scheduleAnalysis() の解析部分、#ensureAnalysisPrefetch()
+  └─ vocal activity
+
+StemPreparationQueue   = getStemPreparationQueue() — 新規シングルトン、concurrency=1（createAnalysisQueue() は元々シリアル）
+  └─ full-track Demucs
+      ├─ outgoing (A, Phase 8)                    — #scheduleAnalysis() の分離ステップ
+      ├─ next (B, HIGH, Phase 9B)                 — 同上（B は #scheduleAnalysis() に相乗り、9B のノート参照）
+      └─ next+1 (C, LOW, Phase 9B)                — #runLowPriorityStemPrefetch()
+```
+
+### 未決事項 / 既知の制約
+
+- **CPU pressure 検出は未実装**: タスクの指示どおり、`StemQueue.pause()`/`resume()` という能力のみ実装し、それを自動的に呼び出す CPU 監視は実装していない。唯一の自動トリガーは realtime queue 自身の underrun イベント（既存の `noteUnderrun()`/`noteUnderrunCleared()` と同じ mixStream イベント）で、これは §5.4 の例示どおり「Demucs 実行中に実際に underrun が起きている」ケースへの対応であり、それ以外の CPU 負荷（他プロセス起因など）は関知しない。
+- **キュー間の優先度は依然として存在しない**: §5.3 の「StemPreparationQueue 内で HIGH（B）が LOW（C）より先に処理される」という優先度そのものは、Phase 9B のノートに書かれていた「呼び出し順以上の意味を持たない」という制約が今回もそのまま残る。9C はキューを 2 本に分ける（realtime vs stem）ことだけを扱い、stem queue 内部の HIGH/LOW 優先度付けは対象外（`StemPrefetchTracker` の `priority` フィールドは引き続き observational のまま）。
+- **`#scheduleAnalysis()` の分離ステップは fire-and-forget になった**: 9C 以前は `#scheduleAnalysis()` の返り値 Promise が分離の完了まで resolve/reject しなかったが、9C 以降は BPM/phrase 解析が終わった時点で resolve する（分離は別ジョブとして stem queue 上で並行に進む）。`#scheduleAnalysis()` の返り値を誰も awai/consume していないこと（fire-and-forget 呼び出しのみ）をコードリーディングで確認済みだが、将来誰かがこの返り値に依存するコードを追加する場合はこの変更点に注意が必要。
+- **§5.5 の完了条件の検証範囲**:
+  - 「Demucs実行中でもBPM/phrase解析がブロックされない」は **構造的にのみ** 検証できる、かつ検証済み: `RealtimeAnalysisQueue`/`StemPreparationQueue` は `createAnalysisQueue()` の完全に独立した closure インスタンスであり（`jobs`/`running`/`paused` 等の状態を一切共有しない）、FIFO の意味で一方が他方の前に割り込むことは構造上不可能。ユニットテスト（`analysisQueue.test.js`「pausing one queue instance never touches a separate instance」）と player 統合テスト（`player.acceptance.test.js` の Phase 9C セクション、stem queue mock への enqueue 回数と realtime queue mock への enqueue 回数を独立に計測）の両方で確認した。ただし「実際の Demucs 実行の重さ（CPU 時間）が本当に BPM/phrase 解析のレイテンシに影響しないか」という実測（実音源・実 CPU 負荷下でのタイミング計測）はこのエージェント環境では実施できない — phase7/8/9A/9B のノートが繰り返し書いている同じ制約。
+  - 「incoming stem cache hit rate >= 90%」は Phase 9B のノートに書かれていたとおり実運用計測が必要な指標で、9C 側の変更（どのキューが実行するか）はこの数値そのものには影響しない設計（同じ dedup・同じキャッシュチェックロジック、実行順序と並行性のみ変更）と考えられるが、これも実音源・実 Discord セッションでの計測が必要であり本エージェント環境では検証できない。
+
+### 完了条件（§5.5/§17 9C 相当）
+
+- [x] `RealtimeAnalysisQueue`（`getAnalysisQueue()`、無変更）と `StemPreparationQueue`（`getStemPreparationQueue()`、新規）が独立したシングルトンとして存在する
+- [x] `StemPreparationQueue` の concurrency は 1（`createAnalysisQueue()` の既存のシリアル FIFO 実装をそのまま利用）
+- [x] `StemQueue.pause()`/`resume()`（§5.4）が実装され、realtime queue の underrun イベントから連動して呼ばれる（自動 CPU 監視トリガーは対象外、上記未決事項参照)
+- [x] Phase 8 の outgoing-track 分離（`#scheduleAnalysis()`）と Phase 9B の next/next+1 分離（同経路 + `#runLowPriorityStemPrefetch()`）が両方とも `StemPreparationQueue` 経由になった。BPM/downbeat/phrase/key/vocal-activity は `RealtimeAnalysisQueue` のまま
+- [x] 既存の dedup（`#scheduledAnalysisTokens`）・underrun pause/kill・nice-level spawn は両キューインスタンスで維持（`createAnalysisQueue()` 自体を変更せず、2 個目のインスタンスとして再利用したため自動的に満たされる）
+- [x] どのトラックが解析/分離されるか、いつされるか、どの transition mode が選ばれるかは無変更（`bun run test:server` で Phase 6-9B の既存テストが1件も変わらず通過、703件中695件 pass / 4件 fail は ffmpeg 未インストールによる既知の `silenceTrim.test.js` の失敗のみ、4件 skip も既知）
+- [ ] 「Demucs実行中でもBPM/phrase解析がブロックされない」の実音源・実運用計測（構造的な検証は完了、上記未決事項参照）
+- [ ] 「incoming stem cache hit rate >= 90%」の実測（上記未決事項参照、Phase 9B から持ち越しの既知の制約）
