@@ -2038,7 +2038,14 @@ export class GuildPlayer {
       let inCachedStems = null;
       let norm = null;
       let stemPlan = null;
-      const stemCacheLookupKey = `${current.videoId ?? ''}:${next.videoId ?? ''}`;
+      // Codex review (PR #43, round 9): videoId-less tracks (the playlist
+      // route explicitly allows this) previously all collapsed to the same
+      // ":" key here — an evaluated A→B pair's stash would then get
+      // wrongly consumed by an unrelated later B→C handoff within the 30s
+      // freshness window if either pair lacked a videoId. #prefetchKey()
+      // (existing, used elsewhere for the same "stable identity when
+      // videoId is absent" need) falls back to webpageUrl instead.
+      const stemCacheLookupKey = `${this.#prefetchKey(current) ?? ''}:${this.#prefetchKey(next) ?? ''}`;
       // Phase 9A (docs/mix-transition-phase9.md §3): whether the stem-cache
       // lookup below actually ran this tick — distinguishes a genuine
       // HIT/MISS from "never checked" (beatmix already won, or this pair is
@@ -2626,7 +2633,11 @@ export class GuildPlayer {
     this.#lastEvaluatedTransitionReport = null;
     if (!stashed) return null;
     if (Date.now() - stashed.evaluatedAt >= LAST_EVALUATED_TRANSITION_MAX_AGE_MS) return null;
-    const pairKey = `${outgoingTrack?.videoId ?? ''}:${incomingTrack?.videoId ?? ''}`;
+    // Codex review (PR #43, round 9): must use the same #prefetchKey()
+    // fallback identity the stash was built with (see stemCacheLookupKey
+    // above) — otherwise a videoId-less pair could never match its own
+    // stash at all, silently falling back to the generic stub every time.
+    const pairKey = `${this.#prefetchKey(outgoingTrack) ?? ''}:${this.#prefetchKey(incomingTrack) ?? ''}`;
     if (stashed.pairKey !== pairKey) return null;
     const { report } = stashed;
     // Codex review (PR #43, round 7): a stashed report whose evaluated
