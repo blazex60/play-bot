@@ -2219,9 +2219,18 @@ export class GuildPlayer {
       }
       if (remaining == null) return;
       // Analysis determines the exact overlap. Legacy crossfade caps at
-      // MAX_CROSSFADE_SEC, but a beatmix overlap (up to BEATMIX_OVERLAP_BARS
-      // bars) can run longer at slower tempos — MAX_TRANSITION_LEAD_SEC must
-      // cover both, or a slow-tempo beatmix's prep window never opens.
+      // MAX_CROSSFADE_SEC, but a beatmix/stem-mix overlap (up to
+      // MIX_BARS.extended = 16 bars as of Phase 9E, docs/mix-transition-
+      // phase9.md §7.2) can run longer at slower tempos — MAX_TRANSITION_LEAD_SEC
+      // must cover both, or a slow-tempo beatmix's prep window never opens.
+      // MAX_TRANSITION_LEAD_SEC is still TAIL_WINDOW_SEC (45s, unchanged by
+      // Phase 9E) — at slow enough tempos a full 16-bar reach can itself
+      // exceed 45s (e.g. 16 bars at 80 BPM/4-beat is 48s), which both caps
+      // how early this gate opens AND caps findExitCandidates()'s own
+      // candidate pool short of a true 16-bar-back exit point. This is the
+      // known, deliberately out-of-scope-for-9E limitation Phase 9F (§8,
+      // widening the tail analysis window) exists to address — see
+      // docs/mix-transition-phase9.md's Phase 9E implementation notes.
       if (remaining > CROSSFADE_PREP_LEAD_SEC + MAX_TRANSITION_LEAD_SEC) return;
       // TRACK loop must re-arm the same track; upcoming()[0] would advance on promote.
       const next = this.#queue.loopMode === LoopMode.TRACK

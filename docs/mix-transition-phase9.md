@@ -1728,3 +1728,55 @@ round 2 で見つかった追加の1件（P2）:
 - [x] `[MIX PLAN]` レポート（§3.2）が独立評価を正しく反映する（beatmix が勝っても phrase-crossfade/stem-mix は実際の評価結果を報告する。stem-mix が「未評価」なのは、キャッシュ未確認 or BPM無しで原理的に不可能な場合のみ）
 - [x] 既存の Phase 7-9C の挙動が変わっていないことをテストで確認: `bun run test:server` で 729件中 721 pass / 4 fail（`silenceTrim.test.js` の ffmpeg 未インストールによる既知の失敗のみ、Phase 9A/9B/9C のノートに書かれているものと同一）/ 4 skip
 - [ ] stem preference bonus の実運用での聴感評価（上記未決事項参照）
+
+## 実装ノート (Phase 9E)
+
+§7 の Long Mix Zone（4/8/16 bars）を実装した。beatmix/stem-mix のバー数探索を「preferred=4 bars 固定、足りなければ minimum=2 bars へフォールバック」という Phase 7C 以来の二段構成から、§7.2 の「16 → 8 → 4 → fallback」の三段構成に拡張し、最上段（16 bars = extended tier）は stem-mix かつ両側の解析信頼度が高いペアだけに許可した。
+
+### 実装箇所
+
+- `src/audio/beatmixTransition.js`:
+  - `MIX_BARS = { preferred: 8, minimum: 4, extended: 16 }`（§7.2 そのまま）を新設し、既存の `BEATMIX_OVERLAP_BARS`/`MIN_OVERLAP_BARS` はこのオブジェクトの `preferred`/`minimum` を指すエイリアスに変更した。両定数は `src/mix/ordering.js`（`transitionCost()` の beatmix 項）や、この2ファイル自身の複数のテストから名前で import されているため、値だけを差し替えてエクスポート名は維持している。
+  - `preferred` を 4→8 bars、`minimum` を 2→4 bars に引き上げた（§7.2 の新設定そのもの）。`extended`（16 bars）は完全に新規。
+  - `extendedTierEligible(outgoing, incoming, stemAware)`（新規、非公開関数）: §7.2 の3条件「phrase confidence high / stem available / vocal plan usable」を、既存のこのコードベースの解析フィールドにマップした:
+    - **stem available** = 呼び出し元が渡す `stemAware` フラグそのもの。`planBeatmixTransition()` は `planStemTransition()`（`stemTransition.js`）から呼ばれるときだけ `stemAware: true` を渡し、その呼び出し元（`player.js`/`transitionCandidates.js`）は両側のキャッシュ済み stem の存在を既に確認済み、という既存の契約をそのまま利用している——`extendedTierEligible()` 自身はキャッシュを再確認しない。プレーンな（非 stem）beatmix 呼び出しは `stemAware` を渡さないため、16 bars の単一ストリームクロスフェード（両トラックのボーカルが overlap 全体で重なる）が生まれることはない——これは per-stem ボーカルエンベロープ（`buildStemEnvelopes()`）が防ごうとしている失敗パターンそのものなので、意図的な設計。
+    - **phrase confidence high** = 両側の `downbeatGrid.confidence >= EXTENDED_PHRASE_CONFIDENCE_MIN`（新設: `0.7`）。この 0.7 は、既存の `DOWNBEAT_CONFIDENCE_MIN`（0.4、bar-1 の eligibility floor）を「単に通過した」水準ではなく「§8.3 の marginal-tempo tier が要求する `MARGINAL_TEMPO_MIN_SCORE`（同じく 0.7）」と揃えた、「non-default tier に見合う高信頼度」という同ファイル内の既存の前例を再利用した値。
+    - **vocal plan usable** = 両側の `vocalConfidence >= EXTENDED_VOCAL_CONFIDENCE_MIN`（新設: `0.85`）。`vocalActivity.js` の `classifyVocalEnvelope()` が最上位の 0.85 を返すのは RMS フレームが十分（5フレーム以上）分類できたときのみ——`hasVocalAnalysis()`（既存、`analysisSource !== 'none'` のみを見る）より厳しい、「薄いが本物の読み取り」と「十分にサンプリングされた読み取り」を区別するゲート。
+  - `planBeatmixTransition()` のバー数探索ループ: 従来は `overlapBars`（=preferred）から `minOverlapBars`（=minimum）まで1本のループで降順に試し、最初にフィットしたバー数を採用していた。この形は変えず、開始点だけを `extendedTierEligible(outgoing, incoming, stemAware) ? MIX_BARS.extended : overlapBars` に変更した——§7.2 の「16→8→4→fallback」という名前つき三段は、実装上は 16 (or 8), 15, 14, ..., 4 という単一の降順スイープとして実現されており、extended 非該当のペアは単に 8 から始まるだけで、それ以外のロジック（vocal-safe/forward-safe room チェック、ペアごとのスコアリング）は完全に無変更。
+- `src/player.js` `#maybeStartCrossfade()`: `MAX_TRANSITION_LEAD_SEC`（= `TAIL_WINDOW_SEC`、45秒、Phase 9E で無変更）まわりの既存コメントに、16 bars 到達時の制約を追記した——下記「未決事項」参照。ロジック自体の変更はなし。
+- テスト:
+  - `src/audio/beatmixTransition.test.js`: `MIX_BARS`/`extendedTierEligible()`/16-bars 探索開始点まわりに8件追加（stem-mix + 高信頼度ペアが16 barsを選ぶこと、いずれか一方の条件が欠けると8 barsへ落ちること、非 stem-mix 呼び出しは常に8 bars始まりであること、など）。全件パス。
+  - `src/mix/ordering.test.js`: `MIN_OVERLAP_BARS` が 2→4 bars になったことで、`transitionCost()` の beatmix 項が「新しい 4-bar floor をちょうど下回る/ちょうど満たす」ことを検証している3件のフィクスチャの秒数を再較正した（例: 「3.5秒しか room がない」ケースは floor が 4s だった頃の想定のままなので、floor が 8s になった今も変わらず「4s には足りるが8sには足りない」という同じ意味を保つよう `7s room, needs 8s` に更新——アサーションの意味・落ちる/落ちない境界の位置関係は完全に不変、絶対値だけがスケールした）。
+  - `src/player.acceptance.test.js`: `MIN_OVERLAP_BARS`/`BEATMIX_OVERLAP_BARS` が伸びたことで、9件の beatmix/stem-mix acceptance テストのフィクスチャが「新しい minimum(8s)/preferred(16s) を満たさない」状態になり fail していた（プレーンな beatmix は `crossfade`/`phrase-crossfade` へ意図せず降格、stem-mix は `no-overlap-fit` で丸ごと ineligible）。9件とも exit/entry 候補の room（`durationSec`/`lastVocalEndSec`/`firstVocalStartSec`/phrase 秒数）を「新しい4-bar floor(8s) はちょうど超えるが5-bar(10s)には届かない」という、この phase 以前と同じ「ぎりぎり minimum 止まり」の形になるよう再較正した。アサーションの中身（spawn 引数、promotion の宛先、`[MIX PLAN]` レポートの形、prep revalidation の挙動、remainingSec の具体値 3.4s など）はどれも変更していない——変えたのは各フィクスチャがどのバー数に着地するかを決める秒数だけ。共有ヘルパー `stemFixtures()`（6件のstem-mixテストが使用）も同様に更新し、他の（元から通っていた）stemFixtures 利用テスト（cache-miss/eviction系）が緩いアサーション（`if (startedPlan) assert.notEqual(...)`）のおかげで影響を受けないことを確認済み。
+
+### §7.2 の探索順との対応
+
+```text
+仕様（§7.2）:            実装:
+16 bars                  extendedTierEligible() が真のときだけ startBars = 16
+  ↓                         ↓ (bars -= 1 の同一ループ内)
+8 bars                    それ以外は startBars = 8（= MIX_BARS.preferred）
+  ↓                         ↓
+4 bars                    ループは MIX_BARS.minimum (4) まで降順に継続
+  ↓                         ↓
+fallback                  no-overlap-fit → planBeatSyncedTransition()/
+                           rankTransitionCandidates() の他候補（phrase-crossfade 等）
+```
+
+### 未決事項 / 既知の制約
+
+- **16 bars の到達距離は TAIL_WINDOW_SEC（45秒）を超えうる**: `player.js` の `#maybeStartCrossfade()` が exit 候補を探す tail 解析窓は `TAIL_WINDOW_SEC`（45秒、無変更）で頭打ちになっている。16 bars @ 120 BPM/4-beat は 32秒だが、テンポが遅いほど1バーの秒数は伸びる——例えば 80 BPM/4-beat では 16 bars = 48秒で、45秒の窓を超える。これは二重の意味で効く: (1) `MAX_TRANSITION_LEAD_SEC`(=`TAIL_WINDOW_SEC`) がそのまま prep ゲートの開くタイミングの上限にもなっているため、遅いテンポの16-bar到達点はそもそも「まだ早すぎる」として prep が開かない可能性がある、(2) `findExitCandidates()` 自身が tail 解析窓の外の phrase 境界を最初から知らない——遅いテンポでは「本当は16 bars分のroomがあるのに、そのroomの入口が45秒解析窓の外にあるため exit 候補として見つからない」ケースが起こりうる。これは Phase 9E のスコープ外として意図的に据え置いた既知の制約で、`player.js` の `#maybeStartCrossfade()` 内のコメント（`MAX_TRANSITION_LEAD_SEC` の直上）にも同じ説明を残している。tail 解析窓自体を広げる対応は §8（Phase 9F, Exit Candidate 探索範囲拡張）のスコープ。
+  - 実用上の影響度: 16 bars（extended tier）は stem-mix かつ高信頼度ペアのみが対象なので、影響を受けるのは「遅めのテンポ・かつ stem 準備済み・かつ高信頼度」という比較的狭い交差点のみ。8 bars（preferred）・4 bars（minimum）はどちらのテンポでも 45秒の窓に収まる（8 bars は BPM 64 以上、4 bars は BPM 32 以上で収まる計算——通常の楽曲のテンポ域を十分にカバーする）ため、この制約は主に extended tier にのみ及ぶ。
+- **実測評価は未実施**: Phase 9A-9D のノートが繰り返し書いている制約と同じく、16 bars の Mix Zone が実際の楽曲・実運用でどれだけ「聴感上心地よいロングミックス」として機能するか（そしてどの程度の割合の遷移が実際に extended tier に到達するか）は実音源・実 Discord セッションでの確認が必要で、本エージェント環境では実施できない。
+- **§17 9E の "8 bars以上のMix Zoneが実際に再生される" の検証範囲**: `player.acceptance.test.js` の beatmix/stem-mix テスト（今回再較正した9件を含む）で、8 bars(16s)/4 bars(8s) のバー数で実際に `crossfadestart` イベントが発火し、`MixStream` がそのフレーム数だけ overlap を駆動し、トラックが promotion まで進むこと（＝「プランされるだけでなく実際に再生される」）を構造的に確認済み。16 bars（extended）到達の acceptance レベルでの専用テストは今回追加していない——`beatmixTransition.test.js` 側の8件のユニットテストで `extendedTierEligible()`/開始バー数の選択ロジック自体はカバーしているが、`player.js` の実プレイバック経路（spawn/crossfade/promotion）を16 barsの overlap で最後まで駆動する acceptance テストは未追加。理由: 16 bars @ 120 BPM = 32秒の overlap をフレーム単位（20ms/frame = 1600 reads）で駆動する acceptance テストはこのファイルの実行時間（`player.acceptance.test.js` 単体で最大約45秒程度）をさらに押し上げる割に、実際に検証したいロジック（プランナーの開始バー数選択）は既に `beatmixTransition.test.js` 側でユニットレベルにカバーされているため、今回は見送った。次フェーズ以降で必要になれば追加を推奨する。
+
+### 完了条件（§7/§17 9E 相当）
+
+- [x] `MIX_BARS = { preferred: 8, minimum: 4, extended: 16 }`（§7.2）を実装し、既存の `BEATMIX_OVERLAP_BARS`/`MIN_OVERLAP_BARS` の全呼び出し元（`ordering.js`、両ファイルのテスト）に後方互換のまま反映した
+- [x] 探索順「16 → 8 → 4 → fallback」を実装した（`extendedTierEligible()` が startBars を決め、既存の単一降順ループがそれ以降を担う）
+- [x] 16 bars tier のゲート（stem-mix / phrase confidence high / vocal plan usable、§7.2）を実装し、`beatmixTransition.test.js` で境界（3条件のいずれか1つでも欠けると8 barsへ落ちる）を検証した
+- [x] 8 bars 以上の Mix Zone が実際に `crossfadestart`→overlap 駆動→promotion まで再生されることを acceptance レベルで確認した（既存9件の beatmix/stem-mix acceptance テストを新しい bar floor に合わせて再較正、全件パス）
+- [x] `bun run test:server` で Phase 7-9D の既存挙動が変わっていないことを確認: 736件中 728 pass / 4 fail（`silenceTrim.test.js` の ffmpeg 未インストールによる既知の失敗のみ、Phase 9A-9D のノートに書かれているものと同一）/ 4 skip
+- [ ] 16 bars（extended tier）到達の acceptance レベル専用テスト（上記未決事項参照、次フェーズ以降で追加を推奨）
+- [ ] 16 bars Mix Zone の実運用での聴感評価（上記未決事項参照）
+- [ ] TAIL_WINDOW_SEC(45s) を超える低テンポでの extended tier 到達率の実測（Phase 9F のスコープ、上記未決事項参照）

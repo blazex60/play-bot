@@ -556,13 +556,19 @@ test('acceptance (mixer): beatmix transition spawns a tempo-matched, seeked inco
 
   // §9.2/§16 tier 1: bpm/beatConfidence/downbeatGrid.confidence/meter on
   // both sides, a vocal-safe phrase-boundary exit (outgoing) and entry
-  // (incoming) with >= 2 bars (4s @ 120BPM) of forward-safe room. Same BPM
-  // on both sides keeps tempoRatio exactly 1, so the only thing under test
-  // is the wiring (spawn options, plan shape, promotion) — not the planner
-  // math itself, which beatmixTransition.test.js already covers in depth.
+  // (incoming) with >= 4 bars (8s @ 120BPM, MIN_OVERLAP_BARS as of Phase 9E
+  // — was 2 bars/4s pre-9E) of forward-safe room. Same BPM on both sides
+  // keeps tempoRatio exactly 1, so the only thing under test is the wiring
+  // (spawn options, plan shape, promotion) — not the planner math itself,
+  // which beatmixTransition.test.js already covers in depth.
+  //
+  // Room is tuned to land exactly on the 4-bar (8s) minimum tier, not the
+  // 8-bar (16s) preferred one: durationSec - exit(1.0s) = 8.5s and
+  // firstVocalStartSec(8.7s) - entry(0.2s) = 8.5s room on each side — past
+  // the 4-bar floor (8s), short of the next bar step up (5 bars = 10s).
   const outgoingAnalysis = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
+    durationSec: 9.5,
     lastVocalEndSec: 1.0,
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -574,8 +580,12 @@ test('acceptance (mixer): beatmix transition spawns a tempo-matched, seeked inco
   };
   const incomingAnalysis = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
-    firstVocalStartSec: 5.0,
+    // Own room (durationSec - entry) is 11.8s, well clear of the 4-bar
+    // floor so it's never the binding constraint (firstVocalStartSec below
+    // is) — kept generous so remainingSec has meaningful runway left after
+    // the fadeSec + trailing frames the assertion at the bottom measures.
+    durationSec: 12.0,
+    firstVocalStartSec: 8.7,
     headVocalGaps: [],
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -595,10 +605,10 @@ test('acceptance (mixer): beatmix transition spawns a tempo-matched, seeked inco
     probeTempoBackendFn: async () => 'rubberband',
     createPcmSourceFn: async (track, opts) => {
       if (track.videoId === 'vid-b') incomingSpawnArgs.push(opts);
-      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+      return PcmSource.fromBuffers(Array.from({ length: 500 }, () => Buffer.from(frame)));
     },
   });
-  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 12, videoId: 'vid-b' }));
 
   player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
 
@@ -625,8 +635,9 @@ test('acceptance (mixer): beatmix transition spawns a tempo-matched, seeked inco
     `expected a tempo filter on the incoming spawn, got ${spawned.tempoFilter}`,
   );
 
-  // Drive well past the 4s (2-bar) overlap so the crossfade promotes Track B.
-  for (let i = 0; i < 220; i += 1) {
+  // Drive well past the 8s (4-bar, MIN_OVERLAP_BARS as of Phase 9E) overlap
+  // so the crossfade promotes Track B.
+  for (let i = 0; i < 420; i += 1) {
     player.mixStream.read(FRAME_BYTES);
   }
 
@@ -638,13 +649,16 @@ test('acceptance (mixer): beatmix transition spawns a tempo-matched, seeked inco
   );
 
   // Codex round-1 P1: the incoming source was spawned seeked to entrySec
-  // (0.2s), so Track B's remaining playback is (8 - 0.2) = 7.8s native, not
-  // the full 8s — tempoRatio is 1 here so playback-domain is the same.
-  // The 220-read loop above consumes the 4s (200-frame) overlap plus 20
-  // more frames (0.4s) of Track B as sole "current" afterward, so
-  // positionSec sits at ~4.4s post-promotion: remainingSec ~= 7.8 - 4.4 =
-  // 3.4s. Before the fix this would read ~3.8s (entrySec never subtracted
-  // from the native duration fed to setDurationSec).
+  // (0.2s), so Track B's remaining playback is (12.0 - 0.2) = 11.8s native,
+  // not the full 12.0s — tempoRatio is 1 here so playback-domain is the
+  // same. The 420-read loop above consumes the 8s (400-frame, Phase 9E's
+  // 4-bar minimum) overlap plus 20 more frames (0.4s) of Track B as sole
+  // "current" afterward, so positionSec sits at ~8.4s post-promotion:
+  // remainingSec ~= 11.8 - 8.4 = 3.4s. Before the fix this would read
+  // ~3.8s (entrySec never subtracted from the native duration fed to
+  // setDurationSec) — same 3.4s target as pre-9E since the incoming
+  // duration's own headroom above the overlap (3.8s) is unchanged, only
+  // the overlap itself grew.
   assert.ok(
     Math.abs(player.mixStream.remainingSec - 3.4) < 0.05,
     `expected remainingSec to subtract the 0.2s entry seek from Track B's duration, got ${player.mixStream.remainingSec}`,
@@ -730,14 +744,25 @@ test('acceptance (mixer): a chained beatmix transition subtracts the current sou
   const firedPlans = [];
   const incomingSpawnArgsByTrack = new Map();
 
+  // Phase 9E (docs/mix-transition-phase9.md §7.2): both the A->B and B->C
+  // legs need room for MIN_OVERLAP_BARS = 4 bars @ 120 BPM/4-beat = 8s (was
+  // 2 bars/4s pre-9E) — see analysisA/analysisB/analysisC's own comments
+  // below for how each side's room was widened to clear that floor. The
+  // fixed-vs-buggy threshold math itself (subtracting BS_ENTRY_SEC before
+  // comparing against positionSec) is independent of the bar minimum, so
+  // BS_ENTRY_SEC is unchanged; only BC_EXIT_SEC moved, to keep B's own
+  // exit-room (durationSec - BC_EXIT_SEC) comfortably past the new floor.
   const BS_ENTRY_SEC = 5.0; // B's own entry offset, baked in by A->B.
-  const BC_EXIT_SEC = 20.0; // absolute, native position in B's file.
-  const FIXED_THRESHOLD = BC_EXIT_SEC - BS_ENTRY_SEC; // 15.0
-  const BUGGY_THRESHOLD = BC_EXIT_SEC; // 20.0 (pre-fix, unsubtracted)
+  const BC_EXIT_SEC = 21.5; // absolute, native position in B's file.
+  const FIXED_THRESHOLD = BC_EXIT_SEC - BS_ENTRY_SEC; // 16.5
+  const BUGGY_THRESHOLD = BC_EXIT_SEC; // 21.5 (pre-fix, unsubtracted)
 
   const analysisA = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
+    // durationSec - exit(1.0s) = 8.5s room: past the new 4-bar (8s) floor,
+    // short of the 8-bar (16s) preferred tier — same pattern as the
+    // single-hop beatmix acceptance fixture above.
+    durationSec: 9.5,
     lastVocalEndSec: 1.0,
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -749,12 +774,17 @@ test('acceptance (mixer): a chained beatmix transition subtracts the current sou
   };
   const analysisB = {
     version: ANALYSIS_VERSION,
+    // durationSec - BC_EXIT_SEC = 8.5s room for the B->C exit — same
+    // just-past-the-4-bar-floor sizing as analysisA's.
     durationSec: 30,
     lastVocalEndSec: BC_EXIT_SEC,
     // Must be strictly after BS_ENTRY_SEC — findEntryCandidates() only
     // offers entry points before firstVocalStartSec (or inside a
-    // headVocalGaps window) as vocal-safe.
-    firstVocalStartSec: BS_ENTRY_SEC + 5.0,
+    // headVocalGaps window) as vocal-safe. Also needs
+    // firstVocalStartSec - BS_ENTRY_SEC >= 8s (Phase 9E's 4-bar floor) for
+    // the A->B entry's forward-safe room — 8.5s here, same margin as the
+    // exit sides.
+    firstVocalStartSec: BS_ENTRY_SEC + 8.5,
     headVocalGaps: [],
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -772,8 +802,11 @@ test('acceptance (mixer): a chained beatmix transition subtracts the current sou
   };
   const analysisC = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
-    firstVocalStartSec: 5.0,
+    // entry(0.5s) + 12s room, clearing both the 4-bar floor for its own
+    // (durationSec - entry) room check and (via firstVocalStartSec below)
+    // the forward-safe check.
+    durationSec: 12.5,
+    firstVocalStartSec: 9.0,
     headVocalGaps: [],
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -799,7 +832,7 @@ test('acceptance (mixer): a chained beatmix transition subtracts the current sou
     },
   });
   queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 30, videoId: 'vid-b' }));
-  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 8, videoId: 'vid-c' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 12.5, videoId: 'vid-c' }));
 
   player.mixStream.on('crossfadestart', (plan) => { firedPlans.push(plan); });
 
@@ -808,7 +841,10 @@ test('acceptance (mixer): a chained beatmix transition subtracts the current sou
   await pollUntil(() => firedPlans.length >= 1);
   assert.equal(firedPlans.length, 1, 'expected the A->B beatmix transition to arm');
 
-  for (let i = 0; i < 220; i += 1) player.mixStream.read(FRAME_BYTES);
+  // A->B's fadeSec lands on the 4-bar (8s = 400-frame) minimum tier, same
+  // as the single-hop beatmix fixture above — 400 frames of overlap plus
+  // 20 more (0.4s) to land solidly on Track B as sole "current".
+  for (let i = 0; i < 420; i += 1) player.mixStream.read(FRAME_BYTES);
   assert.equal(queue.current.videoId, 'vid-b', 'expected A->B to promote Track B');
   assert.ok(
     (incomingSpawnArgsByTrack.get('vid-b') ?? []).some((opts) => Math.abs((opts.startSec ?? 0) - BS_ENTRY_SEC) < 1e-6),
@@ -1005,9 +1041,14 @@ test('acceptance (mixer): an unhonored beatmix with a zero entry offset still do
   new Int16Array(frame.buffer).fill(4000);
   let startedPlan = null;
 
+  // Phase 9E (docs/mix-transition-phase9.md §7.2): MIN_OVERLAP_BARS is now
+  // 4 bars @ 120 BPM/4-beat = 8s (was 2 bars/4s pre-9E) — both sides widened
+  // the same way as the other beatmix acceptance fixtures above, landing on
+  // the 4-bar floor (durationSec - exit(1.0s) = 8.5s; firstVocalStartSec(8.5s)
+  // - entry(0) = 8.5s), well short of the 8-bar (16s) preferred tier.
   const outgoingAnalysis = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
+    durationSec: 9.5,
     lastVocalEndSec: 1.0,
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -1019,10 +1060,10 @@ test('acceptance (mixer): an unhonored beatmix with a zero entry offset still do
   };
   const incomingAnalysis = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
+    durationSec: 12.0,
     // Zero-sec head candidate: entrySec will be 0, but headBpm still
     // differs from the outgoing target enough to require a tempo filter.
-    firstVocalStartSec: 5.0,
+    firstVocalStartSec: 8.5,
     headVocalGaps: [],
     vocalConfidence: 0.85,
     confidence: 0.8,
@@ -1792,7 +1833,15 @@ test('acceptance (mixer): lookahead analysis does not persist YouTube metadata d
 function stemFixtures() {
   const outgoingAnalysis = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
+    // Phase 9E (docs/mix-transition-phase9.md §7.2): MIN_OVERLAP_BARS is now
+    // 4 bars @ 120 BPM/4-beat = 8s (was 2 bars/4s pre-9E) — planStemTransition()
+    // reuses planBeatmixTransition()'s room check unchanged
+    // (requireExitVocalSafe:false only relaxes the vocal-floor filter, not
+    // the bar-derived minOverlapSec). durationSec - exit(1.0s) = 8.5s: just
+    // over the new 4-bar floor, still short of the 8-bar (16s) preferred
+    // tier, so the search lands on 4 bars the same way it landed on the old
+    // 2-bar floor before this phase.
+    durationSec: 9.5,
     // Still singing well past the only exit candidate below (1.0s) — plain
     // beatmix's findExitCandidates() rejects this outright; stem-mix is the
     // only tier that can still accept the pair.
@@ -1807,7 +1856,13 @@ function stemFixtures() {
   };
   const incomingAnalysis = {
     version: ANALYSIS_VERSION,
-    durationSec: 8,
+    // Phase 9E: requireEntryForwardSafe:false (stem-mix) skips the
+    // vocal-forward-room cap, but planBeatmixTransition()'s
+    // roomInIncomingPlayback check (incoming's own remaining native seconds
+    // past entry) is untouched — durationSec - entry(0.2s) = 11.8s, well
+    // clear of the new 4-bar (8s) floor, so it's never the binding
+    // constraint (the outgoing exit room above is).
+    durationSec: 12.0,
     firstVocalStartSec: 5.0,
     headVocalGaps: [],
     vocalConfidence: 0.85,

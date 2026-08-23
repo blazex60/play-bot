@@ -204,9 +204,10 @@ test('transitionCost\'s beatmix term is absent when the outgoing side has no usa
 test('transitionCost\'s beatmix term requires the planner\'s own bar-derived overlap room, not a flat 2s floor', () => {
   // Codex round-1 on PR #35: a fixed 2s floor admitted candidates
   // planBeatmixTransition() would reject with no-exit-candidate (needs
-  // MIN_OVERLAP_BARS * barSec = 2 bars @ 120 BPM/4-beat = 4s). This exit
-  // candidate has 3.5s of room — enough for the old flat floor, not enough
-  // for the real bar-derived one.
+  // MIN_OVERLAP_BARS * barSec = 4 bars @ 120 BPM/4-beat = 8s as of Phase
+  // 9E, was 2 bars/4s before). This exit candidate has 3.5s of room —
+  // enough for the old flat floor, not enough for the real bar-derived one
+  // (still true after Phase 9E raised that floor further).
   //
   // Codex round-3 on PR #35: an empty exitCandidates result here means every
   // candidate was conclusively filtered for lacking room — since both sides
@@ -545,18 +546,19 @@ test('transitionCost\'s beatmix term rejects an entry whose start is vocal-safe 
   // that follows is enough for even the shortest real overlap.
   // planBeatmixTransition() additionally requires forwardSafePlayback to
   // cover the fadeSec it picks (entryForwardSafeSec()); this term must
-  // apply the same floor derived by minOverlapSecFor() (2 bars @ 120 BPM/
-  // 4-beat = 4s here). Single exit/entry candidate on each side so there's
-  // no candidate-selection ambiguity — this isolates the forward-room
-  // filter itself from the "best pair" search covered above.
+  // apply the same floor derived by minOverlapSecFor() (4 bars @ 120 BPM/
+  // 4-beat = 8s here, as of Phase 9E — was 2 bars/4s before). Single
+  // exit/entry candidate on each side so there's no candidate-selection
+  // ambiguity — this isolates the forward-room filter itself from the
+  // "best pair" search covered above.
   const from = richOutgoing();
   const tightEntry = richIncoming({
     firstVocalStartSec: 20,
-    phrases: { head: [{ sec: 16.5, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] }, // 3.5s room, needs 4s
+    phrases: { head: [{ sec: 13, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] }, // 7s room, needs 8s
   });
   const roomyEntry = richIncoming({
     firstVocalStartSec: 20,
-    phrases: { head: [{ sec: 15, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] }, // 5s room
+    phrases: { head: [{ sec: 8, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }] }, // 12s room
   });
   assert.ok(
     transitionCost(from, tightEntry) > transitionCost(from, roomyEntry),
@@ -570,20 +572,21 @@ test('transitionCost\'s beatmix term measures incoming overlap room in playback 
   // seconds — comparing native room directly against minOverlapSec (itself
   // a playback-domain, targetBpm-derived duration) can admit a candidate
   // the live planner rejects with no-overlap-fit. 114 -> 120 BPM stretches
-  // by ~1.053x, so 4.1 native seconds of room leave only ~3.9 playback
-  // seconds — enough for the old native-only check (needs 4s), not enough
-  // once divided by match.ratio the way planBeatmixTransition() does.
+  // by ~1.0526x, so 8.2 native seconds of room leave only ~7.79 playback
+  // seconds — enough for the old native-only check (needs 8s as of Phase
+  // 9E's minOverlapSecFor(), was 4s pre-9E), not enough once divided by
+  // match.ratio the way planBeatmixTransition() does.
   const from = richOutgoing(); // tailBpm 120
-  const fourPointOneSecRoom = { sec: 15.9, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] };
+  const eightPointTwoSecRoom = { sec: 11.8, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] };
   const stretchedIncoming = richIncoming({
     bpm: 114,
     headBpm: 114, // ratio ~1.0526 once matched against the 120 target
     firstVocalStartSec: 20,
-    phrases: { head: [fourPointOneSecRoom] },
+    phrases: { head: [eightPointTwoSecRoom] },
   });
   const unstretchedIncoming = richIncoming({
     firstVocalStartSec: 20,
-    phrases: { head: [fourPointOneSecRoom] }, // same 4.1s native room, but ratio ~1 (no conversion needed)
+    phrases: { head: [eightPointTwoSecRoom] }, // same 8.2s native room, but ratio ~1 (no conversion needed)
   });
   assert.ok(
     transitionCost(from, stretchedIncoming) > transitionCost(from, unstretchedIncoming),

@@ -20,8 +20,55 @@ import { HEAD_WINDOW_SEC } from './vocalActivity.js';
 export const BEAT_CONFIDENCE_MIN = 0.5;
 export const DOWNBEAT_CONFIDENCE_MIN = 0.4;
 export const HARMONIC_CONFIDENCE_MIN = 0.55; // matches src/mix/ordering.js's harmonicOk threshold
-export const BEATMIX_OVERLAP_BARS = 4;
-export const MIN_OVERLAP_BARS = 2;
+
+/**
+ * Phase 9E (docs/mix-transition-phase9.md §7.2): the beatmix bar-count
+ * search space. `preferred`/`minimum` are the same two-tier sweep that
+ * existed before this phase (renamed from the standalone
+ * BEATMIX_OVERLAP_BARS=4/MIN_OVERLAP_BARS=2 constants, kept exported below
+ * for every existing call site — src/mix/ordering.js, this file's own
+ * default params, both modules' tests — that already imports them by name).
+ * `extended` is new: a third, wider starting point the search only reaches
+ * for a pair that clears extendedTierEligible() below. See that function's
+ * docstring for what "16 bars only when phrase confidence is high, stems
+ * are available, and the vocal plan is usable" (§7.2) maps onto in this
+ * codebase's actual analysis fields.
+ */
+export const MIX_BARS = {
+  preferred: 8,
+  minimum: 4,
+  extended: 16,
+};
+export const BEATMIX_OVERLAP_BARS = MIX_BARS.preferred;
+export const MIN_OVERLAP_BARS = MIX_BARS.minimum;
+/**
+ * §7.2 "phrase confidence high" gate for the extended (16-bar) tier. This
+ * codebase has no standalone aggregate phrase-confidence field — phrase
+ * candidates (buildPhraseCandidates() in trackAnalysis.js) are built
+ * directly from each side's downbeat grid, so downbeatGrid.confidence (the
+ * same field DOWNBEAT_CONFIDENCE_MIN already gates bar-1 eligibility on) is
+ * the closest existing signal to "how much do we trust phrase alignment."
+ * Set well above DOWNBEAT_CONFIDENCE_MIN (0.4) — a bare pass on the
+ * eligibility floor is not the same as "high" — reusing the same 0.7
+ * "confident enough for an extended/non-default tier" precedent
+ * MARGINAL_TEMPO_MIN_SCORE below already sets for §8.3's marginal-tempo
+ * tier in this exact file.
+ */
+export const EXTENDED_PHRASE_CONFIDENCE_MIN = 0.7;
+/**
+ * §7.2 "vocal plan usable" gate for the extended (16-bar) tier.
+ * vocalActivity.js's classifyVocalEnvelope() only reports its top
+ * vocalConfidence tier (0.85) when at least 5 RMS frames were classified —
+ * enough real vocal-envelope data to trust the resulting
+ * lastVocalEndSec/firstVocalStartSec timing for a vocal fade schedule this
+ * long (up to 32s at 120 BPM); the lower 0.5 tier ("some frames, not enough
+ * to be confident") is not. This is deliberately a stronger requirement
+ * than hasVocalAnalysis() (analysisSource !== 'none', already required for
+ * ANY exit/entry candidate to exist at all) — a real-but-thin reading and a
+ * well-sampled one both pass hasVocalAnalysis(), but only the latter should
+ * be trusted with a full extended-tier overlap.
+ */
+export const EXTENDED_VOCAL_CONFIDENCE_MIN = 0.85;
 /** Vocal margin (seconds past/before the vocal boundary) for full vocal-safety credit. */
 const VOCAL_MARGIN_FULL_CREDIT_SEC = 2;
 /** Max camelotDistance() value (opposite wheel position + mode penalty). */
@@ -311,6 +358,40 @@ function rejected(reasons) {
 }
 
 /**
+ * Phase 9E (docs/mix-transition-phase9.md §7.2): the three extended-tier
+ * (16-bar) gates, evaluated up front — the bar search loop's own starting
+ * point depends on this, so it can't wait for a winning exit/entry pair the
+ * way per-pair scoring does.
+ *
+ * - phrase confidence high: EXTENDED_PHRASE_CONFIDENCE_MIN, see its
+ *   docstring.
+ * - stem available: `stemAware`. planBeatmixTransition() is only ever
+ *   called with stemAware:true from planStemTransition() (see
+ *   stemTransition.js), whose own docstring makes "both sides' stems are
+ *   already cached" a precondition the CALLER (player.js /
+ *   transitionCandidates.js's rankTransitionCandidates()) must have already
+ *   verified before invoking it — by the time stemAware is true here, stems
+ *   being available is already an established fact, not something this
+ *   function needs to re-check itself. A plain (non-stem) beatmix call
+ *   never sets stemAware, so it never claims stems are available and never
+ *   qualifies for the extended tier — deliberately: a 32-second (at 120
+ *   BPM) single-stream crossfade with both tracks' vocals overlapping for
+ *   the whole overlap is exactly the failure mode per-stem vocal envelopes
+ *   (buildStemEnvelopes() in stemTransition.js) exist to prevent, so a
+ *   plain crossfade that long is not something this codebase should ever
+ *   plan even when phrase/vocal confidence happen to be high.
+ * - vocal plan usable: EXTENDED_VOCAL_CONFIDENCE_MIN, see its docstring.
+ */
+function extendedTierEligible(outgoing, incoming, stemAware) {
+  if (!stemAware) return false;
+  const phraseConfidenceHigh = (outgoing?.downbeatGrid?.confidence ?? 0) >= EXTENDED_PHRASE_CONFIDENCE_MIN
+    && (incoming?.downbeatGrid?.confidence ?? 0) >= EXTENDED_PHRASE_CONFIDENCE_MIN;
+  const vocalPlanUsable = (outgoing?.vocalConfidence ?? 0) >= EXTENDED_VOCAL_CONFIDENCE_MIN
+    && (incoming?.vocalConfidence ?? 0) >= EXTENDED_VOCAL_CONFIDENCE_MIN;
+  return phraseConfidenceHigh && vocalPlanUsable;
+}
+
+/**
  * §9.2/§9.3: Tier 1 of the §16 fallback ladder. Requires valid BPM on both
  * sides, sufficient beat/downbeat confidence, a tempo ratio within
  * HARD_LIMIT_RATIO (session tempo — incoming stretches to outgoing's
@@ -442,6 +523,16 @@ export function planBeatmixTransition(outgoing, incoming, {
   const durationSec = outgoing.durationSec;
   const incomingDurationSec = Number.isFinite(incoming.durationSec) ? incoming.durationSec : Infinity;
 
+  // Phase 9E (docs/mix-transition-phase9.md §7.2): "search order 16 -> 8 ->
+  // 4 -> fallback" is realized as one dense sweep (unchanged in shape from
+  // pre-9E) that simply starts higher when extendedTierEligible() clears —
+  // 16,15,...,4 instead of 8,7,...,4 — rather than a separate discrete pass
+  // per named tier. The per-pair loop below already tries every bar count
+  // down to minOverlapBars and keeps the best-scoring fit across all of
+  // them, so a sweep starting at 16 naturally passes through (and can still
+  // land on) 8 or 4 for a pair that doesn't have room for the full 16.
+  const startBars = extendedTierEligible(outgoing, incoming, stemAware) ? MIX_BARS.extended : overlapBars;
+
   let best = null;
   for (const exit of exitCandidates) {
     const roomAfterExitPlayback = (durationSec - exit.sec) / outgoingRatio;
@@ -458,7 +549,7 @@ export function planBeatmixTransition(outgoing, incoming, {
       const forwardSafePlayback = requireEntryForwardSafe
         ? entryForwardSafeSec(incoming, entry.sec) / match.ratio
         : Infinity;
-      for (let bars = overlapBars; bars >= minOverlapBars; bars -= 1) {
+      for (let bars = startBars; bars >= minOverlapBars; bars -= 1) {
         const fadeSec = barSec * bars;
         if (
           fadeSec > roomAfterExitPlayback + 1e-6

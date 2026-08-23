@@ -8,6 +8,11 @@ import {
   planBeatmixTransition,
   planPhraseCrossfade,
   planBeatSyncedTransition,
+  MIX_BARS,
+  BEATMIX_OVERLAP_BARS,
+  MIN_OVERLAP_BARS,
+  EXTENDED_PHRASE_CONFIDENCE_MIN,
+  EXTENDED_VOCAL_CONFIDENCE_MIN,
 } from './beatmixTransition.js';
 
 function makeAnalysis({
@@ -29,6 +34,7 @@ function makeAnalysis({
   tailKey = null,
   headKey = null,
   harmonicConfidence = 0,
+  vocalConfidence = null,
   analysisSource = 'demucs', // real (possibly null-vocal) analysis by default; pass 'none' to simulate a failed pass
 } = {}) {
   return {
@@ -51,6 +57,7 @@ function makeAnalysis({
     tailKey,
     headKey,
     harmonicConfidence,
+    vocalConfidence,
     analysisSource,
   };
 }
@@ -276,12 +283,19 @@ test('planBeatmixTransition builds a full TransitionPlan v2 for a clean, compati
   assert.equal(plan.targetBpm, 120); // session tempo: incoming stretches to outgoing's BPM
   assert.equal(plan.outgoing.exitStartSec, 184);
   assert.equal(plan.incoming.entrySec, 4);
-  assert.equal(plan.sync.bars, 4);
+  // Phase 9E (docs/mix-transition-phase9.md §7.2): the sweep now starts at
+  // MIX_BARS.preferred (8, not the pre-9E 4) — but this fixture's incoming
+  // entry only has ~11.2 playback seconds of forward vocal-free room before
+  // firstVocalStartSec (15), so 8/7/6 bars (16/14/12s) don't fit and 5 bars
+  // (10s) is the widest that does. See the dedicated
+  // "reaches the new preferred 8-bar tier" test below for a fixture with
+  // enough forward room to actually land on 8.
+  assert.equal(plan.sync.bars, 5);
   assert.equal(plan.sync.beatsPerBar, 4);
   assert.ok(Math.abs(plan.incoming.tempoRatio - 120 / 122) < 1e-9);
   assert.match(plan.incoming.tempoFilter, /^rubberband=tempo=0\.9836$/);
   assert.ok(plan.confidence > 0.5 && plan.confidence <= 1);
-  assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * 4) < 1e-6);
+  assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * 5) < 1e-6);
 });
 
 test('planBeatmixTransition rejects when BPM is unavailable on either side', () => {
@@ -323,25 +337,28 @@ test('planBeatmixTransition rejects when the incoming track has no vocal-safe en
   assert.deepEqual(plan.reasons, ['no-entry-candidate']);
 });
 
-test('planBeatmixTransition degrades overlap bars when 4 bars does not fit but 2 does', () => {
+test('planBeatmixTransition degrades overlap bars when 8 (preferred) does not fit but 4 (minimum) does', () => {
   const { outgoing, incoming } = happyPathTracks();
-  // Only the 184s candidate remains, with 5s of room after it (189 - 184):
-  // 4 bars (8s) and 3 bars (6s) don't fit, 2 bars (4s) does.
+  // Phase 9E: preferred is now 8 bars (16s @ 120 BPM), minimum is 4 bars
+  // (8s). Only the 184s candidate remains, with 9s of room after it
+  // (193 - 184): 8 down through 5 bars (16s..10s) don't fit, 4 bars (8s)
+  // does — the sweep degrades all the way to the new floor.
   const tightOutgoing = {
     ...outgoing,
-    durationSec: 189,
+    durationSec: 193,
     phrases: { tail: [{ sec: 184, barIndex: 0, score: 0.6, reasons: [] }] },
   };
   const plan = planBeatmixTransition(tightOutgoing, incoming);
   assert.equal(plan.eligible, true);
-  assert.equal(plan.sync.bars, 2);
-  assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * 2) < 1e-6);
+  assert.equal(plan.sync.bars, 4);
+  assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * 4) < 1e-6);
 });
 
 test('planBeatmixTransition rejects when no overlap length fits on the incoming side', () => {
   const { outgoing, incoming } = happyPathTracks();
   // Incoming track is only 6s long; the one entry candidate at 4s leaves 2s
-  // of room, less than even MIN_OVERLAP_BARS (2 bars = 4s at 120 BPM).
+  // of room, less than even MIN_OVERLAP_BARS (4 bars = 8s at 120 BPM as of
+  // Phase 9E).
   const shortIncoming = {
     ...incoming,
     durationSec: 6,
@@ -426,15 +443,17 @@ test('planBeatmixTransition converts overlap room to the stretched incoming time
     bpm: 120,
     beatConfidence: 0.75,
     downbeatConfidence: 0.65,
-    durationSec: 11.8, // 7.8s of *native* room after the entry candidate
+    durationSec: 13.7, // 9.7s of *native* room after the entry candidate
     firstVocalStartSec: 15,
     phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: [] }],
   });
   const plan = planBeatmixTransition(outgoing, incoming);
   assert.equal(plan.eligible, true);
-  // 4 bars (~7.74s) fits the native 7.8s room but not the ~7.55s of actual
-  // playback time left once incoming plays back sped up by ~3.3%.
-  assert.equal(plan.sync.bars, 3);
+  // Phase 9E: minimum is now 4 bars (not 2), so the sweep's lowest
+  // candidate is 4 bars (~7.74s) / 5 bars (~9.68s), not 3/4. 5 bars fits the
+  // native 9.7s room but not the ~9.39s of actual playback time left once
+  // incoming plays back sped up by ~3.3% — 4 bars does fit either way.
+  assert.equal(plan.sync.bars, 4);
 });
 
 test('planBeatmixTransition stretches the incoming entry against its head BPM, not the tail-biased aggregate', () => {
@@ -871,7 +890,8 @@ test('requireEntryForwardSafe:false does NOT disable findEntryCandidates()\'s ow
     headDownbeats: [3.5], // ...and the only candidate sits inside that gap: itself
     // vocal-safe (per findEntryCandidates), but with only 0.5s of room
     // before vocals resume at 4 — nowhere near forward-safe for even the
-    // minimum 2-bar (4s at 120 BPM) overlap this pair would otherwise fit.
+    // minimum 4-bar (8s at 120 BPM, as of Phase 9E) overlap this pair
+    // would otherwise fit.
   });
 
   const entryCandidates = findEntryCandidates(incoming);
@@ -886,4 +906,122 @@ test('requireEntryForwardSafe:false does NOT disable findEntryCandidates()\'s ow
   assert.equal(relaxed.eligible, true,
     'relaxing only requireEntryForwardSafe accepts the same (still entry-point-vocal-safe) candidate');
   assert.equal(relaxed.incoming.entrySec, 3.5);
+});
+
+// --- Phase 9E (docs/mix-transition-phase9.md §7): Long Mix Zone -----------
+
+test('MIX_BARS matches §7.2 exactly, and BEATMIX_OVERLAP_BARS/MIN_OVERLAP_BARS mirror its preferred/minimum for existing callers', () => {
+  assert.deepEqual(MIX_BARS, { preferred: 8, minimum: 4, extended: 16 });
+  assert.equal(BEATMIX_OVERLAP_BARS, MIX_BARS.preferred);
+  assert.equal(MIN_OVERLAP_BARS, MIX_BARS.minimum);
+});
+
+/** A pair with ample room on both sides at every tier (16/8/4 bars all
+ * physically fit), so which tier actually gets used is driven purely by
+ * extendedTierEligible()'s three §7.2 gates, not by room constraints. */
+function longMixZoneTracks({
+  outgoingDownbeatConfidence = 0.9,
+  incomingDownbeatConfidence = 0.9,
+  outgoingVocalConfidence = 0.9,
+  incomingVocalConfidence = 0.9,
+} = {}) {
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: outgoingDownbeatConfidence,
+    vocalConfidence: outgoingVocalConfidence,
+    durationSec: 260,
+    lastVocalEndSec: 200, // irrelevant once requireExitVocalSafe:false, but a real reading either way
+    phrasesTail: [{ sec: 200, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], // 60s of native room after exit
+  });
+  const incoming = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: incomingDownbeatConfidence,
+    vocalConfidence: incomingVocalConfidence,
+    durationSec: 260,
+    firstVocalStartSec: 240, // irrelevant once requireEntryForwardSafe:false
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], // ~256s of room after entry
+  });
+  return { outgoing, incoming };
+}
+
+/** stemAware:true plus the vocal-safety relaxations planStemTransition() itself
+ * always passes (see stemTransition.js's planStemTransition()) — isolates the
+ * extended-tier gate from the ordinary vocal-safe candidate search. */
+const STEM_MIX_OPTIONS = { stemAware: true, requireExitVocalSafe: false, requireEntryForwardSafe: false };
+
+test('planBeatmixTransition reaches the extended 16-bar tier when stemAware, phrase confidence, and vocal confidence all clear the §7.2 gates', () => {
+  const { outgoing, incoming } = longMixZoneTracks();
+  const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.extended);
+  assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * MIX_BARS.extended) < 1e-6);
+});
+
+test('planBeatmixTransition never reaches the extended tier without stemAware, even with ample room and high confidence', () => {
+  // §7.2's "stem available" gate: a plain (non-stem) beatmix call never
+  // claims stems are cached, so it must cap at MIX_BARS.preferred (8) no
+  // matter how high phrase/vocal confidence are — see
+  // extendedTierEligible()'s docstring for why this is intentional, not a
+  // missed case.
+  const { outgoing, incoming } = longMixZoneTracks();
+  // requireExitVocalSafe/requireEntryForwardSafe stay at their (stricter)
+  // defaults here since a plain, non-stem plan has no per-stem vocal
+  // envelope to fall back on — lastVocalEndSec/firstVocalStartSec are set
+  // far enough from the candidates for this pair to still be vocal-safe.
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred);
+});
+
+test('planBeatmixTransition falls back to the preferred 8-bar tier when phrase confidence is not high enough for the extended tier', () => {
+  const { outgoing, incoming } = longMixZoneTracks({
+    // Both sides still clear DOWNBEAT_CONFIDENCE_MIN (tier-1 eligibility)
+    // but not EXTENDED_PHRASE_CONFIDENCE_MIN.
+    outgoingDownbeatConfidence: EXTENDED_PHRASE_CONFIDENCE_MIN - 0.05,
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred);
+});
+
+test('planBeatmixTransition falls back to the preferred 8-bar tier when the vocal plan is not usable enough for the extended tier', () => {
+  const { outgoing, incoming } = longMixZoneTracks({
+    // classifyVocalEnvelope() (vocalActivity.js) never reports exactly this
+    // mid-tier value in practice (its own output is 0/0.5/0.85), but any
+    // reading below EXTENDED_VOCAL_CONFIDENCE_MIN must fail the gate the
+    // same way — this pins the threshold itself, not a specific real value.
+    incomingVocalConfidence: EXTENDED_VOCAL_CONFIDENCE_MIN - 0.05,
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred);
+});
+
+test('planBeatmixTransition degrades from the extended tier down through the dense sweep when 16 bars does not fit but a lower count does', () => {
+  // Same eligibility as the "reaches 16" test above, but room after the
+  // exit is capped so only 10 bars (20s) fit, not 16 (32s) or higher — the
+  // search must still land on the best FITTING count, not reject outright
+  // just because the extended tier's own ceiling doesn't fit.
+  const { incoming } = longMixZoneTracks();
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    vocalConfidence: 0.9,
+    durationSec: 220,
+    lastVocalEndSec: 200,
+    phrasesTail: [{ sec: 200, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], // 20s of native room after exit
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, 10);
+});
+
+test('extendedTierEligible-equivalent gate is symmetric: low confidence on the OUTGOING side alone also blocks the extended tier', () => {
+  const { outgoing, incoming } = longMixZoneTracks({ outgoingVocalConfidence: 0.5 });
+  const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred);
 });
