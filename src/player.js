@@ -353,6 +353,18 @@ export class GuildPlayer {
   #logTransitionPlanFn;
   /** Phase 9A (Codex review, PR #43): test-only override — see logGaplessTransition()'s own docstring for why the snap-handoff path needs a separate, report-less logging entry point. */
   #logGaplessTransitionFn;
+  /**
+   * Codex review (PR #43, round 3): the track that just naturally finished,
+   * stashed by #handleAfter()'s #startQueueRefill (autoplay-continuation)
+   * branch when it can't call playNext() itself (the external
+   * handleQueueExhausted callback does, after it adds a track) — consumed
+   * exactly once by the next playNext() call so the eventual hard handoff
+   * still gets logged, but only after its source actually starts (see
+   * #playNextMixer). Anything else in the meantime (e.g. a user /skip
+   * racing the autoplay fetch) would misattribute this — accepted as a
+   * low-impact, debug-log-only edge case, same as other documented races.
+   */
+  #pendingGaplessFrom = null;
   /** Test-only override — the two stem-prep methods call createFileSource() directly (they bypass #createPcmSource entirely, since stem WAVs need no download/normalize/loudnorm pass), so a dedicated injection point mirrors this file's existing DI convention for every other real-process spawn. */
   #createFileSourceFn;
   /** @type {{ videoId: string, prep: {startSec:number,tempoFilter:string|null}, vocal: object, instrumental: object } | null} */
@@ -510,16 +522,31 @@ export class GuildPlayer {
     });
   }
 
-  async playNext() {
+  /**
+   * Codex review (PR #43, round 3): `gaplessFrom` — the track that just
+   * naturally finished, when this call is a hard handoff (no crossfade, no
+   * snap adoption) — is consume-once via #pendingGaplessFrom when the
+   * caller doesn't pass it explicitly, so the external autoplay-continuation
+   * path (#handleAfter's #startQueueRefill branch, whose own
+   * handleQueueExhausted callback eventually calls this public method after
+   * adding a track) is covered too, not just #handleAfter's own direct
+   * playNext() call. Logged only after #playNextMixer's setCurrent()
+   * actually accepts the source (see there) — never here — so a track that
+   * fails to start (Codex round-3 P2) doesn't get counted as a committed
+   * transition.
+   */
+  async playNext(gaplessFrom = null) {
     const track = this.#queue.current;
     if (!track) {
       await this.#onDisconnect();
       return;
     }
-    await this.#playNextMixer(track);
+    const resolvedGaplessFrom = gaplessFrom ?? this.#pendingGaplessFrom;
+    this.#pendingGaplessFrom = null;
+    await this.#playNextMixer(track, { gaplessFrom: resolvedGaplessFrom });
   }
 
-  async #playNextMixer(track) {
+  async #playNextMixer(track, { gaplessFrom = null } = {}) {
     if (this.#queueRefill && this.#queueRefill.key !== this.#queueRefillKey(track)) {
       this.#queueRefill = null;
     }
@@ -591,6 +618,13 @@ export class GuildPlayer {
     const durationSec = this.#resolvePlaybackDurationSec(track);
     if (!this.#mixStream.setCurrent(source, { durationSec })) {
       return;
+    }
+    // Codex review (PR #43, round 3): only now that setCurrent() has
+    // actually accepted this source — a track that fails earlier in this
+    // method (PCM/source-audio-wait errors above) never reaches here and is
+    // correctly never counted as a committed transition.
+    if (gaplessFrom) {
+      this.#logGaplessTransitionFn({ outgoingTrack: gaplessFrom, incomingTrack: track });
     }
     this.#resetSessionTempoFor(track);
     // Attach the opus pipeline only after PCM has arrived so the encoder's
@@ -1206,22 +1240,32 @@ export class GuildPlayer {
       // waits on a user pick (recommend mode) needs a clean slate rather than
       // an interval left ticking against an idle player forever.
       this.#clearWatchdog();
+      // Codex review (PR #43, round 3): can't log here — there is no next
+      // track yet, and the eventual continuation (if handleQueueExhausted
+      // adds one) calls the public playNext() itself, outside this method's
+      // call stack. Stash the finished track so that call picks it up (see
+      // #pendingGaplessFrom's docstring) and logs only once its source
+      // actually starts, same "natural, non-error" guard as the branch below.
+      if (!shouldForceAdvance) {
+        this.#pendingGaplessFrom = finishedTrack;
+      }
       const handled = await this.#startQueueRefill(finishedTrack);
       // null = another round already owns the autoplay lock; do not disconnect.
       if (handled !== false) return;
+      this.#pendingGaplessFrom = null;
       await this.#onDisconnect();
     } else {
       // Codex review (PR #43): a "hard handoff" — no crossfade was armed AND
       // #onSnapHandoff() either never ran or its prepared source was missing/
       // rejected — still advances the queue to a real next track here, and
       // never touches any of the other two transition-logging call sites.
-      // Only log the natural case: forceSkip/reconnect-retry already
-      // returned above, so !shouldForceAdvance means this wasn't an
-      // error-forced skip either.
-      if (!shouldForceAdvance) {
-        this.#logGaplessTransitionFn({ outgoingTrack: finishedTrack, incomingTrack: nextTrack });
-      }
-      await this.playNext();
+      // Only the natural case is worth logging: forceSkip/reconnect-retry
+      // already returned above, so !shouldForceAdvance means this wasn't an
+      // error-forced skip either. Pass it through to playNext() rather than
+      // logging here directly (Codex round-3 P2) — the incoming track can
+      // still fail to start inside #playNextMixer, and only that method
+      // knows once setCurrent() has actually accepted the source.
+      await this.playNext(shouldForceAdvance ? null : finishedTrack);
     }
   }
 
