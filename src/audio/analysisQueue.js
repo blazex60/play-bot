@@ -138,9 +138,22 @@ export function createAnalysisQueue({
     if (!job) return;
     running = true;
     pauseCount = 0;
-    paused = false;
-    stoppedAt = 0;
-    underrunSince = null;
+    // Codex review (PR #45, P2): don't blindly clear pause state on every
+    // job start — pause()/noteUnderrun() can be called while idle (no job
+    // running yet), and previously this unconditional reset threw that
+    // pause away the instant a job started, letting a CPU-heavy job begin
+    // fully unpaused during the exact pressure that was supposed to
+    // suppress it. If underrunSources still holds a reason, this new job
+    // starts already paused instead — register() below already SIGSTOPs a
+    // freshly spawned child when `paused` is true at spawn time.
+    if (underrunSources.size === 0) {
+      paused = false;
+      stoppedAt = 0;
+      underrunSince = null;
+    } else if (!paused) {
+      paused = true;
+      stoppedAt = clock();
+    }
     currentReject = job.reject;
     const abortController = new AbortController();
     let abortFn = null;
@@ -262,9 +275,28 @@ export function createAnalysisQueue({
     },
     spawn: spawnNice,
     register,
-    enqueue(fn) {
+    // Codex review (PR #45, P1): §5.3's HIGH(B)/LOW(C) priority previously
+    // meant nothing beyond call order within this queue's plain FIFO — a
+    // LOW job already sitting in `jobs` (or, worse, already RUNNING —
+    // concurrency=1 means a HIGH request arriving mid-run must still wait
+    // for it; true preemption of an in-flight Demucs job is a bigger change
+    // than this fix, deliberately not attempted here, see
+    // docs/mix-transition-phase9.md's Phase 9C notes) would still run
+    // before a HIGH job requested afterward. `priority: 'high'` now
+    // inserts ahead of every PENDING (not yet started) non-high job,
+    // preserving relative order within each priority tier.
+    enqueue(fn, { priority = 'normal' } = {}) {
       return new Promise((resolve, reject) => {
-        jobs.push({ fn, resolve, reject });
+        const job = { fn, resolve, reject, priority };
+        if (priority === 'high') {
+          let insertAt = jobs.length;
+          for (let i = 0; i < jobs.length; i += 1) {
+            if (jobs[i].priority !== 'high') { insertAt = i; break; }
+          }
+          jobs.splice(insertAt, 0, job);
+        } else {
+          jobs.push(job);
+        }
         pump();
       });
     },

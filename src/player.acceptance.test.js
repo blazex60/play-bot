@@ -2516,7 +2516,14 @@ test('acceptance (mixer): Phase 9C — next=HIGH (B) and next+1=LOW (C) stem pre
   }
 });
 
-test('acceptance (mixer): Phase 9C — a mixer underrun pauses the dedicated stem queue via pause(), independent of the realtime queue\'s own noteUnderrun(), and underrunClear resumes both', async () => {
+test('acceptance (mixer): Phase 9C — a mixer underrun debounces into the dedicated stem queue via noteUnderrun(), same as the realtime queue, and underrunClear clears both (Codex review, PR #45, P2)', async () => {
+  // Codex review (PR #45, P2): a raw mixer underrun event can be jittery
+  // (several isolated one-frame stalls in quick succession) — routing it
+  // straight to the stem queue's immediate pause() command (this test's own
+  // previous assertion) could rack up pause()'s pauseCount past MAX_PAUSES
+  // and kill a long-running Demucs job over transient noise the realtime
+  // queue's own noteUnderrun() debounce is built to ignore. Both queues now
+  // receive the same debounced signal.
   const realtimeCalls = [];
   const stemCalls = [];
   const realtimeQueue = {
@@ -2527,8 +2534,10 @@ test('acceptance (mixer): Phase 9C — a mixer underrun pauses the dedicated ste
   };
   const stemQueue = {
     enqueue: (fn) => fn({ spawnNice: () => {}, signal: undefined }),
-    pause(source) { stemCalls.push(['pause', source]); },
-    resume(source) { stemCalls.push(['resume', source]); },
+    noteUnderrun(source) { stemCalls.push(['noteUnderrun', source]); },
+    noteUnderrunCleared(source) { stemCalls.push(['noteUnderrunCleared', source]); },
+    pause() { stemCalls.push(['pause']); },
+    resume() { stemCalls.push(['resume']); },
     kill() {},
   };
   const { player } = makePlayer({ analysisQueue: realtimeQueue, stemQueue });
@@ -2536,17 +2545,133 @@ test('acceptance (mixer): Phase 9C — a mixer underrun pauses the dedicated ste
   player.mixStream.emit('underrun');
   assert.equal(realtimeCalls.filter(([name]) => name === 'noteUnderrun').length, 1,
     'expected the realtime queue to receive its own debounced noteUnderrun() signal');
-  assert.equal(stemCalls.filter(([name]) => name === 'pause').length, 1,
-    'expected the mixer underrun to also immediately pause() the dedicated stem-preparation queue (§5.4 "Playback Safety")');
-  assert.equal(stemCalls.some(([name]) => name === 'noteUnderrun'), false,
-    'the stem queue must be paused via its own pause() API, not by calling the realtime-only noteUnderrun()');
+  assert.equal(stemCalls.filter(([name]) => name === 'noteUnderrun').length, 1,
+    'expected the mixer underrun to forward the SAME debounced noteUnderrun() signal to the stem-preparation queue');
+  assert.equal(stemCalls.some(([name]) => name === 'pause'), false,
+    'the stem queue must be paused via its own debounced noteUnderrun() API, not the immediate pause() command');
 
   player.mixStream.emit('underrunClear');
   assert.equal(realtimeCalls.filter(([name]) => name === 'noteUnderrunCleared').length, 1);
-  assert.equal(stemCalls.filter(([name]) => name === 'resume').length, 1,
-    'expected underrunClear to resume() the stem queue too');
+  assert.equal(stemCalls.filter(([name]) => name === 'noteUnderrunCleared').length, 1,
+    'expected underrunClear to clear the stem queue via noteUnderrunCleared() too');
 
   await player.stop();
+});
+
+test('acceptance (mixer): Phase 9C — skip() releases this player\'s stem-queue pause source even mid-underrun (Codex review, PR #45, P1)', async () => {
+  const stemCalls = [];
+  const stemQueue = {
+    enqueue: (fn) => fn({ spawnNice: () => {}, signal: undefined }),
+    noteUnderrun(source) { stemCalls.push(['noteUnderrun', source]); },
+    noteUnderrunCleared(source) { stemCalls.push(['noteUnderrunCleared', source]); },
+    resume(source) { stemCalls.push(['noteUnderrunCleared', source]); },
+    kill() {},
+  };
+  const { player, queue } = makePlayer({ trackDuration: 60, stemQueue });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60 }));
+
+  await player.playNext();
+  player.mixStream.emit('underrun'); // simulate a pause source registered mid-underrun
+  stemCalls.length = 0;
+
+  await player.skip();
+  assert.equal(stemCalls.filter(([name, source]) => name === 'noteUnderrunCleared' && source === player).length, 1,
+    'skip() must release this player\'s stem-queue pause source, not leave the shared queue stuck paused for other guilds');
+
+  await player.stop();
+});
+
+test('acceptance (mixer): Phase 9C — disconnecting without an explicit stop() (e.g. queue exhaustion) still releases the stem-queue pause source (Codex review, PR #45, P1)', async () => {
+  // Several normal paths (queue exhaustion with no autoplay handler, among
+  // others) call the injected onDisconnect callback directly, bypassing
+  // stop()'s own cleanup entirely — the #disconnect() wrapper this
+  // regression test targets exists specifically to close that gap.
+  const stemCalls = [];
+  const stemQueue = {
+    enqueue: (fn) => fn({ spawnNice: () => {}, signal: undefined }),
+    noteUnderrun(source) { stemCalls.push(['noteUnderrun', source]); },
+    noteUnderrunCleared(source) { stemCalls.push(['noteUnderrunCleared', source]); },
+    resume(source) { stemCalls.push(['noteUnderrunCleared', source]); },
+    kill() {},
+  };
+  let disconnected = false;
+  const { player } = makePlayer({
+    trackDuration: 3,
+    stemQueue,
+    onDisconnect: async () => { disconnected = true; },
+  });
+
+  await player.playNext();
+  player.mixStream.emit('underrun');
+  stemCalls.length = 0;
+
+  triggerTrackEnd({ mixStream: player.mixStream }); // queue exhausted, no handler -> disconnect
+  await waitMs(20);
+
+  assert.equal(disconnected, true, 'expected the queue-exhaustion path to disconnect');
+  assert.equal(stemCalls.filter(([name, source]) => name === 'noteUnderrunCleared' && source === player).length, 1,
+    'the #disconnect() wrapper must release the stem-queue pause source even though stop() was never called');
+});
+
+// --- Codex review (PR #45 round 2): retry a HIGH stem separation the stem queue itself killed ---
+
+test('acceptance (mixer): a stem-queue-level ANALYSIS_KILLED on the HIGH (next-track) job is retried once, not treated as a permanent failure', async () => {
+  // The realtime #analysisQ() job that dispatches separation resolves
+  // immediately (the stem-queue dispatch is deliberately not awaited), so
+  // by the time the stem queue itself kills the separation job (e.g. its
+  // own maxPauses/maxStoppedMs machinery preempting it mid-underrun), the
+  // outer #scheduleAnalysis().catch()'s own ANALYSIS_KILLED retry has
+  // already run its course and won't fire again for this rejection.
+  const analysis = {
+    version: ANALYSIS_VERSION, durationSec: 60, lastVocalEndSec: 50, vocalConfidence: 0.85, confidence: 0.8,
+  };
+  let stemAttempt = 0;
+  const separateCalls = [];
+  const realtimeQueue = {
+    enqueue: (fn) => Promise.resolve().then(() => fn({ spawnNice: () => {}, signal: undefined })),
+    noteUnderrun() {}, noteUnderrunCleared() {}, kill() {},
+  };
+  const stemQueue = {
+    enqueue: (fn) => {
+      stemAttempt += 1;
+      if (stemAttempt === 1) {
+        // Simulate the stem queue's own kill machinery preempting this job.
+        const err = new Error('analysis killed');
+        err.code = 'ANALYSIS_KILLED';
+        return Promise.reject(err);
+      }
+      return Promise.resolve().then(() => fn({ spawnNice: () => {}, signal: undefined }));
+    },
+    noteUnderrun() {}, noteUnderrunCleared() {}, resume() {}, kill() {},
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => analysis,
+    prefetchTrackFn: async () => ({ filePath: '/tmp/musicbot-9c-retry-original', measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged.${stemAttempt}`,
+    getCachedStemsFn: async () => null,
+    separateTrackStemsFn: async (filePath, videoId) => {
+      separateCalls.push({ filePath, videoId });
+      return { vocalPath: '/tmp/v.wav', instrumentalPath: '/tmp/i.wav' };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+    analysisQueue: realtimeQueue,
+    stemQueue,
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b-retry' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => separateCalls.length > 0);
+
+    assert.equal(stemAttempt, 2, 'expected exactly one retry after the stem-queue-level kill');
+    assert.equal(separateCalls.length, 1, 'the retried attempt must actually reach separation');
+    assert.equal(separateCalls[0].videoId, 'vid-b-retry');
+    assert.equal(byIdState(player, 'vid-b-retry'), 'ready');
+  } finally {
+    await player.stop();
+  }
 });
 
 function byIdState(player, videoId) {

@@ -270,6 +270,84 @@ test('pausing one queue instance never touches a separate instance from the same
   await assert.rejects(stemJob, (err) => err.code === 'ANALYSIS_KILLED');
 });
 
+// --- Codex review (PR #45 round 1) ---
+
+test('enqueue({priority: "high"}) runs ahead of already-pending normal-priority jobs', async () => {
+  // Codex review (PR #45, P1): a HIGH (next-track) job requested after a
+  // LOW (next+1) job is already sitting in the pending queue must still run
+  // first — plain FIFO call order previously meant it did not.
+  const order = [];
+  const queue = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
+  const blocker = queue.enqueue(async () => {
+    order.push('blocker-start');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    order.push('blocker-end');
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5)); // let the blocker actually start running
+
+  const low = queue.enqueue(async () => { order.push('low'); }, { priority: 'low' });
+  const high = queue.enqueue(async () => { order.push('high'); }, { priority: 'high' });
+
+  await Promise.all([blocker, low, high]);
+  assert.deepEqual(order, ['blocker-start', 'blocker-end', 'high', 'low']);
+});
+
+test('enqueue({priority: "high"}) preserves relative order among multiple high-priority jobs', async () => {
+  const order = [];
+  const queue = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
+  const blocker = queue.enqueue(() => new Promise((resolve) => setTimeout(resolve, 20)));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const normal = queue.enqueue(async () => { order.push('normal'); });
+  const highA = queue.enqueue(async () => { order.push('high-a'); }, { priority: 'high' });
+  const highB = queue.enqueue(async () => { order.push('high-b'); }, { priority: 'high' });
+
+  await Promise.all([blocker, normal, highA, highB]);
+  assert.deepEqual(order, ['high-a', 'high-b', 'normal']);
+});
+
+test('pause() called while idle keeps a subsequently enqueued job paused at spawn time (§5.4)', async () => {
+  // Codex review (PR #45, P2): pause()/noteUnderrun() can arrive while the
+  // queue has no job running yet (e.g. a mixer underrun fires before the
+  // async cache check ahead of the next stem job's dispatch). Without this,
+  // pump() unconditionally reset `paused` to false the instant the next job
+  // started, so a CPU-heavy job could start fully unpaused during the exact
+  // pressure that was supposed to suppress it.
+  let spawnedProc = null;
+  let sigstops = 0;
+  const originalKill = process.kill;
+  const queue = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
+
+  assert.equal(queue.isRunning, false);
+  queue.pause('cpu-pressure');
+  // While idle there is no running job to SIGSTOP, so isPaused itself stays
+  // false here — pauseQueue() only records the source in underrunSources.
+  // The actual regression this test guards is what pump() does with that
+  // recorded source once a job DOES start, asserted below.
+  assert.equal(queue.isPaused, false, 'nothing to pause yet while idle');
+
+  process.kill = (pid, sig) => {
+    if (sig === 'SIGSTOP') sigstops += 1;
+  };
+  try {
+    const job = queue.enqueue(({ spawnNice }) => {
+      spawnedProc = spawnNice('ffmpeg', ['-i', 'in.wav']);
+      return new Promise(() => {});
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5)); // let the job actually start
+
+    assert.equal(queue.isPaused, true, 'the newly started job must inherit the pre-existing pause instead of clearing it');
+    assert.ok(spawnedProc, 'expected the job to have spawned a child');
+    assert.equal(sigstops, 1, 'a child spawned while already paused must be SIGSTOPed at register() time');
+
+    queue.resume('cpu-pressure');
+    queue.kill('test cleanup');
+    await assert.rejects(job, (err) => err.code === 'ANALYSIS_KILLED');
+  } finally {
+    process.kill = originalKill;
+  }
+});
+
 test('killed analysis callback does not commit after abort', async () => {
   const queue = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
   let committed = false;
