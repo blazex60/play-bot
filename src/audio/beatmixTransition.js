@@ -306,6 +306,46 @@ export function scoreTransitionPairDetailed(params) {
   return scoreTransitionPairDetail(params);
 }
 
+/**
+ * Codex review (PR #46, Phase 9D §6.4): an eligible stem-mix plan's
+ * `confidence` is computed with vocalSafety relaxed to entry-only
+ * (scoreTransitionPairDetail's `stemAware: true` branch) — correct for
+ * stem-mix's OWN eligibility (a mid-vocal exit really is safe once
+ * per-stem separation handles the outgoing vocal tail on its own
+ * schedule), but not comparable to beatmix/phrase-crossfade's strict
+ * (min(exit, entry)) vocalSafety when RANKING across modes: for the same
+ * underlying pair, the relaxed score can only be >= the strict score, so
+ * stem-mix could never lose to beatmix on quality alone — combined with
+ * §6.4's own +0.10 vs +0.05 preference bonus, this made the documented
+ * "unless stem-mix quality is clearly lower" exception unreachable.
+ *
+ * Recomputes the confidence of an ALREADY-ELIGIBLE stem-mix plan's winning
+ * exit/entry pair as if vocalSafety had used the strict formula, for
+ * ranking purposes only — the plan's own `confidence`/eligibility, its
+ * reported `quality.vocalSafety`, and its actual fadeSec/entry/exit are
+ * untouched. Delta-patches `confidence` rather than re-running the full
+ * scorer (which would need the winning pair's raw phrase-boundary `.score`,
+ * not exposed on the plan's `outgoing`/`incoming` sub-objects) — exact
+ * given `totalWeight` is derivable from which terms scoreTransitionPairDetail()
+ * unconditionally includes (harmonicCompatibility is the only conditional
+ * one, and its presence/absence is already visible on `quality`).
+ */
+export function comparableStemMixConfidence(stemPlan, outgoing) {
+  if (!stemPlan?.eligible) return stemPlan?.confidence ?? 0;
+  const exitSec = stemPlan.outgoing?.exitStartSec;
+  if (!Number.isFinite(exitSec)) return stemPlan.confidence;
+  const relaxedVocalSafety = stemPlan.quality?.vocalSafety ?? 0;
+  const lastVocalEndSec = Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0;
+  const strictExitVocalSafety = clamp01((exitSec - lastVocalEndSec) / VOCAL_MARGIN_FULL_CREDIT_SEC);
+  const strictVocalSafety = Math.min(strictExitVocalSafety, relaxedVocalSafety);
+  if (strictVocalSafety >= relaxedVocalSafety) return stemPlan.confidence;
+  const totalWeight = VOCAL_SAFETY_WEIGHT + PHRASE_ALIGNMENT_WEIGHT + TEMPO_COMPATIBILITY_WEIGHT
+    + DOWNBEAT_CONFIDENCE_WEIGHT + ENERGY_CONTINUITY_WEIGHT
+    + (stemPlan.quality?.harmonicCompatibility != null ? HARMONIC_WEIGHT : 0);
+  const delta = (relaxedVocalSafety - strictVocalSafety) * VOCAL_SAFETY_WEIGHT;
+  return clamp01(stemPlan.confidence - delta / totalWeight);
+}
+
 function rejected(reasons) {
   return { mode: null, eligible: false, reasons };
 }
