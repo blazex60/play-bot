@@ -2688,6 +2688,86 @@ test('acceptance (mixer): a stem-queue-level ANALYSIS_KILLED on the HIGH (next-t
   }
 });
 
+test('acceptance (mixer): the stem-queue-level kill retry waits for the killed separateTrackStemsFn call to actually settle before dispatching the replacement (Codex review, PR #45, P2, round 3)', async () => {
+  // Codex review round 3: the production separateTrackStems() (stemCache.js)
+  // dedups per-videoId via its own module-level `inFlight` Map, cleared
+  // only once that specific call's own promise settles — the stem queue's
+  // kill only rejects the OUTER race (analysisQueue.js's pump()), it does
+  // not cancel or clear this inner call. Dispatching the retry immediately
+  // (instead of waiting for that inner promise) would just hit the same
+  // dedup check and get back the same doomed (killed -> resolves null)
+  // promise, silently burning the one retry for nothing. This mock
+  // reproduces that dedup shape directly, unlike the round-2 test's
+  // stemQueue mock (which never even invoked the job callback on the
+  // killed first attempt, so it couldn't have caught this).
+  const analysis = {
+    version: ANALYSIS_VERSION, durationSec: 60, lastVocalEndSec: 50, vocalConfidence: 0.85, confidence: 0.8,
+  };
+  let enqueueCalls = 0;
+  let realSeparationStarts = 0;
+  const inFlightSim = new Map();
+  const separateTrackStemsFn = async (filePath, videoId) => {
+    if (inFlightSim.has(videoId)) return inFlightSim.get(videoId);
+    realSeparationStarts += 1;
+    const isFirstAttempt = realSeparationStarts === 1;
+    const attempt = (async () => {
+      await waitMs(50); // simulates the time until the killed subprocess's exit event actually arrives
+      // The first (killed) attempt's own runSeparation() catches the SIGKILL
+      // failure and resolves null; a genuinely fresh retry (not hitting the
+      // dedup) succeeds normally.
+      return isFirstAttempt ? null : { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+    })().finally(() => inFlightSim.delete(videoId));
+    inFlightSim.set(videoId, attempt);
+    return attempt;
+  };
+  const realtimeQueue = {
+    enqueue: (fn) => Promise.resolve().then(() => fn({ spawnNice: () => {}, signal: undefined })),
+    noteUnderrun() {}, noteUnderrunCleared() {}, kill() {},
+  };
+  const stemQueue = {
+    enqueue: (fn) => {
+      enqueueCalls += 1;
+      // Mirrors analysisQueue.js's pump(): the job callback actually runs
+      // (starting the real separateTrackStemsFn call), but on the first
+      // attempt the OUTER promise this enqueue() call returns is raced
+      // away by an immediate kill rejection, same as Promise.race() there
+      // — the inner `workPromise` is never cancelled, just abandoned.
+      const workPromise = fn({ spawnNice: () => {}, signal: undefined });
+      if (enqueueCalls === 1) {
+        const err = new Error('analysis killed');
+        err.code = 'ANALYSIS_KILLED';
+        return Promise.reject(err);
+      }
+      return workPromise;
+    },
+    noteUnderrun() {}, noteUnderrunCleared() {}, resume() {}, kill() {},
+  };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => analysis,
+    prefetchTrackFn: async () => ({ filePath: '/tmp/musicbot-9c-retry3-original', measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async () => null,
+    separateTrackStemsFn,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+    analysisQueue: realtimeQueue,
+    stemQueue,
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b-retry3' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => byIdState(player, 'vid-b-retry3') === 'ready', { timeoutMs: 3000 });
+
+    assert.equal(realSeparationStarts, 2,
+      'expected the retry to start a genuinely fresh separateTrackStemsFn call, not reuse the killed attempt\'s doomed dedup entry');
+    assert.equal(byIdState(player, 'vid-b-retry3'), 'ready');
+  } finally {
+    await player.stop();
+  }
+});
+
 function byIdState(player, videoId) {
   return player.stemPrefetchStatus.find((e) => e.videoId === videoId)?.state ?? null;
 }

@@ -1574,9 +1574,23 @@ export class GuildPlayer {
           // the former only happens once every attempt (original + at most
           // one retry) has truly settled, the latter happens exactly once
           // regardless of how many attempts ran.
+          // Codex review (PR #45, P2, round 3): stemCache.js's default
+          // separateTrackStems() dedups per-videoId via its own module-level
+          // `inFlight` Map, cleared only once that specific call's own
+          // promise settles — the stem queue's kill only rejects the OUTER
+          // race in analysisQueue.js's pump(), it does not cancel or clear
+          // this inner call. `currentAttemptSeparation` captures that inner
+          // promise so a retry can await it settling (swallowing whatever
+          // it resolves/rejects to — it's about to be discarded either way)
+          // before dispatching the replacement attempt; otherwise
+          // separateTrackStems()'s own dedup check would just hand the
+          // retry back this same doomed (killed → resolves null) promise,
+          // silently burning the one retry for nothing.
+          let currentAttemptSeparation = null;
           const runSeparation = (allowRetry) => this.#stemQ().enqueue(async ({ spawnNice: stemSpawnNice, signal: stemSignal } = {}) => {
             if (stemSignal?.aborted) return null;
-            return this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: stemSpawnNice, signal: stemSignal });
+            currentAttemptSeparation = this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: stemSpawnNice, signal: stemSignal });
+            return currentAttemptSeparation;
           }, { priority: stemJobPriority }).then(
             (stems) => {
               // Phase 9B: this is the one place that actually learns when a
@@ -1616,7 +1630,7 @@ export class GuildPlayer {
                 && !this.#stemPrefetchRetriedAfterKill.has(track.videoId)
               ) {
                 this.#stemPrefetchRetriedAfterKill.add(track.videoId);
-                return runSeparation(false);
+                return (currentAttemptSeparation ?? Promise.resolve()).catch(() => {}).then(() => runSeparation(false));
               }
             },
           );
