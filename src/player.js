@@ -432,6 +432,15 @@ export class GuildPlayer {
   #stemPrefetchTracker = new StemPrefetchTracker();
   /** Dedup guard for #runLowPriorityStemPrefetch() — same rationale as #scheduledAnalysisTokens, but keyed by videoId presence only since this path has no killed-job/stale-token race to guard against (it never gets restarted mid-flight, only skipped while already in the Set). */
   #lowPriorityStemPrefetch = new Set();
+  /**
+   * Codex review (PR #44, P2): videoIds whose #scheduleAnalysis() job has
+   * already been retried once after an ANALYSIS_KILLED abort — caps the
+   * retry to a single attempt per videoId so a guild under sustained CPU
+   * pressure can't loop forever re-scheduling the same doomed job. Pruned
+   * alongside #stemPrefetchTracker in #prefetchUpcoming() once a videoId
+   * leaves the active prefetch window.
+   */
+  #stemPrefetchRetriedAfterKill = new Set();
 
   constructor({
     guildId,
@@ -1559,11 +1568,28 @@ export class GuildPlayer {
       // the separation step above means neither markReady/markFailed branch
       // there ran either — same "don't leave it stuck at PROCESSING
       // forever" reasoning.
-      if (this.#stemPrefetchTracker.get(track.videoId)) {
+      const tracked = this.#stemPrefetchTracker.get(track.videoId);
+      if (tracked) {
         this.#stemPrefetchTracker.markFailed(track.videoId);
       }
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
+        // Codex review (PR #44, P2): specifically an ANALYSIS_KILLED abort
+        // (a real-time-pressure preemption, e.g. a mixer underrun stopping
+        // this job mid-run) is the transient case worth retrying — unlike
+        // separateTrackStemsFn() resolving a clean `null` (a genuine "this
+        // track has no separable stems" outcome the existing Phase 8 tests
+        // rely on staying a one-shot attempt), a kill says nothing about
+        // whether the track is actually separable. filePath is still the
+        // one this call was given, not a staged copy — the file this HIGH
+        // track's full-prefetch download resolved to, still present since
+        // it hasn't been promoted/consumed yet. Retried at most once per
+        // videoId (#stemPrefetchRetriedAfterKill) to avoid looping forever
+        // against a guild that's continuously CPU-starved.
+        if (tracked && !this.#stemPrefetchRetriedAfterKill.has(track.videoId)) {
+          this.#stemPrefetchRetriedAfterKill.add(track.videoId);
+          this.#scheduleAnalysis(track, filePath);
+        }
         return;
       }
       console.warn('[GuildPlayer] analysis failed:', err.message);
@@ -2552,7 +2578,11 @@ export class GuildPlayer {
     if (second && isNormalizeDurationAllowed(second)) {
       this.#ensureStemPrefetch(second, StemPrefetchPriority.LOW);
     }
-    this.#stemPrefetchTracker.prune(upcoming.map((t) => t?.videoId).filter(Boolean));
+    const activeVideoIds = new Set(upcoming.map((t) => t?.videoId).filter(Boolean));
+    this.#stemPrefetchTracker.prune(activeVideoIds);
+    for (const videoId of [...this.#stemPrefetchRetriedAfterKill]) {
+      if (!activeVideoIds.has(videoId)) this.#stemPrefetchRetriedAfterKill.delete(videoId);
+    }
   }
 
   /**
