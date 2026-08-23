@@ -2627,6 +2627,7 @@ test('acceptance (mixer): a stem-queue-level ANALYSIS_KILLED on the HIGH (next-t
   };
   let stemAttempt = 0;
   const separateCalls = [];
+  const stageCalls = [];
   const realtimeQueue = {
     enqueue: (fn) => Promise.resolve().then(() => fn({ spawnNice: () => {}, signal: undefined })),
     noteUnderrun() {}, noteUnderrunCleared() {}, kill() {},
@@ -2648,8 +2649,17 @@ test('acceptance (mixer): a stem-queue-level ANALYSIS_KILLED on the HIGH (next-t
     trackDuration: 60,
     getTrackAnalysisFn: async () => null,
     analyzeTrackFileFn: async () => analysis,
+    // Codex review (PR #45, P2, round 2): by the time a stem-queue-level
+    // kill retries, `filePath` (the original normalized file) may already
+    // be gone via unrelated track promotion/end cleanup — returning a
+    // path here that no later step actually revisits (the retry must
+    // reuse the already-staged copy, not re-stage/re-download from this)
+    // is exactly what proves the fix doesn't depend on it still existing.
     prefetchTrackFn: async () => ({ filePath: '/tmp/musicbot-9c-retry-original', measured: {} }),
-    stageTempFileCopyFn: async (filePath) => `${filePath}.staged.${stemAttempt}`,
+    stageTempFileCopyFn: async (filePath) => {
+      stageCalls.push(filePath);
+      return `${filePath}.staged`;
+    },
     getCachedStemsFn: async () => null,
     separateTrackStemsFn: async (filePath, videoId) => {
       separateCalls.push({ filePath, videoId });
@@ -2668,6 +2678,10 @@ test('acceptance (mixer): a stem-queue-level ANALYSIS_KILLED on the HIGH (next-t
     assert.equal(stemAttempt, 2, 'expected exactly one retry after the stem-queue-level kill');
     assert.equal(separateCalls.length, 1, 'the retried attempt must actually reach separation');
     assert.equal(separateCalls[0].videoId, 'vid-b-retry');
+    assert.equal(stageCalls.length, 1,
+      'the retry must reuse the already-staged copy, not call stageTempFileCopyFn (re-stage from filePath) again');
+    assert.equal(separateCalls[0].filePath, '/tmp/musicbot-9c-retry-original.staged',
+      'the retry must separate from the exact same staged file the killed first attempt used');
     assert.equal(byIdState(player, 'vid-b-retry'), 'ready');
   } finally {
     await player.stop();
