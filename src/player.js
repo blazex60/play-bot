@@ -542,6 +542,13 @@ export class GuildPlayer {
       this.#hadError = true;
       this.#abortSourceAudioWait();
       this.#mixStream?.dropCurrent();
+      // Codex review (PR #45, P1): dropCurrent() resets MixStream's own
+      // underrun state WITHOUT emitting 'underrunClear' — if this player
+      // had a stem-queue pause source registered (mid-underrun when this
+      // error hit), nothing would ever clear it otherwise, indefinitely
+      // SIGSTOPping the shared process-wide stem queue's current job for
+      // every guild. See #initMixerPipeline()'s 'underrun' wiring.
+      this.#stemQ().noteUnderrunCleared(this);
     });
 
     // AutoPaused means playable.length === 0. Re-subscribe so a Ready
@@ -574,7 +581,7 @@ export class GuildPlayer {
   async playNext(gaplessFrom = null) {
     const track = this.#queue.current;
     if (!track) {
-      await this.#onDisconnect();
+      await this.#disconnect();
       return;
     }
     const resolvedGaplessFrom = gaplessFrom ?? this.#pendingGaplessFrom;
@@ -603,7 +610,7 @@ export class GuildPlayer {
     if (this.#queue.current !== track) {
       source.destroy();
       await this.#cleanupCurrentTempFile();
-      if (!this.#queue.current) await this.#onDisconnect();
+      if (!this.#queue.current) await this.#disconnect();
       return;
     }
     if (this.#forceSkip) {
@@ -612,7 +619,7 @@ export class GuildPlayer {
       this.#forceSkip = false;
       const nextTrack = this.#queue.next({ forceAdvance: true });
       if (nextTrack === null) {
-        await this.#onDisconnect();
+        await this.#disconnect();
       } else {
         await this.playNext();
       }
@@ -722,6 +729,10 @@ export class GuildPlayer {
       this.#hadError = true;
       this.#abortSourceAudioWait();
       this.#mixStream.dropCurrent();
+      // Codex review (PR #45, P1): see the audioPlayer 'error' handler's
+      // identical comment above — dropCurrent() here has the same silent
+      // underrun-state reset.
+      this.#stemQ().noteUnderrunCleared(this);
     });
     this.#mixStream.on('incomingerror', (err) => {
       // Mid-fade incoming failure: MixStream already cleared overlap and kept
@@ -752,11 +763,22 @@ export class GuildPlayer {
       // stem-preparation queue's pause() exists to relieve — forward the
       // same underrun signal to it. This is the only automatic trigger for
       // StemQueue.pause(); no separate CPU-monitoring signal exists yet.
-      this.#stemQ().pause(this);
+      //
+      // Codex review (PR #45): routed through noteUnderrun() (debounced —
+      // only actually pauses once the underrun has persisted past
+      // pauseAfterUnderrunMs), matching the realtime queue's own line
+      // above, NOT the immediate pause() command. A raw underrun event can
+      // be jittery (several isolated one-frame stalls in quick succession);
+      // charging each one straight against pause()'s pauseCount could hit
+      // MAX_PAUSES and kill a long-running Demucs job over transient noise
+      // the realtime queue itself is built to ignore. pause()/resume()
+      // remain available as an explicit, non-debounced command for a
+      // future direct/CPU-monitoring trigger — just not this one.
+      this.#stemQ().noteUnderrun(this);
     });
     this.#mixStream.on('underrunClear', () => {
       this.#analysisQ().noteUnderrunCleared(this);
-      this.#stemQ().resume(this);
+      this.#stemQ().noteUnderrunCleared(this);
     });
   }
 
@@ -1054,7 +1076,7 @@ export class GuildPlayer {
     const nextTrack = this.#queue.current;
     if (!nextTrack) {
       if (outgoingTemp) await cleanupTempFile(outgoingTemp);
-      await this.#onDisconnect();
+      await this.#disconnect();
       return;
     }
 
@@ -1194,6 +1216,25 @@ export class GuildPlayer {
     this.#forceSkip = true;
     this.#abortSourceAudioWait();
     this.#mixStream?.dropCurrent();
+    // Codex review (PR #45, P1): same silent underrun-state reset as the
+    // other dropCurrent() call sites — a /skip landing mid-underrun must
+    // not leave this player's stem-queue pause source stuck forever.
+    this.#stemQ().noteUnderrunCleared(this);
+  }
+
+  /**
+   * Codex review (PR #45, P1): several normal paths (queue exhaustion with
+   * no autoplay handler, a track failing to start, etc.) call the injected
+   * #onDisconnect callback directly, without going through stop() first —
+   * stop()'s own noteUnderrunCleared()/resume() calls only run when it's
+   * actually invoked. Every #onDisconnect() call site in this file goes
+   * through this wrapper instead, so a player that disconnects mid-underrun
+   * always releases its stem-queue pause source too, not just on an
+   * explicit /leave or /stop.
+   */
+  async #disconnect() {
+    this.#stemQ().noteUnderrunCleared(this);
+    await this.#onDisconnect();
   }
 
   async stop() {
@@ -1316,7 +1357,7 @@ export class GuildPlayer {
       // null = another round already owns the autoplay lock; do not disconnect.
       if (handled !== false) return;
       this.#pendingGaplessFrom = null;
-      await this.#onDisconnect();
+      await this.#disconnect();
     } else {
       // Codex review (PR #43): a "hard handoff" — no crossfade was armed AND
       // #onSnapHandoff() either never ran or its prepared source was missing/
@@ -1509,10 +1550,25 @@ export class GuildPlayer {
           // fixes. The stem job's own .finally() below owns
           // cleanup/token-release for this attempt once separation
           // actually settles; this realtime job returns immediately.
+          // Codex review (PR #45, P1): give this a real priority instead of
+          // implicit call-order-only FIFO — B (HIGH, tracked by
+          // #stemPrefetchTracker) must not sit behind an already-pending
+          // LOW (C) job. A (the currently-playing track, untracked here —
+          // §4.2 deliberately keeps A outside #stemPrefetchTracker) stays
+          // at the default 'normal' priority, unchanged from pre-9C
+          // behavior.
+          const stemJobPriority = this.#stemPrefetchTracker.get(track.videoId)?.priority === StemPrefetchPriority.HIGH
+            ? 'high'
+            : 'normal';
+          // Codex review (PR #45, P2): retryStemKillAfterCleanup defers the
+          // actual retry call to the .finally() below — #scheduleAnalysis()'s
+          // #scheduledAnalysisTokens dedup guard would otherwise see this
+          // attempt's own (not-yet-released) token and no-op the retry.
+          let retryStemKillAfterCleanup = false;
           this.#stemQ().enqueue(async ({ spawnNice: stemSpawnNice, signal: stemSignal } = {}) => {
             if (stemSignal?.aborted) return null;
             return this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: stemSpawnNice, signal: stemSignal });
-          }).then(
+          }, { priority: stemJobPriority }).then(
             (stems) => {
               // Phase 9B: this is the one place that actually learns when a
               // HIGH-priority (B) stem prefetch finishes — #ensureStemPrefetch()
@@ -1535,8 +1591,28 @@ export class GuildPlayer {
               if (this.#stemPrefetchTracker.get(track.videoId)) {
                 this.#stemPrefetchTracker.markFailed(track.videoId);
               }
+              // Codex review (PR #45, P2): a stem-queue-level ANALYSIS_KILLED
+              // (this queue's own pause/kill machinery preempting the job,
+              // e.g. maxPauses exceeded during a sustained underrun) rejects
+              // here, one level below the realtime #analysisQ() job that
+              // dispatched it — that job already resolved by the time this
+              // rejects (the dispatch above is deliberately not awaited), so
+              // the outer .catch()'s own ANALYSIS_KILLED retry (below) is
+              // never reached for this kind of kill. Same bounded-once-per-
+              // videoId retry as that outer catch.
+              if (
+                err?.code === 'ANALYSIS_KILLED'
+                && this.#stemPrefetchTracker.get(track.videoId)
+                && !this.#stemPrefetchRetriedAfterKill.has(track.videoId)
+              ) {
+                this.#stemPrefetchRetriedAfterKill.add(track.videoId);
+                retryStemKillAfterCleanup = true;
+              }
             },
-          ).finally(() => finishAnalysisAttempt(stagedPath));
+          ).finally(() => {
+            finishAnalysisAttempt(stagedPath);
+            if (retryStemKillAfterCleanup) this.#scheduleAnalysis(track, filePath);
+          });
           return analysis;
         } else if (this.#stemPrefetchTracker.get(track.videoId)) {
           // Codex review (PR #44, carried into Phase 9C's stem-queue
@@ -2723,7 +2799,10 @@ export class GuildPlayer {
       } finally {
         await cleanupTempFile(downloaded.filePath);
       }
-    });
+    // Codex review (PR #45, P1): explicit LOW priority so a HIGH (B) job
+    // requested afterward can still jump ahead of this one in the pending
+    // queue instead of only ever winning by coincidence of call order.
+    }, { priority: 'low' });
   }
 
   #ensureFullPrefetch(track) {
@@ -2864,6 +2943,9 @@ export class GuildPlayer {
       console.warn('[GuildPlayer] watchdog: stall detected');
       this.#hadError = true;
       this.#mixStream?.dropCurrent();
+      // Codex review (PR #45, P1): same silent underrun-state reset as the
+      // other dropCurrent() call sites.
+      this.#stemQ().noteUnderrunCleared(this);
     }, WATCHDOG_INTERVAL);
   }
 
