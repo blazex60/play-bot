@@ -11,6 +11,7 @@ import {
   cleanupTempFile,
   downloadAudio,
   analyzeLoudness,
+  prefetchTrack,
   TEMP_DIR,
 } from './normalize.js'
 
@@ -170,4 +171,41 @@ test('downloadAudio/analyzeLoudness: default to real node:child_process spawn wh
   // remain unaffected by this signature change.
   assert.doesNotThrow(() => { downloadAudio('https://example.com', '/tmp/unused-dest').catch(() => {}) })
   assert.doesNotThrow(() => { analyzeLoudness('/tmp/unused.wav').catch(() => {}) })
+})
+
+test('prefetchTrack: stops before the next spawnFn-using step once signal.aborted is true (Codex review, PR #44, P1)', async () => {
+  // trimSilence() is fail-soft (catches its own spawn failures internally,
+  // returns `false` rather than rejecting) — without an explicit signal
+  // check between steps, an aborted job would sail on into the NEXT step's
+  // spawn call even though its own job was already killed. Aborting right
+  // after the download succeeds and counting spawnFn calls proves
+  // prefetchTrack() stops there instead of proceeding into trimSilence's
+  // own spawn.
+  let calls = 0
+  const signal = { aborted: false }
+  const spawnFn = (cmd, args = []) => {
+    calls += 1
+    signal.aborted = true // simulate the queue killing this job right as the download finishes
+    const proc = new EventEmitter()
+    proc.stdout = new EventEmitter()
+    proc.stderr = new EventEmitter()
+    proc.kill = () => {}
+    queueMicrotask(() => proc.emit('close', 0))
+    return proc
+  }
+
+  const track = { title: 'Track', webpageUrl: 'https://example.com/watch?v=fake', duration: 60 }
+  try {
+    await assert.rejects(
+      () => prefetchTrack(track, { spawnFn, signal }),
+      (err) => err.code === 'ANALYSIS_KILLED',
+    )
+    assert.equal(calls, 1, 'expected only the download\'s spawn call, not a trimSilence spawn after the abort')
+  } finally {
+    // downloadAudio's mkdir + prefetchTrack's own tempFilePath() naming
+    // means we don't know the exact path here — best-effort sweep isn't
+    // needed since the file was never actually written (fake spawn never
+    // touches disk), only cleanupTempFile()'s own no-op-on-missing-file
+    // path would run inside prefetchTrack's catch block already.
+  }
 })

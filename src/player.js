@@ -2641,7 +2641,7 @@ export class GuildPlayer {
       // download would have nothing to actually SIGSTOP. Passing spawnNice
       // routes those subprocesses through the same register()/children Set
       // every other job in this queue already uses.
-      const downloaded = await this.#prefetchTrackFn(track, { spawnFn: spawnNice });
+      const downloaded = await this.#prefetchTrackFn(track, { spawnFn: spawnNice, signal });
       try {
         throwIfAborted(signal);
         const stagedPath = await this.#stageTempFileCopyFn(downloaded.filePath).catch((err) => {

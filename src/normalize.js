@@ -200,7 +200,25 @@ function tempFilePath(track) {
   return path.join(TEMP_DIR, `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}-${safeTitle}`)
 }
 
-export async function prefetchTrack(track, { spawnFn } = {}) {
+// Codex review (PR #44, P1): a queue abort (e.g. a mixer underrun killing
+// this job) rejects whichever spawnFn-based call is in flight, but
+// trimSilence() deliberately swallows its OWN spawn failures (fail-soft —
+// "leave the original file untouched" per its own docstring) and returns
+// `false` rather than rejecting. Without an explicit check, prefetchTrack()
+// would sail on into the NEXT step's spawnFn call even though its own job
+// was already killed — and since analysisQueue.js's spawnEpoch guard only
+// kills spawns issued BEFORE a newer abort (not a stale continuation's
+// brand-new spawn issued AFTER its own abort), that new process would get
+// silently registered into whatever job happens to be running next,
+// consuming CPU/being paused-or-killed alongside unrelated work indefinitely.
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return
+  const err = new Error('prefetch aborted')
+  err.code = 'ANALYSIS_KILLED'
+  throw err
+}
+
+export async function prefetchTrack(track, { spawnFn, signal } = {}) {
   if (!isNormalizeDurationAllowed(track)) {
     throw new NormalizeDurationError(`track exceeds ${MAX_NORMALIZE_DURATION_SEC}s normalize limit`)
   }
@@ -208,6 +226,7 @@ export async function prefetchTrack(track, { spawnFn } = {}) {
   const filePath = tempFilePath(track)
   try {
     await downloadAudio(track.webpageUrl, filePath, { spawnFn })
+    throwIfAborted(signal)
     // Trim YouTube/source padding before loudnorm + MIX analysis so
     // remainingSec and crossfade sit on audible audio.
     //
@@ -225,6 +244,10 @@ export async function prefetchTrack(track, { spawnFn } = {}) {
     // spawnBuffered() adapter downloadAudio()/analyzeLoudness() already use
     // internally, so trimSilence() sees the buffered shape it expects.
     await trimSilence(filePath, spawnFn ? { spawnFn: (cmd, args) => spawnBuffered(cmd, args, spawnFn) } : undefined)
+    // trimSilence() is fail-soft (catches its own spawn failures and
+    // returns `false`) — check explicitly rather than relying on it to
+    // have thrown, or an abort mid-trim would go unnoticed here.
+    throwIfAborted(signal)
     const measured = await analyzeLoudness(filePath, { spawnFn })
     return { filePath, measured }
   } catch (err) {
