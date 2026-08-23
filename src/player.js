@@ -2100,6 +2100,19 @@ export class GuildPlayer {
         // it in between.
         outgoingTempoRatio: this.#sessionTempo.tempoRatio ?? 1,
       });
+      // Codex review (PR #43, round 8): several awaits above
+      // (#getCachedAnalysis() x2, #probeTempoBackendFn(), the stem-cache
+      // Promise.all) can yield long enough for a concurrent snap handoff to
+      // promote the queue out from under this tick — `current`/`next`
+      // captured at the top of this method are then stale, describing a
+      // pair that is no longer live. Stashing (or acting on) a report for
+      // that stale pair risks a later, unrelated recurrence of the same
+      // pair replaying it within the 30s freshness window. Bail out before
+      // stashing — and before any further decision-making below, which
+      // would be equally stale — once the live queue no longer matches.
+      const stillCurrentPair = this.#queue.current === current
+        && (this.#queue.loopMode === LoopMode.TRACK ? next === current : this.#queue.upcoming()[0] === next);
+      if (!stillCurrentPair) return;
       // Codex review (PR #43, round 4): stash a snapshot now, before this
       // tick's own downgrade/commit logic below mutates transitionPlanReport
       // in place — a hard handoff for this exact pair later (prep raced
@@ -2625,7 +2638,13 @@ export class GuildPlayer {
     if (report.selected !== 'gapless') report.downgradedFrom = report.selected;
     report.selected = 'gapless';
     report.entry.sec = entrySec;
-    report.entry.bar = entrySec === 0 ? 0 : null;
+    // Codex review (PR #43, round 8): entrySec===0 does not mean bar 0 was
+    // detected/aligned — a hard handoff performs no bar alignment at all,
+    // it just starts the file at whatever native offset it started at.
+    // Same reasoning already applied to the downgraded-crossfade case
+    // (fixed in 3b404ec); this call site reintroduced the same false
+    // "bar 0" assertion via the entrySec===0 special case.
+    report.entry.bar = null;
     report.exit.sec = null;
     report.exit.bar = null;
     report.exit.vocalActive = null;

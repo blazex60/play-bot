@@ -1945,6 +1945,13 @@ test('acceptance (mixer): a natural gapless handoff whose evaluated rawPlan was 
     assert.equal(report.selected, 'gapless');
     assert.equal(report.downgradedFrom, null,
       'a rawPlan that was already gapless must not be reported as downgraded from itself');
+    // Codex review (PR #43, round 8): entrySec===0 (this hard handoff's
+    // native start offset, the ordinary #playNextMixer path never honors a
+    // seek) does not mean bar 0 was actually detected/aligned — no bar
+    // alignment happened at all on this path.
+    assert.equal(report.entry.sec, 0);
+    assert.equal(report.entry.bar, null,
+      'entrySec===0 must not be reported as bar 0 — a hard handoff performs no bar alignment');
   } finally {
     await player.stop();
   }
@@ -2137,6 +2144,62 @@ test('acceptance (mixer): concurrent arm ticks do not spawn duplicate stem sourc
     assert.equal(startedPlan.mode, 'stem-mix');
     assert.equal(stemSourceCalls.length, 4,
       `expected exactly 2 outgoing + 2 incoming stem sources despite concurrent arm ticks, got ${stemSourceCalls.length}`);
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): an arm tick whose queue advances out from under it (mid-analysis) does not stash a stale evaluation (Codex review, PR #43, P2)', async () => {
+  // Codex review (PR #43, round 8): #maybeStartCrossfade() awaits
+  // #getCachedAnalysis() (among other things) before stashing its
+  // evaluation for the (current, next) pair it captured at the very top of
+  // the tick. If the queue advances during that await (a skip, here — a
+  // snap handoff racing the same tick is the finding's original scenario,
+  // but any queue advance during the await exercises the same staleness
+  // window), the captured pair is stale by the time the stash would run.
+  // Delaying getTrackAnalysisFn for the CURRENT track (A) reliably parks an
+  // arm tick mid-await long enough to skip past it.
+  let releaseAnalysis;
+  let analysisRequested = false;
+  const logCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => {
+      if (videoId === 'vid-a') {
+        analysisRequested = true;
+        return new Promise((resolve) => { releaseAnalysis = () => resolve(null); });
+      }
+      return null;
+    },
+    analyzeTrackFileFn: null,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.alloc(FRAME_BYTES))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    await pollUntil(() => analysisRequested, { timeoutMs: 2000 });
+    // The arm tick evaluating A (current) / B (next) is now parked inside
+    // #getCachedAnalysis(current)'s await. Advance the queue out from
+    // under it before releasing that await.
+    await player.skip();
+    await nextTurn();
+    assert.equal(queue.current.videoId, 'vid-b', 'expected skip() to have advanced the queue while the tick was parked');
+
+    releaseAnalysis();
+    await waitMs(200); // let the parked tick resume and (correctly) bail out
+
+    assert.equal(startedPlan, null, 'the stale A/B evaluation must never reach a crossfade start');
+    assert.ok(
+      !logCalls.some((r) => r.from === 'Track A'),
+      'a report evaluated for the stale (A, B) pair must never be stashed/logged once A is no longer current',
+    );
   } finally {
     await player.stop();
   }
