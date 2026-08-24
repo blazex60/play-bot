@@ -1753,3 +1753,12 @@ round 2 の `comparablePhraseCrossfadeConfidence()`（post-hoc 補正）は、st
   - テスト: `beatmixTransition.test.js` に、vocal境界ぎりぎり（margin ほぼ0）だが phraseAlignment が高いペアと、margin は十分だが phraseAlignment がやや低いペアの両方を候補として与え、比較可能スコアでのランキングが後者を選ぶことを確認するテストを追加した。
 - 併せて、PR #46 のスコア較正修正で唯一残っていた未対応の指摘（"Preserve the non-stem fallback until stem prep commits" — take 時に stem prep が間に合わなかった場合、`bestNonStemPlan` へフォールバックせずこの試行全体を中断してしまう問題）は、根本的な修正が `player.js` の take-time commit パスへの実質的な改修（`bestNonStemPlan` 用の代替ソースを投機的に準備する、または take-time の abort 箇所でその場で `bestNonStemPlan` から再プランして即座にフォールバックする、のいずれか）を要するアーキテクチャ上のより大きな変更と判断し、このセッションでは対応を保留し、診断結果と2つの対応方針候補を PR コメントで提示した。
 - **P2: 部分的な stem-cache hit がメモ化されなかった** — `#stemCacheHit` は current/next の**両方**が hit した場合にのみメモ化されていたため、片側（多くは outgoing）が既にキャッシュ済みでもう片側の分離がまだ進行中、という頻出する過渡状態では毎回（約200msごとの arm tick ごとに）両方を再確認していた — `getCachedStems()` は読み取り専用ではなく `utimes()` で LRU の mtime を更新するため、無駄な fs アクセスが積み重なる。`#stemCacheHit` を `#outStemCacheHit`/`#inStemCacheHit` の2つに分割し、それぞれ自分のトラック識別子だけをキーにして独立にメモ化するよう変更した — 既に hit している側はどの `next` と組み合わされていても再利用され、まだ miss の側だけが毎 tick 再確認される。
+
+### 追記: Codex レビュー対応（PR #46, round 4）
+
+round 3 の `#outStemCacheHit`/`#inStemCacheHit`（片側ごとの独立メモ化）に、round 3 のマージ後さらに1件の指摘が見つかった。
+
+- **P2: 部分的な hit がメモ化されたまま失効を検知できない** — round 3 修正は、片側（多くは outgoing）が既に hit してメモ化されている間、もう片側の分離が完了するまで何十ティックも `getCachedStemsFn()` を呼ばずに済ませる設計だった。しかし `pruneStemCache()` はバックグラウンドでいつでもエントリを evict しうるため、メモ化された側のファイルがその間に消えても、もう片側が hit した瞬間にそのまま「両方揃った」と判定してしまう（stale なメモを一度も再検証しない）。これにより、実際にはもう存在しない stem ペアを `stemsAvailable: true` として ranker に渡してしまい、まだ準備できていた beatmix 等の候補を stem-mix が上書きしてしまう——そして stem-mix 自身も `#ensureOutgoingStemPrep()`/`#ensureIncomingStemPrep()` 側の prep-time revalidation で初めて失敗に気づくため、その時点では手遅れ（take-time abort パスに落ちる）。
+  - 修正: 「もう片側がちょうどこのティックで hit に転じた」瞬間（`needIn && !needOut` またはその逆）にのみ、メモ化されていた側を1回だけ再検証するようにした。まだ両方待ち状態のティック（もう片側がまだ missing のまま）や、両方とも既にメモ化済みの定常状態（外側の `needOut || needIn` チェックがそもそも false になり、このブロック全体がスキップされる）には影響しない——メモ化本来の目的（片側 hit 中の毎ティック fs アクセスを避けること）を損なわずに、新規に導入されたステイル判定ウィンドウだけを閉じている。
+  - テスト: outgoing 側は最初の呼び出しのみ hit・以降は毎回 miss（バックグラウンド eviction を模擬）、incoming 側は最初の数ティックは miss・その後 hit に転じるフィクスチャを用意し、incoming が hit した後もステム専用ソース（`createFileSourceFn`）が一度も spawn されないこと、また最終的に選ばれた遷移モードが `stem-mix` にならないことを確認するテストを追加した。修正を revert すると、期待どおりステム専用ソースが 2 件 spawn される（stale なメモを信じて stem-mix にコミットしてしまう）ことを確認済み。
+- テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。

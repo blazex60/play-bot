@@ -2329,6 +2329,32 @@ export class GuildPlayer {
           inCachedStems = freshIn;
           if (needOut && outCachedStems) this.#outStemCacheHit = { key: outKey, stems: outCachedStems };
           if (needIn && inCachedStems) this.#inStemCacheHit = { key: inKey, stems: inCachedStems };
+          // Codex review (PR #46, round 4): a side reused from memo above
+          // (not freshly checked THIS tick) must still be revalidated once,
+          // right here, the moment the OTHER side just landed and the pair
+          // is about to be reported complete for the first time —
+          // pruneStemCache() can evict a memoized hit's files at any point
+          // in the background, and without this the newly-complete pair
+          // would report stemsAvailable:true off a memo that may have
+          // already gone stale, potentially displacing an already-ready
+          // beatmix candidate for a stem-mix plan whose OWN prep-time
+          // revalidation (#ensureOutgoingStemPrep()/#ensureIncomingStemPrep())
+          // only discovers the missing file much later, after the ranker's
+          // choice already stuck. Only fires on this "just became complete"
+          // transition — ordinary "still waiting" ticks (the other side
+          // stays missing) and the steady both-hit state (the outer
+          // `needOut || needIn` check above is false, skipping this whole
+          // block every tick) are unaffected, so this doesn't reintroduce
+          // the per-tick fs cost the memoization itself exists to avoid.
+          if (outCachedStems && inCachedStems) {
+            if (needIn && !needOut) {
+              outCachedStems = await this.#getCachedStemsFn(current.videoId);
+              this.#outStemCacheHit = outCachedStems ? { key: outKey, stems: outCachedStems } : null;
+            } else if (needOut && !needIn) {
+              inCachedStems = await this.#getCachedStemsFn(next.videoId);
+              this.#inStemCacheHit = inCachedStems ? { key: inKey, stems: inCachedStems } : null;
+            }
+          }
         }
       }
 
