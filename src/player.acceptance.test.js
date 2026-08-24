@@ -1254,6 +1254,82 @@ test('acceptance (mixer): TRACK loop mode restarts from the beginning, not the b
   await player.stop();
 });
 
+test('acceptance (mixer): TRACK loop mode strips a phrase-crossfade\'s baseSwap/EQ, not just beatmix\'s, when resetting the entry to 0 (Codex review, PR #46, round 5)', async () => {
+  // Codex round-5: the TRACK-loop entry-reset override only stripped
+  // baseSwap/sync/eq for mode === 'beatmix' — with the independent ranker
+  // (Phase 9D), a phrase-crossfade plan can win on its own (baseSwap: true,
+  // EQ chosen for its own selected phrase boundary) even without beatmix
+  // ever being eligible. No BPM data forces beatmix ineligible here
+  // (bpm-unavailable), same as the "unhonored entry seek" fixture above, so
+  // phrase-crossfade is the only real candidate — its nonzero head-phrase
+  // entry must still get its baseSwap/EQ stripped once TRACK loop forces
+  // entrySec back to 0, the same way beatmix's already does.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const incomingSpawnArgs = [];
+  let startedPlan = null;
+
+  const analysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 8,
+    lastVocalEndSec: 1.0,
+    firstVocalStartSec: 5.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    phrases: {
+      tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }],
+      head: [{ sec: 3.0, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+    },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async (track, opts) => {
+      incomingSpawnArgs.push(opts);
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.loopMode = LoopMode.TRACK;
+
+  // Confirm the fixture actually reaches phrase-crossfade with a nonzero
+  // entry candidate, not beatmix (no BPM data) or a zero entry (nothing to
+  // downgrade).
+  const rawPlan = planBeatSyncedTransition(analysis, analysis, {
+    outgoingPlaybackBpm: null,
+    tempoBackend: 'rubberband',
+    maxOverlapSec: 6,
+  });
+  assert.equal(rawPlan.mode, 'phrase-crossfade',
+    `test invariant: expected phrase-crossfade to win with no BPM data, got ${rawPlan.mode}`);
+  assert.ok(rawPlan.entrySec > 0,
+    `test invariant: expected a nonzero phrase-crossfade entry candidate, got ${rawPlan.entrySec}`);
+  assert.equal(rawPlan.baseSwap, true,
+    'test invariant: expected the raw phrase-crossfade plan to carry baseSwap:true before any downgrade');
+
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  await player.playNext();
+  for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+
+  assert.ok(startedPlan, 'expected the TRACK-loop repeat to arm a transition');
+  assert.equal(startedPlan.mode, 'crossfade');
+  assert.equal(startedPlan.baseSwap, false,
+    'expected baseSwap to be stripped once TRACK loop forced the phrase-crossfade entry back to 0');
+
+  const nonzeroSpawns = incomingSpawnArgs.filter((opts) => (opts.startSec ?? 0) !== 0);
+  assert.equal(nonzeroSpawns.length, 0,
+    `expected every TRACK-loop repeat spawn to start at 0 (full replay), got nonzero startSec in: ${JSON.stringify(nonzeroSpawns)}`);
+
+  await player.stop();
+});
+
 function spawnBuffered(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });

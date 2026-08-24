@@ -458,12 +458,14 @@ test('planBeatmixTransition({stemAware:true}) evaluates the marginal-tempo confi
   // A deep mid-vocal exit (150s into a track whose vocal doesn't end until
   // 190s) is only a valid candidate at all under stemAware's relaxed
   // requireExitVocalSafe:false — its STRICT score (used for ranking/
-  // selection) is ~0.53 (zero vocal-safety credit), below
+  // selection, round 2's fix) is ~0.53 (zero vocal-safety credit), below
   // MARGINAL_TEMPO_MIN_SCORE (0.7). But stem separation is exactly what
   // makes this exit safe: the RELAXED (stemAware:true) score is ~0.768,
   // comfortably above the threshold. The marginal-tempo eligibility gate
-  // must credit that relaxed quality, not the strict one. Exact numbers
-  // confirmed via scoreTransitionPairDetailed().
+  // must credit that relaxed quality, not the strict one — rejecting a
+  // genuinely viable stem-mix candidate just because its stem-safe vocal
+  // handling doesn't count under strict scoring defeats the whole point of
+  // stemAware. Exact numbers confirmed via scoreTransitionPairDetailed().
   const outgoing = makeAnalysis({
     bpm: 120,
     beatConfidence: 0.9,
