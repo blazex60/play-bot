@@ -1276,6 +1276,85 @@ test('acceptance (mixer): TRACK loop mode strips a phrase-crossfade\'s baseSwap/
   await player.stop();
 });
 
+test('acceptance (mixer): TRACK loop mode\'s stem-mix -> bestNonStemPlan downgrade refreshes the report\'s exit, not just its entry (Codex review, PR #46, round 6)', async () => {
+  // Codex round-6: when TRACK loop re-plans away from stem-mix to
+  // bestNonStemPlan, the [MIX PLAN] report's `.exit` was still built from
+  // the ORIGINAL stem-mix plan (report-construction time, before the
+  // re-plan) — bestNonStemPlan comes from an entirely independent (strict,
+  // non-relaxed) candidate search and can genuinely pick a DIFFERENT exit
+  // point than stem-mix's own relaxed search did. Only `.entry` was
+  // reconciled after a downgrade; `.exit` was not.
+  //
+  // Same track's analysis serves as both outgoing/incoming (TRACK loop).
+  // Two tail exit candidates: a mid-vocal one (sec 1.0, high phrase score)
+  // that only stem-mix's relaxed search can use — and that wins stem-mix's
+  // OWN strict-scoring internal ranking over the vocal-safe alternative —
+  // and a vocal-safe one (sec 8.1, low phrase score, thin vocal margin)
+  // that is the ONLY candidate plain beatmix's strict search can see at
+  // all (findExitCandidates() excludes mid-vocal exits structurally,
+  // regardless of score). bestNonStemPlan therefore necessarily picks
+  // 8.1 while stem-mix picks 1.0.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const logCalls = [];
+
+  const analysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 14,
+    lastVocalEndSec: 8.0,
+    firstVocalStartSec: 10.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: {
+      tail: [
+        { sec: 1.0, barIndex: 0, score: 1.0, reasons: ['bar-multiple'] }, // mid-vocal: stem-mix only, wins stem-mix's own ranking
+        { sec: 8.1, barIndex: 1, score: 0.0, reasons: [] }, // vocal-safe (thin margin): the only candidate plain beatmix can see
+      ],
+      head: [{ sec: 0.2, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+    },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 14,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 14, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 700 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => ({
+      vocalPath: `/tmp/${videoId}.vocal.wav`,
+      instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+    }),
+    createFileSourceFn: () => PcmSource.fromBuffers(Array.from({ length: 700 }, () => Buffer.from(frame))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.loopMode = LoopMode.TRACK;
+
+  await player.playNext();
+  // The downgraded plan's own exit sits at 8.1s (bestNonStemPlan's, not
+  // stem-mix's 1.0s) — readyToFade only trips once positionSec reaches
+  // that, so this must drive well past 8.1s of 20ms frames (~405), not the
+  // 60-frame nudge that suffices for the near-0 exits used elsewhere in
+  // this file.
+  for (let i = 0; i < 430; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+
+  assert.equal(logCalls.length, 1, 'expected exactly one committed transition to have been logged');
+  const report = logCalls[0];
+  assert.equal(report.downgradedFrom, 'stem-mix',
+    `test invariant: expected the report to record a downgrade away from stem-mix, got downgradedFrom=${report.downgradedFrom}`);
+  assert.equal(report.exit.sec, 8.1,
+    `expected the report's exit to be refreshed to bestNonStemPlan's own exit (8.1), not left describing the original stem-mix plan's exit (1.0), got ${report.exit.sec}`);
+
+  await player.stop();
+});
+
 function spawnBuffered(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });

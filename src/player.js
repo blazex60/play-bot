@@ -26,7 +26,7 @@ import { LoopMode } from './queue.js';
 import { getAnalysisQueue, getStemPreparationQueue } from './audio/analysisQueue.js';
 import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
 import { planStemTransition } from './audio/stemTransition.js';
-import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition } from './audio/transitionLog.js';
+import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition, exitInfo } from './audio/transitionLog.js';
 import { StemPreparationState, StemPrefetchPriority, StemPrefetchTracker } from './audio/stemPrefetch.js';
 
 const WATCHDOG_INTERVAL = 10_000;
@@ -2464,6 +2464,18 @@ export class GuildPlayer {
           // planned 'stem-mix' — see transitionPlanReport's finalization
           // below.
           modeDowngraded = true;
+          // Codex review (PR #46, round 6): transitionPlanReport.exit was
+          // built (above, at report-construction time) from the ORIGINAL
+          // selectedPlan (stem-mix) — bestNonStemPlan's own ranker-selected
+          // exit/entry pair need not be the same one, since it comes from
+          // an entirely independent (stricter, non-relaxed) candidate
+          // search. Without recomputing here, a committed [MIX PLAN] log
+          // for this downgrade could report the stem-mix plan's exit
+          // second/bar/vocalActive state while the audio actually executed
+          // bestNonStemPlan's different exit — the existing entry-side
+          // reconciliation below (pendingEntrySec) only fixes entry, not
+          // exit.
+          transitionPlanReport.exit = exitInfo(bestNonStemPlan, outAnalysis, this.#sessionTempo.tempoRatio ?? 1);
         }
         norm.entrySec = 0;
         norm.tempoFilter = null;

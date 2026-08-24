@@ -443,6 +443,21 @@ export function planBeatmixTransition(outgoing, incoming, {
   const incomingDurationSec = Number.isFinite(incoming.durationSec) ? incoming.durationSec : Infinity;
 
   let best = null;
+  // Codex review (PR #46, round 6): the marginal-tempo gate must filter
+  // candidates DURING the search, not just re-check the single pair the
+  // strict-score search already committed to — the same "a post-hoc check
+  // can't recover a pair the search already discarded" bug the round-2 fix
+  // addressed for cross-mode ranking. With multiple stem exit pairs, a
+  // vocal-safe pair can win the strict-score race outright (e.g. ~0.678)
+  // while its OWN relaxed/stem-aware score is barely different (still
+  // ~0.678, below MARGINAL_TEMPO_MIN_SCORE) — rejecting the whole plan even
+  // though a mid-vocal alternative that lost the strict race (~0.626)
+  // would have cleared the gate stem-aware (~0.730). Filtering by the
+  // relaxed eligibility gate per pair, then ranking survivors by strict
+  // score, preserves round 2's invariant (strict score decides WHICH pair
+  // wins among those that qualify) while no longer discarding a marginal-
+  // tempo-eligible pair before it ever gets considered.
+  let anyMarginalRejected = false;
   for (const exit of exitCandidates) {
     const roomAfterExitPlayback = (durationSec - exit.sec) / outgoingRatio;
     for (const entry of entryCandidates) {
@@ -476,32 +491,22 @@ export function planBeatmixTransition(outgoing, incoming, {
         // the single surviving winner (the previous fix) couldn't recover —
         // a pair discarded during this search never comes back.
         const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: false });
+        if (isMarginalTempo) {
+          const marginalCheckScore = stemAware
+            ? scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: true })
+            : pairScore;
+          if (marginalCheckScore < MARGINAL_TEMPO_MIN_SCORE) {
+            anyMarginalRejected = true;
+            break; // widest bar count that fits this pair is the one worth checking
+          }
+        }
         if (!best || pairScore > best.pairScore) best = { exit, entry, bars, fadeSec, pairScore };
         break; // widest bar count that fits this pair is the one worth scoring
       }
     }
   }
-  if (!best) return rejected(['no-overlap-fit']);
-  if (isMarginalTempo) {
-    // Codex review (PR #46, round 5): `best.pairScore` is always the STRICT
-    // (stemAware: false) score — the round-2 fix above deliberately made
-    // that true for ranking/selection, so a mid-vocal exit doesn't win the
-    // search just because the relaxed scorer credits it more. But that same
-    // strict score being reused here for the marginal-tempo eligibility gate
-    // is a different question: for a genuine stem-mix candidate, a mid-vocal
-    // exit's zero strict vocal-safety can drag the score below
-    // MARGINAL_TEMPO_MIN_SCORE even though stem separation is exactly what
-    // makes that exit safe, and the relaxed (stemAware) score would clear
-    // the gate. Recompute with the real `stemAware` value for ELIGIBILITY
-    // only — `best` itself (which pair won) stays chosen by strict scoring.
-    const marginalCheckScore = stemAware
-      ? scoreTransitionPair({
-        outgoing, incoming, exit: best.exit, entry: best.entry, targetBpm, match, stemAware: true,
-      })
-      : best.pairScore;
-    if (marginalCheckScore < MARGINAL_TEMPO_MIN_SCORE) {
-      return rejected(['marginal-tempo-low-confidence']);
-    }
+  if (!best) {
+    return rejected(anyMarginalRejected ? ['marginal-tempo-low-confidence'] : ['no-overlap-fit']);
   }
 
   // Phase 9D (docs/mix-transition-phase9.md §6.3): the Candidate Ranker

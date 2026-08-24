@@ -140,7 +140,7 @@ function isInsideVocalGap(sec, vocalGaps) {
   return vocalGaps.some((gap) => sec >= gap.startSec && sec < gap.endSec);
 }
 
-function exitInfo(plan, outgoingAnalysis, outgoingTempoRatio = 1) {
+export function exitInfo(plan, outgoingAnalysis, outgoingTempoRatio = 1) {
   let sec = null;
   let bar = null;
   if (plan.mode === 'beatmix' || plan.mode === 'stem-mix') {
