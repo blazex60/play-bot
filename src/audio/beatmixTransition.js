@@ -424,6 +424,20 @@ export function planBeatmixTransition(outgoing, incoming, {
   requireExitVocalSafe = true,
   requireEntryForwardSafe = true,
   stemAware = false,
+  // Codex review (PR #48, round 5): planStemTransition()'s vocal-fade-
+  // envelope usability check (MIN_MEANINGFUL_INVOCAL_FADE_SEC) used to run
+  // once, post-hoc, against only the single pair this search already
+  // committed to — the same "post-hoc check can't recover a pair the
+  // search already discarded" bug the marginal-tempo gate (round 6) and
+  // stem-mix/phrase-crossfade ranking (rounds 2-3) all hit independently.
+  // A different pair (or narrower tier) could leave a perfectly usable
+  // inVocal fade window even when the strict-score winner doesn't. Rather
+  // than teach this function about vocal-envelope math (stemTransition.js's
+  // domain, not this one's), `pairFilter` is a generic per-pair predicate
+  // hook the caller can supply: a pair failing it is skipped exactly like a
+  // room/marginal-tempo failure, so the search naturally falls through to
+  // the next pair/tier instead of rejecting the whole plan outright.
+  pairFilter = null,
 } = {}) {
   if (!outgoing || !incoming) return rejected(['missing-analysis']);
 
@@ -543,8 +557,19 @@ export function planBeatmixTransition(outgoing, incoming, {
   // below the normal preferred width — `overlapBars` is otherwise treated
   // as an explicit ceiling this function must respect, same as before Phase
   // 9E introduced the extended tier at all.
+  //
+  // Codex review (PR #48, round 5): "hasn't narrowed it" was implemented as
+  // `overlapBars >= MIX_BARS.preferred`, which also matches an explicit
+  // ceiling ABOVE the preferred width but still below the extended one (e.g.
+  // `overlapBars: 12`) — that caller asked for a 12-bar cap, but the
+  // extended tier bumped it up to 16 anyway, exceeding the very ceiling this
+  // fix was meant to respect. Only the true default (the caller passed
+  // nothing, so `overlapBars` still equals `MIX_BARS.preferred` exactly) is
+  // eligible for the extended-tier upgrade; any other explicit value —
+  // narrower OR wider than the default, as long as it isn't the default
+  // itself — is left untouched as the caller's own ceiling.
   const extendedEligible = extendedTierEligible(outgoing, incoming, stemAware);
-  const startBars = (overlapBars >= MIX_BARS.preferred && extendedEligible)
+  const startBars = (overlapBars === MIX_BARS.preferred && extendedEligible)
     ? MIX_BARS.extended
     : overlapBars;
   // Codex review (PR #48, round 3): the three §7.2 named tiers (16/8/4)
@@ -590,6 +615,13 @@ export function planBeatmixTransition(outgoing, incoming, {
   // "something fit room-wise but was rejected specifically for marginal-
   // tempo quality" for the specific rejection reason below.
   let anyMarginalRejected = false;
+  // Codex review (PR #48, round 5): mirrors `anyMarginalRejected` — lets
+  // the caller-supplied `pairFilter` reject specific pairs (see its
+  // docstring above) without this function needing to know why, while
+  // still surfacing "something fit room/tempo-wise but every survivor
+  // failed the caller's own pair check" as a distinct rejection reason from
+  // a plain room failure.
+  let anyPairFilterRejected = false;
   for (const bars of tierBars) {
     const fadeSec = barSec * bars;
     let bestAtTier = null;
@@ -669,13 +701,19 @@ export function planBeatmixTransition(outgoing, incoming, {
             continue;
           }
         }
+        if (pairFilter && !pairFilter({ exit, entry, bars, fadeSec, outgoingRatio })) {
+          anyPairFilterRejected = true;
+          continue;
+        }
         if (!bestAtTier || pairScore > bestAtTier.pairScore) bestAtTier = { exit, entry, bars, fadeSec, pairScore };
       }
     }
     if (bestAtTier) { best = bestAtTier; break; }
   }
   if (!best) {
-    return rejected(anyMarginalRejected ? ['marginal-tempo-low-confidence'] : ['no-overlap-fit']);
+    if (anyMarginalRejected) return rejected(['marginal-tempo-low-confidence']);
+    if (anyPairFilterRejected) return rejected(['pair-filter-rejected']);
+    return rejected(['no-overlap-fit']);
   }
 
   // Phase 9D (docs/mix-transition-phase9.md §6.3): the Candidate Ranker

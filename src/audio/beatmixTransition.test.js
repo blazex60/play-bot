@@ -1201,6 +1201,19 @@ test('planBeatmixTransition still enforces the extended tier\'s stem-availabilit
     `expected the extended tier to still be blocked (not stemAware, low vocalConfidence) even with an explicit overlapBars:16 ceiling, got ${plan.sync.bars}`);
 });
 
+test('planBeatmixTransition honors an explicit overlapBars ceiling ABOVE the preferred width, not just below it (Codex review, PR #48, round 5)', () => {
+  // Round 2's fix only guarded a ceiling NARROWER than MIX_BARS.preferred
+  // (overlapBars < 8) — its `overlapBars >= MIX_BARS.preferred` check still
+  // let the extended tier override any ceiling from 8 up to 15, silently
+  // widening a caller's explicit `overlapBars: 12` all the way to 16 even
+  // though it's just as much an explicit ceiling as `overlapBars: 4` is.
+  const { outgoing, incoming } = longMixZoneTracks();
+  const plan = planBeatmixTransition(outgoing, incoming, { ...STEM_MIX_OPTIONS, overlapBars: 12 });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, 12,
+    `expected an explicit overlapBars:12 ceiling to cap the search at 12 bars — not bumped up to the 16-bar extended tier — even though extendedTierEligible() would otherwise allow it, got ${plan.sync.bars}`);
+});
+
 test('planBeatmixTransition honors an explicit overlapBars ceiling even when the extended tier is otherwise eligible (Codex review, PR #48, round 2)', () => {
   // Before this fix, extendedTierEligible() unconditionally overrode
   // `overlapBars`, so a caller-provided ceiling (e.g. planStemTransition()
