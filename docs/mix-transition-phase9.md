@@ -1828,4 +1828,29 @@ round 2 のプッシュ後、さらに2件の実バグが見つかった。い�
   - テスト: `minOverlapBars: 2` を渡しつつ、8-barには収まらないが4-barには収まる room（9秒）を持つ既存の "degrades... down to 4" と同じフィクスチャで、`plan.sync.bars === 4`（2ではなく）になることを確認するテストを追加した。
 - **P1: marginal-tempo の信頼度ゲートがペア単位ではなく探索後の勝者1件にのみ適用されていた** — round 2 の「ティア優先・ペアは内側」の探索構造では、あるティアで最初に見つかった適合ペアで即座に `break` してしまうため、`isMarginalTempo && best.pairScore < MARGINAL_TEMPO_MIN_SCORE` のチェックはループの外で最終的な `best`（＝そのティアの勝者）に対してしか行われていなかった。広いティアには room はあるが品質の低い（marginal-tempo の閾値未満の）ペアしかなく、狭いティアには品質の高い（閾値を超える）別のペアがある場合、探索は広いティアの低品質ペアで先に確定してしまい、遷移全体が `marginal-tempo-low-confidence` で reject されていた——実際には狭いティアの高品質ペアが利用可能だったにもかかわらず。修正: extended tier の phraseAlignment ゲートと同じパターンで、marginal-tempo のスコアチェックをペアごとの評価内に移動した。閾値を満たさないペアはそのティアでスキップされ（次の候補ペアまたは次のティアへフォールスルー）、ループ終了後の最終判定は「そもそも1件もペアが見つからなかった（`no-overlap-fit`）」場合と「room的には適合するペアがあったが marginal-tempo の品質チェックで全て弾かれた（`marginal-tempo-low-confidence`）」場合を区別する `anyMarginalRejected` フラグで賄うようにした。
   - テスト: room は潤沢だが低品質（score ~0.682、閾値0.7未満）のペアと、room は4-barティア分しかないが高品質（score ~0.784）のペアの両方を候補として与え、後者が正しく見つかること（`plan.sync.bars === MIX_BARS.minimum`、`plan.outgoing.exitStartSec === 290`）を確認するテストを追加した。数値は `scoreTransitionPairDetailed()` を直接呼ぶデバッグスクリプトで実測して較正した。
+
+### 追記: Codex レビュー対応（PR #46, round 3）
+
+round 2 の `comparablePhraseCrossfadeConfidence()`（post-hoc 補正）は、stem-mix の round 2 修正と全く同じ構造上の欠陥を持っていた — `planPhraseCrossfade()` 自身の候補探索が既に raw `phraseAlignment` だけでペアを選び終えたあとにしか補正を適用できず、探索時点で「vocal-safety margin は薄いが phraseAlignment は高い」ペアが「margin は十分だが phraseAlignment はやや低い」より良いペアを既に捨ててしまっていた場合、補正はそれを救えなかった。
+
+- **P2: phrase-crossfade もペア探索自体で比較可能スコアを使うべき** — stem-mix の round 2 根本修正（探索ループ自体を strict スコアでランキング）と同じアプローチを適用した。`planPhraseCrossfade()` の候補探索ループを、raw `phraseAlignment` ではなく `comparablePhraseCrossfadeConfidence()` と同じ加重式（vocalSafety/phraseAlignment/energyContinuity、tempoCompatibility/downbeatConfidence はゼロ点）で各ペアをランキングするよう変更した。これにより勝者ペア自身の `confidence` が既に cross-mode で比較可能な値になったため、`comparablePhraseCrossfadeConfidence()` 関数と `transitionCandidates.js` 側の `scoreOverride` 呼び出しは完全に不要になり削除した（`toCandidate()` の `scoreOverride` パラメータ自体も削除 — stem-mix・phrase-crossfade どちらの post-hoc 補正も今は探索側の修正で不要になったため）。
+  - テスト: `beatmixTransition.test.js` に、vocal境界ぎりぎり（margin ほぼ0）だが phraseAlignment が高いペアと、margin は十分だが phraseAlignment がやや低いペアの両方を候補として与え、比較可能スコアでのランキングが後者を選ぶことを確認するテストを追加した。
+- 併せて、PR #46 のスコア較正修正で唯一残っていた未対応の指摘（"Preserve the non-stem fallback until stem prep commits" — take 時に stem prep が間に合わなかった場合、`bestNonStemPlan` へフォールバックせずこの試行全体を中断してしまう問題）は、根本的な修正が `player.js` の take-time commit パスへの実質的な改修（`bestNonStemPlan` 用の代替ソースを投機的に準備する、または take-time の abort 箇所でその場で `bestNonStemPlan` から再プランして即座にフォールバックする、のいずれか）を要するアーキテクチャ上のより大きな変更と判断し、このセッションでは対応を保留し、診断結果と2つの対応方針候補を PR コメントで提示した。
+- **P2: 部分的な stem-cache hit がメモ化されなかった** — `#stemCacheHit` は current/next の**両方**が hit した場合にのみメモ化されていたため、片側（多くは outgoing）が既にキャッシュ済みでもう片側の分離がまだ進行中、という頻出する過渡状態では毎回（約200msごとの arm tick ごとに）両方を再確認していた — `getCachedStems()` は読み取り専用ではなく `utimes()` で LRU の mtime を更新するため、無駄な fs アクセスが積み重なる。`#stemCacheHit` を `#outStemCacheHit`/`#inStemCacheHit` の2つに分割し、それぞれ自分のトラック識別子だけをキーにして独立にメモ化するよう変更した — 既に hit している側はどの `next` と組み合わされていても再利用され、まだ miss の側だけが毎 tick 再確認される。
+
+### 追記: Codex レビュー対応（PR #46, round 4）
+
+round 3 の `#outStemCacheHit`/`#inStemCacheHit`（片側ごとの独立メモ化）に、round 3 のマージ後さらに1件の指摘が見つかった。
+
+- **P2: 部分的な hit がメモ化されたまま失効を検知できない** — round 3 修正は、片側（多くは outgoing）が既に hit してメモ化されている間、もう片側の分離が完了するまで何十ティックも `getCachedStemsFn()` を呼ばずに済ませる設計だった。しかし `pruneStemCache()` はバックグラウンドでいつでもエントリを evict しうるため、メモ化された側のファイルがその間に消えても、もう片側が hit した瞬間にそのまま「両方揃った」と判定してしまう（stale なメモを一度も再検証しない）。これにより、実際にはもう存在しない stem ペアを `stemsAvailable: true` として ranker に渡してしまい、まだ準備できていた beatmix 等の候補を stem-mix が上書きしてしまう——そして stem-mix 自身も `#ensureOutgoingStemPrep()`/`#ensureIncomingStemPrep()` 側の prep-time revalidation で初めて失敗に気づくため、その時点では手遅れ（take-time abort パスに落ちる）。
+  - 修正: 「もう片側がちょうどこのティックで hit に転じた」瞬間（`needIn && !needOut` またはその逆）にのみ、メモ化されていた側を1回だけ再検証するようにした。まだ両方待ち状態のティック（もう片側がまだ missing のまま）や、両方とも既にメモ化済みの定常状態（外側の `needOut || needIn` チェックがそもそも false になり、このブロック全体がスキップされる）には影響しない——メモ化本来の目的（片側 hit 中の毎ティック fs アクセスを避けること）を損なわずに、新規に導入されたステイル判定ウィンドウだけを閉じている。
+  - テスト: outgoing 側は最初の呼び出しのみ hit・以降は毎回 miss（バックグラウンド eviction を模擬）、incoming 側は最初の数ティックは miss・その後 hit に転じるフィクスチャを用意し、incoming が hit した後もステム専用ソース（`createFileSourceFn`）が一度も spawn されないこと、また最終的に選ばれた遷移モードが `stem-mix` にならないことを確認するテストを追加した。修正を revert すると、期待どおりステム専用ソースが 2 件 spawn される（stale なメモを信じて stem-mix にコミットしてしまう）ことを確認済み。
+- テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
+### 追記: Codex レビュー対応（PR #48, round 4）
+
+round 3 のプッシュ後、さらに1件の実バグが見つかった。
+
+- **P2: `overlapBars: 16` を直接渡すと extended tier のゲートが素通りしていた** — round 2 の修正（`overlapBars` が `MIX_BARS.preferred` 未満に狭められている場合は `extendedTierEligible()` による upgrade を行わない）は「デフォルトより狭い場合の upgrade」だけを扱っており、呼び出し元が直接 `overlapBars: 16` を渡した場合は `extendedTierEligible()` の結果に関わらず `startBars` がそのまま 16 になっていた。`tierBars` は常に `MIX_BARS.extended` を候補として含む（round 3 の修正）ため、この経路では 16-bar ティアがペア単位の phraseAlignment チェックだけしか通らず、stem 利用可否・両側の vocalConfidence という §7.2 の残り2条件を完全にスキップしてしまっていた——plain（非 stem）呼び出しで vocalConfidence が低くても 16-bar プランが成立しうる状態だった。修正: `extendedTierEligible()` の結果を1回だけ計算して `extendedEligible` に保持し、`bars === MIX_BARS.extended` のペア単位ゲートで phraseAlignment チェックに加えて `extendedEligible` 自体も要求するようにした——探索がどの経路で 16-bar ティアに到達したか（デフォルトからの upgrade か、呼び出し元による直接指定か）に関わらず、§7.2 のトラック全体条件が必ず成立している必要がある。
+  - テスト: `overlapBars: MIX_BARS.extended` を直接渡しつつ、両側の `vocalConfidence` を `EXTENDED_VOCAL_CONFIDENCE_MIN` 未満に設定したフィクスチャで、`plan.sync.bars === MIX_BARS.preferred`（16ではなく）になることを確認するテストを追加した。修正を revert すると期待どおり 16 が返ることを確認済み。
 - テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。

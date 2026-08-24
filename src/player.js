@@ -423,18 +423,28 @@ export class GuildPlayer {
   /** Identity key of an in-flight #ensureIncomingStemPrep() cache-revalidation await, or null — same rationale as #preparingOutgoingStemsKey. */
   #preparingIncomingStemsKey = null;
   /**
-   * Phase 8 (Codex): memoizes a POSITIVE stem-cache lookup for the current
-   * (current,next) pair — #maybeStartCrossfade() re-runs the eligibility
-   * check on every CROSSFADE_ARM_INTERVAL_MS tick for up to the whole lead
-   * window, and getCachedStems() touches the entry's mtime on every hit, so
-   * without this a single transition attempt generates hundreds of
-   * redundant metadata writes once both sides are already cached. Only
-   * positive results are memoized — a miss must keep re-checking every
-   * tick, since background separation completing mid-window is the whole
-   * point of prepping this early, and a miss never touches mtime anyway.
-   * @type {{ key: string, outCachedStems: object, inCachedStems: object } | null}
+   * Phase 8 (Codex), Phase 9D round 3 (Codex): memoizes a POSITIVE
+   * stem-cache lookup, independently per side (outgoing/incoming) —
+   * #maybeStartCrossfade() re-runs the eligibility check on every
+   * CROSSFADE_ARM_INTERVAL_MS tick for up to the whole lead window, and
+   * getCachedStems() touches the entry's mtime on every hit, so without
+   * this a single transition attempt generates hundreds of redundant
+   * metadata writes. Originally memoized only once BOTH sides hit — but
+   * the far more common transient state is one side (usually outgoing,
+   * separated earlier) already cached while the other's separation is
+   * still in flight, and that case got zero benefit from a same-pair-only
+   * memo keyed on both sides at once. Each side is now keyed on its own
+   * track identity (#prefetchKey()) alone, so a positive outgoing hit
+   * stays memoized across ticks regardless of which `next` it's currently
+   * paired with. Only positive results are memoized per side — a miss
+   * must keep re-checking every tick, since background separation
+   * completing mid-window is the whole point of prepping this early, and
+   * a miss never touches mtime anyway.
+   * @type {{ key: string, stems: object } | null}
    */
-  #stemCacheHit = null;
+  #outStemCacheHit = null;
+  /** @type {{ key: string, stems: object } | null} */
+  #inStemCacheHit = null;
   /**
    * videoId:videoId key of a (current, next) pair whose stem-mix attempt
    * was aborted at take time (spawn/prep failure, drift, or an unhonored
@@ -1922,7 +1932,7 @@ export class GuildPlayer {
       // Revalidate against the live cache right before actually spawning —
       // this only runs on a genuine (re)prep, i.e. rarely, not on the
       // steady-state no-op ticks above, so it doesn't reintroduce the
-      // per-tick fs cost player.js's #stemCacheHit memo exists to avoid.
+      // per-tick fs cost player.js's #outStemCacheHit/#inStemCacheHit memo exists to avoid.
       // `cached` (the caller's argument) may be a memoized lookup from
       // several arm-ticks ago; pruneStemCache() can evict the entry any
       // time in the background, and a stale path here would spawn ffmpeg
@@ -2308,15 +2318,51 @@ export class GuildPlayer {
       // bookkeeping; does not affect selection.
       const stemCacheAttempted = mightBeatmix && this.#stemMixUnavailableKey !== stemCacheLookupKey;
       if (stemCacheAttempted) {
-        if (this.#stemCacheHit?.key === stemCacheLookupKey) {
-          ({ outCachedStems, inCachedStems } = this.#stemCacheHit);
-        } else {
-          [outCachedStems, inCachedStems] = await Promise.all([
-            this.#getCachedStemsFn(current.videoId),
-            this.#getCachedStemsFn(next.videoId),
+        // Codex review (PR #46, round 3, P2): each side is checked/memoized
+        // independently — a positive outgoing hit from an earlier tick (or
+        // an earlier pairing entirely, keyed on the track alone) is reused
+        // without re-touching the filesystem, and only the side(s) still
+        // missing actually call getCachedStemsFn() this tick.
+        const outKey = this.#prefetchKey(current);
+        const inKey = this.#prefetchKey(next);
+        outCachedStems = this.#outStemCacheHit?.key === outKey ? this.#outStemCacheHit.stems : null;
+        inCachedStems = this.#inStemCacheHit?.key === inKey ? this.#inStemCacheHit.stems : null;
+        const needOut = !outCachedStems;
+        const needIn = !inCachedStems;
+        if (needOut || needIn) {
+          const [freshOut, freshIn] = await Promise.all([
+            needOut ? this.#getCachedStemsFn(current.videoId) : Promise.resolve(outCachedStems),
+            needIn ? this.#getCachedStemsFn(next.videoId) : Promise.resolve(inCachedStems),
           ]);
+          outCachedStems = freshOut;
+          inCachedStems = freshIn;
+          if (needOut && outCachedStems) this.#outStemCacheHit = { key: outKey, stems: outCachedStems };
+          if (needIn && inCachedStems) this.#inStemCacheHit = { key: inKey, stems: inCachedStems };
+          // Codex review (PR #46, round 4): a side reused from memo above
+          // (not freshly checked THIS tick) must still be revalidated once,
+          // right here, the moment the OTHER side just landed and the pair
+          // is about to be reported complete for the first time —
+          // pruneStemCache() can evict a memoized hit's files at any point
+          // in the background, and without this the newly-complete pair
+          // would report stemsAvailable:true off a memo that may have
+          // already gone stale, potentially displacing an already-ready
+          // beatmix candidate for a stem-mix plan whose OWN prep-time
+          // revalidation (#ensureOutgoingStemPrep()/#ensureIncomingStemPrep())
+          // only discovers the missing file much later, after the ranker's
+          // choice already stuck. Only fires on this "just became complete"
+          // transition — ordinary "still waiting" ticks (the other side
+          // stays missing) and the steady both-hit state (the outer
+          // `needOut || needIn` check above is false, skipping this whole
+          // block every tick) are unaffected, so this doesn't reintroduce
+          // the per-tick fs cost the memoization itself exists to avoid.
           if (outCachedStems && inCachedStems) {
-            this.#stemCacheHit = { key: stemCacheLookupKey, outCachedStems, inCachedStems };
+            if (needIn && !needOut) {
+              outCachedStems = await this.#getCachedStemsFn(current.videoId);
+              this.#outStemCacheHit = outCachedStems ? { key: outKey, stems: outCachedStems } : null;
+            } else if (needOut && !needIn) {
+              inCachedStems = await this.#getCachedStemsFn(next.videoId);
+              this.#inStemCacheHit = inCachedStems ? { key: inKey, stems: inCachedStems } : null;
+            }
           }
         }
       }
@@ -2826,7 +2872,7 @@ export class GuildPlayer {
    *
    * Either way, dispatch happens only after #getCachedStemsFn() confirms a
    * miss — a cache HIT just marks the entry READY (sticky, like
-   * #stemCacheHit's own "only positive results are memoized" — a MISS
+   * #outStemCacheHit/#inStemCacheHit's own "only positive results are memoized" — a MISS
    * keeps getting re-checked on every #prefetchUpcoming() call, since
    * background separation completing mid-window is the whole point).
    * Nothing here is awaited by #maybeStartCrossfade() or anything else on

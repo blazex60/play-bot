@@ -1,4 +1,4 @@
-import { planBeatmixTransition, planPhraseCrossfade, comparablePhraseCrossfadeConfidence } from './beatmixTransition.js';
+import { planBeatmixTransition, planPhraseCrossfade } from './beatmixTransition.js';
 import { planStemTransition } from './stemTransition.js';
 import { planTransition } from './transition.js';
 
@@ -52,23 +52,22 @@ export function transitionModeBonus(mode) {
  * struct. `mode` is passed explicitly (not read off `plan.mode`) because a
  * rejected plan's own `mode` is always null (see beatmixTransition.js's
  * `rejected()`) — the caller always knows which slot it's building.
- * `scoreOverride`, when given, replaces `plan.confidence` as the reported/
- * ranked `score` — used for phrase-crossfade (see
- * comparablePhraseCrossfadeConfidence()'s docstring in beatmixTransition.js):
- * tier 2's own `confidence` is just `phraseAlignment` (it never scores tempo
- * sync or downbeat alignment at all), which isn't comparable to beatmix/
- * stem-mix's six-term weighted confidence for cross-mode ranking. Stem-mix
- * needs no override here — its pair SEARCH now ranks by the same strict
- * scoring beatmix uses (see planBeatmixTransition()'s pairScore comment),
- * so `plan.confidence` is already comparable. */
-function toCandidate(mode, plan, scoreOverride = null) {
+ * `plan.confidence` is used directly as the ranked `score` for all three
+ * modes — each one's own pair SEARCH now ranks candidates by a strict,
+ * cross-mode-comparable formula (see planBeatmixTransition()'s pairScore
+ * comment for stem-mix/beatmix, and planPhraseCrossfade()'s search-loop
+ * comment for phrase-crossfade), so no post-hoc score correction is needed
+ * here — earlier rounds of this fix used one (a `scoreOverride` param),
+ * which papered over pair-search bugs those modes' own searches have
+ * since been fixed to not have. */
+function toCandidate(mode, plan) {
   if (!plan?.eligible) {
     return { mode, eligible: false, reasons: plan?.reasons ?? ['unknown'] };
   }
   return {
     mode,
     eligible: true,
-    score: scoreOverride ?? plan.confidence,
+    score: plan.confidence,
     quality: plan.quality ?? null,
     fadeSec: plan.fadeSec,
     bars: plan.sync?.bars ?? null,
@@ -136,7 +135,7 @@ export function rankTransitionCandidates(outgoing, incoming, {
   const candidates = {
     beatmix: toCandidate('beatmix', beatmixPlan),
     stemMix: toCandidate('stem-mix', stemMixPlan),
-    phraseCrossfade: toCandidate('phrase-crossfade', phraseCrossfadePlan, comparablePhraseCrossfadeConfidence(phraseCrossfadePlan)),
+    phraseCrossfade: toCandidate('phrase-crossfade', phraseCrossfadePlan),
   };
   const plans = {
     beatmix: beatmixPlan, stemMix: stemMixPlan, phraseCrossfade: phraseCrossfadePlan, legacy: legacyPlan,

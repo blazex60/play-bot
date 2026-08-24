@@ -1141,6 +1141,25 @@ test('extendedTierEligible-equivalent gate is symmetric: low confidence on the O
   assert.equal(plan.sync.bars, MIX_BARS.preferred);
 });
 
+test('planBeatmixTransition still enforces the extended tier\'s stem-availability/vocal-confidence gates when a caller directly supplies overlapBars:16 (Codex review, PR #48, round 4)', () => {
+  // A caller explicitly setting overlapBars to 16 makes `startBars` reach
+  // 16 without ever going through extendedTierEligible()'s override branch
+  // (round 2's fix only gates the UPGRADE from a lower default, not an
+  // explicitly-supplied ceiling that's already 16) — tierBars then lists 16
+  // as reachable, and before this fix the per-pair gate at bars===16 only
+  // checked phraseAlignment, letting a plain (non-stem, low-vocal-
+  // confidence) call land a 16-bar plan despite failing the other two
+  // §7.2 conditions entirely.
+  const { outgoing, incoming } = longMixZoneTracks({
+    outgoingVocalConfidence: 0.5, // below EXTENDED_VOCAL_CONFIDENCE_MIN
+    incomingVocalConfidence: 0.5,
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, { overlapBars: MIX_BARS.extended });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred,
+    `expected the extended tier to still be blocked (not stemAware, low vocalConfidence) even with an explicit overlapBars:16 ceiling, got ${plan.sync.bars}`);
+});
+
 test('planBeatmixTransition honors an explicit overlapBars ceiling even when the extended tier is otherwise eligible (Codex review, PR #48, round 2)', () => {
   // Before this fix, extendedTierEligible() unconditionally overrode
   // `overlapBars`, so a caller-provided ceiling (e.g. planStemTransition()
@@ -1234,4 +1253,35 @@ test('planBeatmixTransition({stemAware:true}) ranks candidate exit pairs by the 
   assert.equal(plan.eligible, true);
   assert.equal(plan.outgoing.exitStartSec, 152,
     `expected the search to prefer the vocal-safe exit (152) over the higher-phrase-score mid-vocal one (100) under strict ranking, got ${plan.outgoing.exitStartSec}`);
+});
+
+// --- phrase-crossfade pair-search ranking (Codex review, PR #46, round 3) -
+//
+// findExitCandidates()'s default vocal-safe filter is a bare `sec >=
+// lastVocalEndSec` check — it says nothing about HOW FAR past the vocal
+// boundary a candidate sits, so two candidates can both be "vocal safe" by
+// the filter while one has almost no margin (exitVocalSafety near 0) and
+// the other has full margin (exitVocalSafety at its cap). The search must
+// not let a higher raw phraseAlignment alone win over a pair with
+// meaningfully better vocal safety margin.
+
+test('planPhraseCrossfade ranks candidate pairs by the full comparable score, not raw phraseAlignment alone', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: 150,
+    phrasesTail: [
+      { sec: 150, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }, // right at the vocal boundary, high phrase score
+      { sec: 154, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }, // full vocal-safety margin, lower phrase score
+    ],
+  });
+  const incoming = makeAnalysis({
+    firstVocalStartSec: 30,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+  });
+
+  const plan = planPhraseCrossfade(outgoing, incoming);
+
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.startSec, 154,
+    `expected the search to prefer the fuller-margin exit (154) over the higher-phrase-score boundary-hugging one (150) under comparable ranking, got ${plan.startSec}`);
 });
