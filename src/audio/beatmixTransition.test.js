@@ -454,6 +454,38 @@ test('planBeatmixTransition allows a marginal tempo match when transition qualit
   assert.ok(Math.abs(plan.incoming.tempoRatio - 120 / 126) < 1e-9);
 });
 
+test('planBeatmixTransition({stemAware:true}) evaluates the marginal-tempo confidence gate with the relaxed (stem-aware) score, not the strict ranking score (Codex review, PR #46, round 5)', () => {
+  // A deep mid-vocal exit (150s into a track whose vocal doesn't end until
+  // 190s) is only a valid candidate at all under stemAware's relaxed
+  // requireExitVocalSafe:false — its STRICT score (used for ranking/
+  // selection) is ~0.53 (zero vocal-safety credit), below
+  // MARGINAL_TEMPO_MIN_SCORE (0.7). But stem separation is exactly what
+  // makes this exit safe: the RELAXED (stemAware:true) score is ~0.768,
+  // comfortably above the threshold. The marginal-tempo eligibility gate
+  // must credit that relaxed quality, not the strict one. Exact numbers
+  // confirmed via scoreTransitionPairDetailed().
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    durationSec: 200,
+    lastVocalEndSec: 190,
+    phrasesTail: [{ sec: 150, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 126, // ~4.76% off 120 — marginal tier
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    durationSec: 200,
+    firstVocalStartSec: 150,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
+  assert.equal(plan.eligible, true,
+    'expected the stem-aware-relaxed score to clear the marginal-tempo gate, not the strict ranking score');
+  assert.equal(plan.outgoing.exitStartSec, 150);
+});
+
 test('planBeatmixTransition applies the marginal-tempo confidence gate per pair, not just to whichever pair the tiers-outer search settles on first (Codex review, PR #48, round 3)', () => {
   // A low-quality pair (phraseAlignment 0.1, overall score ~0.682 — below
   // MARGINAL_TEMPO_MIN_SCORE 0.7) has ample room and would win the widest

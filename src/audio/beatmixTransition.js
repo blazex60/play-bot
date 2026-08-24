@@ -670,9 +670,23 @@ export function planBeatmixTransition(outgoing, incoming, {
         // the single surviving winner (the previous fix) couldn't recover —
         // a pair discarded during this search never comes back.
         const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: false });
-        if (isMarginalTempo && pairScore < MARGINAL_TEMPO_MIN_SCORE) {
-          anyMarginalRejected = true;
-          continue;
+        if (isMarginalTempo) {
+          // Codex review (PR #46, round 5): `pairScore` above is always the
+          // STRICT score — deliberately so for ranking/selection (round 2's
+          // fix) — but reusing it here for the marginal-tempo ELIGIBILITY
+          // gate is a different question. A genuine stem-mix candidate's
+          // mid-vocal exit can have zero strict vocal-safety even though
+          // stem separation is exactly what makes that exit safe; the
+          // relaxed (stemAware) score would clear the threshold. Recompute
+          // with the real `stemAware` value for this gate only — which pair
+          // wins stays decided by the strict `pairScore` above.
+          const marginalCheckScore = stemAware
+            ? scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: true })
+            : pairScore;
+          if (marginalCheckScore < MARGINAL_TEMPO_MIN_SCORE) {
+            anyMarginalRejected = true;
+            continue;
+          }
         }
         if (!bestAtTier || pairScore > bestAtTier.pairScore) bestAtTier = { exit, entry, bars, fadeSec, pairScore };
       }
