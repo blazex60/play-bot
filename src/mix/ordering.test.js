@@ -574,6 +574,49 @@ test('transitionCost\'s beatmix term rejects a low-scoring marginal-tempo pair, 
   );
 });
 
+test('transitionCost\'s beatmix term applies the marginal-tempo gate per pair DURING the tier search, not once after committing to a tier (Codex review, PR #48, round 7)', () => {
+  // Round 6's tiers-outer restructure only checked MARGINAL_TEMPO_MIN_SCORE
+  // once, against whatever pair `bestAtTier`/`break` had already settled
+  // on — but planBeatmixTransition() applies the marginal gate per pair,
+  // DURING the search, so a sub-threshold pair at a wide tier doesn't stop
+  // the search from reaching a qualifying pair at a narrower one.
+  // exitWide (20s room, clears the 8-bar/16s preferred tier) has phrase
+  // score 0 — combined with the marginal tempo tier, its pair score falls
+  // below MARGINAL_TEMPO_MIN_SCORE, exactly like weakMarginal above.
+  // exitNarrow (10s room, clears only the 4-bar/8s minimum tier) has the
+  // default high phrase score, clearing the threshold easily. Live
+  // planning would skip exitWide at the 8-bar tier (marginal-tempo gate),
+  // find nothing else at that tier, then find exitNarrow at the 4-bar
+  // tier. Before this fix, ordering.js committed to exitWide's tier-8
+  // score outright and rejected the whole edge as fully infeasible without
+  // ever considering exitNarrow.
+  const exitWide = { sec: 180, barIndex: 0, score: 0, reasons: [] }; // 20s room, sub-threshold marginal score
+  const exitNarrow = { sec: 190, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }; // 10s room, clears the marginal gate
+  const fromBothTiers = richOutgoing({ phrases: { tail: [exitWide, exitNarrow] } });
+  const fromNarrowTierOnly = richOutgoing({ phrases: { tail: [exitNarrow] } });
+  // entry score lowered from the default 0.9 to 0.2 (calibrated via
+  // scoreTransitionPair() directly) so exitWide's pair score (~0.63) falls
+  // clearly below MARGINAL_TEMPO_MIN_SCORE (0.7) while exitNarrow's
+  // (~0.72) still clears it — the default entry score left exitWide just
+  // above the threshold too (~0.70), not distinguishing the two cases.
+  const toAnalysis = richIncoming({
+    bpm: 125.4, headBpm: 125.4, firstVocalStartSec: 100,
+    phrases: { head: [{ sec: 4, barIndex: 0, score: 0.2, reasons: ['bar-multiple'] }] },
+  });
+
+  const costBothTiers = transitionCost(fromBothTiers, toAnalysis);
+  const costNarrowOnly = transitionCost(fromNarrowTierOnly, toAnalysis);
+
+  assert.ok(
+    costBothTiers < BEATMIX_INFEASIBLE_COST * DEFAULT_BEATMIX_WEIGHT,
+    `expected exitNarrow's qualifying pair to be found at the 4-bar tier, not the whole edge rejected as fully infeasible over exitWide's sub-threshold score alone, got cost ${costBothTiers}`,
+  );
+  assert.ok(
+    Math.abs(costBothTiers - costNarrowOnly) < 1e-6,
+    `expected offering the sub-threshold exitWide alongside exitNarrow to leave the cost unchanged (still exitNarrow's, ${costNarrowOnly}), got ${costBothTiers}`,
+  );
+});
+
 test('transitionCost\'s beatmix term rejects an entry whose start is vocal-safe but leaves no forward overlap room', () => {
   // Codex round-2 on PR #35 (follow-up to the round-1 exit-side fix):
   // findEntryCandidates() only checks that entry.sec ITSELF is vocal-safe

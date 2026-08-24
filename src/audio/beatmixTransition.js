@@ -672,7 +672,17 @@ export function planBeatmixTransition(outgoing, incoming, {
         // that fails this is skipped at this tier — the outer tierBars loop
         // falls through to the next (narrower) tier only once no pair at
         // all survives this one.
-        if (bars === MIX_BARS.extended) {
+        //
+        // Codex review (PR #48, round 7): `bars === MIX_BARS.extended` only
+        // caught exactly 16 — a caller-supplied `overlapBars` ABOVE 16 (e.g.
+        // 17) lands `bars: 17` in `tierBars` (sorted widest-first, so it's
+        // tried before 16 itself) and skipped this whole gate entirely,
+        // since 17 !== 16. That let an even-longer transition than the
+        // extended tier bypass every one of its safeguards (stem
+        // availability, vocal confidence, phrase alignment). `>=` catches
+        // every width at or beyond the extended tier, not just the exact
+        // named stop.
+        if (bars >= MIX_BARS.extended) {
           // Codex review (PR #48, round 4): `tierBars` always lists
           // MIX_BARS.extended as A candidate stop (round 3's fix), and
           // `startBars` itself reaches 16 whenever the CALLER explicitly

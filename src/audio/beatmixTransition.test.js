@@ -1201,6 +1201,23 @@ test('planBeatmixTransition still enforces the extended tier\'s stem-availabilit
     `expected the extended tier to still be blocked (not stemAware, low vocalConfidence) even with an explicit overlapBars:16 ceiling, got ${plan.sync.bars}`);
 });
 
+test('planBeatmixTransition still enforces the extended tier\'s gates for a caller-supplied overlapBars ABOVE 16, not just exactly 16 (Codex review, PR #48, round 7)', () => {
+  // Round 4's fix only caught `bars === MIX_BARS.extended` (exactly 16) —
+  // a caller-supplied overlapBars ABOVE 16 (17 here) lands `bars: 17` in
+  // tierBars (sorted widest-first, tried before 16 itself) and skipped the
+  // whole extended-tier gate block entirely, since 17 !== 16. That let an
+  // even-longer-than-extended transition bypass every one of its
+  // safeguards (stem availability, vocal confidence, phrase alignment).
+  const { outgoing, incoming } = longMixZoneTracks({
+    outgoingVocalConfidence: 0.5, // below EXTENDED_VOCAL_CONFIDENCE_MIN
+    incomingVocalConfidence: 0.5,
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, { overlapBars: 17 });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred,
+    `expected the extended tier's gates to still block bars >= 16 (not stemAware, low vocalConfidence) even with an explicit overlapBars:17 ceiling, got ${plan.sync.bars}`);
+});
+
 test('planBeatmixTransition honors an explicit overlapBars ceiling ABOVE the preferred width, not just below it (Codex review, PR #48, round 5)', () => {
   // Round 2's fix only guarded a ceiling NARROWER than MIX_BARS.preferred
   // (overlapBars < 8) — its `overlapBars >= MIX_BARS.preferred` check still
