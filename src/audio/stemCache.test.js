@@ -1,0 +1,286 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { mkdir, writeFile, rm, readFile, readdir, stat, utimes } from 'node:fs/promises';
+import path from 'node:path';
+import {
+  STEM_CACHE_DIR,
+  getCachedStems,
+  separateTrackStems,
+  pruneStemCache,
+  cleanupStaleStemStaging,
+} from './stemCache.js';
+import { DEMUCS_MODEL } from './vocalActivity.js';
+
+function uniqueVideoId(label) {
+  return `stem-test-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+async function cleanup(videoId) {
+  await rm(path.join(STEM_CACHE_DIR, videoId), { recursive: true, force: true }).catch(() => {});
+}
+
+/**
+ * Mirrors vocalActivity.test.js's fakeVocalSpawn shape (an EventEmitter-
+ * based fake child process), but ALSO writes real files at the paths
+ * separateTrackStems() expects to find them at afterward (input.wav from
+ * the ffmpeg cut step, then vocals.wav/no_vocals.wav under
+ * <tmpRoot>/<DEMUCS_MODEL>/input/ from the Demucs step) — stemCache.js
+ * checks file existence via access(), so a fake with no real I/O side
+ * effect can't stand in for it the way vocalActivity.js's stderr-only fake
+ * can for a read-only ffmpeg -f null pass.
+ */
+function fakeSpawn({ cutFails = false, demucsFails = false, cmds = [] } = {}) {
+  return (cmd, args = []) => {
+    cmds.push({ cmd, args });
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.kill = () => {};
+    queueMicrotask(async () => {
+      try {
+        if (cmd === 'ffmpeg') {
+          if (cutFails) {
+            proc.emit('close', 1);
+            return;
+          }
+          const outPath = args[args.length - 1];
+          await mkdir(path.dirname(outPath), { recursive: true });
+          await writeFile(outPath, Buffer.from('fake-input-wav'));
+          proc.emit('close', 0);
+          return;
+        }
+        // Anything else stands in for whatever resolveDemucsBin() resolved to.
+        if (demucsFails) {
+          proc.emit('close', 1);
+          return;
+        }
+        const oIndex = args.indexOf('-o');
+        const outRoot = args[oIndex + 1];
+        const stemDir = path.join(outRoot, DEMUCS_MODEL, 'input');
+        await mkdir(stemDir, { recursive: true });
+        await writeFile(path.join(stemDir, 'vocals.wav'), Buffer.from('fake-vocal'));
+        await writeFile(path.join(stemDir, 'no_vocals.wav'), Buffer.from('fake-instrumental'));
+        proc.emit('close', 0);
+      } catch (err) {
+        proc.emit('error', err);
+      }
+    });
+    return proc;
+  };
+}
+
+test('getCachedStems returns null when nothing has been separated for this videoId', async () => {
+  const videoId = uniqueVideoId('miss');
+  assert.equal(await getCachedStems(videoId), null);
+});
+
+test('separateTrackStems writes vocal/instrumental into the persistent cache and getCachedStems then finds them', async () => {
+  const videoId = uniqueVideoId('hit');
+  try {
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn() });
+    assert.ok(result);
+    assert.ok(result.vocalPath.endsWith('vocal.wav'));
+    assert.ok(result.instrumentalPath.endsWith('instrumental.wav'));
+    assert.equal((await readFile(result.vocalPath)).toString(), 'fake-vocal');
+    assert.equal((await readFile(result.instrumentalPath)).toString(), 'fake-instrumental');
+
+    const cached = await getCachedStems(videoId);
+    assert.deepEqual(cached, result);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('getCachedStems invalidates an entry whose sidecar records a different Demucs model', async () => {
+  const videoId = uniqueVideoId('stale-model');
+  try {
+    await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn() });
+    const metaPath = path.join(STEM_CACHE_DIR, videoId, 'meta.json');
+    await writeFile(metaPath, JSON.stringify({ demucsModel: 'some-other-model', separatedAt: Date.now() }));
+    assert.equal(await getCachedStems(videoId), null);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('separateTrackStems returns null and does not throw when the ffmpeg cut step fails', async () => {
+  const videoId = uniqueVideoId('cut-fail');
+  try {
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, {
+      spawnFn: fakeSpawn({ cutFails: true }),
+    });
+    assert.equal(result, null);
+    assert.equal(await getCachedStems(videoId), null);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('separateTrackStems returns null and does not throw when the Demucs step fails', async () => {
+  const videoId = uniqueVideoId('demucs-fail');
+  try {
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, {
+      spawnFn: fakeSpawn({ demucsFails: true }),
+    });
+    assert.equal(result, null);
+    assert.equal(await getCachedStems(videoId), null);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('separateTrackStems dedupes concurrent calls for the same videoId (only one separation runs)', async () => {
+  const videoId = uniqueVideoId('concurrent');
+  try {
+    const cmds = [];
+    const spawnFn = fakeSpawn({ cmds });
+    const [a, b] = await Promise.all([
+      separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn }),
+      separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn }),
+    ]);
+    assert.deepEqual(a, b);
+    // ffmpeg cut + demucs = 2 spawns for ONE separation; a duplicate run
+    // would double this to 4.
+    assert.equal(cmds.length, 2, `expected exactly one separation's worth of spawns, got ${cmds.length}`);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('separateTrackStems stages its working directory under STEM_CACHE_DIR, not os.tmpdir()', async () => {
+  // Codex: the eventual rename() of Demucs' output into the persistent
+  // cache must land on the SAME filesystem as its source, or it fails with
+  // EXDEV — in the production container, STEM_CACHE_DIR (data/, bind-
+  // mounted) and os.tmpdir() (the container's own /tmp) are different
+  // filesystems. Staging under STEM_CACHE_DIR itself keeps the rename local.
+  const videoId = uniqueVideoId('staging-dir');
+  try {
+    const cmds = [];
+    await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn({ cmds }) });
+    const ffmpegCall = cmds.find((c) => c.cmd === 'ffmpeg');
+    const inputWav = ffmpegCall.args[ffmpegCall.args.length - 1];
+    assert.ok(inputWav.startsWith(STEM_CACHE_DIR),
+      `expected the ffmpeg cut step's working file (${inputWav}) to be staged under STEM_CACHE_DIR`);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('separateTrackStems re-checks the cache and skips re-running Demucs when already cached', async () => {
+  const videoId = uniqueVideoId('already-cached');
+  try {
+    await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn() });
+    const cmds = [];
+    const second = await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn({ cmds }) });
+    assert.ok(second);
+    assert.equal(cmds.length, 0, 'expected zero spawns on a second call once already cached');
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+async function entryTotalBytes(videoId) {
+  const dir = path.join(STEM_CACHE_DIR, videoId);
+  let total = 0;
+  for (const file of ['vocal.wav', 'instrumental.wav', 'meta.json']) {
+    total += (await stat(path.join(dir, file))).size;
+  }
+  return total;
+}
+
+/**
+ * STEM_CACHE_DIR is the same persistent, machine-shared directory a real
+ * Bot process caches into (data/stems — see stemCache.js's module docstring).
+ * A dev machine running this suite alongside a populated real cache must not
+ * have its unrelated entries swept up by this test's tight maxBytes cap —
+ * baseline against whatever was already there before this test's own writes.
+ */
+async function currentTotalBytes() {
+  let entries;
+  try {
+    entries = await readdir(STEM_CACHE_DIR, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      total += await entryTotalBytes(entry.name);
+    } catch {
+      // Racing with another writer/pruner — skip, best-effort baseline only.
+    }
+  }
+  return total;
+}
+
+test('pruneStemCache evicts the oldest entries once the total size exceeds maxBytes', async () => {
+  const oldId = uniqueVideoId('prune-old');
+  const newId = uniqueVideoId('prune-new');
+  try {
+    const baseline = await currentTotalBytes();
+    await separateTrackStems('/tmp/fake-track-source', oldId, { spawnFn: fakeSpawn() });
+    // Backdate the old entry's files so mtime-based LRU picks it first.
+    const oldDir = path.join(STEM_CACHE_DIR, oldId);
+    const past = new Date(Date.now() - 60_000);
+    for (const file of ['vocal.wav', 'instrumental.wav', 'meta.json']) {
+      await utimes(path.join(oldDir, file), past, past);
+    }
+    await separateTrackStems('/tmp/fake-track-source', newId, { spawnFn: fakeSpawn() });
+
+    const newSize = await entryTotalBytes(newId);
+    // Cap tight enough that only the newer entry (plus whatever pre-existed
+    // before this test ran) survives — big enough to hold the new entry on
+    // top of the baseline, too small to also hold the old test entry.
+    await pruneStemCache({ maxBytes: baseline + newSize });
+
+    assert.equal(await getCachedStems(oldId), null, 'expected the older entry to be evicted');
+    assert.ok(await getCachedStems(newId), 'expected the newer entry to survive');
+  } finally {
+    await cleanup(oldId);
+    await cleanup(newId);
+  }
+});
+
+test('pruneStemCache does nothing when the total size is already under maxBytes', async () => {
+  const videoId = uniqueVideoId('prune-noop');
+  try {
+    await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn() });
+    await pruneStemCache({ maxBytes: Number.MAX_SAFE_INTEGER });
+    assert.ok(await getCachedStems(videoId), 'expected the entry to survive a prune well under the cap');
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('cleanupStaleStemStaging removes an orphaned .stemsep-* directory left by a killed process', async () => {
+  // Codex: runSeparation()'s own finally block removes its jobTmpRoot on
+  // every normal exit, but a killed process or a recreated container skips
+  // that finally entirely — the staging dir (and its partial WAVs) is then
+  // orphaned forever, since pruneStemCache() deliberately skips anything
+  // that isn't a valid videoId shape (so it never touches an in-progress
+  // job's staging dir). Only cleanupStaleStemStaging(), called once at
+  // startup, ever reclaims these.
+  await mkdir(STEM_CACHE_DIR, { recursive: true });
+  const staleDir = path.join(STEM_CACHE_DIR, `.stemsep-orphan-${Date.now()}`);
+  await mkdir(staleDir, { recursive: true });
+  await writeFile(path.join(staleDir, 'input.wav'), 'partial-orphaned-data');
+  try {
+    await cleanupStaleStemStaging();
+    await assert.rejects(() => stat(staleDir), 'expected the orphaned staging directory to be removed');
+  } finally {
+    await rm(staleDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('cleanupStaleStemStaging leaves real videoId cache entries untouched', async () => {
+  const videoId = uniqueVideoId('staging-cleanup-noop');
+  try {
+    await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn() });
+    await cleanupStaleStemStaging();
+    assert.ok(await getCachedStems(videoId), 'expected a real cache entry to survive staging cleanup');
+  } finally {
+    await cleanup(videoId);
+  }
+});

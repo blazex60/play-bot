@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { rm, mkdir, rename, access } from 'node:fs/promises'
+import { rm, mkdir, rename, access, copyFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { buildYtdlpArgs, YTDLP_AUDIO_FORMAT } from './search.js'
@@ -220,6 +220,22 @@ export async function prefetchTrack(track) {
 export async function cleanupTempFile(filePath) {
   if (!filePath) return
   await rm(filePath, { force: true })
+}
+
+/**
+ * Copy filePath to a new, independently-owned temp path under TEMP_DIR.
+ * Phase 8 (Codex, PR #39): a track's normalize temp file can be deleted at
+ * any time by unrelated cleanup (track promotion/stop/skip/prefetch
+ * discard) while a queued job that also needs it (stem separation) is
+ * still waiting its turn on the shared analysisQueue, or still running a
+ * many-minute Demucs pass. Staging an independent copy immediately, before
+ * that wait/run window opens, keeps the caller's own exposure to just this
+ * copy's fast local I/O instead of however long the queue takes.
+ */
+export async function stageTempFileCopy(filePath) {
+  const staged = path.join(TEMP_DIR, `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}-stage`)
+  await copyFile(filePath, staged)
+  return staged
 }
 
 export async function cleanupStaleTempDir() {

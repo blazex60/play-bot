@@ -1,5 +1,5 @@
 node_modules/
-.env
+.env*
 dist/
 build/
 __pycache__/
@@ -7,6 +7,7 @@ __pycache__/
 progress.txt
 data/
 tmp/
+.claude/
 
 .omc
 .omo
