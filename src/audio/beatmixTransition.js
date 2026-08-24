@@ -625,6 +625,16 @@ export function planPhraseCrossfade(outgoing, incoming, {
   }
   if (!best) return rejected(['no-overlap-fit']);
 
+  // Phase 9D (docs/mix-transition-phase9.md §6.3): tier 2 has no tempo sync
+  // or downbeat-grid requirement (its whole point is to still work when
+  // those aren't available), and doesn't score harmonic compatibility at
+  // all — those three quality sub-terms stay null (never fabricated) rather
+  // than a misleading 0. vocalSafety/energyContinuity ARE meaningful here
+  // (this tier's candidate search enforces the same vocal-safe windows
+  // beatmix does) — already computed per-candidate during the search above
+  // (best.vocalSafety/best.energy), since they now drive which pair wins,
+  // not just what gets reported about it afterward.
+
   return {
     mode: 'phrase-crossfade',
     eligible: true,
