@@ -564,37 +564,59 @@ export function planBeatmixTransition(outgoing, incoming, {
   // Codex review (PR #48, round 1): "search order 16 -> 8 -> 4 -> fallback"
   // (§7.2) names three specific tiers, not every integer bar count between
   // them — a dense sweep could land on an unadvertised width like 15 or 10
-  // bars. tierBars restricts the per-pair loop below to just the
-  // configured stops that are both reachable (<= startBars) and above the
-  // hard floor (>= minOverlapBars), widest first.
-  const startBars = extendedTierEligible(outgoing, incoming, stemAware) ? MIX_BARS.extended : overlapBars;
+  // bars. tierBars restricts the loop below to just the configured stops
+  // that are both reachable (<= startBars) and above the hard floor
+  // (>= minOverlapBars), widest first.
+  //
+  // Codex review (PR #48, round 2): extendedTierEligible() used to
+  // unconditionally win over `overlapBars`, so a caller-provided ceiling
+  // (e.g. planStemTransition(outgoing, incoming, { overlapBars: 4 })) was
+  // silently ignored whenever the extended-tier gates passed. Only let the
+  // extended tier override `overlapBars` when the caller hasn't narrowed it
+  // below the normal preferred width — `overlapBars` is otherwise treated
+  // as an explicit ceiling this function must respect, same as before Phase
+  // 9E introduced the extended tier at all.
+  const startBars = (overlapBars >= MIX_BARS.preferred && extendedTierEligible(outgoing, incoming, stemAware))
+    ? MIX_BARS.extended
+    : overlapBars;
   const tierBars = [...new Set([startBars, overlapBars, minOverlapBars])]
     .filter((bars) => bars <= startBars && bars >= minOverlapBars)
     .sort((a, b) => b - a);
 
+  // Codex review (PR #48, round 2): tiers must be searched OUTER, pairs
+  // INNER — the previous structure (bars nested inside each exit/entry
+  // pair, taking the widest tier that fit THAT pair, then comparing
+  // pairScore across every pair regardless of which tier it landed on) let
+  // a marginally higher-scoring pair that only fits a narrow tier beat a
+  // lower-scoring pair that fits the full 16 bars, contradicting the
+  // documented "16 -> 8 -> 4 -> fallback" precedence (a wider tier should
+  // always be preferred over a narrower one when ANY pair reaches it). Now
+  // every candidate pair is evaluated at the widest tier first; only when
+  // NO pair fits (or, for the extended tier, no pair's own phrase alignment
+  // clears EXTENDED_PHRASE_CONFIDENCE_MIN) does the search descend to the
+  // next tier.
   let best = null;
-  for (const exit of exitCandidates) {
-    const roomAfterExitPlayback = (durationSec - exit.sec) / outgoingRatio;
-    for (const entry of entryCandidates) {
-      const roomInIncomingPlayback = (incomingDurationSec - entry.sec) / match.ratio;
-      // entry.sec itself being vocal-safe (findEntryCandidates()) says
-      // nothing about whether the overlap that FOLLOWS it stays clear — an
-      // entry 0.1s before firstVocalStartSec, or 0.1s before a gap ends,
-      // would otherwise let a multi-bar overlap run straight into vocals.
-      // requireEntryForwardSafe=false (stem-mix only) skips this cap: the
-      // incoming vocal stem's own delayed start (buildStemEnvelopes()) is
-      // what keeps it clear of the outgoing vocal, not forward room in the
-      // incoming track's OWN head window.
-      const forwardSafePlayback = requireEntryForwardSafe
-        ? entryForwardSafeSec(incoming, entry.sec) / match.ratio
-        : Infinity;
-      for (const bars of tierBars) {
-        const fadeSec = barSec * bars;
-        if (
-          fadeSec > roomAfterExitPlayback + 1e-6
-          || fadeSec > roomInIncomingPlayback + 1e-6
-          || fadeSec > forwardSafePlayback + 1e-6
-        ) continue;
+  for (const bars of tierBars) {
+    const fadeSec = barSec * bars;
+    let bestAtTier = null;
+    for (const exit of exitCandidates) {
+      const roomAfterExitPlayback = (durationSec - exit.sec) / outgoingRatio;
+      if (fadeSec > roomAfterExitPlayback + 1e-6) continue;
+      for (const entry of entryCandidates) {
+        const roomInIncomingPlayback = (incomingDurationSec - entry.sec) / match.ratio;
+        if (fadeSec > roomInIncomingPlayback + 1e-6) continue;
+        // entry.sec itself being vocal-safe (findEntryCandidates()) says
+        // nothing about whether the overlap that FOLLOWS it stays clear —
+        // an entry 0.1s before firstVocalStartSec, or 0.1s before a gap
+        // ends, would otherwise let a multi-bar overlap run straight into
+        // vocals. requireEntryForwardSafe=false (stem-mix only) skips this
+        // cap: the incoming vocal stem's own delayed start
+        // (buildStemEnvelopes()) is what keeps it clear of the outgoing
+        // vocal, not forward room in the incoming track's OWN head window.
+        const forwardSafePlayback = requireEntryForwardSafe
+          ? entryForwardSafeSec(incoming, entry.sec) / match.ratio
+          : Infinity;
+        if (fadeSec > forwardSafePlayback + 1e-6) continue;
         // Codex review (PR #48, round 1): the extended (16-bar) tier's own
         // eligibility gate (extendedTierEligible(), above) only sees
         // TRACK-WIDE proxies (downbeatGrid.confidence, vocalConfidence) —
@@ -604,8 +626,9 @@ export function planBeatmixTransition(outgoing, incoming, {
         // downbeat-grid confidence) could still reach 16 bars on a track
         // whose overall phrase confidence is high. Gate the 16-bar
         // candidacy on THIS pair's own phraseAlignment specifically; a pair
-        // that fails this falls through to the next (narrower) tier in
-        // tierBars instead of being rejected outright.
+        // that fails this is skipped at this tier — the outer tierBars loop
+        // falls through to the next (narrower) tier only once no pair at
+        // all survives this one.
         if (bars === MIX_BARS.extended) {
           const pairPhraseAlignment = clamp01(((exit.score ?? 0) + (entry.score ?? 0)) / 2);
           if (pairPhraseAlignment < EXTENDED_PHRASE_CONFIDENCE_MIN) continue;
@@ -621,10 +644,10 @@ export function planBeatmixTransition(outgoing, incoming, {
         // the single surviving winner (the previous fix) couldn't recover —
         // a pair discarded during this search never comes back.
         const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: false });
-        if (!best || pairScore > best.pairScore) best = { exit, entry, bars, fadeSec, pairScore };
-        break; // widest bar count that fits this pair is the one worth scoring
+        if (!bestAtTier || pairScore > bestAtTier.pairScore) bestAtTier = { exit, entry, bars, fadeSec, pairScore };
       }
     }
+    if (bestAtTier) { best = bestAtTier; break; }
   }
   if (!best) return rejected(['no-overlap-fit']);
   if (isMarginalTempo && best.pairScore < MARGINAL_TEMPO_MIN_SCORE) {

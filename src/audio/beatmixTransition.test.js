@@ -1052,6 +1052,57 @@ test('extendedTierEligible-equivalent gate is symmetric: low confidence on the O
   assert.equal(plan.sync.bars, MIX_BARS.preferred);
 });
 
+test('planBeatmixTransition honors an explicit overlapBars ceiling even when the extended tier is otherwise eligible (Codex review, PR #48, round 2)', () => {
+  // Before this fix, extendedTierEligible() unconditionally overrode
+  // `overlapBars`, so a caller-provided ceiling (e.g. planStemTransition()
+  // forwarding { overlapBars: 4 }) was silently ignored whenever the
+  // extended-tier gates happened to pass.
+  const { outgoing, incoming } = longMixZoneTracks();
+  const plan = planBeatmixTransition(outgoing, incoming, { ...STEM_MIX_OPTIONS, overlapBars: 4 });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, 4,
+    `expected an explicit overlapBars:4 ceiling to cap the search even though extendedTierEligible() would otherwise allow 16 bars, got ${plan.sync.bars}`);
+});
+
+test('planBeatmixTransition searches every candidate pair at a given tier before descending, not just each pair\'s own best-fitting tier (Codex review, PR #48, round 2)', () => {
+  // Exit A only has 9s of room after it — enough for the 4-bar (8s) tier,
+  // never the 16-bar (32s) one — but scores higher than exit B, which has
+  // ample room and reaches the extended tier. A search that nests bars
+  // inside each pair (taking whichever tier fits THAT pair, then comparing
+  // raw pairScore across every pair regardless of tier) would wrongly pick
+  // exit A's narrow 4-bar plan. Tiers must be searched widest-first across
+  // ALL pairs — only once no pair at all reaches a tier should the search
+  // descend to the next one.
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    vocalConfidence: 0.9,
+    durationSec: 260,
+    lastVocalEndSec: null,
+    phrasesTail: [
+      { sec: 251, barIndex: 0, score: 1.0, reasons: ['bar-multiple'] }, // 9s room: 4-bar only, higher score
+      { sec: 150, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }, // 110s room: reaches 16-bar, lower score
+    ],
+  });
+  const incoming = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    vocalConfidence: 0.9,
+    durationSec: 260,
+    firstVocalStartSec: null,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }],
+  });
+
+  const plan = planBeatmixTransition(outgoing, incoming, STEM_MIX_OPTIONS);
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.extended,
+    `expected the search to reach the widest tier any pair supports (16 bars, via the 150s exit) rather than settling for a narrower tier just because another pair scored higher, got ${plan.sync.bars}`);
+  assert.equal(plan.outgoing.exitStartSec, 150,
+    `expected the 16-bar-capable exit (150s) to win despite exit 251s scoring higher, got exitStartSec ${plan.outgoing.exitStartSec}`);
+});
+
 // --- stem-mix pair-search ranking (Codex review, PR #46, round 2) ---------
 //
 // The eligibility relaxation (requireExitVocalSafe:false) makes a mid-vocal
