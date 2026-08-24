@@ -1762,3 +1762,13 @@ round 3 の `#outStemCacheHit`/`#inStemCacheHit`（片側ごとの独立メモ�
   - 修正: 「もう片側がちょうどこのティックで hit に転じた」瞬間（`needIn && !needOut` またはその逆）にのみ、メモ化されていた側を1回だけ再検証するようにした。まだ両方待ち状態のティック（もう片側がまだ missing のまま）や、両方とも既にメモ化済みの定常状態（外側の `needOut || needIn` チェックがそもそも false になり、このブロック全体がスキップされる）には影響しない——メモ化本来の目的（片側 hit 中の毎ティック fs アクセスを避けること）を損なわずに、新規に導入されたステイル判定ウィンドウだけを閉じている。
   - テスト: outgoing 側は最初の呼び出しのみ hit・以降は毎回 miss（バックグラウンド eviction を模擬）、incoming 側は最初の数ティックは miss・その後 hit に転じるフィクスチャを用意し、incoming が hit した後もステム専用ソース（`createFileSourceFn`）が一度も spawn されないこと、また最終的に選ばれた遷移モードが `stem-mix` にならないことを確認するテストを追加した。修正を revert すると、期待どおりステム専用ソースが 2 件 spawn される（stale なメモを信じて stem-mix にコミットしてしまう）ことを確認済み。
 - テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
+### 追記: Codex レビュー対応（PR #46, round 5）
+
+round 4 のプッシュ後、さらに2件の実バグが見つかった。
+
+- **P2: marginal-tempo の信頼度ゲートが常に strict スコアを見ていた** — round 2 の根本修正（`planBeatmixTransition()` の探索を `stemAware` の値に関わらず常に strict スコアでランキングする）以降、`isMarginalTempo && best.pairScore < MARGINAL_TEMPO_MIN_SCORE` の判定も同じ strict `pairScore` を再利用していた。しかし stem-mix 候補にとって、mid-vocal な exit の strict vocalSafety はゼロになりうる——それこそが stem separation が安全にする対象そのものであり、relaxed（`stemAware: true`）スコアなら閾値をクリアする場合がある。修正: marginal-tempo の適格性判定だけ、`stemAware` が true のときは同じペアを `stemAware: true` で再スコアリングした値を使うようにした（どのペアが勝つか自体は引き続き strict スコアで決まる）。
+  - テスト: 深く mid-vocal な exit（strict score ~0.53、閾値0.7未満）だが relaxed score は ~0.768（閾値クリア）というフィクスチャで、`stemAware: true` 呼び出しが `eligible: true` になることを確認するテストを追加した。数値は `scoreTransitionPairDetailed()` を直接呼ぶデバッグスクリプトで実測して較正した。
+- **P2: TRACK loop のエントリーリセットが phrase-crossfade の baseSwap/EQ を剥がしていなかった** — TRACK loop（`next === current`）がエントリーを強制的に 0 へリセットする際、`norm.mixPlan.mode === 'beatmix'` のときだけ `baseSwap`/`sync`/`eq` を剥がしていた。Phase 9D の独立ランカー以降、beatmix が原理的に ineligible（例: BPM データなし）でも phrase-crossfade 単独で勝つケースがあり、そのケースでは元々選択されたフレーズ境界向けの `baseSwap: true`/EQ がそのまま、実際にはエントリー0（曲の先頭）から再生される音声に適用されてしまっていた。修正: `normalizeTransitionPlan()` を呼ぶたびに、どの raw plan（`selectedPlan` か、stem-mix 降格時の `bestNonStemPlan`）が現在 `norm` に反映されているかを `normRawMode` として追跡し、`norm.mixPlan.mode === 'beatmix' || normRawMode === 'phrase-crossfade'` のときに剥がすよう拡張した。
+  - テスト: BPM データなし（beatmix が bpm-unavailable で ineligible、phrase-crossfade のみが候補）のフィクスチャで TRACK loop を有効にし、`planBeatSyncedTransition()` の raw plan が実際に `phrase-crossfade`（`baseSwap: true`、エントリーは非ゼロ）であることをテスト不変条件として確認した上で、実際の TRACK loop 再生後に `startedPlan.baseSwap === false` になることを確認するテストを追加した。修正を revert すると `baseSwap` が `true` のまま漏れることを確認済み。
+- テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。

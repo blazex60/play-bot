@@ -2422,6 +2422,14 @@ export class GuildPlayer {
 
       if (selectedPlan.mode === 'gapless' || !(selectedPlan.fadeSec > 0)) return;
       let norm = normalizeTransitionPlan(selectedPlan);
+      // Codex review (PR #46, round 5): which RAW (pre-normalizeTransitionPlan)
+      // mode `norm` currently reflects — normalizeTransitionPlan() flattens
+      // both 'beatmix' and 'phrase-crossfade' into mixPlan.mode: 'crossfade'/
+      // 'beatmix' respectively at different points, so `norm.mixPlan.mode`
+      // alone can't distinguish a phrase-crossfade plan from a legacy one
+      // below. Reassigned alongside `norm` itself whenever it's rebuilt from
+      // a different rawPlan (the stem-mix -> bestNonStemPlan re-plan below).
+      let normRawMode = selectedPlan.mode;
 
       let modeDowngraded = false;
 
@@ -2433,8 +2441,9 @@ export class GuildPlayer {
       // re-arms with the same nonzero entrySec (Codex round-5). The outgoing
       // exit point is still meaningful (fade the ending into the beginning),
       // so only the entry side is forced back to a true restart; downgrade
-      // out of beatmix since its bar envelope assumed the original,
-      // downbeat-aligned candidate rather than the file's real start.
+      // out of beatmix/phrase-crossfade since both assumed the original
+      // selected boundary (bar-aligned or phrase-aligned) rather than the
+      // file's real start.
       if (next === current) {
         if (norm.mixPlan.mode === 'stem-mix') {
           // stem-mix's own exitStartSec was chosen with vocal-safety
@@ -2450,6 +2459,7 @@ export class GuildPlayer {
           // performs safely for non-stem plans.
           if (bestNonStemPlan.mode === 'gapless' || !(bestNonStemPlan.fadeSec > 0)) return;
           norm = normalizeTransitionPlan(bestNonStemPlan);
+          normRawMode = bestNonStemPlan.mode;
           // Phase 9A: the mode actually used just changed away from the
           // planned 'stem-mix' — see transitionPlanReport's finalization
           // below.
@@ -2458,7 +2468,15 @@ export class GuildPlayer {
         norm.entrySec = 0;
         norm.tempoFilter = null;
         norm.sessionTempo = null;
-        if (norm.mixPlan.mode === 'beatmix') {
+        // Codex review (PR #46, round 5): with the independent ranker
+        // (Phase 9D), a phrase-crossfade plan (baseSwap:true, EQ chosen for
+        // its own selected phrase boundary) can win even while beatmix is
+        // eligible — previously only checking `mode === 'beatmix'` here left
+        // a phrase-crossfade's boundary-dependent EQ/baseSwap applied to
+        // audio that TRACK loop just reset to entrySec 0, the same class of
+        // bug the forcePlainCrossfade downgrade below already guards
+        // against for an unhonored source seek.
+        if (norm.mixPlan.mode === 'beatmix' || normRawMode === 'phrase-crossfade') {
           norm.mixPlan = {
             ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null,
           };

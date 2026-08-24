@@ -413,6 +413,44 @@ test('planBeatmixTransition allows a marginal tempo match when transition qualit
   assert.ok(Math.abs(plan.incoming.tempoRatio - 120 / 126) < 1e-9);
 });
 
+test('planBeatmixTransition({stemAware:true}) evaluates the marginal-tempo confidence gate with the relaxed (stem-aware) score, not the strict ranking score (Codex review, PR #46, round 5)', () => {
+  // A deep mid-vocal exit (150s into a track whose vocal doesn't end until
+  // 190s) is only a valid candidate at all under stemAware's relaxed
+  // requireExitVocalSafe:false — its STRICT score (used for ranking/
+  // selection, round 2's fix) is ~0.53 (zero vocal-safety credit), below
+  // MARGINAL_TEMPO_MIN_SCORE (0.7). But stem separation is exactly what
+  // makes this exit safe: the RELAXED (stemAware:true) score is ~0.768,
+  // comfortably above the threshold. The marginal-tempo eligibility gate
+  // must credit that relaxed quality, not the strict one — rejecting a
+  // genuinely viable stem-mix candidate just because its stem-safe vocal
+  // handling doesn't count under strict scoring defeats the whole point of
+  // stemAware. Exact numbers confirmed via scoreTransitionPairDetailed().
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    durationSec: 200,
+    lastVocalEndSec: 190,
+    phrasesTail: [{ sec: 150, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 126, // ~4.76% off 120 — marginal tier
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    durationSec: 200,
+    firstVocalStartSec: 150,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, {
+    requireExitVocalSafe: false,
+    requireEntryForwardSafe: false,
+    stemAware: true,
+  });
+  assert.equal(plan.eligible, true,
+    'expected the stem-aware-relaxed score to clear the marginal-tempo gate, not the strict ranking score');
+  assert.equal(plan.outgoing.exitStartSec, 150);
+});
+
 test('planBeatmixTransition converts overlap room to the stretched incoming timeline before choosing bar count', () => {
   const outgoing = makeAnalysis({
     bpm: 124,
