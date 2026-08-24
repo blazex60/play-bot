@@ -56,6 +56,48 @@ test('planStemTransition accepts a mid-vocal outgoing exit that plain planBeatmi
   assert.equal(stemPlan.outgoing.exitStartSec, 158);
 });
 
+test('planStemTransition rejects a technically-nonzero but near-instant inVocal fade (Codex review, PR #48, round 1)', () => {
+  // richOutgoing()/richIncoming() land this pair on the preferred (8-bar,
+  // 16s) tier. lastVocalEndSec is set so the outgoing vocal tail leaves
+  // only a sliver of a second for inVocal to fade in (well below
+  // MIN_MEANINGFUL_INVOCAL_FADE_SEC) — a technically-nonzero fade the OLD
+  // `> 0` check would have accepted as eligible.
+  const outgoing = richOutgoing({ lastVocalEndSec: 173.7 }); // exit at 158, 15.7s of native vocal tail remains
+  const incoming = richIncoming();
+
+  const stemPlan = planStemTransition(outgoing, incoming);
+  assert.equal(stemPlan.eligible, false);
+  assert.deepEqual(stemPlan.reasons, ['stem-mix-no-invocal-fade-room']);
+});
+
+test('planStemTransition retries other exit candidates before rejecting the plan outright when the strict-score winner leaves no usable inVocal fade (Codex review, PR #48, round 5)', () => {
+  // Two exit candidates: sec 158 (high phrase score 0.9, wins the strict-
+  // score race outright) but its 15.7s outgoing vocal tail leaves no room
+  // for inVocal to fade in — the same fixture as the round-1 test above.
+  // sec 172 (low phrase score 0.1, loses the strict-score race) has only a
+  // 1.7s tail, leaving 14.1s of usable inVocal fade window. Before this fix,
+  // the fade-room check ran once, post-hoc, against only the pair the
+  // search already committed to (sec 158) — rejecting the whole plan even
+  // though sec 172 would have produced a perfectly usable envelope.
+  const outgoing = richOutgoing({
+    lastVocalEndSec: 173.7,
+    phrases: {
+      tail: [
+        { sec: 158, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] },
+        { sec: 172, barIndex: 0, score: 0.1, reasons: ['bar-multiple'] },
+      ],
+    },
+  });
+  const incoming = richIncoming();
+
+  const stemPlan = planStemTransition(outgoing, incoming);
+  assert.equal(stemPlan.eligible, true,
+    'expected the search to fall through to the sec-172 pair instead of rejecting the whole plan over sec 158 alone');
+  assert.equal(stemPlan.outgoing.exitStartSec, 172);
+  assert.ok(stemPlan.stems.inVocal.fadeSec >= 0.5,
+    `expected a usable inVocal fade window, got ${stemPlan.stems.inVocal.fadeSec}`);
+});
+
 test('planStemTransition still requires everything plain beatmix requires except the outgoing vocal-safety window', () => {
   // Tempo/downbeat/meter gating must be untouched — stem-mix only widens
   // the vocal-clash axis, never weakens tempo sync (docs/mix-transition-

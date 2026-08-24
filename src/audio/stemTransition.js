@@ -7,9 +7,41 @@ import { planBeatmixTransition } from './beatmixTransition.js';
  * rounding edge. Provisional — see the doc's 未決事項.
  */
 export const DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC = 0.2;
+/**
+ * Codex review (PR #48, round 1): the minimum inVocal.fadeSec that still
+ * reads as an actual fade rather than a near-instant onset. The previous
+ * check only rejected an EXACTLY zero fade — a long outgoing vocal tail
+ * (e.g. ending just before the overlap window closes) can leave inVocal
+ * with a few tenths of a second, technically nonzero but audibly
+ * indistinguishable from a hard cut once gainForStemPosition() ramps it.
+ * Applies uniformly across all bar tiers (not just the Phase 9E extended
+ * one) — any tier's stem-mix plan can produce a too-short fade given the
+ * right vocal-tail timing, not only 16-bar ones.
+ */
+export const MIN_MEANINGFUL_INVOCAL_FADE_SEC = 0.5;
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
+}
+
+/**
+ * Shared by buildStemEnvelopes() (final envelope, on the winning pair) and
+ * planStemTransition()'s pairFilter (every candidate pair, during the
+ * search) — a single source of truth for "how much of this pair's fade
+ * window would inVocal actually get" so the two can never silently diverge.
+ * @param {object} outgoing analysis (needs lastVocalEndSec)
+ * @param {{ exitStartSec: number, outgoingRatio: number, fadeSec: number }} pair
+ * @param {number} vocalCrossoverMarginSec
+ * @returns {number} inVocal's fadeSec for this pair
+ */
+function estimateInVocalFadeSec(outgoing, { exitStartSec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec) {
+  const lastVocalEndSec = outgoing?.lastVocalEndSec;
+  const outVocalTailNativeSec = Number.isFinite(lastVocalEndSec)
+    ? Math.max(0, lastVocalEndSec - exitStartSec)
+    : 0;
+  const outVocalFadeSec = clamp(outVocalTailNativeSec / outgoingRatio, 0, fadeSec);
+  const inVocalDelaySec = clamp(outVocalFadeSec + vocalCrossoverMarginSec, 0, fadeSec);
+  return Math.max(0, fadeSec - inVocalDelaySec);
 }
 
 /**
@@ -48,6 +80,9 @@ export function buildStemEnvelopes(outgoing, plan, {
     : 0;
   const outVocalFadeSec = clamp(outVocalTailNativeSec / outgoingRatio, 0, fadeSec);
   const inVocalDelaySec = clamp(outVocalFadeSec + vocalCrossoverMarginSec, 0, fadeSec);
+  const inVocalFadeSec = estimateInVocalFadeSec(
+    outgoing, { exitStartSec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec,
+  );
 
   return {
     outVocal: { role: 'out', fadeSec: outVocalFadeSec, curve, startOffsetSec: 0 },
@@ -55,7 +90,7 @@ export function buildStemEnvelopes(outgoing, plan, {
     inInstrumental: { role: 'in', fadeSec, curve, startOffsetSec: 0 },
     inVocal: {
       role: 'in',
-      fadeSec: Math.max(0, fadeSec - inVocalDelaySec),
+      fadeSec: inVocalFadeSec,
       curve,
       startOffsetSec: inVocalDelaySec,
     },
@@ -82,26 +117,46 @@ export function buildStemEnvelopes(outgoing, plan, {
  *   planBeatmixTransition() returns when not.
  */
 export function planStemTransition(outgoing, incoming, options = {}) {
+  const vocalCrossoverMarginSec = options.vocalCrossoverMarginSec ?? DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC;
   const plan = planBeatmixTransition(outgoing, incoming, {
     ...options,
     requireExitVocalSafe: false,
     requireEntryForwardSafe: false,
     stemAware: true,
+    // Codex (round 1) / Codex review (PR #48, round 1 then round 5): when
+    // the outgoing vocal tail is long enough to need most or all of the
+    // overlap just to fade out, inVocal's own fadeSec shrinks toward 0 —
+    // gainForStemPosition() then holds inVocal silent for nearly the entire
+    // window and ramps it up over a sliver of a second right as promotion
+    // switches to incoming.full (already at its native volume there). That
+    // reads as a hard vocal onset, not a fade, even when the fade window is
+    // technically nonzero — the whole point of this plan is a genuine fade.
+    //
+    // Round 1 rejected the whole plan post-hoc, on only the single pair the
+    // search had already committed to — the same "post-hoc check can't
+    // recover a pair the search already discarded" bug hit independently by
+    // stem-mix/phrase-crossfade ranking (rounds 2-3) and the marginal-tempo
+    // gate (round 6): a different pair the strict-score race didn't pick
+    // (or a narrower tier) could well leave a usable inVocal window. Now
+    // filtered per pair, during the search itself, via planBeatmixTransition
+    // ()'s generic pairFilter hook — a pair failing this check is simply
+    // skipped, letting the search fall through to the next candidate/tier
+    // instead of rejecting the whole plan outright.
+    pairFilter: ({ exit, fadeSec, outgoingRatio }) => estimateInVocalFadeSec(
+      outgoing, { exitStartSec: exit.sec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec,
+    ) >= MIN_MEANINGFUL_INVOCAL_FADE_SEC,
   });
-  if (!plan.eligible) return plan;
-  const stems = buildStemEnvelopes(outgoing, plan, options);
-  // Codex: when the outgoing vocal tail is long enough to need the whole
-  // (or more than the) overlap just to fade out, inVocalDelaySec clamps to
-  // fadeSec and inVocal's own fadeSec clamps to 0 — gainForStemPosition()
-  // then holds inVocal silent for the entire window and jumps it straight
-  // to full gain only on the last frame, right as promotion switches to
-  // incoming.full (already at its native volume there). That's a hard
-  // vocal onset, not a fade — the whole point of this plan. Reject rather
-  // than produce a degenerate envelope; the caller's existing ladder falls
-  // back to a plain crossfade for a pair like this.
-  if (!(stems.inVocal.fadeSec > 0)) {
-    return { mode: null, eligible: false, reasons: ['stem-mix-no-invocal-fade-room'] };
+  if (!plan.eligible) {
+    // Surface the same specific reason external callers/tests have always
+    // seen for this case — pairFilter itself is a generic beatmixTransition
+    // ()-level concept with no idea WHY a pair was rejected, so the mapping
+    // back to this plan's own domain-specific rejection reason happens here.
+    if (plan.reasons?.includes('pair-filter-rejected')) {
+      return { mode: null, eligible: false, reasons: ['stem-mix-no-invocal-fade-room'] };
+    }
+    return plan;
   }
+  const stems = buildStemEnvelopes(outgoing, plan, options);
   return {
     ...plan,
     mode: 'stem-mix',
