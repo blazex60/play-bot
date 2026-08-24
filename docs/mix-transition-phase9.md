@@ -1696,6 +1696,105 @@ round 2 で見つかった追加の1件（P2）:
 - [ ] 「Demucs実行中でもBPM/phrase解析がブロックされない」の実音源・実運用計測（構造的な検証は完了、上記未決事項参照）
 - [ ] 「incoming stem cache hit rate >= 90%」の実測（上記未決事項参照、Phase 9B から持ち越しの既知の制約）
 
+## 実装ノート (Phase 9D)
+
+§6 の Candidate Ranker を実装した。§6.1 の waterfall（`planBeatSyncedTransition()` が beatmix→phrase-crossfade→legacy の順に評価し、tier 1 が eligible ならその場で return — tier 2/3 は評価すらされない。stem-mix は `player.js` 側で「beatmix が勝たなかった場合のみ」試す bolt-on）を、§6.2 が求める「4 モードすべてを独立候補として評価し、Candidate Ranker が勝者を選ぶ」形に置き換えた。
+
+### 実装箇所
+
+- `src/audio/beatmixTransition.js`:
+  - `planBeatmixTransition()` の eligible な返り値に `quality`（§6.3 の6項目オブジェクト）を追加した。既存の `scoreTransitionPairDetail()`（Phase 9D 前段の commit 39bf91d で既に抽出済み）を勝者の exit/entry ペアに対して1回だけ追加で呼び出すだけで、探索ループ自体（`scoreTransitionPair()` を使った比較）は変更していない。
+  - `planPhraseCrossfade()` にも同様に `quality` を追加した。ただし tier 2 はテンポ同期もダウンビートグリッドも harmonic 判定も一切行わないため、`tempoCompatibility`/`downbeatConfidence`/`harmonicCompatibility` は（§6.3 の `harmonicCompatibility` が既に確立していた原則どおり）`0` ではなく `null` にしている — 「評価して低かった」と「評価自体をしていない」を区別するため。`vocalSafety`/`energyContinuity` は beatmix と同じ式を、tier 2 が選んだ実際の exit/entry ペアに対して計算している。
+  - `planBeatSyncedTransition()`（§16 waterfall 本体）自体は**完全に無変更** — 関数もその既存テスト（`beatmixTransition.test.js` の waterfall セクション）もそのまま残した。`player.js` がこの関数を呼ばなくなっただけで、単体の正しい waterfall プランナーとしては引き続き存在する。理由: 既存テストの「tier 1 が勝てば tier 2 は評価しない」という waterfall 前提のアサーションを、意味のない形で壊さないため。
+- `src/audio/transitionCandidates.js`（新規）: Candidate Ranker 本体。
+  - `transitionModeBonus(mode)`: §6.4 の表をそのまま実装（stem-mix +0.10 / beatmix +0.05 / phrase-crossfade +0.02 / それ以外 0）。
+  - `rankTransitionCandidates(outgoing, incoming, options)`: `planBeatmixTransition()` / `planPhraseCrossfade()` / `planStemTransitionFn()`（デフォルトは `planStemTransition()`、`player.js` の `#planStemTransitionFn` DI と同じ差し替え口）/ `planTransition()`（legacy）を**それぞれ独立に**呼ぶ。stem-mix だけは呼び出し元が渡す `stemsAvailable`（両側のキャッシュ hit を確認済みかどうか）でゲートする — ネットワーク/ディスクを叩くキャッシュ確認自体は非同期なので、この関数は Phase 7C の `planBeatSyncedTransition()` と同じく同期のままにし、キャッシュ確認は呼び出し元（`player.js`）の責務として残した。beatmix/stem-mix/phrase-crossfade の3つを `score + transitionModeBonus(mode)` の argmax で比較し、勝者を `selectedPlan` として返す。
+  - legacy（`planTransition()`）は§6.2 の図には候補として描かれているが、**スコアでは競合させていない** — legacy には beatmix/stem-mix/phrase-crossfade のような品質モデルがなく（`confidence` は単に `outgoing.confidence` の生値で、遷移の相性スコアではない）、これを他の3つと同じ土俵でスコア比較すると、無関係に高い `confidence` を持つ legacy が本来 beatmix 等が選ばれるべき場面で誤って勝ってしまうリスクがある。beatmix/stem-mix/phrase-crossfade が1つも eligible でない場合にのみ legacy を選ぶ、という Phase 9D 以前の waterfall の最下段の挙動をそのまま保持している（意図的なスコープ判断 — 下記「未決事項」参照）。
+  - `bestNonStemPlan`: stem-mix を除いた3候補（beatmix/phrase-crossfade/legacy）だけで同じ argmax を行った結果も一緒に返す。stem-mix の exitStartSec/entrySec は vocal-safety を緩和して選ばれている（stem 別のフェード envelope があって初めて安全）ため、TRACK ループ再選択で stem-mix が使えなくなった場合の再プランは、stem-mix 自身の window を流用せずこちらから行う必要がある（§8 由来の既存制約、下記参照）。
+- `src/audio/transitionLog.js`: `buildTransitionPlanReport()` のシグネチャを `rawPlan`/`stemPlan` から `candidates`（`rankTransitionCandidates()` の `candidates.beatmix`/`.stemMix`/`.phraseCrossfade`、§6.3 Candidate 構造そのもの）+ `selectedPlan` に変更した。従来 `barredCandidate()`/`phraseCandidate()` が担っていた「waterfall のどの段まで評価が進んだか」の推測（`rawPlan.mode === 'beatmix'` なら tier 2/stem-mix は `not-evaluated-beatmix-selected`）は完全に不要になった — 各候補は独立評価の結果を **常に** 直接持っているため、単純に整形するだけの `candidateToReportShape()` に置き換えている。`not-evaluated-*` の reason は「stem-mix のキャッシュ確認自体が走らなかった」ケース（`#stemMixUnavailableKey` によるスキップ、または `mightBeatmix` 前提チェックで最初から不可能と分かっている場合）専用の `not-evaluated-stem-mix-unavailable` 1本に統合した。
+- `src/player.js` `#maybeStartCrossfade()`:
+  - `planBeatSyncedTransition()` の呼び出しを `rankTransitionCandidates()` に置き換えた。
+  - stem キャッシュの確認（`getCachedStemsFn()`）を、従来の「`rawPlan.mode !== 'beatmix'`（＝ beatmix が勝っていない）」というゲートから外し、「`mightBeatmix`（＝そもそも両側に BPM がある）かつ `#stemMixUnavailableKey` に一致しない」というゲートに変更した。beatmix が eligible かどうかに関わらず常に確認する（§6.2 の独立評価の要請どおり）が、BPM が無く beatmix/stem-mix のどちらも原理的に成立し得ないことが既に分かっている pair では、200ms ごとの arm tick で無駄な fs アクセスを繰り返さないよう従来どおりスキップする（純粋なパフォーマンス最適化で、独立評価の意味論には影響しない）。
+  - TRACK ループ再選択（`next === current`）で stem-mix プランを捨てて再プランする箇所は、従来の `rawPlan`（waterfall の非 stem-mix 結果）の代わりに `rankTransitionCandidates()` が返す `bestNonStemPlan` を使うよう変更した。
+  - それ以外（prepDue/readyToFade のゲート、`forcePlainCrossfade` によるダウングレード、`#stemMixUnavailableKey` の設定箇所など）は無変更。
+- テスト:
+  - `src/audio/transitionLog.test.js`: `buildTransitionPlanReport()` の新シグネチャに合わせて全面的に書き直した。「beatmix が勝ったので phrase-crossfade/stem-mix は not-evaluated」という waterfall 前提のテストは、「phrase-crossfade は独立評価されて real reject reason を返す」「stem-mix はキャッシュ未確認なら not-evaluated-stem-mix-unavailable」というテストに置き換えている。アサーションの意味そのもの（HIT/MISS の扱い、vocalActive の判定、legacy exit のフォールバック計算など）は変更していない。
+  - `src/audio/beatmixTransition.js`/`src/audio/stemTransition.js` の既存テストは無変更のまま全件パス（`quality` フィールドの追加は既存の `deepEqual` アサーションと衝突しない — reject 系のテストは `plan.reasons` の部分一致のみを見ており、eligible 系のテストは個別フィールドの `assert.equal` のみで全体 `deepEqual` を使っていないことを確認済み）。
+  - `src/player.acceptance.test.js` は無変更。Phase 8 由来の stem-mix 系テスト（`stemFixtures()` を使うもの全て）は、フィクスチャの outgoing 側 exit 候補が意図的に vocal 区間の途中にあり、beatmix 側の `requireExitVocalSafe` を素で満たせないよう作られている — 独立評価に変えても beatmix は真に ineligible のままなので、stem-mix が勝つという既存の期待どおりの結果になる。beatmix と stem-mix が両方 eligible になる（かつ stem preference bonus の実際の勝敗が試される）フィクスチャは既存テストに存在しないことをコードリーディングで確認した。
+
+### 未決事項 / 既知の制約
+
+- **legacy はスコア競合の対象外**: 上述のとおり、legacy（`planTransition()`）は §6.2 の図には4番目の候補として描かれているが、実装では「beatmix/stem-mix/phrase-crossfade が1つも eligible でないときのみ選ばれる」という waterfall 最下段のセマンティクスのまま据え置いた。理由は上記「実装箇所」参照。将来的に legacy にも意味のある品質モデル（例えば `outgoing.confidence` ではなく実際の遷移相性を反映したスコア）を与えられるなら、`transitionModeBonus()` の `default: 0` と合わせて4候補を完全に対等競合させることもできるはずだが、これは Phase 9D のスコープ外と判断した。
+- ~~stem preference bonus (§6.4) を実際に検証する新規フィクスチャは追加していない~~ → 下記「追記: Codex レビュー対応（PR #46, round 2）」で `src/audio/transitionCandidates.test.js` に実際の分析値によるフィクスチャを追加し、beatmix/stem-mix/phrase-crossfade 間のタイブレークが数値どおりに機能することを検証した。
+- **`mightBeatmix` ゲートは stem-mix の独立評価をわずかに妥協している**: 純粋な §6.2 の要請どおりなら、beatmix が原理的に不可能な pair でも stem-mix のキャッシュ確認自体は独立に行うべきだが、BPM が無ければ `planStemTransition()`（内部で `planBeatmixTransition()` の BPM ゲートを再利用している）も必ず reject するため、確認しても意味がない。200ms ごとの arm tick で無駄な fs アクセスを避けるための意図的な最適化であり、実際の eligibility 判定結果には影響しない。
+- **実測評価は未実施**: Phase 9A/9B/9C のノートが繰り返し書いている制約と同じく、stem preference bonus が実際の楽曲でどの程度 stem-mix を選ばせるようになるか（そしてそれが聴感上望ましいか）は実音源・実運用での確認が必要で、本エージェント環境では実施できない。
+
+### 完了条件（§6 相当）
+
+- [x] beatmix / stem-mix / phrase-crossfade が独立候補として評価される（一方が eligible でも他方の評価をスキップしない）
+- [x] Candidate 構造（§6.3: `mode`/`eligible`/`score`/`quality`/`fadeSec`/`bars`）を実装し、`quality` の6項目（`phraseAlignment`/`tempoCompatibility`/`vocalSafety`/`downbeatConfidence`/`harmonicCompatibility`/`energyContinuity`）を各モードから返す
+- [x] `transitionModeBonus()`（§6.4）を実装し、`rankTransitionCandidates()` のスコア比較に適用した
+- [x] stem preference: stem-mix と beatmix が両方 eligible な場合、bonus によりタイ・僅差では stem-mix が優先され、品質差が大きい場合は beatmix が選ばれ得る（argmax(`score + bonus`) の自然な帰結。上記未決事項のとおり、この具体的なタイブレーク挙動を検証する専用テストは未追加）
+- [x] `[MIX PLAN]` レポート（§3.2）が独立評価を正しく反映する（beatmix が勝っても phrase-crossfade/stem-mix は実際の評価結果を報告する。stem-mix が「未評価」なのは、キャッシュ未確認 or BPM無しで原理的に不可能な場合のみ）
+- [x] 既存の Phase 7-9C の挙動が変わっていないことをテストで確認: `bun run test:server` で 729件中 721 pass / 4 fail（`silenceTrim.test.js` の ffmpeg 未インストールによる既知の失敗のみ、Phase 9A/9B/9C のノートに書かれているものと同一）/ 4 skip
+- [ ] stem preference bonus の実運用での聴感評価（上記未決事項参照）
+
+### 追記: Codex レビュー対応（PR #46, round 2）
+
+初回実装後の Codex レビューで、§6.4 のスコア比較そのものに関わる実バグ2件が見つかった。いずれも「あるモードのスコアが、他モードと同じ土俵で比較できない形で計算されている」という同じ種類の問題で、`transitionModeBonus()` の小さな差分（+0.10/+0.05/+0.02）と組み合わさることで、本来品質で劣るはずの候補が誤って勝ってしまっていた。
+
+- **P2: stem-mix のスコアが常に beatmix 以上になり、事実上負けられない**（`comparableStemMixConfidence()` による最初の修正 → さらに round 2 で修正）
+  - 1回目の指摘: `planStemTransition()` は `vocalSafety` を relaxed（exit 側を評価対象から外す、`stemAware: true`）に計算するため、同じペアなら relaxed スコアは strict スコア以上にしかならない。beatmix の strict スコアと直接比較すると、stem-mix 側の +0.10 bonus（beatmix は +0.05）と合わさって「stem-mix の品質が明らかに劣る場合は beatmix を選ぶ」という §6.4 の除外規定が実質的に到達不能になっていた。最初の修正として `comparableStemMixConfidence()`（`transitionCandidates.js` の ranking 直前に適用する post-hoc 補正）を追加したが、これはレビューで round 2 の指摘を受けた:
+  - 2回目の指摘: post-hoc 補正は `planStemTransition()`（内部で `planBeatmixTransition({stemAware:true, ...})` を呼ぶ）が **relaxed スコアで exit/entry ペアの探索を既に終えたあと** の、生き残った1個のペアにしか適用できない。relaxed 探索が「エネルギー的には良いが深く vocal 中の exit」を先に選んでしまっていた場合、strict スコアなら勝っていたはずの「vocal-safe な別の exit」は探索の時点で既に捨てられており、post-hoc 補正では復元できない。
+  - 根本修正: `planBeatmixTransition()` の探索ループ自体（`pairScore` の計算、`beatmixTransition.js`）を、`stemAware` の値に関わらず常に strict スコア（`scoreTransitionPair({ ..., stemAware: false })`）でランキングするよう変更した。`stemAware: true`（`requireExitVocalSafe: false` 経由）は引き続き「mid-vocal な exit を候補として許可する」役割のみを担い、「その候補たちの中でどれが最良か」の判定は strict スコアで行う。結果として、vocal-safe な exit が候補に存在すればそちらが自然に選ばれ、mid-vocal な exit しか無い場合のみ（そしてその場合に限り）そちらが選ばれる。この修正により `planStemTransition()`/`planBeatmixTransition()` が返す `confidence` 自体が既に cross-mode で比較可能になったため、`comparableStemMixConfidence()` とその `transitionCandidates.js` 側の呼び出しは削除した（もはや不要かつ、二重補正になり誤った値を返すリスクがあった）。最終的な `quality.vocalSafety`（レポート用、relaxed のまま）は変更していない — stem-mix 自身の「per-stem envelope があるので実際には安全」という主張はそのまま保持している。
+  - テスト: `beatmixTransition.test.js` に、mid-vocal だが高い phrase score を持つ exit と、vocal-safe だが低い phrase score の exit の両方を候補として与え、strict ランキングが後者を選ぶことを確認するテストを追加した（探索ロジック自体の修正を直接検証）。修正を一時的に revert すると期待どおり前者が選ばれ、修正で失敗が再現することを確認済み。
+- **P2: phrase-crossfade のスコアが beatmix の tempo/downbeat ペナルティを回避できてしまう**
+  - 指摘: `planPhraseCrossfade()` の `confidence` は `phraseAlignment` 単独（tier 2 はテンポ同期もダウンビートグリッドも一切評価しない）。beatmix の6項目加重平均と直接比較すると、テンポが全く同期していない phrase-crossfade でも `phraseAlignment: 1`（きれいなフレーズ境界が見つかっただけ）で `confidence: 1` になり得る一方、実際には強くテンポ同期できている beatmix が `tempoCompatibility`/`downbeatConfidence` 項の加重平均で 1 未満に収まる分だけ不利になり、beatmix の bonus（+0.05）を足しても phrase-crossfade の bonus（+0.02）付きスコアに負けることがあった。
+  - 修正: `comparablePhraseCrossfadeConfidence()`（`beatmixTransition.js`）を追加した。stem-mix の場合と異なり、こちらは探索ループ自体を直す必要がない（tier 2 の候補探索は元々 `phraseAlignment` のみで比較しており、tempo/downbeat 項は最初から存在しないため「別の候補を先に捨ててしまう」問題は起きない）ので、`transitionCandidates.js` 側の ranking 直前で post-hoc 補正するだけで十分。`scoreTransitionPairDetail()` と同じ加重式を使い、`vocalSafety`/`phraseAlignment`/`energyContinuity` は実際の値を、`tempoCompatibility`/`downbeatConfidence` は（項自体を加重平均の分母から除外するのではなく）明示的に `0` として計算する — 除外すると「同期していないことを評価しない」＝今回のバグの再現になってしまうため、必ず加算対象に含めた上でゼロ点を与える必要がある。
+  - テスト: `comparablePhraseCrossfadeConfidence()` の単体テストに加え、`transitionCandidates.test.js` に実際の分析値（`bpm: 120` vs `124`、`downbeatConfidence` 0.5前後）による beatmix/phrase-crossfade 両方 eligible なフィクスチャを追加し、修正前は phrase-crossfade（rank 1.02）が beatmix（rank 0.822）に勝ってしまうこと、修正後は beatmix が正しく勝つこと（phrase-crossfade の補正後 rank は約0.591）を確認した。逆に、beatmix が原理的に ineligible（incoming 側に BPM が無い）な場合は phrase-crossfade がそのまま勝つことも別テストで確認し、「常に beatmix を優先するだけの修正になっていないか」を検証した。
+- 上記2件を踏まえ `src/audio/transitionCandidates.js` の `toCandidate()` は `scoreOverride` 引数を維持しつつ、適用先を stem-mix から phrase-crossfade に切り替えた（stem-mix は探索側の修正で不要になったため）。
+- テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
+### 追記: Codex レビュー対応（PR #46, round 3）
+
+round 2 の `comparablePhraseCrossfadeConfidence()`（post-hoc 補正）は、stem-mix の round 2 修正と全く同じ構造上の欠陥を持っていた — `planPhraseCrossfade()` 自身の候補探索が既に raw `phraseAlignment` だけでペアを選び終えたあとにしか補正を適用できず、探索時点で「vocal-safety margin は薄いが phraseAlignment は高い」ペアが「margin は十分だが phraseAlignment はやや低い」より良いペアを既に捨ててしまっていた場合、補正はそれを救えなかった。
+
+- **P2: phrase-crossfade もペア探索自体で比較可能スコアを使うべき** — stem-mix の round 2 根本修正（探索ループ自体を strict スコアでランキング）と同じアプローチを適用した。`planPhraseCrossfade()` の候補探索ループを、raw `phraseAlignment` ではなく `comparablePhraseCrossfadeConfidence()` と同じ加重式（vocalSafety/phraseAlignment/energyContinuity、tempoCompatibility/downbeatConfidence はゼロ点）で各ペアをランキングするよう変更した。これにより勝者ペア自身の `confidence` が既に cross-mode で比較可能な値になったため、`comparablePhraseCrossfadeConfidence()` 関数と `transitionCandidates.js` 側の `scoreOverride` 呼び出しは完全に不要になり削除した（`toCandidate()` の `scoreOverride` パラメータ自体も削除 — stem-mix・phrase-crossfade どちらの post-hoc 補正も今は探索側の修正で不要になったため）。
+  - テスト: `beatmixTransition.test.js` に、vocal境界ぎりぎり（margin ほぼ0）だが phraseAlignment が高いペアと、margin は十分だが phraseAlignment がやや低いペアの両方を候補として与え、比較可能スコアでのランキングが後者を選ぶことを確認するテストを追加した。
+- 併せて、PR #46 のスコア較正修正で唯一残っていた未対応の指摘（"Preserve the non-stem fallback until stem prep commits" — take 時に stem prep が間に合わなかった場合、`bestNonStemPlan` へフォールバックせずこの試行全体を中断してしまう問題）は、根本的な修正が `player.js` の take-time commit パスへの実質的な改修（`bestNonStemPlan` 用の代替ソースを投機的に準備する、または take-time の abort 箇所でその場で `bestNonStemPlan` から再プランして即座にフォールバックする、のいずれか）を要するアーキテクチャ上のより大きな変更と判断し、このセッションでは対応を保留し、診断結果と2つの対応方針候補を PR コメントで提示した。
+- **P2: 部分的な stem-cache hit がメモ化されなかった** — `#stemCacheHit` は current/next の**両方**が hit した場合にのみメモ化されていたため、片側（多くは outgoing）が既にキャッシュ済みでもう片側の分離がまだ進行中、という頻出する過渡状態では毎回（約200msごとの arm tick ごとに）両方を再確認していた — `getCachedStems()` は読み取り専用ではなく `utimes()` で LRU の mtime を更新するため、無駄な fs アクセスが積み重なる。`#stemCacheHit` を `#outStemCacheHit`/`#inStemCacheHit` の2つに分割し、それぞれ自分のトラック識別子だけをキーにして独立にメモ化するよう変更した — 既に hit している側はどの `next` と組み合わされていても再利用され、まだ miss の側だけが毎 tick 再確認される。
+
+### 追記: Codex レビュー対応（PR #46, round 4）
+
+round 3 の `#outStemCacheHit`/`#inStemCacheHit`（片側ごとの独立メモ化）に、round 3 のマージ後さらに1件の指摘が見つかった。
+
+- **P2: 部分的な hit がメモ化されたまま失効を検知できない** — round 3 修正は、片側（多くは outgoing）が既に hit してメモ化されている間、もう片側の分離が完了するまで何十ティックも `getCachedStemsFn()` を呼ばずに済ませる設計だった。しかし `pruneStemCache()` はバックグラウンドでいつでもエントリを evict しうるため、メモ化された側のファイルがその間に消えても、もう片側が hit した瞬間にそのまま「両方揃った」と判定してしまう（stale なメモを一度も再検証しない）。これにより、実際にはもう存在しない stem ペアを `stemsAvailable: true` として ranker に渡してしまい、まだ準備できていた beatmix 等の候補を stem-mix が上書きしてしまう——そして stem-mix 自身も `#ensureOutgoingStemPrep()`/`#ensureIncomingStemPrep()` 側の prep-time revalidation で初めて失敗に気づくため、その時点では手遅れ（take-time abort パスに落ちる）。
+  - 修正: 「もう片側がちょうどこのティックで hit に転じた」瞬間（`needIn && !needOut` またはその逆）にのみ、メモ化されていた側を1回だけ再検証するようにした。まだ両方待ち状態のティック（もう片側がまだ missing のまま）や、両方とも既にメモ化済みの定常状態（外側の `needOut || needIn` チェックがそもそも false になり、このブロック全体がスキップされる）には影響しない——メモ化本来の目的（片側 hit 中の毎ティック fs アクセスを避けること）を損なわずに、新規に導入されたステイル判定ウィンドウだけを閉じている。
+  - テスト: outgoing 側は最初の呼び出しのみ hit・以降は毎回 miss（バックグラウンド eviction を模擬）、incoming 側は最初の数ティックは miss・その後 hit に転じるフィクスチャを用意し、incoming が hit した後もステム専用ソース（`createFileSourceFn`）が一度も spawn されないこと、また最終的に選ばれた遷移モードが `stem-mix` にならないことを確認するテストを追加した。修正を revert すると、期待どおりステム専用ソースが 2 件 spawn される（stale なメモを信じて stem-mix にコミットしてしまう）ことを確認済み。
+- テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
+### 追記: Codex レビュー対応（PR #46, round 5）
+
+round 4 のプッシュ後、さらに2件の実バグが見つかった。
+
+- **P2: marginal-tempo の信頼度ゲートが常に strict スコアを見ていた** — round 2 の根本修正（`planBeatmixTransition()` の探索を `stemAware` の値に関わらず常に strict スコアでランキングする）以降、`isMarginalTempo && best.pairScore < MARGINAL_TEMPO_MIN_SCORE` の判定も同じ strict `pairScore` を再利用していた。しかし stem-mix 候補にとって、mid-vocal な exit の strict vocalSafety はゼロになりうる——それこそが stem separation が安全にする対象そのものであり、relaxed（`stemAware: true`）スコアなら閾値をクリアする場合がある。修正: marginal-tempo の適格性判定だけ、`stemAware` が true のときは同じペアを `stemAware: true` で再スコアリングした値を使うようにした（どのペアが勝つか自体は引き続き strict スコアで決まる）。
+  - テスト: 深く mid-vocal な exit（strict score ~0.53、閾値0.7未満）だが relaxed score は ~0.768（閾値クリア）というフィクスチャで、`stemAware: true` 呼び出しが `eligible: true` になることを確認するテストを追加した。数値は `scoreTransitionPairDetailed()` を直接呼ぶデバッグスクリプトで実測して較正した。
+- **P2: TRACK loop のエントリーリセットが phrase-crossfade の baseSwap/EQ を剥がしていなかった** — TRACK loop（`next === current`）がエントリーを強制的に 0 へリセットする際、`norm.mixPlan.mode === 'beatmix'` のときだけ `baseSwap`/`sync`/`eq` を剥がしていた。Phase 9D の独立ランカー以降、beatmix が原理的に ineligible（例: BPM データなし）でも phrase-crossfade 単独で勝つケースがあり、そのケースでは元々選択されたフレーズ境界向けの `baseSwap: true`/EQ がそのまま、実際にはエントリー0（曲の先頭）から再生される音声に適用されてしまっていた。修正: `normalizeTransitionPlan()` を呼ぶたびに、どの raw plan（`selectedPlan` か、stem-mix 降格時の `bestNonStemPlan`）が現在 `norm` に反映されているかを `normRawMode` として追跡し、`norm.mixPlan.mode === 'beatmix' || normRawMode === 'phrase-crossfade'` のときに剥がすよう拡張した。
+  - テスト: BPM データなし（beatmix が bpm-unavailable で ineligible、phrase-crossfade のみが候補）のフィクスチャで TRACK loop を有効にし、`planBeatSyncedTransition()` の raw plan が実際に `phrase-crossfade`（`baseSwap: true`、エントリーは非ゼロ）であることをテスト不変条件として確認した上で、実際の TRACK loop 再生後に `startedPlan.baseSwap === false` になることを確認するテストを追加した。修正を revert すると `baseSwap` が `true` のまま漏れることを確認済み。
+- テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
+### 追記: Codex レビュー対応（PR #46, round 6）
+
+round 5 のプッシュ後、さらに2件の指摘が見つかった。いずれも「ある時点で正しく計算された値が、その後の別の分岐で更新されずに古いまま使われ続ける」という同じ種類の見落としで、片方は round 2/3 の探索アーキテクチャの教訓（post-hoc 補正では既に捨てたペアを復元できない）が marginal-tempo ゲートには波及していなかったケース、もう片方は round 5 の `.entry` reconciliation と対になるはずの `.exit` 側が漏れていたケース。
+
+- **P2: marginal-tempo ゲートが strict 勝者ペアの post-hoc 再チェックのままだった** — `planBeatmixTransition()` の探索ループ自体は round 2 の根本修正で常に strict スコアでランキングしているが、marginal-tempo 判定（`isMarginalTempo && ... < MARGINAL_TEMPO_MIN_SCORE`）はループの外、strict スコアで既に選ばれた単一の `best` ペアに対してのみ実行されていた。これは round 2/3 で stem-mix/phrase-crossfade の探索そのものに適用したのと全く同じ「post-hoc 補正は、探索が既に他のペアを捨ててしまったあとでは救えない」構造上の欠陥で、marginal-tempo ゲートには波及していなかった。具体的には、strict スコアで僅差で勝つ vocal-safe なペアがマージナル閾値を割り込む一方、strict スコアでは僅差で負けるが marginal 判定用の（`stemAware` なら relaxed）スコアなら閾値を大きく超える別のペアが存在する場合、探索ループが前者を選んだ時点で後者は既に捨てられており、post-hoc チェックは前者を reject するだけで後者へのフォールバックができず、`marginal-tempo-low-confidence` で丸ごと不合格になっていた。
+  - 修正: `beatmixTransition.js` の探索ループ内で、`isMarginalTempo` のときは各ペアごとにマージナル判定用スコア（`stemAware` なら `stemAware: true` で再計算、そうでなければ strict の `pairScore` をそのまま使用）を都度計算し、閾値を下回るペアはその場で候補から除外（`anyMarginalRejected` フラグを立てて次のペアへ）してから `best` の更新判定に進むよう変更した。全ペアが reject された場合のみ最終的に `marginal-tempo-low-confidence` で不合格にする。9D（`beatmixTransition.js` の単純な密探索）と 9E（tiers-outer 構造の探索）の両方のアーキテクチャに、それぞれの構造に合わせた形で同じ修正を適用した。
+  - テスト: strict スコアの勝負では vocal-safe な exit（marginal 判定でも threshold 未満）が勝つが、marginal 判定のスコアでは threshold を上回る mid-vocal な exit が別に存在する、という `stemAware: true` 呼び出し用フィクスチャを `beatmixTransition.test.js` に追加し、`planBeatmixTransition()` が後者（`exitStartSec` が mid-vocal 側の値）を選んで `eligible: true` になることを確認した。数値は `scoreTransitionPairDetailed()` を直接呼ぶデバッグスクリプトで実測して較正した。
+- **P2: TRACK loop の stem-mix→bestNonStemPlan 降格が `transitionPlanReport.exit` を更新していなかった** — TRACK loop が stem-mix から `bestNonStemPlan` へ再プランする際（round 5 で追加した `norm = normalizeTransitionPlan(bestNonStemPlan)` の降格パス）、`transitionPlanReport.exit` はレポート構築時点（降格より前）のオリジナル `selectedPlan`（stem-mix）の exit のまま更新されていなかった。`bestNonStemPlan` は relaxed ではない独立した探索から得られるため、stem-mix とは全く異なる exit ペアを選ぶことが構造的にあり得る（stem-mix の relaxed 探索は mid-vocal な exit も候補にできるが、strict な非 stem 系探索はそもそも vocal-safe な exit しか候補に入れない）。round 5 で追加した entry 側の reconciliation（`pendingEntrySec`）は entry のみを直しており、exit 側の同じ問題には未対応だった。結果、実際に再生される音声は `bestNonStemPlan` の exit で降格しているのに、コミットされる `[MIX PLAN]` ログの `.exit` はオリジナルの stem-mix の exit（秒数・bar・vocalActive）を報告し続けてしまっていた。
+  - 修正: `transitionLog.js` の（元々 private だった）`exitInfo()` を export し、`player.js` の降格分岐内で `transitionPlanReport.exit = exitInfo(bestNonStemPlan, outAnalysis, this.#sessionTempo.tempoRatio ?? 1)` を呼んで再計算するようにした。
+  - テスト: 同一トラックの分析を outgoing/incoming 両方に使う TRACK loop フィクスチャで、tail に mid-vocal（stem-mix の relaxed 探索でのみ勝てる、phrase score が高い exit）と vocal-safe（strict 探索が唯一見られる exit）の2候補を用意し、`selectedPlan`（stem-mix）は前者の exit を、`bestNonStemPlan`（beatmix）は後者の exit を選ぶフィクスチャで、コミットされた `[MIX PLAN]` レポートの `report.exit.sec` が `bestNonStemPlan` 側の exit になることを確認するテストを `player.acceptance.test.js` に追加した。修正を revert すると、期待どおり `report.exit.sec` がオリジナルの stem-mix の exit のまま漏れることを確認済み。
+- テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
 ### 追記: Codex レビュー対応（PR #45, round 4）
 
 - **P2: 明示的な `pause()` 単発呼び出しに対して maxStoppedMs のタイムアウトが実際には効いていなかった** — `applyPause()` の `maxStoppedMs` チェックは、自分自身が**再度呼ばれたとき**にしか走らない。`noteUnderrun()` 経由の debounce パスは、実際のアンダーランが続く限りミキサーが繰り返し `noteUnderrun()` を発火させるため、この再チェックが自然に機能する。しかし §5.4 の明示的な `pause(source)` コマンドは edge-triggered（1回呼ばれて、通常は1回の `resume()` と対になるだけ）であり、その `resume()` が来ない場合（呼び出し元の CPU 監視やプレイヤーが消えた、あるいは対応する `noteUnderrunCleared()` が呼ばれ損ねたなど）、SIGSTOP されたままの Demucs 子プロセスを誰も気に留めず、stem キュー全体が永久にブロックされ得た。`applyPause()` が新規に一時停止へ遷移するたび（`noteUnderrun()`/`pauseQueue()`/`pump()` の3経路すべて）に実際の `setTimeout` を張る `armStopTimeout()`/`clearStopTimeout()` を追加し、`applyPause()` の再呼び出しの有無に関わらず `maxStoppedMs` 経過時に確実に `killCurrent()` されるようにした。resume 系（`noteUnderrunCleared()`、`killCurrent()` 自身、`pump()` の完了パス）ではタイマーを解除する。

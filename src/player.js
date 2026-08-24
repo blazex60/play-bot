@@ -18,7 +18,7 @@ import { shouldReconnectRetry } from './player/playbackPolicy.js';
 import { MixStream } from './audio/mixStream.js';
 import { createStreamSource, createFileSource } from './audio/pcmSource.js';
 import { analyzeTrackFile, ANALYSIS_VERSION } from './audio/trackAnalysis.js';
-import { planBeatSyncedTransition } from './audio/beatmixTransition.js';
+import { rankTransitionCandidates } from './audio/transitionCandidates.js';
 import { probeDurationSec } from './audio/duration.js';
 import { createSessionTempoState, resetSessionTempo, probeTempoBackend, compensateDurationSec, buildTempoFilter } from './audio/tempo.js';
 import { TAIL_WINDOW_SEC } from './audio/vocalActivity.js';
@@ -26,7 +26,7 @@ import { LoopMode } from './queue.js';
 import { getAnalysisQueue, getStemPreparationQueue } from './audio/analysisQueue.js';
 import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
 import { planStemTransition } from './audio/stemTransition.js';
-import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition } from './audio/transitionLog.js';
+import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition, exitInfo } from './audio/transitionLog.js';
 import { StemPreparationState, StemPrefetchPriority, StemPrefetchTracker } from './audio/stemPrefetch.js';
 
 const WATCHDOG_INTERVAL = 10_000;
@@ -423,18 +423,28 @@ export class GuildPlayer {
   /** Identity key of an in-flight #ensureIncomingStemPrep() cache-revalidation await, or null — same rationale as #preparingOutgoingStemsKey. */
   #preparingIncomingStemsKey = null;
   /**
-   * Phase 8 (Codex): memoizes a POSITIVE stem-cache lookup for the current
-   * (current,next) pair — #maybeStartCrossfade() re-runs the eligibility
-   * check on every CROSSFADE_ARM_INTERVAL_MS tick for up to the whole lead
-   * window, and getCachedStems() touches the entry's mtime on every hit, so
-   * without this a single transition attempt generates hundreds of
-   * redundant metadata writes once both sides are already cached. Only
-   * positive results are memoized — a miss must keep re-checking every
-   * tick, since background separation completing mid-window is the whole
-   * point of prepping this early, and a miss never touches mtime anyway.
-   * @type {{ key: string, outCachedStems: object, inCachedStems: object } | null}
+   * Phase 8 (Codex), Phase 9D round 3 (Codex): memoizes a POSITIVE
+   * stem-cache lookup, independently per side (outgoing/incoming) —
+   * #maybeStartCrossfade() re-runs the eligibility check on every
+   * CROSSFADE_ARM_INTERVAL_MS tick for up to the whole lead window, and
+   * getCachedStems() touches the entry's mtime on every hit, so without
+   * this a single transition attempt generates hundreds of redundant
+   * metadata writes. Originally memoized only once BOTH sides hit — but
+   * the far more common transient state is one side (usually outgoing,
+   * separated earlier) already cached while the other's separation is
+   * still in flight, and that case got zero benefit from a same-pair-only
+   * memo keyed on both sides at once. Each side is now keyed on its own
+   * track identity (#prefetchKey()) alone, so a positive outgoing hit
+   * stays memoized across ticks regardless of which `next` it's currently
+   * paired with. Only positive results are memoized per side — a miss
+   * must keep re-checking every tick, since background separation
+   * completing mid-window is the whole point of prepping this early, and
+   * a miss never touches mtime anyway.
+   * @type {{ key: string, stems: object } | null}
    */
-  #stemCacheHit = null;
+  #outStemCacheHit = null;
+  /** @type {{ key: string, stems: object } | null} */
+  #inStemCacheHit = null;
   /**
    * videoId:videoId key of a (current, next) pair whose stem-mix attempt
    * was aborted at take time (spawn/prep failure, drift, or an unhonored
@@ -442,7 +452,7 @@ export class GuildPlayer {
    * cache lookup and `planStemTransitionFn()` above are independent of
    * spawn success, leaving this unset would have every subsequent ~200ms
    * arm tick re-select the SAME relaxed stem-mix plan, abort it again, and
-   * never let rawPlan's own plain-crossfade fallback run at all (Codex).
+   * never let the ranker's other candidates run at all (Codex).
    * Checked at plan-selection time to skip stem-mix for this exact pair.
    * Explicitly cleared in #onCrossfadePromoted() once that pair's
    * transition attempt actually concludes — comparing against the CURRENT
@@ -1922,7 +1932,7 @@ export class GuildPlayer {
       // Revalidate against the live cache right before actually spawning —
       // this only runs on a genuine (re)prep, i.e. rarely, not on the
       // steady-state no-op ticks above, so it doesn't reintroduce the
-      // per-tick fs cost player.js's #stemCacheHit memo exists to avoid.
+      // per-tick fs cost player.js's #outStemCacheHit/#inStemCacheHit memo exists to avoid.
       // `cached` (the caller's argument) may be a memoized lookup from
       // several arm-ticks ago; pruneStemCache() can evict the entry any
       // time in the background, and a stale path here would spawn ffmpeg
@@ -2248,10 +2258,13 @@ export class GuildPlayer {
       const outAnalysis = (await this.#getCachedAnalysis(current)) ?? fallbackAnalysis(current);
       const inAnalysis = (await this.#getCachedAnalysis(next)) ?? fallbackAnalysis(next);
       const outgoingPlaybackBpm = this.#sessionTempo.playbackBpm ?? outAnalysis.bpm ?? null;
-      // planBeatmixTransition rejects before ever touching the backend when
-      // either side lacks a usable BPM (the common case — most analyses are
-      // fallbackAnalysis() or simply BPM-less) — skip the real ffmpeg -filters
-      // probe entirely then, rather than spawning it every 200ms arm tick.
+      // planBeatmixTransition/planStemTransition both reject before ever
+      // touching the tempo backend when either side lacks a usable BPM (the
+      // common case — most analyses are fallbackAnalysis() or simply
+      // BPM-less) — skip the real ffmpeg -filters probe (and the stem-cache
+      // fs lookup below) entirely then, rather than spawning either every
+      // 200ms arm tick for a pair that can never be beatmix/stem-mix
+      // eligible anyway.
       const mightBeatmix = outAnalysis.bpm > 0 && (inAnalysis.headBpm ?? inAnalysis.bpm) > 0;
       // 'rubberband' is only a placeholder for the branch where no probe ran
       // at all (planBeatmixTransition rejects on bpm-unavailable before ever
@@ -2261,37 +2274,25 @@ export class GuildPlayer {
       // backend is available when it isn't, producing a filter string ffmpeg
       // can't actually apply.
       const tempoBackend = mightBeatmix ? await this.#probeTempoBackendFn() : 'rubberband';
-      const rawPlan = planBeatSyncedTransition(outAnalysis, inAnalysis, {
-        outgoingPlaybackBpm,
-        tempoBackend,
-        maxOverlapSec: MAX_CROSSFADE_SEC,
-      });
 
-      // Phase 8 (docs/mix-transition-phase8.md): only attempted when plain
-      // tier-1 beatmix did NOT win the fallback ladder (mode !== 'beatmix')
-      // — stem-mix reuses 100% of beatmix's tempo/downbeat/meter gating (via
-      // planStemTransition()'s relaxed-flag options into
-      // planBeatmixTransition()), so if beatmix already succeeded there is
-      // nothing for it to improve on; it exists specifically to rescue the
-      // case where only the whole-overlap vocal-safety requirement stood in
-      // the way. Gated on stems already being cached (a cheap fs check) so
-      // this never triggers separation itself — #scheduleAnalysis() already
-      // does that in the background, well before a transition is imminent.
-      // Looked up once here and reused at both the prepDue and readyToFade
-      // points below — a second fs check right before spawning would risk
-      // observing a DIFFERENT cache state than what eligibility was actually
-      // decided against a few lines up.
-      //
-      // Tried BEFORE rawPlan's own gapless/no-fade early return (not after)
-      // — planStemTransition() is derived independently from outAnalysis/
-      // inAnalysis, not from rawPlan, so a rawPlan that fell all the way to
-      // 'gapless' (e.g. low aggregate/vocal confidence even with strong
-      // beat/downbeat analysis) must not preempt an otherwise-eligible
-      // stem-mix plan (Codex).
+      // Phase 9D (docs/mix-transition-phase9.md §6): beatmix / stem-mix /
+      // phrase-crossfade are evaluated as independent candidates —
+      // rankTransitionCandidates() plans all of them regardless of whether
+      // the others are eligible, then picks a winner by score +
+      // transitionModeBonus() (§6.4) rather than the pre-Phase-9D waterfall
+      // (tier 1 beatmix winning outright, stem-mix only attempted when it
+      // didn't). The stem-cache lookup below therefore always runs (subject
+      // only to the mightBeatmix/`#stemMixUnavailableKey` gates above/below,
+      // not to whether beatmix already "won") — gated on stems already
+      // being cached (a cheap fs check) so this never triggers separation
+      // itself; #scheduleAnalysis() already does that in the background,
+      // well before a transition is imminent. Looked up once here and
+      // reused at both the prepDue and readyToFade points below — a second
+      // fs check right before spawning would risk observing a DIFFERENT
+      // cache state than what eligibility was actually decided against a
+      // few lines up.
       let outCachedStems = null;
       let inCachedStems = null;
-      let norm = null;
-      let stemPlan = null;
       // Codex review (PR #43, round 9): videoId-less tracks (the playlist
       // route explicitly allows this) previously all collapsed to the same
       // ":" key here — an evaluated A→B pair's stash would then get
@@ -2302,34 +2303,69 @@ export class GuildPlayer {
       const stemCacheLookupKey = `${this.#prefetchKey(current) ?? ''}:${this.#prefetchKey(next) ?? ''}`;
       // Phase 9A (docs/mix-transition-phase9.md §3): whether the stem-cache
       // lookup below actually ran this tick — distinguishes a genuine
-      // HIT/MISS from "never checked" (beatmix already won, or this pair is
-      // marked #stemMixUnavailableKey) for the [MIX PLAN] log/metrics built
-      // further down. Read-only bookkeeping; does not affect selection.
-      const stemCacheAttempted = rawPlan.mode !== 'beatmix' && this.#stemMixUnavailableKey !== stemCacheLookupKey;
+      // HIT/MISS from "never checked" (this pair is marked
+      // #stemMixUnavailableKey, or stem-mix could never be eligible anyway)
+      // for the [MIX PLAN] log/metrics built further down. Read-only
+      // bookkeeping; does not affect selection.
+      const stemCacheAttempted = mightBeatmix && this.#stemMixUnavailableKey !== stemCacheLookupKey;
       if (stemCacheAttempted) {
-        if (this.#stemCacheHit?.key === stemCacheLookupKey) {
-          ({ outCachedStems, inCachedStems } = this.#stemCacheHit);
-        } else {
-          [outCachedStems, inCachedStems] = await Promise.all([
-            this.#getCachedStemsFn(current.videoId),
-            this.#getCachedStemsFn(next.videoId),
+        // Codex review (PR #46, round 3, P2): each side is checked/memoized
+        // independently — a positive outgoing hit from an earlier tick (or
+        // an earlier pairing entirely, keyed on the track alone) is reused
+        // without re-touching the filesystem, and only the side(s) still
+        // missing actually call getCachedStemsFn() this tick.
+        const outKey = this.#prefetchKey(current);
+        const inKey = this.#prefetchKey(next);
+        outCachedStems = this.#outStemCacheHit?.key === outKey ? this.#outStemCacheHit.stems : null;
+        inCachedStems = this.#inStemCacheHit?.key === inKey ? this.#inStemCacheHit.stems : null;
+        const needOut = !outCachedStems;
+        const needIn = !inCachedStems;
+        if (needOut || needIn) {
+          const [freshOut, freshIn] = await Promise.all([
+            needOut ? this.#getCachedStemsFn(current.videoId) : Promise.resolve(outCachedStems),
+            needIn ? this.#getCachedStemsFn(next.videoId) : Promise.resolve(inCachedStems),
           ]);
+          outCachedStems = freshOut;
+          inCachedStems = freshIn;
+          if (needOut && outCachedStems) this.#outStemCacheHit = { key: outKey, stems: outCachedStems };
+          if (needIn && inCachedStems) this.#inStemCacheHit = { key: inKey, stems: inCachedStems };
+          // Codex review (PR #46, round 4): a side reused from memo above
+          // (not freshly checked THIS tick) must still be revalidated once,
+          // right here, the moment the OTHER side just landed and the pair
+          // is about to be reported complete for the first time —
+          // pruneStemCache() can evict a memoized hit's files at any point
+          // in the background, and without this the newly-complete pair
+          // would report stemsAvailable:true off a memo that may have
+          // already gone stale, potentially displacing an already-ready
+          // beatmix candidate for a stem-mix plan whose OWN prep-time
+          // revalidation (#ensureOutgoingStemPrep()/#ensureIncomingStemPrep())
+          // only discovers the missing file much later, after the ranker's
+          // choice already stuck. Only fires on this "just became complete"
+          // transition — ordinary "still waiting" ticks (the other side
+          // stays missing) and the steady both-hit state (the outer
+          // `needOut || needIn` check above is false, skipping this whole
+          // block every tick) are unaffected, so this doesn't reintroduce
+          // the per-tick fs cost the memoization itself exists to avoid.
           if (outCachedStems && inCachedStems) {
-            this.#stemCacheHit = { key: stemCacheLookupKey, outCachedStems, inCachedStems };
-          }
-        }
-        if (outCachedStems && inCachedStems) {
-          stemPlan = this.#planStemTransitionFn(outAnalysis, inAnalysis, {
-            outgoingPlaybackBpm,
-            tempoBackend,
-            maxOverlapSec: MAX_CROSSFADE_SEC,
-          });
-          if (stemPlan.eligible) {
-            norm = normalizeTransitionPlan(stemPlan);
+            if (needIn && !needOut) {
+              outCachedStems = await this.#getCachedStemsFn(current.videoId);
+              this.#outStemCacheHit = outCachedStems ? { key: outKey, stems: outCachedStems } : null;
+            } else if (needOut && !needIn) {
+              inCachedStems = await this.#getCachedStemsFn(next.videoId);
+              this.#inStemCacheHit = inCachedStems ? { key: inKey, stems: inCachedStems } : null;
+            }
           }
         }
       }
-      // Phase 9A: snapshot the ladder's decision (before any later downgrade
+
+      const { candidates, selectedPlan, bestNonStemPlan } = rankTransitionCandidates(outAnalysis, inAnalysis, {
+        outgoingPlaybackBpm,
+        tempoBackend,
+        maxOverlapSec: MAX_CROSSFADE_SEC,
+        stemsAvailable: Boolean(outCachedStems && inCachedStems),
+        planStemTransitionFn: this.#planStemTransitionFn,
+      });
+      // Phase 9A: snapshot the ranker's decision (before any later downgrade
       // — TRACK loop mode / an incoming source that can't honor a seek or
       // stretch) into a log report. `selected`/`downgradedFrom` are
       // finalized right before the actual startCrossfade()/
@@ -2338,23 +2374,23 @@ export class GuildPlayer {
       //
       // Codex review (PR #43, round 6): built and stashed BEFORE the
       // gapless/no-fade early return below (moved up from after it) — a
-      // 'gapless' rawPlan still means beatmix/stem-mix/phrase-crossfade
+      // 'gapless' selectedPlan still means beatmix/stem-mix/phrase-crossfade
       // were genuinely evaluated and rejected just now, and the eventual
       // hard-handoff log (via #takeMatchingEvaluatedTransition()) should
       // report those real rejection reasons instead of falling back to the
       // generic "no candidate evaluation" stub for every gapless case.
-      const plannedMode = stemPlan?.eligible ? 'stem-mix' : rawPlan.mode;
+      const plannedMode = selectedPlan.mode;
       const transitionPlanReport = buildTransitionPlanReport({
         outgoingTrack: current,
         incomingTrack: next,
         outgoingAnalysis: outAnalysis,
         incomingAnalysis: inAnalysis,
-        rawPlan,
-        stemPlan,
+        candidates,
         stemCacheAttempted,
         outgoingStemsCached: Boolean(outCachedStems),
         incomingStemsCached: Boolean(inCachedStems),
         plannedMode,
+        selectedPlan,
         // Codex review (PR #43, round 5): read directly off #sessionTempo
         // rather than waiting for the local `outgoingTempoRatio` const
         // further down — same instance field, same tick, nothing mutates
@@ -2384,10 +2420,16 @@ export class GuildPlayer {
       // can't retroactively change what was stashed for this tick.
       this.#stashLastEvaluatedTransition(stemCacheLookupKey, transitionPlanReport);
 
-      if (!norm) {
-        if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
-        norm = normalizeTransitionPlan(rawPlan);
-      }
+      if (selectedPlan.mode === 'gapless' || !(selectedPlan.fadeSec > 0)) return;
+      let norm = normalizeTransitionPlan(selectedPlan);
+      // Codex review (PR #46, round 5): which RAW (pre-normalizeTransitionPlan)
+      // mode `norm` currently reflects — normalizeTransitionPlan() flattens
+      // both 'beatmix' and 'phrase-crossfade' into mixPlan.mode: 'crossfade'/
+      // 'beatmix' respectively at different points, so `norm.mixPlan.mode`
+      // alone can't distinguish a phrase-crossfade plan from a legacy one
+      // below. Reassigned alongside `norm` itself whenever it's rebuilt from
+      // a different rawPlan (the stem-mix -> bestNonStemPlan re-plan below).
+      let normRawMode = selectedPlan.mode;
 
       let modeDowngraded = false;
 
@@ -2399,8 +2441,9 @@ export class GuildPlayer {
       // re-arms with the same nonzero entrySec (Codex round-5). The outgoing
       // exit point is still meaningful (fade the ending into the beginning),
       // so only the entry side is forced back to a true restart; downgrade
-      // out of beatmix since its bar envelope assumed the original,
-      // downbeat-aligned candidate rather than the file's real start.
+      // out of beatmix/phrase-crossfade since both assumed the original
+      // selected boundary (bar-aligned or phrase-aligned) rather than the
+      // file's real start.
       if (next === current) {
         if (norm.mixPlan.mode === 'stem-mix') {
           // stem-mix's own exitStartSec was chosen with vocal-safety
@@ -2408,22 +2451,44 @@ export class GuildPlayer {
           // — reusing it for a plain (non-separated) crossfade can violate
           // 禁止5 (vocal-on-vocal collision), since without the per-stem
           // envelope there's nothing keeping the outgoing vocal tail clear
-          // of the incoming track's own start. Re-plan from rawPlan (the
-          // ordinary, non-relaxed fallback-ladder result) instead of merely
-          // stripping stems from the relaxed plan (Codex) — matches the
-          // same beatmix/plain-crossfade downgrade this loop-mode override
-          // already performs safely for non-stem plans.
-          if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
-          norm = normalizeTransitionPlan(rawPlan);
+          // of the incoming track's own start. Re-plan from bestNonStemPlan
+          // (the ranker's best of beatmix/phrase-crossfade/legacy, i.e. the
+          // ordinary, non-relaxed candidates) instead of merely stripping
+          // stems from the relaxed plan (Codex) — matches the same beatmix/
+          // plain-crossfade downgrade this loop-mode override already
+          // performs safely for non-stem plans.
+          if (bestNonStemPlan.mode === 'gapless' || !(bestNonStemPlan.fadeSec > 0)) return;
+          norm = normalizeTransitionPlan(bestNonStemPlan);
+          normRawMode = bestNonStemPlan.mode;
           // Phase 9A: the mode actually used just changed away from the
           // planned 'stem-mix' — see transitionPlanReport's finalization
           // below.
           modeDowngraded = true;
+          // Codex review (PR #46, round 6): transitionPlanReport.exit was
+          // built (above, at report-construction time) from the ORIGINAL
+          // selectedPlan (stem-mix) — bestNonStemPlan's own ranker-selected
+          // exit/entry pair need not be the same one, since it comes from
+          // an entirely independent (stricter, non-relaxed) candidate
+          // search. Without recomputing here, a committed [MIX PLAN] log
+          // for this downgrade could report the stem-mix plan's exit
+          // second/bar/vocalActive state while the audio actually executed
+          // bestNonStemPlan's different exit — the existing entry-side
+          // reconciliation below (pendingEntrySec) only fixes entry, not
+          // exit.
+          transitionPlanReport.exit = exitInfo(bestNonStemPlan, outAnalysis, this.#sessionTempo.tempoRatio ?? 1);
         }
         norm.entrySec = 0;
         norm.tempoFilter = null;
         norm.sessionTempo = null;
-        if (norm.mixPlan.mode === 'beatmix') {
+        // Codex review (PR #46, round 5): with the independent ranker
+        // (Phase 9D), a phrase-crossfade plan (baseSwap:true, EQ chosen for
+        // its own selected phrase boundary) can win even while beatmix is
+        // eligible — previously only checking `mode === 'beatmix'` here left
+        // a phrase-crossfade's boundary-dependent EQ/baseSwap applied to
+        // audio that TRACK loop just reset to entrySec 0, the same class of
+        // bug the forcePlainCrossfade downgrade below already guards
+        // against for an unhonored source seek.
+        if (norm.mixPlan.mode === 'beatmix' || normRawMode === 'phrase-crossfade') {
           norm.mixPlan = {
             ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null,
           };
@@ -2565,10 +2630,10 @@ export class GuildPlayer {
           // the incoming track's own start — a plain crossfade has no such
           // envelope, so this can violate 禁止5 (vocal-on-vocal collision).
           // Abort this attempt entirely rather than downgrade the window
-          // (Codex); mark the pair unavailable so the NEXT arm tick's plan
-          // selection above falls through to rawPlan's own, non-relaxed
-          // selection instead of re-picking this same relaxed stem plan
-          // and looping on this same abort forever (Codex round-9 follow-up).
+          // (Codex); mark the pair unavailable so the NEXT arm tick's
+          // ranker call above evaluates with stemsAvailable: false instead
+          // of re-picking this same relaxed stem plan and looping on this
+          // same abort forever (Codex round-9 follow-up).
           this.#stemMixUnavailableKey = stemCacheLookupKey;
           source.destroy();
           await this.#cleanupIncomingTempFile();
@@ -2645,8 +2710,8 @@ export class GuildPlayer {
           // planStemTransitionFn() above are independent of spawn success,
           // so every subsequent arm tick would re-select this same relaxed
           // stem plan and abort again here — retrying until the outgoing
-          // track reaches EOF and never letting rawPlan's plain-crossfade
-          // fallback run at all (Codex round-9 follow-up).
+          // track reaches EOF and never letting the ranker's other
+          // candidates run at all (Codex round-9 follow-up).
           this.#stemMixUnavailableKey = stemCacheLookupKey;
           source.destroy();
           await this.#cleanupIncomingTempFile();
@@ -2828,12 +2893,13 @@ export class GuildPlayer {
    *
    * Either way, dispatch happens only after #getCachedStemsFn() confirms a
    * miss — a cache HIT just (re-)marks the entry READY. Unlike
-   * #stemCacheHit's own "only positive results are memoized", READY is
-   * NOT sticky here: every #prefetchUpcoming() call re-probes the cache
-   * regardless of the entry's current state (background separation
-   * completing mid-window is the whole point for a MISS, and a previously
-   * cached pair can be evicted later by pruneStemCache() — see the Codex
-   * review note at this method's cache-probe call site).
+   * #outStemCacheHit/#inStemCacheHit's own "only positive results are
+   * memoized", READY is NOT sticky here: every #prefetchUpcoming() call
+   * re-probes the cache regardless of the entry's current state
+   * (background separation completing mid-window is the whole point for a
+   * MISS, and a previously cached pair can be evicted later by
+   * pruneStemCache() — see the Codex review note at this method's
+   * cache-probe call site).
    * Nothing here is awaited by #maybeStartCrossfade() or anything else on
    * the realtime playback path — every call this method makes is
    * fire-and-forget from that path's perspective (§5.4 "Playback Safety",

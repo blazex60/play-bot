@@ -205,8 +205,29 @@ export function findEntryCandidates(incoming) {
  * §10 transitionScore, normalized to 0..1 so it doubles as the resulting
  * plan's `confidence`. Key compatibility is scored when available but never
  * gates eligibility (§9.2: "キー一致は必須条件にしない").
+ *
+ * Phase 9D (docs/mix-transition-phase9.md §6.3): this used to compute and
+ * discard every sub-term, returning only the weighted total. The Candidate
+ * struct now needs those sub-terms (`quality.phraseAlignment`/
+ * `tempoCompatibility`/etc.) for observability, so the actual math moved
+ * into scoreTransitionPairDetail() below; this function is now a thin
+ * wrapper that keeps returning exactly the same scalar it always did (same
+ * rounding, same call signature) — every existing caller/test that treats
+ * this as "the score, a number" is unaffected.
  */
-export function scoreTransitionPair({
+export function scoreTransitionPair(params) {
+  return scoreTransitionPairDetail(params).total;
+}
+
+/**
+ * Phase 9D: same computation as scoreTransitionPair(), but returns every
+ * weighted sub-term alongside the total — this is what planBeatmixTransition()
+ * uses to populate a winning pair's `quality` object (§6.3). Not exported
+ * under a "public API" expectation beyond that internal use (see
+ * scoreTransitionPairDetailed() for the exported wrapper tests/other
+ * modules should use if they need the breakdown directly).
+ */
+function scoreTransitionPairDetail({
   outgoing, incoming, exit, entry, targetBpm, match = null, stemAware = false,
 }) {
   // Phase 8: a stem-mix candidate's outgoing exit is allowed to sit mid-
@@ -247,15 +268,42 @@ export function scoreTransitionPair({
 
   const harmonicOk = (outgoing?.harmonicConfidence ?? 0) >= HARMONIC_CONFIDENCE_MIN
     && (incoming?.harmonicConfidence ?? 0) >= HARMONIC_CONFIDENCE_MIN;
+  let harmonicCompatibility = null;
   if (harmonicOk) {
     const dist = camelotDistance(outgoing?.tailKey, incoming?.headKey);
     if (dist != null) {
-      total += clamp01(1 - dist / MAX_CAMELOT_DISTANCE) * HARMONIC_WEIGHT;
+      harmonicCompatibility = clamp01(1 - dist / MAX_CAMELOT_DISTANCE);
+      total += harmonicCompatibility * HARMONIC_WEIGHT;
       totalWeight += HARMONIC_WEIGHT;
     }
   }
 
-  return Number(clamp01(total / totalWeight).toFixed(3));
+  return {
+    total: Number(clamp01(total / totalWeight).toFixed(3)),
+    phraseAlignment: Number(phraseAlignment.toFixed(3)),
+    tempoCompatibility: Number(tempoCompatibility.toFixed(3)),
+    vocalSafety: Number(vocalSafety.toFixed(3)),
+    downbeatConfidence: Number(downbeatConfidence.toFixed(3)),
+    // null (not 0) when harmonic confidence didn't clear the threshold on
+    // both sides — §9.2's "key match is never required" means "we didn't
+    // score this at all" is a different fact than "we scored it and it was
+    // bad", and the Candidate struct (§6.3) must keep that distinction
+    // rather than fabricating a 0.
+    harmonicCompatibility,
+    energyContinuity: Number(energy.toFixed(3)),
+  };
+}
+
+/**
+ * Phase 9D (docs/mix-transition-phase9.md §6.3): the same breakdown
+ * scoreTransitionPairDetail() computes internally, exposed for anything
+ * outside this module that wants the sub-terms directly rather than reading
+ * them back off a winning plan's `.quality` (tests, mainly — planBeatmixTransition()
+ * itself is the only production caller, and it already gets the breakdown
+ * from the internal function without going through this export).
+ */
+export function scoreTransitionPairDetailed(params) {
+  return scoreTransitionPairDetail(params);
 }
 
 function rejected(reasons) {
@@ -395,6 +443,21 @@ export function planBeatmixTransition(outgoing, incoming, {
   const incomingDurationSec = Number.isFinite(incoming.durationSec) ? incoming.durationSec : Infinity;
 
   let best = null;
+  // Codex review (PR #46, round 6): the marginal-tempo gate must filter
+  // candidates DURING the search, not just re-check the single pair the
+  // strict-score search already committed to — the same "a post-hoc check
+  // can't recover a pair the search already discarded" bug the round-2 fix
+  // addressed for cross-mode ranking. With multiple stem exit pairs, a
+  // vocal-safe pair can win the strict-score race outright (e.g. ~0.678)
+  // while its OWN relaxed/stem-aware score is barely different (still
+  // ~0.678, below MARGINAL_TEMPO_MIN_SCORE) — rejecting the whole plan even
+  // though a mid-vocal alternative that lost the strict race (~0.626)
+  // would have cleared the gate stem-aware (~0.730). Filtering by the
+  // relaxed eligibility gate per pair, then ranking survivors by strict
+  // score, preserves round 2's invariant (strict score decides WHICH pair
+  // wins among those that qualify) while no longer discarding a marginal-
+  // tempo-eligible pair before it ever gets considered.
+  let anyMarginalRejected = false;
   for (const exit of exitCandidates) {
     const roomAfterExitPlayback = (durationSec - exit.sec) / outgoingRatio;
     for (const entry of entryCandidates) {
@@ -417,21 +480,57 @@ export function planBeatmixTransition(outgoing, incoming, {
           || fadeSec > roomInIncomingPlayback + 1e-6
           || fadeSec > forwardSafePlayback + 1e-6
         ) continue;
-        const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware });
+        // Codex review (PR #46, round 2): rank pairs by the STRICT (non-
+        // relaxed) score even in stem-mix mode. `stemAware` only needs to
+        // widen which exits are ELIGIBLE (findExitCandidates() above already
+        // does that via requireExitVocalSafe:false) — it must not also make
+        // the search itself prefer a mid-vocal exit over an available
+        // vocal-safe one of similar quality. Ranking with the relaxed score
+        // here let the search settle on a mid-vocal-optimal pair before
+        // cross-mode ranking ever ran, which a post-hoc correction on just
+        // the single surviving winner (the previous fix) couldn't recover —
+        // a pair discarded during this search never comes back.
+        const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: false });
+        if (isMarginalTempo) {
+          const marginalCheckScore = stemAware
+            ? scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: true })
+            : pairScore;
+          if (marginalCheckScore < MARGINAL_TEMPO_MIN_SCORE) {
+            anyMarginalRejected = true;
+            break; // widest bar count that fits this pair is the one worth checking
+          }
+        }
         if (!best || pairScore > best.pairScore) best = { exit, entry, bars, fadeSec, pairScore };
         break; // widest bar count that fits this pair is the one worth scoring
       }
     }
   }
-  if (!best) return rejected(['no-overlap-fit']);
-  if (isMarginalTempo && best.pairScore < MARGINAL_TEMPO_MIN_SCORE) {
-    return rejected(['marginal-tempo-low-confidence']);
+  if (!best) {
+    return rejected(anyMarginalRejected ? ['marginal-tempo-low-confidence'] : ['no-overlap-fit']);
   }
+
+  // Phase 9D (docs/mix-transition-phase9.md §6.3): the Candidate Ranker
+  // needs the winning pair's full quality breakdown, not just its weighted
+  // total (`best.pairScore`, which the search loop above used via
+  // scoreTransitionPair() for speed — recomputing the detail on every
+  // exit/entry/bars combination would be wasted work when only the winner's
+  // breakdown is ever surfaced). One extra call here, on the winner alone.
+  const quality = scoreTransitionPairDetail({
+    outgoing, incoming, exit: best.exit, entry: best.entry, targetBpm, match, stemAware,
+  });
 
   return {
     mode: 'beatmix',
     eligible: true,
     confidence: best.pairScore,
+    quality: {
+      phraseAlignment: quality.phraseAlignment,
+      tempoCompatibility: quality.tempoCompatibility,
+      vocalSafety: quality.vocalSafety,
+      downbeatConfidence: quality.downbeatConfidence,
+      harmonicCompatibility: quality.harmonicCompatibility,
+      energyContinuity: quality.energyContinuity,
+    },
     targetBpm,
     fadeSec: best.fadeSec,
     outgoing: {
@@ -507,6 +606,18 @@ export function planPhraseCrossfade(outgoing, incoming, {
   // duration, forward vocal-free room) is tightest. Incoming stays in
   // native seconds (tier 2 never stretches it); outgoing room is converted
   // like tier 1's.
+  // Codex review (PR #46, round 3, P2): rank candidate pairs by the same
+  // comparable score used for cross-mode ranking (vocalSafety/phraseAlignment/
+  // energyContinuity, with tempoCompatibility/downbeatConfidence charged as
+  // 0 — tier 2 structurally has neither), not by raw phraseAlignment alone.
+  // Ranking by phraseAlignment let the search settle on a pair with a
+  // clean-but-vocal-adjacent boundary before any later calibration could
+  // ever see a genuinely safer/better-rounded alternative it had already
+  // discarded — the same class of bug fixed for stem-mix's own pair search
+  // (see planBeatmixTransition()'s pairScore comment). vocalSafety/
+  // energyContinuity are computed per-candidate here (previously only for
+  // the winner, after the fact) since they now drive which pair wins, not
+  // just what gets reported about it afterward.
   let best = null;
   for (const exit of exitCandidates) {
     const roomAfterExit = (durationSec - exit.sec) / outgoingRatio;
@@ -516,15 +627,49 @@ export function planPhraseCrossfade(outgoing, incoming, {
       const fadeSec = Math.min(maxOverlapSec, roomAfterExit, roomInIncoming, forwardSafe);
       if (fadeSec < minOverlapSec) continue;
       const phraseAlignment = clamp01(((exit.score ?? 0) + (entry.score ?? 0)) / 2);
-      if (!best || phraseAlignment > best.phraseAlignment) best = { exit, entry, fadeSec, phraseAlignment };
+      const entryVocalSafety = clamp01(entryVocalMargin(incoming, entry.sec) / VOCAL_MARGIN_FULL_CREDIT_SEC);
+      const exitVocalSafety = clamp01(
+        (exit.sec - (Number.isFinite(outgoing?.lastVocalEndSec) ? outgoing.lastVocalEndSec : 0)) / VOCAL_MARGIN_FULL_CREDIT_SEC,
+      );
+      const vocalSafety = Math.min(exitVocalSafety, entryVocalSafety);
+      const energy = energyContinuity(exit, entry);
+      const rankTotal = vocalSafety * VOCAL_SAFETY_WEIGHT
+        + phraseAlignment * PHRASE_ALIGNMENT_WEIGHT
+        + energy * ENERGY_CONTINUITY_WEIGHT;
+      const rankWeight = VOCAL_SAFETY_WEIGHT + PHRASE_ALIGNMENT_WEIGHT + TEMPO_COMPATIBILITY_WEIGHT
+        + DOWNBEAT_CONFIDENCE_WEIGHT + ENERGY_CONTINUITY_WEIGHT;
+      const rankScore = clamp01(rankTotal / rankWeight);
+      if (!best || rankScore > best.rankScore) {
+        best = {
+          exit, entry, fadeSec, phraseAlignment, vocalSafety, energy, rankScore,
+        };
+      }
     }
   }
   if (!best) return rejected(['no-overlap-fit']);
 
+  // Phase 9D (docs/mix-transition-phase9.md §6.3): tier 2 has no tempo sync
+  // or downbeat-grid requirement (its whole point is to still work when
+  // those aren't available), and doesn't score harmonic compatibility at
+  // all — those three quality sub-terms stay null (never fabricated) rather
+  // than a misleading 0. vocalSafety/energyContinuity ARE meaningful here
+  // (this tier's candidate search enforces the same vocal-safe windows
+  // beatmix does) — already computed per-candidate during the search above
+  // (best.vocalSafety/best.energy), since they now drive which pair wins,
+  // not just what gets reported about it afterward.
+
   return {
     mode: 'phrase-crossfade',
     eligible: true,
-    confidence: Number(best.phraseAlignment.toFixed(3)),
+    confidence: Number(best.rankScore.toFixed(3)),
+    quality: {
+      phraseAlignment: Number(best.phraseAlignment.toFixed(3)),
+      tempoCompatibility: null,
+      vocalSafety: Number(best.vocalSafety.toFixed(3)),
+      downbeatConfidence: null,
+      harmonicCompatibility: null,
+      energyContinuity: Number(best.energy.toFixed(3)),
+    },
     fadeSec: best.fadeSec,
     startSec: best.exit.sec,
     curve: 'equal-power',
@@ -545,7 +690,14 @@ export function planPhraseCrossfade(outgoing, incoming, {
 /**
  * The full §16 fallback ladder: beatmix -> phrase-crossfade -> the existing
  * (untouched) planTransition() for crossfade/tail-fade/simple-fade/gapless.
- * Not called from player.js yet — see the module docstring.
+ *
+ * Phase 9D (docs/mix-transition-phase9.md §6): player.js no longer calls
+ * this — #maybeStartCrossfade() evaluates beatmix/stem-mix/phrase-crossfade
+ * as independent candidates via src/audio/transitionCandidates.js's
+ * rankTransitionCandidates() and picks a winner by score, rather than
+ * taking whichever tier is eligible first. This function (and its own
+ * waterfall-shaped tests) is kept exactly as it was — still a fully-built,
+ * correct standalone planner, just no longer the one driving live playback.
  */
 export function planBeatSyncedTransition(outgoing, incoming, options = {}) {
   const beatmix = planBeatmixTransition(outgoing, incoming, options);

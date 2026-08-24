@@ -48,22 +48,42 @@ function rejected(reasons) {
   return { mode: null, eligible: false, reasons };
 }
 
+// Mirrors src/audio/transitionCandidates.js's toCandidate() — these tests
+// exercise buildTransitionPlanReport() as a standalone unit (Phase 9D:
+// rankTransitionCandidates() is no longer in its call path at all), so a
+// §6.3 Candidate struct is built directly from a plan the same way the real
+// ranker would.
+function toCandidate(mode, plan) {
+  if (!plan.eligible) return { mode, eligible: false, reasons: plan.reasons ?? ['unknown'] };
+  return {
+    mode, eligible: true, score: plan.confidence, quality: plan.quality ?? null, fadeSec: plan.fadeSec, bars: plan.sync?.bars ?? null,
+  };
+}
+
 // --- buildTransitionPlanReport --------------------------------------------
 
-test('buildTransitionPlanReport: stem-mix selected — all three candidates eligible', () => {
-  const rawPlan = beatmixPlan(); // ladder still finds beatmix eligible too
-  const stemPlan = stemMixPlan({ bars: 8, fadeSec: 16, confidence: 0.91 });
+test('buildTransitionPlanReport: stem-mix selected — all three candidates independently eligible', () => {
+  // Phase 9D: unlike the pre-Phase-9D waterfall, beatmix being eligible no
+  // longer means phrase-crossfade was never evaluated — all three are
+  // independently planned, and stem-mix wins the ranking (its bonus, §6.4).
+  const beatmixPlanObj = beatmixPlan();
+  const stemPlanObj = stemMixPlan({ bars: 8, fadeSec: 16, confidence: 0.91 });
+  const phrasePlanObj = phraseCrossfadePlan({ fadeSec: 5, confidence: 0.55 });
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: { lastVocalEndSec: 190 },
     incomingAnalysis: { firstVocalStartSec: 12.4 },
-    rawPlan,
-    stemPlan,
+    candidates: {
+      beatmix: toCandidate('beatmix', beatmixPlanObj),
+      stemMix: toCandidate('stem-mix', stemPlanObj),
+      phraseCrossfade: toCandidate('phrase-crossfade', phrasePlanObj),
+    },
     stemCacheAttempted: true,
     outgoingStemsCached: true,
     incomingStemsCached: true,
     plannedMode: 'stem-mix',
+    selectedPlan: stemPlanObj,
   });
 
   assert.equal(report.from, 'Song A');
@@ -71,7 +91,7 @@ test('buildTransitionPlanReport: stem-mix selected — all three candidates elig
   assert.equal(report.selected, 'stem-mix');
   assert.deepEqual(report.candidates.beatmix, { eligible: true, bars: 4, fadeSec: 8, score: 0.82 });
   assert.deepEqual(report.candidates.stemMix, { eligible: true, bars: 8, fadeSec: 16, score: 0.91 });
-  assert.deepEqual(report.candidates.phraseCrossfade, { eligible: false, reason: 'not-evaluated-beatmix-selected' });
+  assert.deepEqual(report.candidates.phraseCrossfade, { eligible: true, bars: null, fadeSec: 5, score: 0.55 });
   assert.deepEqual(report.stemCache, { outgoing: 'hit', incoming: 'hit' });
   // outgoing still singing (190) past the exit point (183.2) -> vocalActive
   assert.equal(report.exit.vocalActive, true);
@@ -80,71 +100,83 @@ test('buildTransitionPlanReport: stem-mix selected — all three candidates elig
   assert.equal(report.entry.firstVocalSec, 12.4);
 });
 
-test('buildTransitionPlanReport: beatmix short-circuits phrase-crossfade AND stem-mix as not-evaluated', () => {
-  const rawPlan = beatmixPlan();
+test('buildTransitionPlanReport: beatmix selected — phrase-crossfade independently evaluated and rejected, stem-mix not evaluated (cache never checked)', () => {
+  const beatmixPlanObj = beatmixPlan();
+  const phrasePlanObj = rejected(['no-phrase-data']);
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: {},
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: {
+      beatmix: toCandidate('beatmix', beatmixPlanObj),
+      stemMix: { mode: 'stem-mix', eligible: false, reasons: ['stems-unavailable'] },
+      phraseCrossfade: toCandidate('phrase-crossfade', phrasePlanObj),
+    },
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
 
   assert.equal(report.selected, 'beatmix');
   assert.deepEqual(report.candidates.beatmix, { eligible: true, bars: 4, fadeSec: 8, score: 0.82 });
-  assert.deepEqual(report.candidates.phraseCrossfade, { eligible: false, reason: 'not-evaluated-beatmix-selected' });
-  assert.deepEqual(report.candidates.stemMix, { eligible: false, reason: 'not-evaluated-beatmix-selected' });
+  assert.deepEqual(report.candidates.phraseCrossfade, { eligible: false, reason: 'no-phrase-data' });
+  assert.deepEqual(report.candidates.stemMix, { eligible: false, reason: 'not-evaluated-stem-mix-unavailable' });
   assert.deepEqual(report.stemCache, { outgoing: null, incoming: null });
 });
 
-test('buildTransitionPlanReport: reject case — phrase-crossfade wins, beatmix/stem-mix both report real rejection reasons', () => {
-  // beatmix rejected -> phrase-crossfade attempted and eligible -> ladder returns
-  // phrase-crossfade with fallbackFrom = [beatmixReason].
-  const rawPlan = { ...phraseCrossfadePlan(), fallbackFrom: ['no-entry-candidate'] };
+test('buildTransitionPlanReport: phrase-crossfade selected — beatmix and stem-mix both report real rejection reasons', () => {
+  const phrasePlanObj = phraseCrossfadePlan();
+  const beatmixPlanObj = rejected(['no-entry-candidate']);
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: { lastVocalEndSec: 180 },
     incomingAnalysis: { firstVocalStartSec: null },
-    rawPlan,
-    stemPlan: null,
+    candidates: {
+      beatmix: toCandidate('beatmix', beatmixPlanObj),
+      // Real evaluated-and-rejected reason — overridden below by the
+      // cache-miss branch either way, since incomingStemsCached is false.
+      stemMix: toCandidate('stem-mix', rejected(['stem-mix-no-invocal-fade-room'])),
+      phraseCrossfade: toCandidate('phrase-crossfade', phrasePlanObj),
+    },
     stemCacheAttempted: true,
     outgoingStemsCached: true,
     incomingStemsCached: false, // incoming side missed the stem cache
     plannedMode: 'phrase-crossfade',
+    selectedPlan: phrasePlanObj,
   });
 
   assert.equal(report.selected, 'phrase-crossfade');
   assert.deepEqual(report.candidates.beatmix, { eligible: false, reason: 'no-entry-candidate' });
   assert.deepEqual(report.candidates.stemMix, { eligible: false, reason: 'stem-cache-miss' });
-  assert.deepEqual(report.candidates.phraseCrossfade, { eligible: true, fadeSec: 6, score: 0.6 });
+  assert.deepEqual(report.candidates.phraseCrossfade, { eligible: true, bars: null, fadeSec: 6, score: 0.6 });
   assert.deepEqual(report.stemCache, { outgoing: 'hit', incoming: 'miss' });
 });
 
-test('buildTransitionPlanReport: both beatmix and phrase-crossfade rejected — fallbackFrom has two reasons in ladder order', () => {
-  const rawPlan = {
-    mode: 'crossfade',
-    fadeSec: 3,
-    startSec: 190,
-    confidence: 0.8,
-    fallbackFrom: ['beat-confidence-low', 'no-phrase-data'],
+test('buildTransitionPlanReport: legacy crossfade selected — beatmix and phrase-crossfade both rejected, stem-mix not evaluated', () => {
+  const legacyPlanObj = {
+    mode: 'crossfade', fadeSec: 3, startSec: 190, confidence: 0.8,
   };
+  const beatmixPlanObj = rejected(['beat-confidence-low']);
+  const phrasePlanObj = rejected(['no-phrase-data']);
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: { lastVocalEndSec: 195 },
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: {
+      beatmix: toCandidate('beatmix', beatmixPlanObj),
+      stemMix: { mode: 'stem-mix', eligible: false, reasons: ['stems-unavailable'] },
+      phraseCrossfade: toCandidate('phrase-crossfade', phrasePlanObj),
+    },
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'crossfade',
+    selectedPlan: legacyPlanObj,
   });
 
   assert.equal(report.selected, 'crossfade');
@@ -156,62 +188,77 @@ test('buildTransitionPlanReport: both beatmix and phrase-crossfade rejected — 
   assert.equal(report.entry.bar, null);
 });
 
-test('buildTransitionPlanReport: stem-mix attempted but ineligible reports planStemTransition()\'s own reject reason', () => {
-  const rawPlan = { ...phraseCrossfadePlan(), fallbackFrom: ['tempo-ratio-exceeds-hard'] };
-  const stemPlan = rejected(['stem-mix-no-invocal-fade-room']);
+test('buildTransitionPlanReport: phrase-crossfade selected — stem-mix attempted but ineligible reports planStemTransition()\'s own reject reason', () => {
+  const phrasePlanObj = phraseCrossfadePlan();
+  const beatmixPlanObj = rejected(['tempo-ratio-exceeds-hard']);
+  const stemPlanObj = rejected(['stem-mix-no-invocal-fade-room']);
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: {},
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan,
+    candidates: {
+      beatmix: toCandidate('beatmix', beatmixPlanObj),
+      stemMix: toCandidate('stem-mix', stemPlanObj),
+      phraseCrossfade: toCandidate('phrase-crossfade', phrasePlanObj),
+    },
     stemCacheAttempted: true,
     outgoingStemsCached: true,
     incomingStemsCached: true,
     plannedMode: 'phrase-crossfade',
+    selectedPlan: phrasePlanObj,
   });
 
   assert.deepEqual(report.candidates.stemMix, { eligible: false, reason: 'stem-mix-no-invocal-fade-room' });
   assert.deepEqual(report.stemCache, { outgoing: 'hit', incoming: 'hit' });
 });
 
+// Shared "only beatmix matters" candidates fixture for the exit/entry-info
+// tests below — none of them are about candidate reporting itself.
+function beatmixOnlyCandidates(beatmixPlanObj) {
+  return {
+    beatmix: toCandidate('beatmix', beatmixPlanObj),
+    stemMix: { mode: 'stem-mix', eligible: false, reasons: ['stems-unavailable'] },
+    phraseCrossfade: { mode: 'phrase-crossfade', eligible: false, reasons: ['no-phrase-data'] },
+  };
+}
+
 test('buildTransitionPlanReport: exit.vocalActive is false when the exit point is already past the last vocal frame', () => {
-  const rawPlan = beatmixPlan({ exitStartSec: 183.2 });
+  const beatmixPlanObj = beatmixPlan({ exitStartSec: 183.2 });
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: { lastVocalEndSec: 150 }, // vocals ended well before the exit
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: beatmixOnlyCandidates(beatmixPlanObj),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
   assert.equal(report.exit.vocalActive, false);
 });
 
 test('buildTransitionPlanReport: exit.vocalActive is null when vocal analysis is unavailable, not falsely false', () => {
-  const rawPlan = beatmixPlan();
+  const beatmixPlanObj = beatmixPlan();
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: { lastVocalEndSec: null },
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: beatmixOnlyCandidates(beatmixPlanObj),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
   assert.equal(report.exit.vocalActive, null);
 });
 
 test('buildTransitionPlanReport: exit.vocalActive is false when the exit point falls inside a recorded vocal gap, even though a later vocal exists (Codex review, PR #43)', () => {
-  const rawPlan = beatmixPlan({ exitStartSec: 100 });
+  const beatmixPlanObj = beatmixPlan({ exitStartSec: 100 });
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
@@ -220,18 +267,18 @@ test('buildTransitionPlanReport: exit.vocalActive is false when the exit point f
       vocalGaps: [{ startSec: 95, endSec: 110 }], // ...but the exit sits inside a silent gap
     },
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: beatmixOnlyCandidates(beatmixPlanObj),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
   assert.equal(report.exit.vocalActive, false);
 });
 
 test('buildTransitionPlanReport: exit.vocalActive stays true when the exit is outside every recorded vocal gap', () => {
-  const rawPlan = beatmixPlan({ exitStartSec: 100 });
+  const beatmixPlanObj = beatmixPlan({ exitStartSec: 100 });
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
@@ -240,46 +287,60 @@ test('buildTransitionPlanReport: exit.vocalActive stays true when the exit is ou
       vocalGaps: [{ startSec: 40, endSec: 50 }],
     },
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: beatmixOnlyCandidates(beatmixPlanObj),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
   assert.equal(report.exit.vocalActive, true);
 });
 
+// Shared "nothing eligible, legacy wins" candidates fixture for the legacy
+// exit-fallback tests below.
+function legacyOnlyCandidates() {
+  return {
+    beatmix: { mode: 'beatmix', eligible: false, reasons: ['bpm-unavailable'] },
+    stemMix: { mode: 'stem-mix', eligible: false, reasons: ['stems-unavailable'] },
+    phraseCrossfade: { mode: 'phrase-crossfade', eligible: false, reasons: ['no-phrase-data'] },
+  };
+}
+
 test('buildTransitionPlanReport: legacy plan (simple-fade/tail-fade/crossfade) with no startSec falls back to duration - fadeSec instead of reporting null (Codex review, PR #43)', () => {
-  const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
+  const legacyPlanObj = {
+    mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3,
+  };
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: { durationSec: 200 },
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: legacyOnlyCandidates(),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'simple-fade',
+    selectedPlan: legacyPlanObj,
   });
   assert.equal(report.exit.sec, 196);
 });
 
 test('buildTransitionPlanReport: legacy plan exit fallback accounts for a stretched outgoing tempo (Codex review, PR #43 round 5)', () => {
-  const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
+  const legacyPlanObj = {
+    mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3,
+  };
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: { durationSec: 200 },
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: legacyOnlyCandidates(),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'simple-fade',
+    selectedPlan: legacyPlanObj,
     // A chained beatmix -> simple-fade: the outgoing source is playing back
     // 10% faster than native, so fadeSec (a playback-domain duration) must
     // be scaled up before subtracting from the native-domain duration.
@@ -289,18 +350,20 @@ test('buildTransitionPlanReport: legacy plan exit fallback accounts for a stretc
 });
 
 test('buildTransitionPlanReport: legacy plan exit stays null when neither startSec nor duration is known', () => {
-  const rawPlan = { mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3 };
+  const legacyPlanObj = {
+    mode: 'simple-fade', fadeSec: 4, startSec: null, confidence: 0.3,
+  };
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: {},
     incomingAnalysis: {},
-    rawPlan,
-    stemPlan: null,
+    candidates: legacyOnlyCandidates(),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'simple-fade',
+    selectedPlan: legacyPlanObj,
   });
   assert.equal(report.exit.sec, null);
 });
@@ -341,17 +404,22 @@ test('logGaplessTransition: kind distinguishes a snap handoff from the generic h
 // --- formatTransitionPlanLog -----------------------------------------------
 
 test('formatTransitionPlanLog: renders the §3.2 shape with from/to/selected and every candidate block', () => {
+  const stemPlanObj = stemMixPlan({ bars: 8, fadeSec: 16, confidence: 0.91 });
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: { lastVocalEndSec: 190 },
     incomingAnalysis: { firstVocalStartSec: 12.4 },
-    rawPlan: beatmixPlan(),
-    stemPlan: stemMixPlan({ bars: 8, fadeSec: 16, confidence: 0.91 }),
+    candidates: {
+      beatmix: toCandidate('beatmix', beatmixPlan()),
+      stemMix: toCandidate('stem-mix', stemPlanObj),
+      phraseCrossfade: { mode: 'phrase-crossfade', eligible: false, reasons: ['no-phrase-data'] },
+    },
     stemCacheAttempted: true,
     outgoingStemsCached: true,
     incomingStemsCached: true,
     plannedMode: 'stem-mix',
+    selectedPlan: stemPlanObj,
   });
   report.selected = 'stem-mix';
   report.downgradedFrom = null;
@@ -373,17 +441,18 @@ test('formatTransitionPlanLog: escapes an untrusted track title instead of inter
   // title containing a quote and a newline could otherwise forge fields or
   // fake an additional [MIX PLAN] block in the MIX_DEBUG log output.
   const maliciousTitle = 'x"\nselected=stem-mix';
+  const beatmixPlanObj = beatmixPlan();
   const report = buildTransitionPlanReport({
     outgoingTrack: { title: maliciousTitle },
     incomingTrack,
     outgoingAnalysis: { lastVocalEndSec: 190 },
     incomingAnalysis: { firstVocalStartSec: 12.4 },
-    rawPlan: beatmixPlan(),
-    stemPlan: null,
+    candidates: beatmixOnlyCandidates(beatmixPlanObj),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
   report.selected = 'beatmix';
   report.downgradedFrom = null;
@@ -406,36 +475,38 @@ test('logGaplessTransition: escapes an untrusted track title the same way (Codex
 });
 
 test('formatTransitionPlanLog: an ineligible candidate prints its reason, not bars/fadeSec/score', () => {
+  const beatmixPlanObj = beatmixPlan();
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: {},
     incomingAnalysis: {},
-    rawPlan: beatmixPlan(),
-    stemPlan: null,
+    candidates: beatmixOnlyCandidates(beatmixPlanObj),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
   report.selected = 'beatmix';
   const text = formatTransitionPlanLog(report);
-  assert.match(text, /stemMix:\n {2}eligible=false\n {2}reason=not-evaluated-beatmix-selected/);
+  assert.match(text, /stemMix:\n {2}eligible=false\n {2}reason=not-evaluated-stem-mix-unavailable/);
   assert.doesNotMatch(text.split('stemMix:')[1].split('phraseCrossfade:')[0], /bars=/);
 });
 
 test('formatTransitionPlanLog: includes downgradedFrom when the report carries one', () => {
+  const beatmixPlanObj = beatmixPlan();
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: {},
     incomingAnalysis: {},
-    rawPlan: beatmixPlan(),
-    stemPlan: null,
+    candidates: beatmixOnlyCandidates(beatmixPlanObj),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
   report.selected = 'crossfade';
   report.downgradedFrom = 'beatmix';
@@ -456,17 +527,18 @@ test('logTransitionPlan always records metrics, even with debug off', () => {
 });
 
 test('logTransitionPlan prints the formatted block through the injected logger when debug is on', () => {
+  const beatmixPlanObj = beatmixPlan();
   const report = buildTransitionPlanReport({
     outgoingTrack,
     incomingTrack,
     outgoingAnalysis: {},
     incomingAnalysis: {},
-    rawPlan: beatmixPlan(),
-    stemPlan: null,
+    candidates: beatmixOnlyCandidates(beatmixPlanObj),
     stemCacheAttempted: false,
     outgoingStemsCached: false,
     incomingStemsCached: false,
     plannedMode: 'beatmix',
+    selectedPlan: beatmixPlanObj,
   });
   report.selected = 'beatmix';
 

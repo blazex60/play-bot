@@ -4,6 +4,7 @@ import {
   findExitCandidates,
   findEntryCandidates,
   scoreTransitionPair,
+  scoreTransitionPairDetailed,
   planBeatmixTransition,
   planPhraseCrossfade,
   planBeatSyncedTransition,
@@ -183,6 +184,59 @@ test('scoreTransitionPair adds a harmonic bonus only when both sides clear the c
   assert.ok(withHarmonic > withoutHarmonic);
 });
 
+// --- scoreTransitionPairDetailed (Phase 9D §6.3: Candidate quality sub-terms) ---
+
+test('scoreTransitionPairDetailed().total matches scoreTransitionPair() exactly for the same inputs', () => {
+  // scoreTransitionPair() is now a thin wrapper around the same computation
+  // scoreTransitionPairDetailed() exposes — same rounding, same call
+  // signature — so every existing caller/test treating it as "the score, a
+  // number" must see no behavior change from this refactor.
+  const outgoing = makeAnalysis({ downbeatConfidence: 0.7 });
+  const incoming = makeAnalysis({ downbeatConfidence: 0.7 });
+  const exit = { sec: 190, score: 0.5 };
+  const entry = { sec: 5, score: 0.5 };
+  const params = { outgoing, incoming, exit, entry, targetBpm: 121 };
+  assert.equal(scoreTransitionPairDetailed(params).total, scoreTransitionPair(params));
+});
+
+test('scoreTransitionPairDetailed() reports harmonicCompatibility as null (not 0) when confidence does not clear the threshold on both sides', () => {
+  // §9.2 "key match is never required": harmonicCompatibility must
+  // distinguish "not scored at all" (null) from "scored and it was bad"
+  // (a low number close to 0) — the Candidate struct in §6.3 relies on
+  // this to avoid fabricating a harmonic quality reading that was never
+  // actually computed.
+  const base = { downbeatGrid: { confidence: 0.6 }, lastVocalEndSec: 0, firstVocalStartSec: null };
+  const exit = { sec: 190, score: 0.5 };
+  const entry = { sec: 5, score: 0.5 };
+  const belowThreshold = scoreTransitionPairDetailed({
+    outgoing: { ...base, harmonicConfidence: 0.2, tailKey: '8B' },
+    incoming: { ...base, harmonicConfidence: 0.2, headKey: '8B' },
+    exit, entry, targetBpm: 120,
+  });
+  assert.equal(belowThreshold.harmonicCompatibility, null);
+
+  const aboveThreshold = scoreTransitionPairDetailed({
+    outgoing: { ...base, harmonicConfidence: 0.9, tailKey: '8B' },
+    incoming: { ...base, harmonicConfidence: 0.9, headKey: '8B' },
+    exit, entry, targetBpm: 120,
+  });
+  assert.ok(typeof aboveThreshold.harmonicCompatibility === 'number');
+  assert.ok(aboveThreshold.harmonicCompatibility >= 0 && aboveThreshold.harmonicCompatibility <= 1);
+});
+
+test('scoreTransitionPairDetailed() returns every §6.3 quality sub-term as a finite 0..1 number', () => {
+  const outgoing = makeAnalysis({ downbeatConfidence: 0.7 });
+  const incoming = makeAnalysis({ downbeatConfidence: 0.7 });
+  const exit = { sec: 190, score: 0.5 };
+  const entry = { sec: 5, score: 0.5 };
+  const detail = scoreTransitionPairDetailed({ outgoing, incoming, exit, entry, targetBpm: 121 });
+  for (const key of ['phraseAlignment', 'tempoCompatibility', 'vocalSafety', 'downbeatConfidence', 'energyContinuity']) {
+    assert.ok(Number.isFinite(detail[key]), `expected ${key} to be a finite number, got ${detail[key]}`);
+    assert.ok(detail[key] >= 0 && detail[key] <= 1, `expected ${key} to be in 0..1, got ${detail[key]}`);
+  }
+  assert.ok(Number.isFinite(detail.total) && detail.total >= 0 && detail.total <= 1);
+});
+
 // --- planBeatmixTransition -----------------------------------------------------
 
 function happyPathTracks() {
@@ -357,6 +411,83 @@ test('planBeatmixTransition allows a marginal tempo match when transition qualit
   const plan = planBeatmixTransition(outgoing, incoming);
   assert.equal(plan.eligible, true);
   assert.ok(Math.abs(plan.incoming.tempoRatio - 120 / 126) < 1e-9);
+});
+
+test('planBeatmixTransition({stemAware:true}) evaluates the marginal-tempo confidence gate with the relaxed (stem-aware) score, not the strict ranking score (Codex review, PR #46, round 5)', () => {
+  // A deep mid-vocal exit (150s into a track whose vocal doesn't end until
+  // 190s) is only a valid candidate at all under stemAware's relaxed
+  // requireExitVocalSafe:false — its STRICT score (used for ranking/
+  // selection, round 2's fix) is ~0.53 (zero vocal-safety credit), below
+  // MARGINAL_TEMPO_MIN_SCORE (0.7). But stem separation is exactly what
+  // makes this exit safe: the RELAXED (stemAware:true) score is ~0.768,
+  // comfortably above the threshold. The marginal-tempo eligibility gate
+  // must credit that relaxed quality, not the strict one — rejecting a
+  // genuinely viable stem-mix candidate just because its stem-safe vocal
+  // handling doesn't count under strict scoring defeats the whole point of
+  // stemAware. Exact numbers confirmed via scoreTransitionPairDetailed().
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    durationSec: 200,
+    lastVocalEndSec: 190,
+    phrasesTail: [{ sec: 150, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const incoming = makeAnalysis({
+    bpm: 126, // ~4.76% off 120 — marginal tier
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.9,
+    durationSec: 200,
+    firstVocalStartSec: 150,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, {
+    requireExitVocalSafe: false,
+    requireEntryForwardSafe: false,
+    stemAware: true,
+  });
+  assert.equal(plan.eligible, true,
+    'expected the stem-aware-relaxed score to clear the marginal-tempo gate, not the strict ranking score');
+  assert.equal(plan.outgoing.exitStartSec, 150);
+});
+
+test('planBeatmixTransition({stemAware:true}) gates marginal-tempo pairs during the search, not just re-checks whichever pair the strict-score race already committed to (Codex review, PR #46, round 6)', () => {
+  // Two exit candidates: a vocal-safe one (sec 155, past lastVocalEndSec
+  // 150) that wins the STRICT-score race outright (~0.678) but whose own
+  // RELAXED/stem-aware score is barely different (still ~0.678, below
+  // MARGINAL_TEMPO_MIN_SCORE 0.7) — round 5's post-hoc-on-`best`-only check
+  // would reject the whole plan here. A mid-vocal alternative (sec 120,
+  // before lastVocalEndSec) loses the strict race (~0.475) but clears the
+  // gate stem-aware (~0.713) — round 5's fix never even looks at it, since
+  // it was already discarded from `best` by the time the marginal check
+  // ran. Exact numbers confirmed via scoreTransitionPairDetailed().
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.8,
+    durationSec: 200,
+    lastVocalEndSec: 150,
+    phrasesTail: [
+      { sec: 155, barIndex: 0, score: 0.6, reasons: [] }, // vocal-safe, wins strict race, fails marginal gate
+      { sec: 120, barIndex: 0, score: 0.9, reasons: [] }, // mid-vocal, loses strict race, clears marginal gate
+    ],
+  });
+  const incoming = makeAnalysis({
+    bpm: 126, // ~4.76% off 120 — marginal tier
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.8,
+    durationSec: 200,
+    firstVocalStartSec: 150,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, {
+    requireExitVocalSafe: false,
+    requireEntryForwardSafe: false,
+    stemAware: true,
+  });
+  assert.equal(plan.eligible, true,
+    'expected the mid-vocal pair (marginal-eligible stem-aware) to be found, not the whole transition rejected over the vocal-safe pair failing the gate');
+  assert.equal(plan.outgoing.exitStartSec, 120);
 });
 
 test('planBeatmixTransition converts overlap room to the stretched incoming timeline before choosing bar count', () => {
@@ -832,4 +963,79 @@ test('requireEntryForwardSafe:false does NOT disable findEntryCandidates()\'s ow
   assert.equal(relaxed.eligible, true,
     'relaxing only requireEntryForwardSafe accepts the same (still entry-point-vocal-safe) candidate');
   assert.equal(relaxed.incoming.entrySec, 3.5);
+});
+
+// --- stem-mix pair-search ranking (Codex review, PR #46, round 2) ---------
+//
+// The eligibility relaxation (requireExitVocalSafe:false) makes a mid-vocal
+// exit a valid CANDIDATE — it must not also make the pair SEARCH itself
+// prefer that candidate over an available vocal-safe one of otherwise
+// similar quality, just because a higher phrase-boundary score happened to
+// land on it. Only vocalSafety differs between stemAware:true/false scoring
+// (§6.3) — this fixture gives the mid-vocal exit a better phrase score than
+// the vocal-safe alternative so the two scoring modes disagree about which
+// pair should win.
+
+test('planBeatmixTransition({stemAware:true}) ranks candidate exit pairs by the strict (non-relaxed) score, not the relaxed one', () => {
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    lastVocalEndSec: 150,
+    phrasesTail: [
+      { sec: 100, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }, // deep mid-vocal, high phrase score
+      { sec: 152, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }, // vocal-safe, lower phrase score
+    ],
+  });
+  const incoming = makeAnalysis({
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.7,
+    durationSec: 200,
+    firstVocalStartSec: 30,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+  });
+
+  const plan = planBeatmixTransition(outgoing, incoming, {
+    requireExitVocalSafe: false,
+    requireEntryForwardSafe: false,
+    stemAware: true,
+  });
+
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.outgoing.exitStartSec, 152,
+    `expected the search to prefer the vocal-safe exit (152) over the higher-phrase-score mid-vocal one (100) under strict ranking, got ${plan.outgoing.exitStartSec}`);
+});
+
+// --- phrase-crossfade pair-search ranking (Codex review, PR #46, round 3) -
+//
+// findExitCandidates()'s default vocal-safe filter is a bare `sec >=
+// lastVocalEndSec` check — it says nothing about HOW FAR past the vocal
+// boundary a candidate sits, so two candidates can both be "vocal safe" by
+// the filter while one has almost no margin (exitVocalSafety near 0) and
+// the other has full margin (exitVocalSafety at its cap). The search must
+// not let a higher raw phraseAlignment alone win over a pair with
+// meaningfully better vocal safety margin.
+
+test('planPhraseCrossfade ranks candidate pairs by the full comparable score, not raw phraseAlignment alone', () => {
+  const outgoing = makeAnalysis({
+    durationSec: 200,
+    lastVocalEndSec: 150,
+    phrasesTail: [
+      { sec: 150, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] }, // right at the vocal boundary, high phrase score
+      { sec: 154, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }, // full vocal-safety margin, lower phrase score
+    ],
+  });
+  const incoming = makeAnalysis({
+    firstVocalStartSec: 30,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+  });
+
+  const plan = planPhraseCrossfade(outgoing, incoming);
+
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.startSec, 154,
+    `expected the search to prefer the fuller-margin exit (154) over the higher-phrase-score boundary-hugging one (150) under comparable ranking, got ${plan.startSec}`);
 });
