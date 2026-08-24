@@ -12,6 +12,7 @@ import {
   downloadAudio,
   analyzeLoudness,
   prefetchTrack,
+  trimSilence,
   TEMP_DIR,
 } from './normalize.js'
 
@@ -244,4 +245,45 @@ test('prefetchTrack: routes trimSilence\'s duration probe through the tracked sp
   assert.ok(calls.includes('ffprobe'), 'expected the duration probe to run through the tracked spawnFn, not real ffprobe')
   assert.ok(!calls.includes('ffmpeg'),
     'expected trimSilence to stop before its silencedetect ffmpeg spawn once the probe-time abort was noticed')
+})
+
+test('trimSilence: an abort noticed right after the re-encode step stops before the final duration probe (Codex review, PR #44, round 3, P1)', async () => {
+  // The previous ordering called probeDurationFn(outPath) for the AFTER
+  // duration and only checked signal.aborted once that probe had already
+  // finished — an abort landing while the preceding access(outPath) was
+  // pending still let a brand-new ffprobe spawn start, which the analysis
+  // queue could register against the NEXT job by the time it exited.
+  await mkdir(TEMP_DIR, { recursive: true })
+  const filePath = `${TEMP_DIR}/trim-abort-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  await writeFile(filePath, 'original-audio-bytes')
+
+  const signal = { aborted: false }
+  const probeCalls = []
+  const probeDurationFn = async (path) => {
+    probeCalls.push(path)
+    return probeCalls.length === 1 ? 60 : 999 // only the BEFORE probe should ever be asked
+  }
+  const spawnFn = async (cmd, args = []) => {
+    if (args.includes('-c:a')) {
+      // The re-encode/atrim step: write a real file to outPath (the last
+      // arg) so the following access(outPath) succeeds, then simulate the
+      // queue aborting this job right as the step finishes.
+      await writeFile(args[args.length - 1], 'trimmed-audio-bytes')
+      signal.aborted = true
+      return { stderr: '' }
+    }
+    // The silencedetect step: a leading-silence log that makes
+    // resolveEdgeTrimWindow() report changed:true, so the pipeline actually
+    // proceeds into the re-encode step above instead of returning early.
+    return { stderr: 'silence_start: 0.00\nsilence_end: 1.00\n' }
+  }
+
+  const result = await trimSilence(filePath, { spawnFn, probeDurationFn, signal })
+
+  assert.equal(result, false, 'trimSilence is fail-soft — an aborted attempt must not throw, and must not report success')
+  assert.equal(probeCalls.length, 1,
+    `expected the final duration probe to be skipped once the abort was noticed, got ${probeCalls.length} probe call(s)`)
+  await access(filePath) // the original file must have been restored from its backup
+  const restored = await readFile(filePath, 'utf8')
+  assert.equal(restored, 'original-audio-bytes', 'expected the original file to be restored untouched on an aborted attempt')
 })

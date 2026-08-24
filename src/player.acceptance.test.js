@@ -1330,6 +1330,85 @@ test('acceptance (mixer): TRACK loop mode strips a phrase-crossfade\'s baseSwap/
   await player.stop();
 });
 
+test('acceptance (mixer): TRACK loop mode\'s stem-mix -> bestNonStemPlan downgrade refreshes the report\'s exit, not just its entry (Codex review, PR #46, round 6)', async () => {
+  // Codex round-6: when TRACK loop re-plans away from stem-mix to
+  // bestNonStemPlan, the [MIX PLAN] report's `.exit` was still built from
+  // the ORIGINAL stem-mix plan (report-construction time, before the
+  // re-plan) — bestNonStemPlan comes from an entirely independent (strict,
+  // non-relaxed) candidate search and can genuinely pick a DIFFERENT exit
+  // point than stem-mix's own relaxed search did. Only `.entry` was
+  // reconciled after a downgrade; `.exit` was not.
+  //
+  // Same track's analysis serves as both outgoing/incoming (TRACK loop).
+  // Two tail exit candidates: a mid-vocal one (sec 1.0, high phrase score)
+  // that only stem-mix's relaxed search can use — and that wins stem-mix's
+  // OWN strict-scoring internal ranking over the vocal-safe alternative —
+  // and a vocal-safe one (sec 8.1, low phrase score, thin vocal margin)
+  // that is the ONLY candidate plain beatmix's strict search can see at
+  // all (findExitCandidates() excludes mid-vocal exits structurally,
+  // regardless of score). bestNonStemPlan therefore necessarily picks
+  // 8.1 while stem-mix picks 1.0.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const logCalls = [];
+
+  const analysis = {
+    version: ANALYSIS_VERSION,
+    durationSec: 14,
+    lastVocalEndSec: 8.0,
+    firstVocalStartSec: 10.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: {
+      tail: [
+        { sec: 1.0, barIndex: 0, score: 1.0, reasons: ['bar-multiple'] }, // mid-vocal: stem-mix only, wins stem-mix's own ranking
+        { sec: 8.1, barIndex: 1, score: 0.0, reasons: [] }, // vocal-safe (thin margin): the only candidate plain beatmix can see
+      ],
+      head: [{ sec: 0.2, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+    },
+    analysisSource: 'demucs',
+  };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 14,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 14, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => analysis,
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 700 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => ({
+      vocalPath: `/tmp/${videoId}.vocal.wav`,
+      instrumentalPath: `/tmp/${videoId}.instrumental.wav`,
+    }),
+    createFileSourceFn: () => PcmSource.fromBuffers(Array.from({ length: 700 }, () => Buffer.from(frame))),
+    logTransitionPlanFn: (report) => logCalls.push(report),
+  });
+  queue.loopMode = LoopMode.TRACK;
+
+  await player.playNext();
+  // The downgraded plan's own exit sits at 8.1s (bestNonStemPlan's, not
+  // stem-mix's 1.0s) — readyToFade only trips once positionSec reaches
+  // that, so this must drive well past 8.1s of 20ms frames (~405), not the
+  // 60-frame nudge that suffices for the near-0 exits used elsewhere in
+  // this file.
+  for (let i = 0; i < 430; i += 1) player.mixStream.read(FRAME_BYTES);
+  await waitMs(300);
+
+  assert.equal(logCalls.length, 1, 'expected exactly one committed transition to have been logged');
+  const report = logCalls[0];
+  assert.equal(report.downgradedFrom, 'stem-mix',
+    `test invariant: expected the report to record a downgrade away from stem-mix, got downgradedFrom=${report.downgradedFrom}`);
+  assert.equal(report.exit.sec, 8.1,
+    `expected the report's exit to be refreshed to bestNonStemPlan's own exit (8.1), not left describing the original stem-mix plan's exit (1.0), got ${report.exit.sec}`);
+
+  await player.stop();
+});
+
 function spawnBuffered(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -3240,6 +3319,81 @@ test('acceptance (mixer): a stem-cache hit marks next/next+1 READY without a red
     assert.equal(byIdState(player, 'vid-c'), 'ready');
     assert.equal(stemCalls.filter((id) => id === 'vid-c').length, 0,
       'a stem-cache HIT for C must not also trigger the LOW-priority separation pipeline');
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): a READY entry is not sticky — a later cache eviction is re-detected the next time the pair is re-probed (Codex review, PR #44, round 3, P2)', async () => {
+  // pruneStemCache() (src/audio/stemCache.js) can evict a previously
+  // separated pair's files under the shared cache's size cap, driven by
+  // unrelated guilds' separations — nothing tells this tracker that its
+  // READY entry has gone stale. #ensureStemPrefetch() used to skip its own
+  // getCachedStemsFn() probe entirely once an entry reached READY, so a
+  // pair evicted while still sitting in the next/next+1 window would report
+  // READY forever and never regenerate.
+  //
+  // A second #prefetchUpcoming() checkpoint over the SAME still-queued B/C
+  // pair (here: calling playNext() again without anything actually
+  // advancing) is what gives C's already-READY entry a second
+  // #ensureStemPrefetch() probe while it's still un-pruned (prune() only
+  // drops entries once they leave the next/next+1 window entirely) — the
+  // cache answers MISS this time, simulating eviction.
+  let cacheCallsForC = 0;
+  let separateCallsForC = 0;
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}.staged`,
+    getCachedStemsFn: async (videoId) => {
+      if (videoId !== 'vid-c') return null;
+      cacheCallsForC += 1;
+      if (cacheCallsForC === 1) {
+        return { vocalPath: '/tmp/vid-c.vocal.wav', instrumentalPath: '/tmp/vid-c.instrumental.wav' };
+      }
+      return null; // every later probe: evicted
+    },
+    separateTrackStemsFn: async (filePath, videoId) => {
+      if (videoId === 'vid-c') separateCallsForC += 1;
+      return { vocalPath: `/tmp/${videoId}.vocal.wav`, instrumentalPath: `/tmp/${videoId}.instrumental.wav` };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => Buffer.alloc(FRAME_BYTES))),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+
+  try {
+    await player.playNext();
+    await pollUntil(() => byIdReady(player, 'vid-c'));
+    assert.equal(byIdState(player, 'vid-c'), 'ready', 'expected the initial cache hit to mark C ready while still next+1');
+    assert.equal(cacheCallsForC, 1);
+    const readyEntry = player.stemPrefetchStatus.find((e) => e.videoId === 'vid-c');
+    assert.equal(readyEntry.startedAt, null, 'sanity check: no separation ran yet — the cache hit alone marked it ready');
+
+    // Nothing in the queue advances — this only re-runs the same
+    // #prefetchUpcoming() checkpoint over the same still-next/next+1 B/C
+    // pair, so any recovery observed below can only come from
+    // #ensureStemPrefetch() itself noticing the now-evicted cache, not from
+    // Phase 8's independent full-prefetch pipeline (which only ever fires
+    // once per track, when it first becomes `next`).
+    await player.playNext();
+    await nextTurn();
+
+    const recoveredSeparation = await pollUntil(() => separateCallsForC >= 1, { timeoutMs: 3000 });
+    assert.ok(recoveredSeparation,
+      'expected a fresh separateTrackStemsFn call for C once the stale cache hit was detected as a miss');
+    assert.ok(cacheCallsForC >= 2,
+      'expected #ensureStemPrefetch to re-probe the cache for C even though it was already marked ready — READY must not be sticky');
+
+    const recoveredReady = await pollUntil(() => byIdReady(player, 'vid-c'), { timeoutMs: 5000 });
+    assert.ok(recoveredReady,
+      'expected C to recover back to ready via a fresh separation, not stay stuck reporting stale ready');
+    const finalEntry = player.stemPrefetchStatus.find((e) => e.videoId === 'vid-c');
+    assert.notEqual(finalEntry.startedAt, null,
+      'expected a genuine re-separation (startedAt stamped) rather than the original stale ready being left untouched');
   } finally {
     await player.stop();
   }

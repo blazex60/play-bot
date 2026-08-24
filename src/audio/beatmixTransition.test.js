@@ -524,6 +524,45 @@ test('planBeatmixTransition applies the marginal-tempo confidence gate per pair,
   assert.equal(plan.outgoing.exitStartSec, 290);
 });
 
+test('planBeatmixTransition({stemAware:true}) gates marginal-tempo pairs during the search, not just re-checks whichever pair the strict-score race already committed to (Codex review, PR #46, round 6)', () => {
+  // Two exit candidates: a vocal-safe one (sec 155, past lastVocalEndSec
+  // 150) that wins the STRICT-score race outright (~0.678) but whose own
+  // RELAXED/stem-aware score is barely different (still ~0.678, below
+  // MARGINAL_TEMPO_MIN_SCORE 0.7) — round 5's post-hoc-on-`best`-only check
+  // would reject the whole plan here. A mid-vocal alternative (sec 120,
+  // before lastVocalEndSec) loses the strict race (~0.475) but clears the
+  // gate stem-aware (~0.713) — round 5's fix never even looks at it, since
+  // it was already discarded from `best` by the time the marginal check
+  // ran. Exact numbers confirmed via scoreTransitionPairDetailed().
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.8,
+    durationSec: 200,
+    lastVocalEndSec: 150,
+    phrasesTail: [
+      { sec: 155, barIndex: 0, score: 0.6, reasons: [] }, // vocal-safe, wins strict race, fails marginal gate
+      { sec: 120, barIndex: 0, score: 0.9, reasons: [] }, // mid-vocal, loses strict race, clears marginal gate
+    ],
+  });
+  const incoming = makeAnalysis({
+    bpm: 126, // ~4.76% off 120 — marginal tier
+    beatConfidence: 0.8,
+    downbeatConfidence: 0.8,
+    durationSec: 200,
+    firstVocalStartSec: 150,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.6, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming, {
+    requireExitVocalSafe: false,
+    requireEntryForwardSafe: false,
+    stemAware: true,
+  });
+  assert.equal(plan.eligible, true,
+    'expected the mid-vocal pair (marginal-eligible stem-aware) to be found, not the whole transition rejected over the vocal-safe pair failing the gate');
+  assert.equal(plan.outgoing.exitStartSec, 120);
+});
+
 test('planBeatmixTransition converts overlap room to the stretched incoming timeline before choosing bar count', () => {
   const outgoing = makeAnalysis({
     bpm: 124,

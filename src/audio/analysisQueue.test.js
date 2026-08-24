@@ -208,6 +208,32 @@ test('queue.pause() eventually kills a stuck job through the same maxStoppedMs t
   await assert.rejects(job, (err) => err.code === 'ANALYSIS_KILLED');
 });
 
+test('queue.pause() kills a stuck job on its own after maxStoppedMs, with no second pause() call (Codex review, PR #45, round 4, P2)', async () => {
+  // Unlike noteUnderrun()'s debounced path (naturally re-invoked as long as
+  // the mixer keeps reporting the underrun, which is what re-checks
+  // maxStoppedMs on each call), a single explicit pause() is edge-triggered
+  // — a CPU-pressure monitor calls it once and is expected to call resume()
+  // once conditions clear. If that resume() never comes (the monitor or
+  // owning player disappears), nothing without a real timer would ever
+  // re-check the timeout, leaving the paused job's SIGSTOP'd children
+  // stopped forever. Uses a real setTimeout (not the injectable `clock`,
+  // which only gates the *value* used in the elapsed-time comparison, not
+  // when that comparison itself re-runs) with a short maxStoppedMs so the
+  // test doesn't have to wait long.
+  const queue = createAnalysisQueue({
+    useNice: false,
+    spawnFn: () => fakeProc(),
+    maxStoppedMs: 15,
+  });
+  const job = queue.enqueue(() => new Promise(() => {}));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  queue.pause('cpu-pressure'); // exactly once — no follow-up call of any kind
+  assert.equal(queue.isPaused, true);
+
+  await assert.rejects(job, (err) => err.code === 'ANALYSIS_KILLED');
+});
+
 test('queue.pause() and noteUnderrun() share pause bookkeeping: the queue stays paused until every source clears', async () => {
   let now = 1000;
   let continued = 0;
