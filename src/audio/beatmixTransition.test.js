@@ -357,6 +357,27 @@ test('planBeatmixTransition degrades overlap bars when 8 (preferred) does not fi
   assert.ok(Math.abs(plan.fadeSec - (60 / 120) * 4 * 4) < 1e-6);
 });
 
+test('planBeatmixTransition still tries the standard 4-bar tier even when a caller-provided minOverlapBars narrows below it (Codex review, PR #48, round 3)', () => {
+  // Same tight-room fixture as the "degrades... down to 4" test above (9s
+  // of room: fits 4 bars/8s, not 8 bars/16s) but with an explicit
+  // minOverlapBars:2 override. Before this fix, tierBars was built only
+  // from [startBars, overlapBars, minOverlapBars] = [8, 8, 2] — the
+  // standard 4-bar tier silently vanished from the search whenever it
+  // wasn't equal to one of those three parameter values, even though 9s of
+  // room clearly fits it. Must still land on 4, not skip straight to the
+  // custom 2-bar floor.
+  const { outgoing, incoming } = happyPathTracks();
+  const tightOutgoing = {
+    ...outgoing,
+    durationSec: 193,
+    phrases: { tail: [{ sec: 184, barIndex: 0, score: 0.6, reasons: [] }] },
+  };
+  const plan = planBeatmixTransition(tightOutgoing, incoming, { minOverlapBars: 2 });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, 4,
+    `expected the standard 4-bar tier to still be tried before falling to the custom 2-bar floor, got ${plan.sync.bars}`);
+});
+
 test('planBeatmixTransition rejects when no overlap length fits on the incoming side', () => {
   const { outgoing, incoming } = happyPathTracks();
   // Incoming track is only 6s long; the one entry candidate at 4s leaves 2s
@@ -431,6 +452,42 @@ test('planBeatmixTransition allows a marginal tempo match when transition qualit
   const plan = planBeatmixTransition(outgoing, incoming);
   assert.equal(plan.eligible, true);
   assert.ok(Math.abs(plan.incoming.tempoRatio - 120 / 126) < 1e-9);
+});
+
+test('planBeatmixTransition applies the marginal-tempo confidence gate per pair, not just to whichever pair the tiers-outer search settles on first (Codex review, PR #48, round 3)', () => {
+  // A low-quality pair (phraseAlignment 0.1, overall score ~0.682 — below
+  // MARGINAL_TEMPO_MIN_SCORE 0.7) has ample room and would win the widest
+  // tier the tiers-outer search tries first. A higher-quality pair
+  // (phraseAlignment 0.95, overall score ~0.784) only has enough room for
+  // the narrowest (4-bar) tier. Before this fix, the marginal-tempo gate
+  // only ran once, after the search, against whichever pair the outer
+  // tier-loop had already committed to — rejecting the whole transition
+  // outright instead of ever considering the higher-quality pair at a
+  // narrower tier. Exact numbers confirmed via scoreTransitionPairDetailed().
+  const outgoing = makeAnalysis({
+    bpm: 120,
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.95,
+    durationSec: 300,
+    lastVocalEndSec: 50,
+    phrasesTail: [
+      { sec: 100, barIndex: 0, score: 0.1, reasons: [] }, // 200s room: fits every tier, low score (~0.682)
+      { sec: 290, barIndex: 0, score: 0.95, reasons: [] }, // 10s room: fits only the 4-bar tier, high score (~0.784)
+    ],
+  });
+  const incoming = makeAnalysis({
+    bpm: 126, // ~4.76% off 120 — marginal tier
+    beatConfidence: 0.9,
+    downbeatConfidence: 0.95,
+    durationSec: 300,
+    firstVocalStartSec: 250,
+    phrasesHead: [{ sec: 4, barIndex: 0, score: 0.9, reasons: [] }],
+  });
+  const plan = planBeatmixTransition(outgoing, incoming);
+  assert.equal(plan.eligible, true,
+    'expected the narrower-tier, marginal-quality-clearing pair to still be found, not the whole transition rejected');
+  assert.equal(plan.sync.bars, MIX_BARS.minimum);
+  assert.equal(plan.outgoing.exitStartSec, 290);
 });
 
 test('planBeatmixTransition converts overlap room to the stretched incoming timeline before choosing bar count', () => {

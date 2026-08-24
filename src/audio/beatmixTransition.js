@@ -579,7 +579,19 @@ export function planBeatmixTransition(outgoing, incoming, {
   const startBars = (overlapBars >= MIX_BARS.preferred && extendedTierEligible(outgoing, incoming, stemAware))
     ? MIX_BARS.extended
     : overlapBars;
-  const tierBars = [...new Set([startBars, overlapBars, minOverlapBars])]
+  // Codex review (PR #48, round 3): the three §7.2 named tiers (16/8/4)
+  // must always be considered, not just whichever of them happen to equal
+  // `startBars`/`overlapBars`/`minOverlapBars`. A caller that narrows
+  // `minOverlapBars` below MIX_BARS.minimum (existing tests use 2, to reach
+  // an even-narrower custom floor) previously dropped the standard 4-bar
+  // tier from the search entirely — e.g. startBars=8, minOverlapBars=2
+  // produced tierBars=[8,2], silently skipping 4 even when it would have
+  // fit. Explicitly including all three named tiers alongside the caller's
+  // own endpoints guarantees a custom floor only ADDS a narrower fallback
+  // stop, never removes a standard one.
+  const tierBars = [...new Set([
+    startBars, overlapBars, MIX_BARS.extended, MIX_BARS.preferred, MIX_BARS.minimum, minOverlapBars,
+  ])]
     .filter((bars) => bars <= startBars && bars >= minOverlapBars)
     .sort((a, b) => b - a);
 
@@ -596,6 +608,20 @@ export function planBeatmixTransition(outgoing, incoming, {
   // clears EXTENDED_PHRASE_CONFIDENCE_MIN) does the search descend to the
   // next tier.
   let best = null;
+  // Codex review (PR #48, round 3): §8.3's marginal-tempo confidence gate
+  // (below) used to run once, after the search loop, against only the
+  // single overall winning pair — but the winning TIER is now fixed by the
+  // first tier where ANY pair fits (round 2's tiers-outer restructure), so
+  // a weak pair that happens to fit a wider tier could win the tier-level
+  // "break" before this gate ever runs, hiding a stronger pair at a
+  // narrower tier that would have cleared MARGINAL_TEMPO_MIN_SCORE. Applied
+  // per-pair instead (mirrors the extended-tier phrase-alignment gate just
+  // below): a marginal-tempo pair that fails the score threshold is skipped
+  // at its tier, letting a real candidate at that or a narrower tier win.
+  // `anyMarginalRejected` distinguishes "nothing fit at all" from
+  // "something fit room-wise but was rejected specifically for marginal-
+  // tempo quality" for the specific rejection reason below.
+  let anyMarginalRejected = false;
   for (const bars of tierBars) {
     const fadeSec = barSec * bars;
     let bestAtTier = null;
@@ -644,14 +670,17 @@ export function planBeatmixTransition(outgoing, incoming, {
         // the single surviving winner (the previous fix) couldn't recover —
         // a pair discarded during this search never comes back.
         const pairScore = scoreTransitionPair({ outgoing, incoming, exit, entry, targetBpm, match, stemAware: false });
+        if (isMarginalTempo && pairScore < MARGINAL_TEMPO_MIN_SCORE) {
+          anyMarginalRejected = true;
+          continue;
+        }
         if (!bestAtTier || pairScore > bestAtTier.pairScore) bestAtTier = { exit, entry, bars, fadeSec, pairScore };
       }
     }
     if (bestAtTier) { best = bestAtTier; break; }
   }
-  if (!best) return rejected(['no-overlap-fit']);
-  if (isMarginalTempo && best.pairScore < MARGINAL_TEMPO_MIN_SCORE) {
-    return rejected(['marginal-tempo-low-confidence']);
+  if (!best) {
+    return rejected(anyMarginalRejected ? ['marginal-tempo-low-confidence'] : ['no-overlap-fit']);
   }
 
   // Phase 9D (docs/mix-transition-phase9.md §6.3): the Candidate Ranker
