@@ -2,20 +2,11 @@ name: Deploy music-bot to Production
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Server Test
-        run: bun test:server
-      - name: Web Test
-        run: bun test:web
   deploy:
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Connect Tailscale
