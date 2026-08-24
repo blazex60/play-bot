@@ -130,7 +130,8 @@ export async function trimSilence(filePath, {
   // the raw-ChildProcess-returning override (prefetchTrack() passes its own
   // `spawnFn` straight through here — no spawnBuffered() wrapping needed,
   // duration.js's probeDurationSec() does its own buffering), and `signal`
-  // is checked immediately after each probe below.
+  // is checked immediately after each probe below — and, before the second
+  // probe specifically, immediately before it too (see that call site).
   probeSpawnFn,
   signal,
   minDurationSec = MIN_TRIMMED_DURATION_SEC,
@@ -180,6 +181,14 @@ export async function trimSilence(filePath, {
       outPath,
     ])
     await access(outPath)
+    // Codex review (PR #44, round 2, P1): an abort landing while the access()
+    // above was pending must be caught HERE, before the next probeDurationFn()
+    // spawns ffprobe — checking only after that probe (the previous ordering)
+    // let an already-aborted signal still launch a subprocess that the
+    // analysis queue may register against the NEXT job by the time it exits,
+    // continuing to consume resources during exactly the pressure the abort
+    // was meant to relieve.
+    throwIfAborted(signal)
     const afterSec = await probeDurationFn(outPath, { spawnFn: probeSpawnFn }).catch(() => null)
     throwIfAborted(signal)
     if (afterSec == null || afterSec < minDurationSec) {

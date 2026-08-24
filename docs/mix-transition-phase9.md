@@ -1615,6 +1615,16 @@ D (next+2)  → 未処理（#ensureAnalysisPrefetch() の軽量パスのみ、Ph
 - **キュー変更（move/remove/optimize/shuffle）時に prefetch ウィンドウが即再計算されない** — `botApi.js`/`queueEditorInteractions.js` 側の変更が必要な cross-file な変更であり、staleness も「次の `#prefetchUpcoming()` チェックポイントまで」に有界なため優先度を下げた。
 - **HIGH（B）が LOW（C）より先に dispatch される保証がない** — 上の「優先度は enqueue() 順以上の意味を持たない」の節で述べた通り、これは専用 priority queue（Phase 9C, §5.2/§5.3）そのものが解決すべき課題であり、9B の場当たり的な修正では本質的な解決にならないと判断した。Phase 9C で対応する。
 
+### 追記: Codex レビュー対応（PR #44, round 2）
+
+- **P1: LOW プリフェッチの duration probe が pause/kill 機構から漏れていた** — `trimSilence()`（`src/normalize.js`）の `probeDurationFn`（`duration.js` の `probeDurationSec()`）は、`spawnFn` を差し替えても常にモジュールレベルの `spawn` 経由で ffprobe を起動しており、queue の pause/kill 機構の対象外だった。`probeSpawnFn`（raw ChildProcess を返す override）を追加し、`prefetchTrack()` → `trimSilence()` まで貫通させた。abort が probe 実行中に届いた場合、probe 自体は最後まで走るが、その直後の signal チェックで次のステップ（silencedetect の ffmpeg 呼び出し）に進むのを止める。
+
+### 追記: Codex レビュー対応（PR #44, round 3）
+
+- **P1: 2回目の duration probe の前に abort チェックが無かった** — `trimSilence()` の atrim/re-encode ステップ後、`access(outPath)` → `probeDurationFn(outPath, ...)`（2回目の ffprobe 呼び出し）→ `throwIfAborted(signal)` という順序だったため、`access()` が pending の間に abort が届いても、2回目の probe（新しい ffprobe サブプロセス）がそのまま起動してしまっていた。signal のチェックは probe の**後**にしかなく、その時点で analysis queue が既に次のジョブへ進んでいれば、この probe は次のジョブの子プロセスとして誤って登録され、まさに abort が緩和しようとしていた再生負荷の最中にリソースを消費し続けるおそれがあった。`access(outPath)` の直後、2回目の `probeDurationFn()` 呼び出しの**前**に `throwIfAborted(signal)` を追加し、1回目の probe（`beforeSec`）と同じパターンに揃えた。
+- **P2: `StemPrefetchTracker` の READY が sticky すぎて、キャッシュ失効を検知できなかった** — `pruneStemCache()`（`src/audio/stemCache.js`）は共有キャッシュがサイズ上限を超えると古いエントリを LRU で追い出すが、これは他ギルドの分離処理が引き金になることもあり、`#ensureStemPrefetch()` の呼び出し元には一切通知されない。従来は `entry.state === READY` なら `getCachedStemsFn()` のプローブ自体を早期 return でスキップしていたため、next/next+1 のウィンドウにまだ滞在中のペアが裏で追い出されても、トラッカーは READY を報告し続け、二度と再分離がディスパッチされなかった（実際の遷移経路自体は take 時に `access()` で再検証してフォールバックするため再生は壊れないが、このプリフェッチ状態表示だけが永久に stale になる）。早期 return を削除し、READY のエントリも MISS のエントリと同じように毎回 `getCachedStemsFn()` で再確認するよう変更した — HIT なら READY を再確認するだけ（no-op）、MISS なら既存の HIGH/LOW 再ディスパッチ経路にそのまま入る。
+  - テストのために `#prefetchUpcoming()` を二度目に呼ぶ具体的な trigger（プロダクションでの実際のトリガーは何であれ、`queue.upcoming()` の中身が変わらないまま同じチェックポイントが再実行されるケース全般を代表する）として、`playNext()` をキューを一切進めずに再度呼ぶ手法を使った。HIGH（next）に昇格するトリガー（skip）は使わなかった — 昇格させると Phase 8 の `#ensureFullPrefetch()`/`#scheduleAnalysis()` パイプラインが（このトラッカーのロジックとは無関係に）独自に `separateTrackStemsFn()` を呼んでしまい、修正の有無に関わらずテストが通ってしまう（実際に一度この汚染に気づかず誤って green なテストを書いてしまった — `separateCallsForC` だけを見て「修正が効いた」と誤認しかけたが、fix を revert しても同じテストが通ることに気づいて設計をやり直した）。
+
 ## 実装ノート (Phase 9C)
 
 §5 の Analysis Queue 分離を実装した。§5.1 が説明する問題（BPM/phrase/vocal 解析とフルトラック Demucs が単一 FIFO を共有し、後者が前者を長時間ブロックしうる — docs/mix-transition-phase8.md §9 の既知の未決事項）そのものを解消する、純粋なインフラ/スケジューリング変更。**どのトラックが解析されるか・いつ解析されるか・どの transition mode が選ばれるかは一切変更していない** — 変えたのは「フルトラック Demucs をどのキューインスタンスで実行するか」だけ。
@@ -1784,3 +1794,8 @@ round 5 のプッシュ後、さらに2件の指摘が見つかった。いず�
   - 修正: `transitionLog.js` の（元々 private だった）`exitInfo()` を export し、`player.js` の降格分岐内で `transitionPlanReport.exit = exitInfo(bestNonStemPlan, outAnalysis, this.#sessionTempo.tempoRatio ?? 1)` を呼んで再計算するようにした。
   - テスト: 同一トラックの分析を outgoing/incoming 両方に使う TRACK loop フィクスチャで、tail に mid-vocal（stem-mix の relaxed 探索でのみ勝てる、phrase score が高い exit）と vocal-safe（strict 探索が唯一見られる exit）の2候補を用意し、`selectedPlan`（stem-mix）は前者の exit を、`bestNonStemPlan`（beatmix）は後者の exit を選ぶフィクスチャで、コミットされた `[MIX PLAN]` レポートの `report.exit.sec` が `bestNonStemPlan` 側の exit になることを確認するテストを `player.acceptance.test.js` に追加した。修正を revert すると、期待どおり `report.exit.sec` がオリジナルの stem-mix の exit のまま漏れることを確認済み。
 - テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
+### 追記: Codex レビュー対応（PR #45, round 4）
+
+- **P2: 明示的な `pause()` 単発呼び出しに対して maxStoppedMs のタイムアウトが実際には効いていなかった** — `applyPause()` の `maxStoppedMs` チェックは、自分自身が**再度呼ばれたとき**にしか走らない。`noteUnderrun()` 経由の debounce パスは、実際のアンダーランが続く限りミキサーが繰り返し `noteUnderrun()` を発火させるため、この再チェックが自然に機能する。しかし §5.4 の明示的な `pause(source)` コマンドは edge-triggered（1回呼ばれて、通常は1回の `resume()` と対になるだけ）であり、その `resume()` が来ない場合（呼び出し元の CPU 監視やプレイヤーが消えた、あるいは対応する `noteUnderrunCleared()` が呼ばれ損ねたなど）、SIGSTOP されたままの Demucs 子プロセスを誰も気に留めず、stem キュー全体が永久にブロックされ得た。`applyPause()` が新規に一時停止へ遷移するたび（`noteUnderrun()`/`pauseQueue()`/`pump()` の3経路すべて）に実際の `setTimeout` を張る `armStopTimeout()`/`clearStopTimeout()` を追加し、`applyPause()` の再呼び出しの有無に関わらず `maxStoppedMs` 経過時に確実に `killCurrent()` されるようにした。resume 系（`noteUnderrunCleared()`、`killCurrent()` 自身、`pump()` の完了パス）ではタイマーを解除する。
+  - テスト: `queue.pause()` を**一度だけ**呼び、その後一切追加の呼び出しをせずに `maxStoppedMs` 経過後、ジョブが自動的に kill されることを確認するテストを追加した（既存の「2回目の `pause()` 呼び出しで初めてタイムアウトに気づく」テストとは区別される）。実際の `setTimeout` を使うため、注入可能な `clock` オプションでは検証できない（`clock` は経過時間の**比較に使う値**を差し替えるだけで、その比較が**いつ再実行されるか**は差し替えない）。タイマーに `unref()` を付けると、他に何もイベントループを保持するものがない単体テスト環境ではタイマー発火前にプロセスが終了してしまい正しく検証できないことが判明したため、`unref()` は使用していない（本番のボットプロセスは他のハンドル・タイマーで常にイベントループが保持されているため、この差は本番動作には影響しない）。
