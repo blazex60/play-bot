@@ -408,7 +408,17 @@ function extendedTierEligible(outgoing, incoming, stemAware) {
 export function planBeatmixTransition(outgoing, incoming, {
   outgoingPlaybackBpm = null,
   minOverlapSec = 2,
-  overlapBars = BEATMIX_OVERLAP_BARS,
+  // Codex review (PR #48, round 6): a default baked into the destructure
+  // (`overlapBars = BEATMIX_OVERLAP_BARS`) makes an explicit
+  // `overlapBars: MIX_BARS.preferred` indistinguishable from the caller
+  // passing nothing at all — both read as the same value below, so round
+  // 5's `overlapBars === MIX_BARS.preferred` upgrade-eligibility check
+  // couldn't tell them apart either, silently upgrading an explicit
+  // preferred-width ceiling to the extended tier same as it does when
+  // no ceiling was given. Left undefined here (no default) so
+  // `overlapBars === undefined` genuinely means "not supplied" — the
+  // actual value used everywhere below is the coalesced `effectiveOverlapBars`.
+  overlapBars,
   minOverlapBars = MIN_OVERLAP_BARS,
   tempoBackend = 'rubberband',
   // Phase 8 (docs/mix-transition-phase8.md): all three default to today's
@@ -563,27 +573,34 @@ export function planBeatmixTransition(outgoing, incoming, {
   // ceiling ABOVE the preferred width but still below the extended one (e.g.
   // `overlapBars: 12`) — that caller asked for a 12-bar cap, but the
   // extended tier bumped it up to 16 anyway, exceeding the very ceiling this
-  // fix was meant to respect. Only the true default (the caller passed
-  // nothing, so `overlapBars` still equals `MIX_BARS.preferred` exactly) is
-  // eligible for the extended-tier upgrade; any other explicit value —
-  // narrower OR wider than the default, as long as it isn't the default
-  // itself — is left untouched as the caller's own ceiling.
+  // fix was meant to respect. Changed to `overlapBars === MIX_BARS.preferred`
+  // (only the true default value is eligible for upgrade) — but that still
+  // couldn't tell an explicit `overlapBars: MIX_BARS.preferred` apart from
+  // the caller passing nothing at all, since the destructure default used
+  // to bake `MIX_BARS.preferred` in either way (round 6 finding). `overlapBars`
+  // is left with no destructure default now specifically so
+  // `overlapBars === undefined` can mean "not supplied" — `overlapBarsExplicit`
+  // below is the real test for "the caller narrowed or widened it", and
+  // `effectiveOverlapBars` (never undefined past this point) is what every
+  // other use of the value further down reads.
+  const overlapBarsExplicit = overlapBars !== undefined;
+  const effectiveOverlapBars = overlapBarsExplicit ? overlapBars : BEATMIX_OVERLAP_BARS;
   const extendedEligible = extendedTierEligible(outgoing, incoming, stemAware);
-  const startBars = (overlapBars === MIX_BARS.preferred && extendedEligible)
+  const startBars = (!overlapBarsExplicit && extendedEligible)
     ? MIX_BARS.extended
-    : overlapBars;
+    : effectiveOverlapBars;
   // Codex review (PR #48, round 3): the three §7.2 named tiers (16/8/4)
   // must always be considered, not just whichever of them happen to equal
-  // `startBars`/`overlapBars`/`minOverlapBars`. A caller that narrows
-  // `minOverlapBars` below MIX_BARS.minimum (existing tests use 2, to reach
-  // an even-narrower custom floor) previously dropped the standard 4-bar
-  // tier from the search entirely — e.g. startBars=8, minOverlapBars=2
+  // `startBars`/`effectiveOverlapBars`/`minOverlapBars`. A caller that
+  // narrows `minOverlapBars` below MIX_BARS.minimum (existing tests use 2,
+  // to reach an even-narrower custom floor) previously dropped the standard
+  // 4-bar tier from the search entirely — e.g. startBars=8, minOverlapBars=2
   // produced tierBars=[8,2], silently skipping 4 even when it would have
   // fit. Explicitly including all three named tiers alongside the caller's
   // own endpoints guarantees a custom floor only ADDS a narrower fallback
   // stop, never removes a standard one.
   const tierBars = [...new Set([
-    startBars, overlapBars, MIX_BARS.extended, MIX_BARS.preferred, MIX_BARS.minimum, minOverlapBars,
+    startBars, effectiveOverlapBars, MIX_BARS.extended, MIX_BARS.preferred, MIX_BARS.minimum, minOverlapBars,
   ])]
     .filter((bars) => bars <= startBars && bars >= minOverlapBars)
     .sort((a, b) => b - a);

@@ -1214,6 +1214,21 @@ test('planBeatmixTransition honors an explicit overlapBars ceiling ABOVE the pre
     `expected an explicit overlapBars:12 ceiling to cap the search at 12 bars — not bumped up to the 16-bar extended tier — even though extendedTierEligible() would otherwise allow it, got ${plan.sync.bars}`);
 });
 
+test('planBeatmixTransition honors an explicit overlapBars ceiling that happens to equal MIX_BARS.preferred, distinguishing it from the caller passing nothing at all (Codex review, PR #48, round 6)', () => {
+  // Round 5's `overlapBars === MIX_BARS.preferred` upgrade-eligibility
+  // check couldn't tell an explicit `overlapBars: MIX_BARS.preferred`
+  // (a real, if numerically-coincidental, 8-bar ceiling) apart from the
+  // caller passing no overlapBars option at all (which also defaults to
+  // MIX_BARS.preferred) — both looked identical once the destructure
+  // default filled the gap. overlapBars now has no destructure default, so
+  // `overlapBars === undefined` genuinely means "not supplied".
+  const { outgoing, incoming } = longMixZoneTracks();
+  const plan = planBeatmixTransition(outgoing, incoming, { ...STEM_MIX_OPTIONS, overlapBars: MIX_BARS.preferred });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.sync.bars, MIX_BARS.preferred,
+    `expected an explicit overlapBars:${MIX_BARS.preferred} ceiling to stay capped at ${MIX_BARS.preferred} — not bumped up to the 16-bar extended tier — even though extendedTierEligible() would otherwise allow it, got ${plan.sync.bars}`);
+});
+
 test('planBeatmixTransition honors an explicit overlapBars ceiling even when the extended tier is otherwise eligible (Codex review, PR #48, round 2)', () => {
   // Before this fix, extendedTierEligible() unconditionally overrode
   // `overlapBars`, so a caller-provided ceiling (e.g. planStemTransition()

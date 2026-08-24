@@ -287,6 +287,41 @@ test('transitionCost\'s beatmix term scores the best exit/entry combination, not
   );
 });
 
+test('transitionCost\'s beatmix term scores the tier live planning will actually select, not the best pair across every tier combined (Codex review, PR #48, round 6)', () => {
+  // planBeatmixTransition()'s own search is tiers-outer/pairs-inner (9E
+  // round 2): the WIDEST bar tier with ANY fitting pair wins outright, even
+  // over a narrower tier's higher-scoring pair. exitWide (20s of room —
+  // clears the 8-bar/16s preferred tier) has a merely-adequate phrase score
+  // (0.5); exitNarrow (10s of room — clears only the 4-bar/8s minimum tier,
+  // not the preferred one) has a near-perfect score (0.99). Live playback
+  // will always pick exitWide's preferred-tier plan, so this term must
+  // score the edge on exitWide, not on exitNarrow's better-looking number.
+  const exitWide = { sec: 180, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }; // 20s room: clears preferred (16s)
+  const exitNarrow = { sec: 190, barIndex: 0, score: 0.99, reasons: ['bar-multiple'] }; // 10s room: clears only minimum (8s)
+  const entry = { sec: 4, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] };
+
+  // firstVocalStartSec widened well past the default so entryForwardSafeSec
+  // comfortably clears the preferred tier's 16s requirement too — isolating
+  // this test from the unrelated forward-safety gate.
+  const toAnalysis = richIncoming({ firstVocalStartSec: 100, phrases: { head: [entry] } });
+  const fromBothTiers = richOutgoing({ phrases: { tail: [exitWide, exitNarrow] } });
+  const fromWideTierOnly = richOutgoing({ phrases: { tail: [exitWide] } });
+  const fromNarrowTierOnly = richOutgoing({ phrases: { tail: [exitNarrow] } });
+
+  const costBothTiers = transitionCost(fromBothTiers, toAnalysis);
+  const costWideOnly = transitionCost(fromWideTierOnly, toAnalysis);
+  const costNarrowOnly = transitionCost(fromNarrowTierOnly, toAnalysis);
+
+  assert.ok(
+    Math.abs(costBothTiers - costWideOnly) < 1e-6,
+    `expected offering exitNarrow alongside exitWide to leave the cost unchanged (still exitWide's, ${costWideOnly}), got ${costBothTiers}`,
+  );
+  assert.ok(
+    costBothTiers > costNarrowOnly,
+    `expected exitWide's merely-adequate score to cost MORE than exitNarrow's excellent score would have (${costNarrowOnly}), confirming the test fixture actually distinguishes the two — got ${costBothTiers}`,
+  );
+});
+
 test('transitionCost\'s beatmix term penalizes sub-threshold beat-grid confidence, matching planBeatmixTransition()\'s beat-confidence-low rejection', () => {
   // Codex round-2 on PR #35: scoreTransitionPair() never inspects
   // beatConfidence at all — only downbeatGrid.confidence factors into its
