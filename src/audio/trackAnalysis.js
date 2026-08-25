@@ -6,7 +6,14 @@ import { analyzeDownbeats } from './downbeatAnalysis.js';
 import { buildPhraseCandidates } from './phraseAnalysis.js';
 import { spawnCapture } from './spawnCapture.js';
 
-export const ANALYSIS_VERSION = 3;
+// Bumped 3->4 for Phase 9F (§8): the tail window widened from 45s to 60s,
+// so pre-existing version-3 cached payloads carry beat/phrase/vocal windows
+// that stop 15s short of what this phase's analysis now covers. Without the
+// bump, #getCachedAnalysis()/internal.js's `version < ANALYSIS_VERSION`
+// staleness check would keep serving those narrower cached windows forever,
+// silently defeating the widened search range for every already-analyzed
+// track (Codex review, PR #52).
+export const ANALYSIS_VERSION = 4;
 // Phase 7 §9.2 prefers entry points in the first 0-30s of the incoming
 // track; keep the BPM window and the vocal head window (vocalActivity.js
 // HEAD_WINDOW_SEC) the same length so beatGrid/vocal boundaries line up.

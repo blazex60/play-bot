@@ -885,6 +885,151 @@ test('acceptance (mixer): a chained beatmix transition subtracts the current sou
   await player.stop();
 });
 
+test('acceptance (mixer): a promoted track\'s exit-candidate pool excludes candidates before its own entry offset', async () => {
+  // Phase 9F Codex review (PR #52, P2): once A->B promotes B with a nonzero
+  // entry offset baked in (same mechanism as the "chained beatmix
+  // transition" test above), B's OWN tail candidate pool is built from its
+  // file's absolute timeline and has no notion of that runtime offset. This
+  // phase's widened tail window (60s) makes it newly possible for that pool
+  // to contain a candidate BEFORE B's entry point on a track in this length
+  // range — if the ranker were to pick it, #maybeStartCrossfade's
+  // `Math.max(0, exitStartSec - currentEntrySec)` clamp would make the B->C
+  // transition due immediately (positionSec starts at ~0 relative to B's
+  // own seek), firing right after promotion instead of near the real exit.
+  // `invalidEarly` below sits before B's entry offset and outscores the
+  // only valid candidate — without excludeExitCandidatesBeforeEntry()
+  // filtering it out before ranking, it would win outright (higher score,
+  // and it alone clears the wider 8-bar tier that the valid candidate can't
+  // reach), reproducing exactly that immediate-fire symptom.
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const firedPlans = [];
+  const incomingSpawnArgsByTrack = new Map();
+
+  const BS_ENTRY_SEC = 5.0; // B's own entry offset, baked in by A->B.
+  const INVALID_EARLY_SEC = 2.0; // before BS_ENTRY_SEC — unreachable once B is current.
+  const VALID_EXIT_SEC = 21.5; // after BS_ENTRY_SEC — the only usable B->C exit.
+
+  const analysisA = {
+    version: ANALYSIS_VERSION,
+    durationSec: 9.5,
+    lastVocalEndSec: 1.0,
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { tail: [{ sec: 1.0, barIndex: 0, score: 0.6, reasons: ['bar-multiple'] }], head: [] },
+    analysisSource: 'demucs',
+  };
+  const analysisB = {
+    version: ANALYSIS_VERSION,
+    durationSec: 30,
+    // 0, not just "low enough to clear the c.sec >= lastVocalEndSec filter":
+    // scoreTransitionPair()'s vocalSafety term also scores an exit by its
+    // OWN margin above this floor (full credit at a 2s margin), so
+    // invalidEarly (sec=2.0 below) needs the full 2s margin to score high
+    // enough to actually outrank validLate on pairScore — otherwise this
+    // fixture wouldn't reproduce the bug it's meant to catch (confirmed via
+    // a debug script exercising rankTransitionCandidates() directly on this
+    // exact pool). This test isolates the entry-offset filter from
+    // vocal-safety filtering, which already has its own coverage elsewhere.
+    lastVocalEndSec: 0,
+    firstVocalStartSec: BS_ENTRY_SEC + 8.5,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: {
+      head: [{ sec: BS_ENTRY_SEC, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
+      // invalidEarly outscores validLate and has 28s of room (durationSec -
+      // sec), clearing even the wider 8-bar/16s tier outright — the ranker
+      // picks the widest tier with any fit and stops there, so unfiltered
+      // it wins immediately. validLate has only 8.5s of room, clearing just
+      // the narrower 4-bar/8s tier.
+      tail: [
+        { sec: INVALID_EARLY_SEC, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] },
+        { sec: VALID_EXIT_SEC, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] },
+      ],
+    },
+    analysisSource: 'demucs',
+  };
+  const analysisC = {
+    version: ANALYSIS_VERSION,
+    durationSec: 12.5,
+    firstVocalStartSec: 9.0,
+    headVocalGaps: [],
+    vocalConfidence: 0.85,
+    confidence: 0.8,
+    bpm: 120,
+    headBpm: 120,
+    beatConfidence: 0.7,
+    downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
+    phrases: { head: [{ sec: 0.5, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }], tail: [] },
+    analysisSource: 'demucs',
+  };
+  const analysisByVideoId = { 'vid-a': analysisA, 'vid-b': analysisB, 'vid-c': analysisC };
+
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => analysisByVideoId[videoId] ?? null,
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async (track, opts) => {
+      if (!incomingSpawnArgsByTrack.has(track.videoId)) incomingSpawnArgsByTrack.set(track.videoId, []);
+      incomingSpawnArgsByTrack.get(track.videoId).push(opts);
+      return PcmSource.fromBuffers(Array.from({ length: 2500 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 30, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 12.5, videoId: 'vid-c' }));
+
+  player.mixStream.on('crossfadestart', (plan) => { firedPlans.push(plan); });
+
+  await player.playNext();
+  for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
+  await pollUntil(() => firedPlans.length >= 1);
+  assert.equal(firedPlans.length, 1, 'expected the A->B beatmix transition to arm');
+
+  for (let i = 0; i < 420; i += 1) player.mixStream.read(FRAME_BYTES);
+  assert.equal(queue.current.videoId, 'vid-b', 'expected A->B to promote Track B');
+  assert.ok(
+    (incomingSpawnArgsByTrack.get('vid-b') ?? []).some((opts) => Math.abs((opts.startSec ?? 0) - BS_ENTRY_SEC) < 1e-6),
+    'expected Track B to have been spawned seeked to its own entrySec',
+  );
+
+  // Drive well past both the invalid (2.0) and valid (21.5) candidates'
+  // native positions so the B->C transition has every chance to arm.
+  // Rather than pinning an assertion to exactly WHEN it arms (the arm
+  // loop's 200ms interval callback only gets to run at an await/yield
+  // point, so its actual first-evaluation timing relative to real time is
+  // not deterministic in a test harness driving frames in tight synchronous
+  // loops), this checks WHICH candidate it armed against — mixPlan.startSec
+  // is the winning candidate's absolute, native exitStartSec (see
+  // normalizeTransitionPlan()'s 'beatmix' branch). That is unambiguous
+  // regardless of timing: only the entry-offset filter working correctly
+  // can make it VALID_EXIT_SEC instead of INVALID_EARLY_SEC.
+  for (let i = 0; i < 1400; i += 1) player.mixStream.read(FRAME_BYTES);
+  await pollUntil(() => firedPlans.length >= 2, { timeoutMs: 8000 });
+
+  assert.equal(firedPlans.length, 2, 'expected the B->C transition to arm');
+  assert.ok(
+    Math.abs((firedPlans[1].startSec ?? 0) - VALID_EXIT_SEC) < 1e-6,
+    `expected the B->C transition to use the valid post-entry candidate (${VALID_EXIT_SEC}), ` +
+    `got startSec=${firedPlans[1].startSec} — an exit candidate before B's own entry point must not be selectable`,
+  );
+  assert.ok(
+    (incomingSpawnArgsByTrack.get('vid-c') ?? []).length >= 1,
+    'expected Track C\'s incoming source to actually be spawned',
+  );
+
+  await player.stop();
+});
+
 test('acceptance (mixer): incoming prep for a beatmix plan starts relative to the selected exit point, not just time-to-EOF', async () => {
   // Codex round-3 P2: the prep gate must fire based on distance to the
   // SELECTED exit point (startSec), not distance to EOF. Track A's exit

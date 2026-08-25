@@ -113,6 +113,46 @@ function fallbackAnalysis(track) {
   };
 }
 
+/**
+ * Phase 9F Codex review (PR #52, P2): #current's decoder is native-timeline
+ * positioned at #currentEntrySec, not 0, when #current was itself promoted
+ * from a seeked beatmix/phrase/stem-mix source (see #currentEntrySec's own
+ * comment, and #maybeStartCrossfade's currentEntrySec usage below). The
+ * exit-candidate pool findExitCandidates() (beatmixTransition.js) searches —
+ * outgoing.phrases.tail / outgoing.downbeatGrid.tail.downbeatsSec — has no
+ * notion of that runtime offset; it's built purely from the file's own
+ * absolute timeline. Phase 9F's widened tail window makes it newly possible
+ * for that pool to contain a candidate BEFORE currentEntrySec on a
+ * 75-90s-ish track (old 45s window: tailStart >= 30s typically kept the pool
+ * past any plausible entrySec; 60s window: tailStart can now dip below it).
+ * If the ranker picks such a candidate, #maybeStartCrossfade's
+ * `Math.max(0, norm.exitStartSec - currentEntrySec)` clamps the resulting
+ * startSec to 0 — "due immediately" — firing the next transition right after
+ * promotion and skipping nearly the whole track. Filtering the pool here,
+ * before ranking, keeps every candidate #maybeStartCrossfade could ever
+ * select strictly reachable from wherever #current's decoder actually
+ * starts.
+ */
+function excludeExitCandidatesBeforeEntry(analysis, currentEntrySec) {
+  if (!(currentEntrySec > 0)) return analysis;
+  const tailPhrases = analysis.phrases?.tail;
+  const tailDownbeats = analysis.downbeatGrid?.tail?.downbeatsSec;
+  const filteredPhrases = Array.isArray(tailPhrases)
+    ? tailPhrases.filter((c) => c.sec > currentEntrySec)
+    : tailPhrases;
+  const filteredDownbeats = Array.isArray(tailDownbeats)
+    ? tailDownbeats.filter((sec) => sec > currentEntrySec)
+    : tailDownbeats;
+  if (filteredPhrases === tailPhrases && filteredDownbeats === tailDownbeats) return analysis;
+  return {
+    ...analysis,
+    phrases: analysis.phrases ? { ...analysis.phrases, tail: filteredPhrases } : analysis.phrases,
+    downbeatGrid: analysis.downbeatGrid
+      ? { ...analysis.downbeatGrid, tail: { ...analysis.downbeatGrid.tail, downbeatsSec: filteredDownbeats } }
+      : analysis.downbeatGrid,
+  };
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -2264,7 +2304,8 @@ export class GuildPlayer {
         return;
       }
 
-      const outAnalysis = (await this.#getCachedAnalysis(current)) ?? fallbackAnalysis(current);
+      const rawOutAnalysis = (await this.#getCachedAnalysis(current)) ?? fallbackAnalysis(current);
+      const outAnalysis = excludeExitCandidatesBeforeEntry(rawOutAnalysis, this.#currentEntrySec ?? 0);
       const inAnalysis = (await this.#getCachedAnalysis(next)) ?? fallbackAnalysis(next);
       const outgoingPlaybackBpm = this.#sessionTempo.playbackBpm ?? outAnalysis.bpm ?? null;
       // planBeatmixTransition/planStemTransition both reject before ever
