@@ -323,22 +323,25 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis, tempoBackend) {
           targetBpm,
           match,
         });
+        // §8.3 / Codex review (PR #48, round 7): planBeatmixTransition()
+        // only takes the 4-6% "marginal" tempo tier "when confidence/
+        // transition conditions are high" — it applies this per-pair,
+        // DURING the tier search itself (beatmixTransition.js's own
+        // `anyMarginalRejected`), so a sub-threshold pair at a wider tier
+        // doesn't block the search from reaching a qualifying pair at a
+        // narrower one. Checking it only ONCE after this loop (round 6's
+        // shape, and the original pre-9E round-4-on-#35 shape before that)
+        // let a sub-threshold pair win the wide tier's `bestAtTier`/`break`
+        // outright, reporting full infeasibility even when live planning
+        // would have found a real, qualifying pair one tier down. Filtering
+        // here instead mirrors the live planner exactly: a pair below
+        // MARGINAL_TEMPO_MIN_SCORE is skipped, letting the search continue
+        // to other pairs at this tier, then to narrower tiers.
+        if (match.tier === 'marginal' && score < MARGINAL_TEMPO_MIN_SCORE) continue;
         if (score > bestAtTier) bestAtTier = score;
       }
     }
     if (bestAtTier > 0) { bestScore = bestAtTier; break; }
-  }
-
-  // §8.3: planBeatmixTransition() only takes the 4-6% "marginal" tempo tier
-  // "when confidence/transition conditions are high" — it rejects the best
-  // pair outright (marginal-tempo-low-confidence) if its score falls below
-  // MARGINAL_TEMPO_MIN_SCORE, regardless of how good the other sub-signals
-  // are. Without this gate a marginal-tempo pair with a mediocre overall
-  // score would still get partial credit here instead of the full
-  // infeasibility penalty the live planner would apply (Codex round-4 on
-  // PR #35).
-  if (match.tier === 'marginal' && bestScore < MARGINAL_TEMPO_MIN_SCORE) {
-    return BEATMIX_INFEASIBLE_COST;
   }
 
   return 1 - bestScore;
