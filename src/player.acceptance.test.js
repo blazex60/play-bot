@@ -1627,8 +1627,8 @@ test('acceptance (mixer): disabling fade during arm prevents a late startCrossfa
 test('acceptance (mixer): crossfade timer defers analysis until the transition window', async () => {
   // Phase 7D round-2: the arm loop's early-return gate now covers
   // CROSSFADE_PREP_LEAD_SEC + MAX_TRANSITION_LEAD_SEC (TAIL_WINDOW_SEC =
-  // 45s), so remaining must exceed 60s for the gate to still be closed at
-  // the start — a 60s track sits exactly ON that boundary.
+  // 60s as of Phase 9F), so remaining must exceed 75s for the gate to still
+  // be closed at the start — this 90s track clears that boundary.
   const frame = Buffer.alloc(FRAME_BYTES);
   let analysisRequests = 0;
   const { player, queue } = makePlayer({

@@ -1926,3 +1926,33 @@ round 6 のプッシュ後、さらに2件の指摘が見つかった。いず�
   - 修正: marginal-tempo のスコアチェックを tier ループの**内側**、各ペアのスコア計算直後に移動した（`match.tier === 'marginal' && score < MARGINAL_TEMPO_MIN_SCORE` なら `continue`）。`planBeatmixTransition()` 自身の `anyMarginalRejected` と全く同じ意味論——閾値未満のペアはそのtier内の他のペア、そして必要ならより狭いtierへと、探索を止めずにスキップされる。ループ後の後付けチェックは（閾値未満のペアがそもそも `bestAtTier`/`bestScore` に反映されなくなったため）冗長になったので削除した——`bestScore` が 0 のまま残るケース（marginal 理由であれ room 不足であれ）は既存の `return 1 - bestScore`（`1 - 0 = 1 = BEATMIX_INFEASIBLE_COST`）がそのまま同じ値を返す。
   - テスト: 20s の room を持つ exit（marginal tempo 込みでスコアが 0.7 未満、8-bar tier を余裕でクリア）と、10s の room しかない exit（スコア 0.7 超、4-bar tier しかクリアしない）を両方候補として与え、`transitionCost()` の結果が「10s の exit だけを候補にした場合」と完全に一致する（＝20s の exit の閾値未満スコアが tier をブロックしない）ことを確認するテストを追加した。数値は `scoreTransitionPair()` を直接呼ぶデバッグスクリプトで実測して較正した（entry 側の phrase score を通常の 0.9 から 0.2 に下げないと、20s の exit のスコアが偶然 0.7 をわずかに上回ってしまい閾値の差が生まれなかったため）。修正を revert すると、期待どおり 20s の exit のスコアがそのまま使われてコストが悪化することを確認済み。
 - テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
+## 実装ノート (Phase 9F)
+
+§8 の Exit Candidate 探索範囲拡張を実装した。tail 解析窓を 45 秒から §8.2 の指定レンジ（60-90秒）の下限である 60 秒へ広げ、findExitCandidates() が実際に探索する候補プールをその新しい窓幅まで届かせた。
+
+### 実装箇所
+
+- `src/audio/vocalActivity.js`: `TAIL_WINDOW_SEC` を 45→60 に変更した。60 秒（レンジの下限）を選んだ理由: 64 BPM/4-beat での 16 bars がちょうど 60 秒（`60 / 64 * 4 * 16 = 60`）になるため、Phase 9E で導入した extended tier（16 bars）が現実的なミキシングテンポ域の下限付近までフルに届くようになる一方、Demucs のtail解析コストの増分は 90 秒（約100%増）よりずっと小さい約33%増（45→60秒）に抑えられる。`analyzeVocalActivity()` 自体は既に `tailWindowSec` を引数として受け取っていたため、コード変更はこの定数1箇所のみ。
+- `src/audio/trackAnalysis.js`: **本 phase で見つかった潜在バグの修正が実装の核心**。`findExitCandidates()`（`beatmixTransition.js`）が実際に検索する候補プール（`phrases.tail`/`downbeatGrid.tail`）は `vocalActivity.js` の `TAIL_WINDOW_SEC` ではなく、`trackAnalysis.js` に**別々に**ハードコードされていた `TAIL_BPM_WINDOW_SEC`（同じく 45）というもう1つの定数でサイズが決まっていた。両者は同じ「tail 解析窓」という概念を指しているにもかかわらず、コード上は完全に独立した2つの定数として存在しており、`TAIL_WINDOW_SEC` だけを広げても `analyzeTrackFile()` が構築する beatGrid.tail/phrases.tail の実際の到達距離（＝ findExitCandidates() が探索できる範囲）は 45 秒のまま変わらない——Demucs のボーカル解析窓（`vocal.lastVocalEndSec`/`vocalGaps` の計算範囲）だけが広がり、完了条件が要求する「phrase boundary 自体を45秒より前から選択可能にする」という実際の効果は一切得られない、という状態になっていた。`TAIL_BPM_WINDOW_SEC` を独立した値ではなく `TAIL_WINDOW_SEC`（`vocalActivity.js` からインポート）からの派生値に変更し、この2つの窓が今後も再び乖離しないようにした。
+- `src/player.js`: `MAX_TRANSITION_LEAD_SEC`（`= TAIL_WINDOW_SEC`）周りの既存コメント（60秒への変更を反映、旧45秒ベースの具体例を更新）と、prep ゲートの早期リターン閾値まわりのコメントを更新した。ロジック自体の変更はなし（`MAX_TRANSITION_LEAD_SEC` は既に `TAIL_WINDOW_SEC` のエイリアスだったため、定数の値が変わるだけでゲートの閾値は自動的に 75 秒（`CROSSFADE_PREP_LEAD_SEC(15) + TAIL_WINDOW_SEC(60)`）に追従する)。
+- テスト:
+  - `src/audio/vocalActivity.test.js`: 「overlap-branch envelope slicing」テスト（60秒トラック、head/tail 窓の重なり境界を検証するテスト）が `tailWindowSec` のデフォルト値に暗黙に依存していたため、`tailWindowSec: 45` を明示的に渡すよう修正し、このテストの意図したシナリオ（`tailStart = max(0, 60-45) = 15` での head/tail overlap）をデフォルト値の変更から切り離した。
+  - `src/audio/trackAnalysis.test.js`: 新規テスト「analyzeTrackFile widens beatGrid.tail/phrases.tail reach in lockstep with TAIL_WINDOW_SEC」を追加。70秒のフェイクトラックで `analyzeTrackFile()` を呼び、`beatGrid.tail.startSec` が新しい `TAIL_BPM_WINDOW_SEC`（60秒）ぶん後退していること（`70-60=10`）、かつ旧45秒境界（`70-45=25`)より前に到達していることを確認する。`TAIL_BPM_WINDOW_SEC = TAIL_WINDOW_SEC` の派生を外して 45 に固定し戻すと、このテストは `startSec=25`（期待は10未満）で期待どおり失敗することを確認済み（revert-test-restore で検証)。ffmpeg/aubiotrack のフル実行は不要——`bash -lc 'command -v aubiotrack'` の応答を「見つからない」にすることで BPM/beat パイプラインを `available:false` で早期終了させ、`tailStart` の計算（これが検証対象そのもの）だけを純粋に検証している。
+  - `src/player.acceptance.test.js`: 「crossfade timer defers analysis until the transition window」テストのコメントを、新しい75秒境界（旧60秒）を反映するよう更新した（アサーション自体は90秒のトラック長がどちらの境界でも変わらず閾値を超えるため無変更)。
+  - `bun run test:server` を再実行し、regression が無いことを確認した: 768件中 760 pass / 4 fail（`silenceTrim.test.js` の ffmpeg 未インストールによる既知の失敗のみ、Phase 9A-9E のノートに記載されているものと同一）/ 4 skip。`player.acceptance.test.js` 単体実行では稀に2件（"chained beatmix transition" と "stem-mix pair marked unavailable" のタイムアウト系）が本 phase の変更と無関係に落ちることがあるが、この worktree で Phase 9F の変更を `git stash` して確認したところベースライン（Phase 9E マージ済みの状態）でも同じ2件が同じ理由（5000msタイムアウト、サンドボックス環境のリソース状況に依存する既知のフレーク）で落ちることを確認済み。
+
+### 未決事項 / 既知の制約
+
+- **§8.2 が明示する 60-90 秒レンジのうち、今回は下限の60秒のみを採用した**: §8.2 自身が「将来的には固定秒数ではなくphrase境界リストベースの探索にすべき」としており、固定秒数のレンジ内でどこを選ぶかは本質的にコストとカバレッジのトレードオフでしかない。60秒は「BPM 64 以上なら16-bar extended tierがフルに届く」水準であり、これを下回るテンポ（バラードなど、より遅いテンポの楽曲）では引き続き extended tier の到達距離が窓の外にはみ出しうる。より広い窓（例えば90秒）へ拡張する、あるいは§8.2が示唆する phrase-boundary-list ベースの探索へ移行するかは、Phase 9A-9E のノートが繰り返し指摘している「実運用でどれだけの割合の遷移が extended tier に到達するか」の実測結果を踏まえて次フェーズ以降で判断すべき事項として保留した。
+- **Demucs tail解析コストの実測は未実施**: 45→60秒への変更が実際の解析時間・CPU負荷にどの程度影響するかは、本エージェント環境では実測できていない（tail窓の長さ増分から比例的に見積もった約33%増という数字は概算）。
+- **実測評価は未実施**: Phase 9A-9E のノートが繰り返し書いている制約と同じく、拡張された tail 窓が実際の楽曲・実運用でどれだけの割合の遷移を「以前は届かなかった exit candidate」まで到達させるかは、実音源・実 Discord セッションでの確認が必要で、本エージェント環境では実施できない。
+
+### 完了条件（§8/§17 9F 相当）
+
+- [x] `TAIL_WINDOW_SEC`（`vocalActivity.js`）を 45→60 秒に拡張した（§8.2 の 60-90 秒レンジの下限)
+- [x] `findExitCandidates()` が実際に検索する候補プール（`phrases.tail`/`downbeatGrid.tail`、`TAIL_BPM_WINDOW_SEC` でサイズが決まる）も同じ幅まで拡張し、2つの独立した「tail窓」定数が乖離していた潜在バグを修正した——これが無いと定数を広げても完了条件の実効果が得られないことをテストで確認済み
+- [x] 「曲末45秒より前のphrase boundaryをexitとして選択可能」（§17 9F の完了条件）を、`analyzeTrackFile()` の `beatGrid.tail.startSec` が新しい60秒窓ぶん後退することを検証するテストで構造的に確認した
+- [x] `bun run test:server` で Phase 7-9E の既存挙動が変わっていないことを確認した（768件中 760 pass / 4 fail はいずれも ffmpeg 未インストールによる既知の失敗のみ / 4 skip）
+- [ ] 60-90秒レンジ内でのより広い値（例: 90秒）への拡張、または phrase-boundary-list ベースの探索への移行（上記未決事項参照、次フェーズ以降）
+- [ ] 拡張された tail 窓の実運用での効果測定（extended tier 到達率の変化、Demucs解析コストの実測）（上記未決事項参照）

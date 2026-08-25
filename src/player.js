@@ -38,7 +38,8 @@ const MAX_CROSSFADE_SEC = 6;
  * Phase 7D: covers the arm loop's early-return gate for both legacy
  * crossfade (MAX_CROSSFADE_SEC) and beatmix/phrase-crossfade. Exit
  * candidates come from findExitCandidates()'s search over the tail analysis
- * window (TAIL_WINDOW_SEC, e.g. 45s before EOF, §5) — the gate must open
+ * window (TAIL_WINDOW_SEC, e.g. 60s before EOF as of Phase 9F §8, §5) — the
+ * gate must open
  * before `remaining` drops below the earliest possible candidate position,
  * or planning (and therefore #ensureIncomingPrep) never runs early enough:
  * by the time the gate finally opened, positionSec could already be PAST a
@@ -2240,14 +2241,13 @@ export class GuildPlayer {
       // MIX_BARS.extended = 16 bars as of Phase 9E, docs/mix-transition-
       // phase9.md §7.2) can run longer at slower tempos — MAX_TRANSITION_LEAD_SEC
       // must cover both, or a slow-tempo beatmix's prep window never opens.
-      // MAX_TRANSITION_LEAD_SEC is still TAIL_WINDOW_SEC (45s, unchanged by
-      // Phase 9E) — at slow enough tempos a full 16-bar reach can itself
-      // exceed 45s (e.g. 16 bars at 80 BPM/4-beat is 48s), which both caps
-      // how early this gate opens AND caps findExitCandidates()'s own
-      // candidate pool short of a true 16-bar-back exit point. This is the
-      // known, deliberately out-of-scope-for-9E limitation Phase 9F (§8,
-      // widening the tail analysis window) exists to address — see
-      // docs/mix-transition-phase9.md's Phase 9E implementation notes.
+      // MAX_TRANSITION_LEAD_SEC is still TAIL_WINDOW_SEC — Phase 9F (§8)
+      // widened it from 45s to 60s specifically so a full 16-bar reach at
+      // slower tempos (e.g. 16 bars at 64 BPM/4-beat is 60s) stays within
+      // both this gate's open point AND findExitCandidates()'s candidate
+      // pool. Below ~64 BPM a 16-bar reach can still exceed the window; see
+      // docs/mix-transition-phase9.md's Phase 9F implementation notes for
+      // the known remaining limitation.
       if (remaining > CROSSFADE_PREP_LEAD_SEC + MAX_TRANSITION_LEAD_SEC) return;
       // TRACK loop must re-arm the same track; upcoming()[0] would advance on promote.
       const next = this.#queue.loopMode === LoopMode.TRACK

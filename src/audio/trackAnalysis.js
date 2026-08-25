@@ -1,6 +1,6 @@
 import { unlink } from 'node:fs/promises';
 import { BYTES_PER_SECOND } from './fade.js';
-import { analyzeVocalActivity, parseRmsLevels } from './vocalActivity.js';
+import { analyzeVocalActivity, parseRmsLevels, TAIL_WINDOW_SEC } from './vocalActivity.js';
 import { analyzeKeys } from './keyAnalysis.js';
 import { analyzeDownbeats } from './downbeatAnalysis.js';
 import { buildPhraseCandidates } from './phraseAnalysis.js';
@@ -11,7 +11,15 @@ export const ANALYSIS_VERSION = 3;
 // track; keep the BPM window and the vocal head window (vocalActivity.js
 // HEAD_WINDOW_SEC) the same length so beatGrid/vocal boundaries line up.
 export const HEAD_BPM_WINDOW_SEC = 30;
-export const TAIL_BPM_WINDOW_SEC = 45;
+// Derived from vocalActivity.js's TAIL_WINDOW_SEC (not a separately-tracked
+// duplicate): beatGrid.tail / phrases.tail (the pool findExitCandidates()
+// searches — see beatmixTransition.js) must reach exactly as far back as
+// vocal.lastVocalEndSec/vocalGaps do, or Phase 9F's widened tail window
+// (§8) would relax the vocal-safety floor's coverage without actually
+// growing the exit-candidate pool it gates, silently missing the phase's
+// completion criterion (a phrase boundary before the old 45s bound must
+// become selectable as exit).
+export const TAIL_BPM_WINDOW_SEC = TAIL_WINDOW_SEC;
 export const PHRASE_FEATURE_FRAME_SEC = 0.1;
 // astats' `reset` option is a frame count, not seconds — asetnsamples forces
 // one filter-frame per PHRASE_FEATURE_FRAME_SEC at a known rate so reset=1
