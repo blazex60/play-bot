@@ -1,4 +1,5 @@
 import { createTrack } from '../../../queue.js'
+import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
 import { resolveMetadata as defaultResolveMetadata, searchYoutube as defaultSearchYoutube } from '../../../search.js'
 import { resolveYoutubeTrack } from '../matching.js'
 import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
@@ -118,12 +119,19 @@ export async function playlistsRoutes(app, {
       const name = typeof request.body?.name === 'string' ? request.body.name.trim() : null
       const idempotencyKey = typeof request.body?.idempotencyKey === 'string' ? request.body.idempotencyKey : null
 
+      // Phase 9F Codex review (PR #52, P2): must reject a stale cached
+      // analysis the same way internal.js's own loadAnalysis() does — an
+      // unversioned read here would keep feeding optimizeTrackOrder() a
+      // pre-upgrade payload_json (e.g. the old 45s tail window) even after
+      // ANALYSIS_VERSION was bumped specifically to invalidate it.
       const loadAnalysis = (videoId) => {
         if (!videoId) return null
         const row = db.prepare('SELECT payload_json AS payloadJson FROM track_analysis WHERE video_id = ?').get(videoId)
         if (!row) return null
         try {
-          return JSON.parse(row.payloadJson)
+          const parsed = JSON.parse(row.payloadJson)
+          if ((parsed.version ?? 1) < ANALYSIS_VERSION) return null
+          return parsed
         } catch {
           return null
         }

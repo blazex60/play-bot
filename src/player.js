@@ -114,34 +114,46 @@ function fallbackAnalysis(track) {
 }
 
 /**
- * Phase 9F Codex review (PR #52, P2): #current's decoder is native-timeline
- * positioned at #currentEntrySec, not 0, when #current was itself promoted
- * from a seeked beatmix/phrase/stem-mix source (see #currentEntrySec's own
- * comment, and #maybeStartCrossfade's currentEntrySec usage below). The
- * exit-candidate pool findExitCandidates() (beatmixTransition.js) searches —
- * outgoing.phrases.tail / outgoing.downbeatGrid.tail.downbeatsSec — has no
- * notion of that runtime offset; it's built purely from the file's own
- * absolute timeline. Phase 9F's widened tail window makes it newly possible
- * for that pool to contain a candidate BEFORE currentEntrySec on a
- * 75-90s-ish track (old 45s window: tailStart >= 30s typically kept the pool
- * past any plausible entrySec; 60s window: tailStart can now dip below it).
- * If the ranker picks such a candidate, #maybeStartCrossfade's
- * `Math.max(0, norm.exitStartSec - currentEntrySec)` clamps the resulting
- * startSec to 0 — "due immediately" — firing the next transition right after
- * promotion and skipping nearly the whole track. Filtering the pool here,
- * before ranking, keeps every candidate #maybeStartCrossfade could ever
- * select strictly reachable from wherever #current's decoder actually
- * starts.
+ * Phase 9F Codex review (PR #52, P2, round 2): #current's decoder is
+ * native-timeline positioned at #currentEntrySec, not 0, when #current was
+ * itself promoted from a seeked beatmix/phrase/stem-mix source (see
+ * #currentEntrySec's own comment, and #maybeStartCrossfade's currentEntrySec
+ * usage below). The exit-candidate pool findExitCandidates()
+ * (beatmixTransition.js) searches — outgoing.phrases.tail /
+ * outgoing.downbeatGrid.tail.downbeatsSec — has no notion of that runtime
+ * offset; it's built purely from the file's own absolute timeline. Phase
+ * 9F's widened tail window makes it newly possible for that pool to contain
+ * a candidate before that position on a 75-90s-ish track (old 45s window:
+ * tailStart >= 30s typically kept the pool past any plausible entrySec; 60s
+ * window: tailStart can now dip below it). If the ranker picks such a
+ * candidate, #maybeStartCrossfade's `Math.max(0, exitStartSec - ...)` clamps
+ * the resulting startSec to 0 — "due immediately" — firing the next
+ * transition right after promotion and skipping nearly the whole track.
+ * Filtering the pool here, before ranking, keeps every candidate
+ * #maybeStartCrossfade could ever select strictly reachable from wherever
+ * #current's decoder actually starts.
+ *
+ * round 1 of this fix floored candidates at #currentEntrySec alone — missing
+ * that MixStream.setCurrent() initializes positionSec to the overlap
+ * already consumed DURING the crossfade (fadeElapsedSec +
+ * incomingSkippedSec — see mixStream.js's promote path), not 0. A candidate
+ * between the entry offset and (entry offset + that consumed overlap,
+ * converted to native seconds) had therefore already played out by the
+ * time #current became current, and round 1 still let it through.
+ * `minReachableNativeSec` (the caller's #currentEntrySec +
+ * #currentEntryOverlapConsumedSec — see that field's own comment for why it
+ * must be a fixed snapshot, not the live/ever-growing positionSec) is that
+ * corrected floor.
  */
-function excludeExitCandidatesBeforeEntry(analysis, currentEntrySec) {
-  if (!(currentEntrySec > 0)) return analysis;
+function excludeExitCandidatesBeforeEntry(analysis, minReachableNativeSec) {
+  if (!(minReachableNativeSec > 0)) return analysis;
   const tailPhrases = analysis.phrases?.tail;
   const tailDownbeats = analysis.downbeatGrid?.tail?.downbeatsSec;
   const filteredPhrases = Array.isArray(tailPhrases)
-    ? tailPhrases.filter((c) => c.sec > currentEntrySec)
+    ? tailPhrases.filter((c) => c.sec > minReachableNativeSec)
     : tailPhrases;
   const filteredDownbeats = Array.isArray(tailDownbeats)
-    ? tailDownbeats.filter((sec) => sec > currentEntrySec)
+    ? tailDownbeats.filter((sec) => sec > minReachableNativeSec)
     : tailDownbeats;
   if (filteredPhrases === tailPhrases && filteredDownbeats === tailDownbeats) return analysis;
   return {
@@ -346,6 +358,22 @@ export class GuildPlayer {
    * transition (Codex round-3 P1).
    */
   #currentEntrySec = 0;
+  /**
+   * Phase 9F Codex review (PR #52, P2, round 2): additional native seconds
+   * already consumed from #current BEFORE it even became #current — the
+   * overlap portion a beatmix/stem-mix crossfade already played through
+   * during the fade (MixStream.setCurrent() initializes positionSec to
+   * fadeElapsedSec + incomingSkippedSec, not 0, on a real promotion — see
+   * mixStream.js's promote path). 0 for a fresh/legacy start or a
+   * snap-adopted handoff (neither ever ran an overlap). Set once, at
+   * promotion, alongside #currentEntrySec — NOT re-derived from the live,
+   * ever-growing positionSec on every arm-loop tick, which would also catch
+   * ordinary arm-loop evaluation lag this codebase already tolerates (fires
+   * as soon as it notices, rather than requiring every candidate to still
+   * be strictly in the future). #currentEntrySec + this is the true
+   * absolute floor for #maybeStartCrossfade's excludeExitCandidatesBeforeEntry().
+   */
+  #currentEntryOverlapConsumedSec = 0;
   #probeTempoBackendFn;
   #createPcmSourceFn;
   #incomingTempFile = null;
@@ -782,6 +810,7 @@ export class GuildPlayer {
     this.#pendingSessionTempo = null;
     this.#pendingIncomingEntrySec = 0;
     this.#currentEntrySec = 0;
+    this.#currentEntryOverlapConsumedSec = 0;
     this.#startCrossfadeArm();
     this.#prefetchUpcoming();
     this.#ensureIncomingPrepForUpcoming();
@@ -987,6 +1016,9 @@ export class GuildPlayer {
     this.#pendingSessionTempo = null;
     this.#pendingIncomingEntrySec = 0;
     this.#currentEntrySec = entrySec;
+    // No overlap ran on this path (a prepared source simply won the race to
+    // EOF — see this function's own docstring), so positionSec starts at 0.
+    this.#currentEntryOverlapConsumedSec = 0;
     this.#clearCrossfadeArm();
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
@@ -1208,6 +1240,14 @@ export class GuildPlayer {
     } else {
       this.#resetSessionTempoFor(nextTrack);
     }
+    // Codex review (PR #52, P2, round 2): MixStream.setCurrent() (mixStream.js)
+    // already initialized positionSec to the overlap portion just consumed
+    // (fadeElapsedSec + incomingSkippedSec) by the time this synchronous
+    // handler runs — snapshot it now, in native seconds, before any further
+    // playback advances it. See #currentEntryOverlapConsumedSec's own
+    // comment for why this must be captured once here rather than derived
+    // live from positionSec on every later arm-loop tick.
+    this.#currentEntryOverlapConsumedSec = (this.#mixStream?.positionSec ?? 0) * this.#sessionTempo.tempoRatio;
     // The incoming source was seeked forward by promotedEntrySec (native
     // seconds) at spawn — its remaining native content is only
     // (duration - promotedEntrySec), not the full native duration. Convert
@@ -2304,8 +2344,13 @@ export class GuildPlayer {
         return;
       }
 
+      // Codex review (PR #52, P2, round 2): the floor for excludeExitCandidatesBeforeEntry()
+      // must include the overlap #current already consumed before becoming
+      // #current (#currentEntryOverlapConsumedSec's own comment) on top of
+      // its entry offset — not just the entry offset alone.
+      const minReachableNativeSec = (this.#currentEntrySec ?? 0) + (this.#currentEntryOverlapConsumedSec ?? 0);
       const rawOutAnalysis = (await this.#getCachedAnalysis(current)) ?? fallbackAnalysis(current);
-      const outAnalysis = excludeExitCandidatesBeforeEntry(rawOutAnalysis, this.#currentEntrySec ?? 0);
+      const outAnalysis = excludeExitCandidatesBeforeEntry(rawOutAnalysis, minReachableNativeSec);
       const inAnalysis = (await this.#getCachedAnalysis(next)) ?? fallbackAnalysis(next);
       const outgoingPlaybackBpm = this.#sessionTempo.playbackBpm ?? outAnalysis.bpm ?? null;
       // planBeatmixTransition/planStemTransition both reject before ever

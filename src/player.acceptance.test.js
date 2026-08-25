@@ -901,6 +901,14 @@ test('acceptance (mixer): a promoted track\'s exit-candidate pool excludes candi
   // filtering it out before ranking, it would win outright (higher score,
   // and it alone clears the wider 8-bar tier that the valid candidate can't
   // reach), reproducing exactly that immediate-fire symptom.
+  //
+  // `midConsumedInvalid` covers round 2 of this same fix (Codex round-2
+  // follow-up): MixStream initializes positionSec to the overlap already
+  // consumed DURING the A->B crossfade (fadeElapsedSec, ~the full fadeSec by
+  // the time promotion completes — not 0), so a candidate AFTER B's entry
+  // offset but still inside that already-consumed overlap window has also
+  // already played by the time B becomes #current. Filtering only against
+  // the entry offset (round 1) would let it through.
   const frame = Buffer.alloc(FRAME_BYTES);
   new Int16Array(frame.buffer).fill(4000);
   const firedPlans = [];
@@ -908,7 +916,11 @@ test('acceptance (mixer): a promoted track\'s exit-candidate pool excludes candi
 
   const BS_ENTRY_SEC = 5.0; // B's own entry offset, baked in by A->B.
   const INVALID_EARLY_SEC = 2.0; // before BS_ENTRY_SEC — unreachable once B is current.
-  const VALID_EXIT_SEC = 21.5; // after BS_ENTRY_SEC — the only usable B->C exit.
+  // Inside B's own consumed-during-overlap window (~8s fadeSec, see the
+  // "chained beatmix transition" test above for the same 4-bar/8s tier) —
+  // after BS_ENTRY_SEC but still already played out by the time of promotion.
+  const MID_CONSUMED_INVALID_SEC = 8.0;
+  const VALID_EXIT_SEC = 21.5; // after the fully-consumed overlap — the only usable B->C exit.
 
   const analysisA = {
     version: ANALYSIS_VERSION,
@@ -945,13 +957,18 @@ test('acceptance (mixer): a promoted track\'s exit-candidate pool excludes candi
     downbeatGrid: { source: 'heuristic', meter: 4, confidence: 0.7, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] } },
     phrases: {
       head: [{ sec: BS_ENTRY_SEC, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] }],
-      // invalidEarly outscores validLate and has 28s of room (durationSec -
+      // invalidEarly outscores everything and has 28s of room (durationSec -
       // sec), clearing even the wider 8-bar/16s tier outright — the ranker
       // picks the widest tier with any fit and stops there, so unfiltered
-      // it wins immediately. validLate has only 8.5s of room, clearing just
-      // the narrower 4-bar/8s tier.
+      // it wins immediately. midConsumedInvalid (score 0.7, between the
+      // other two) also clears the 8-bar tier (22s of room) and would win
+      // once invalidEarly alone is filtered — round 1's entry-offset-only
+      // floor does exactly that but still lets midConsumedInvalid through.
+      // validLate has only 8.5s of room, clearing just the narrower 4-bar/8s
+      // tier — it only wins once BOTH invalid candidates are filtered.
       tail: [
         { sec: INVALID_EARLY_SEC, barIndex: 0, score: 0.9, reasons: ['bar-multiple'] },
+        { sec: MID_CONSUMED_INVALID_SEC, barIndex: 0, score: 0.7, reasons: ['bar-multiple'] },
         { sec: VALID_EXIT_SEC, barIndex: 0, score: 0.5, reasons: ['bar-multiple'] },
       ],
     },
