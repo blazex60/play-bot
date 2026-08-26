@@ -19,6 +19,14 @@ export const DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC = 0.2;
  * right vocal-tail timing, not only 16-bar ones.
  */
 export const MIN_MEANINGFUL_INVOCAL_FADE_SEC = 0.5;
+/**
+ * Phase 9H (docs/mix-transition-phase9.md §10.3): outVocal's release
+ * duration once it starts leaving — a short cut near the very end of the
+ * remaining vocal, not a fade spanning the whole window (see
+ * buildStemEnvelopes() below). §10.4 gives a 200-800ms range; 0.5s is
+ * §10.3's own worked example and a reasonable default within that range.
+ */
+export const DEFAULT_OUTVOCAL_RELEASE_SEC = 0.5;
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
@@ -48,21 +56,39 @@ function estimateInVocalFadeSec(outgoing, { exitStartSec, outgoingRatio, fadeSec
  * Per-stem gain-envelope descriptors for a `mode: 'stem-mix'` plan. The
  * instrumental pair keeps the plan's own single fadeSec/curve — identical
  * to a plain (non-stem) crossfade's envelope. The vocal pair is where
- * Phase 8's actual behavior lives: outVocal fades out only as long as the
+ * Phase 8's actual behavior lives: outVocal leaves only as long as the
  * outgoing track genuinely still has vocal left at the exit point (0 when
  * it was already vocal-safe — the pre-Phase-8 case, reproduced exactly),
  * and inVocal's start is delayed until outVocal has reached silence (plus
  * a small margin), rather than needing the whole overlap to be vocal-free
  * on both sides the way a plain beatmix transition requires.
+ *
+ * Phase 9H (docs/mix-transition-phase9.md §10): outVocal HOLDS at full
+ * volume for nearly the whole remaining-vocal window instead of fading
+ * continuously from bar 0 — §10.1's complaint is that a fade spanning the
+ * entire window already audibly weakens the last singing well before the
+ * vocal itself ends (by its midpoint, an equal-power curve is already down
+ * ~30%). §10.2/§10.3 replace that with hold-then-short-release: full
+ * volume until `outVocalReleaseSec` before the vocal's own end, then only
+ * that short (§10.4: 200-800ms) release — the same hold-then-fade shape
+ * `gainForStemPosition()` already implements for inVocal's fade-IN
+ * (`startOffsetSec` holds, then ramps over `fadeSec`), just applied on the
+ * fade-OUT side here. The instant outVocal reaches silence
+ * (`outVocalWindowSec`, i.e. hold+release) is unchanged from Phase 8's
+ * original `outVocalFadeSec` — only how that same duration is split
+ * between "held" and "releasing" changes — so `inVocalDelaySec`/
+ * `estimateInVocalFadeSec()` (which only care about that instant, not how
+ * outVocal spends the time before it) need no changes.
  * @param {object} outgoing analysis (needs lastVocalEndSec)
  * @param {object} plan a `planBeatmixTransition()`-shaped eligible plan
  *   (specifically `plan.outgoing.exitStartSec`/`tempoRatioApplied`,
  *   `plan.fadeSec`, `plan.gain.curve`)
- * @param {{ vocalCrossoverMarginSec?: number }} [options]
+ * @param {{ vocalCrossoverMarginSec?: number, outVocalReleaseSec?: number }} [options]
  * @returns {{ outVocal: object, outInstrumental: object, inInstrumental: object, inVocal: object }}
  */
 export function buildStemEnvelopes(outgoing, plan, {
   vocalCrossoverMarginSec = DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC,
+  outVocalReleaseSec = DEFAULT_OUTVOCAL_RELEASE_SEC,
 } = {}) {
   const fadeSec = plan.fadeSec;
   const curve = plan.gain?.curve ?? 'equal-power';
@@ -78,14 +104,22 @@ export function buildStemEnvelopes(outgoing, plan, {
   const outVocalTailNativeSec = Number.isFinite(lastVocalEndSec)
     ? Math.max(0, lastVocalEndSec - exitStartSec)
     : 0;
-  const outVocalFadeSec = clamp(outVocalTailNativeSec / outgoingRatio, 0, fadeSec);
-  const inVocalDelaySec = clamp(outVocalFadeSec + vocalCrossoverMarginSec, 0, fadeSec);
+  // Total time-to-silence for outVocal — identical to Phase 8's
+  // outVocalFadeSec (same formula), now split below into hold+release
+  // instead of being the fade duration itself.
+  const outVocalWindowSec = clamp(outVocalTailNativeSec / outgoingRatio, 0, fadeSec);
+  // Never release longer than the window itself has room for (e.g. the
+  // vocal ends almost immediately after the exit point) — degrades to an
+  // immediate release, never a negative hold.
+  const releaseSec = clamp(outVocalReleaseSec, 0, outVocalWindowSec);
+  const holdSec = outVocalWindowSec - releaseSec;
+  const inVocalDelaySec = clamp(outVocalWindowSec + vocalCrossoverMarginSec, 0, fadeSec);
   const inVocalFadeSec = estimateInVocalFadeSec(
     outgoing, { exitStartSec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec,
   );
 
   return {
-    outVocal: { role: 'out', fadeSec: outVocalFadeSec, curve, startOffsetSec: 0 },
+    outVocal: { role: 'out', fadeSec: releaseSec, curve, startOffsetSec: holdSec },
     outInstrumental: { role: 'out', fadeSec, curve, startOffsetSec: 0 },
     inInstrumental: { role: 'in', fadeSec, curve, startOffsetSec: 0 },
     inVocal: {
@@ -134,11 +168,14 @@ export function buildMixZone(plan) {
  * rather than emitting a redundant same-bar duplicate of
  * 'incoming-instrumental-start'.
  *
- * 'outgoing-vocal-release' marks the START of outVocal's fade (bar 0 today,
- * since this envelope model has no hold phase yet — Phase 9H's own bar,
- * once it introduces one), not its completion — "release" names the
- * moment release BEGINS, matching §10.4's own "phrase終了→short release"
- * planner sketch. A separate 'outgoing-vocal-silent' marks the bar outVocal
+ * 'outgoing-vocal-release' marks the START of outVocal's fade — since
+ * Phase 9H (§10), that's `stems.outVocal.startOffsetSec`'s hold boundary,
+ * not bar 0: outVocal now holds at full volume until shortly before the
+ * vocal's own end, so this event fires much later in the window than it
+ * used to (see buildStemEnvelopes()'s holdSec/releaseSec split) — not its
+ * completion — "release" names the moment release BEGINS, matching §10.4's
+ * own "phrase終了→short release" planner sketch. A separate
+ * 'outgoing-vocal-silent' marks the bar outVocal
  * actually reaches silence, for any consumer that needs that instant
  * specifically (Codex review, PR #53, P2: the original version fired
  * 'outgoing-vocal-release' only after the fade had already completed, so

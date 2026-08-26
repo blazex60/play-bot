@@ -2055,3 +2055,33 @@ round 1 の修正（commit `f87ad0e`）に対し、Codex から新たに2件の�
 - **P2: `endMixer()` を同期的に呼ぶ `mixzoneevent` リスナーが `ERR_STREAM_PUSH_AFTER_EOF` を引き起こす**。round 1 で修正した null-deref（`#fireDueMixZoneEvents()` 内で `this.#stemCrossfade` への書き戻しが `null` に対して行われる問題）は解消されていたが、その一段上——`#tryPushFrame()`（`mixStream.js`）——に別の同種の問題が残っていた。`endMixer()` は `#destroyed` を立てたうえで自ら `this.push(null)`（EOF）を呼ぶが、`#tryPushFrame()` は `const frame = this.#readFrame();` を実行した**後**に `this.#destroyed` を再チェックしていなかったため、`#readFrame()` の内部（`#readStemCrossfadeFrame()` → `#fireDueMixZoneEvents()` → `emit('mixzoneevent')` → リスナーが同期的に `endMixer()` を呼ぶ）で EOF が送出された直後でも、呼び出し元は構わず `this.push(frame)` を実行してしまい、Node が `ERR_STREAM_PUSH_AFTER_EOF` を投げてストリーム自体を破壊していた。修正として `#tryPushFrame()` の `const frame = this.#readFrame();` の直後に `if (this.#destroyed) return;` を追加し、読み取り中に同期的にテアダウンされた場合はそこで即座に処理を打ち切るようにした。`mixStream.test.js` に、`mixzoneevent` リスナーの中で同期的に `mix.endMixer()` を呼ぶ回帰テストを追加し、`'error'` イベントが一切発生しないことを確認した。revert-test-restore: 追加した `if (this.#destroyed) return;` を一時的に削除すると、この新規テストが `ERR_STREAM_PUSH_AFTER_EOF` で期待どおり失敗する（実際に `stream.push() after EOF` エラーを再現した）ことを確認したうえで復元した。
 
 検証: `bun test src/audio/mixStream.test.js`（32 pass中25 pass・7 failは既知のタイミング依存flake、うち2件が今回追加でともにpass）、`bun run test:server` を再実行し regression が無いことを確認した。
+
+
+## 実装ノート (Phase 9H)
+
+§10 の Outgoing Vocal Hold/Release を実装した。§10.1 の問題提起（outVocal がtransition開始と同時にフェードアウトを始めるため、最後の歌唱がフェード途中で弱くなって聞こえる）に対し、§10.2/§10.3 が示す「ほぼ全期間 hold → 直前の短い release」という envelope 形状を、既存の `gainForStemPosition()`（hold→fadeの2区間モデル、Phase 8 で実装・検証済み）にそのまま乗せる形で実装した——`gainForStemPosition()` 自体・その呼び出し箇所は一切変更していない。
+
+### 実装箇所
+
+- `src/audio/stemTransition.js`:
+  - `DEFAULT_OUTVOCAL_RELEASE_SEC`（新規定数、`0.5`）: §10.3 の worked example (`releaseSec: 0.5`) をそのままデフォルト値として採用した。§10.4 は 200〜800ms のレンジを示しているが、固定デフォルトを使うことでテスト・挙動の再現性を保った——将来的に楽曲ごとに変える必要が出れば `buildStemEnvelopes()` の `outVocalReleaseSec` オプションで上書きできる。
+  - `buildStemEnvelopes()`: 従来 `outVocalFadeSec`（= 残り native vocal tail を playback 秒に換算した時間）をそのまま `outVocal.fadeSec` として使い `startOffsetSec: 0` から即座にフェードしていた箇所を変更した。同じ時間を `outVocalWindowSec`（"無音に達するまでの時間"、Phase 8 の `outVocalFadeSec` と数値的に同一）として保持したうえで、`releaseSec = clamp(outVocalReleaseSec, 0, outVocalWindowSec)`（window が release のデフォルト値より短い場合はwindow全体に縮退——holdSecが負にならないためのガード）、`holdSec = outVocalWindowSec - releaseSec` を計算し、`outVocal: { startOffsetSec: holdSec, fadeSec: releaseSec, ... }` を返すようにした。「無音に達する瞬間」（`holdSec + releaseSec = outVocalWindowSec`）自体は Phase 8 から不変のため、`inVocalDelaySec`（`outVocalWindowSec + vocalCrossoverMarginSec` を使う既存の計算）・`estimateInVocalFadeSec()` は無変更——incoming vocal のタイミングロジックには影響しない。
+  - `buildTransitionEvents()`: コード自体の変更はなし（`stems.outVocal.startOffsetSec`/`fadeSec` を読むだけなので、Phase 9H の変更は自動的に反映される）。ただし `'outgoing-vocal-release'` イベントの docstring を、「Phase 9H 導入前は常に bar 0」から「Phase 9H 以降は hold 境界のbar（= ウィンドウのほぼ終盤）」に更新した。
+- テスト（`stemTransition.test.js`）:
+  - 既存3件（`outVocal fades out over exactly...`/`tail is converted from native to playback seconds...`/`clamps inVocal to a zero-length window...`）の fixture・アサーションを新しい hold/release セマンティクスに合わせて更新した（`outVocal.fadeSec` が「無音までの全時間」ではなく「release時間のみ」になったため）。
+  - 新規2件を追加: (1) window が `DEFAULT_OUTVOCAL_RELEASE_SEC` より短い場合に release がwindow全体へ縮退し hold が負にならないことを確認するテスト、(2) `gainForStemPosition()` を実際に呼び出し、hold区間（0〜6.49秒）で常にgain=1、release区間の途中で0と1の間、windowの終端でgain=0になることを確認する回帰テスト——§10.1 の問題提起そのもの（連続フェードだと中間点で既に~30%減衰している）が解消されていることの直接証拠。
+
+### 未決事項 / 既知の制約
+
+- **「last vocal phrase start」の専用検出は行っていない**: §10.4 のプランナー・スケッチは「最後のvocal phraseの開始」を起点とした設計を示唆しているが、既存の解析パイプライン（`vocalActivity.js`）は `lastVocalEndSec`（最後にvocalが検出された終端）と `vocalGaps`（1.5秒以上の無音区間）のみを提供し、phrase単位の開始点を明示的には持たない。今回は新しい解析ステップを追加せず、既存の `outVocalTailNativeSec`（= exit point から `lastVocalEndSec` までの時間、Phase 8 から不変）をそのまま「hold+release の合計時間」として使い、その中で release だけを短く切り出す設計にした——`exitStartSec` 自体が vocal-safe な点に近いところで選ばれる前提（`beatmixTransition.js` の vocalFloor ゲート）に立てば、この区間はほぼ「最後のvocal phraseの範囲」と一致すると考えられるが、厳密な phrase 境界検出ではない。より精緻な phrase 単位の制御が必要になれば、`vocalGaps` を使って `lastVocalEndSec` 直前の gap の終端を「phrase start」として明示的に検出する拡張が考えられる。
+- **releaseSec は固定デフォルト**: §10.4 が示す 200〜800ms のレンジ内で楽曲ごとに変化させる仕組みは実装していない。実運用での聴感評価を踏まえて可変にする価値があるかは今後の判断に委ねる。
+- **実運用での聴感評価は未実施**: 既存フェーズのノートと同様、本エージェント環境では実施できない。
+
+### 完了条件（§10/§17 9H 相当）
+
+- [x] outVocal envelope を `{ holdSec, releaseSec, curve }`（実装上は既存の `{ startOffsetSec, fadeSec, curve }` 形状のまま、意味論だけ hold/release に変更）に変更した
+- [x] hold は「無音に達するまでの残り時間」から release 分を引いた長さ、release は §10.3 の例に沿った固定 0.5秒（window が短い場合は window 全体へ縮退）
+- [x] 既存のゲイン計算関数（`gainForStemPosition()`）・incoming vocal のタイミングロジック（`inVocalDelaySec`/`estimateInVocalFadeSec()`）に regression が無いことを確認した（`bun run test:server`: 784件中776 pass、既知の4件のみ fail）
+- [ ] 「last vocal phrase start」の専用検出（上記未決事項参照、必要になれば次フェーズ以降）
+- [ ] release時間を楽曲ごとに可変にする（上記未決事項参照）
+- [ ] 実運用での聴感評価（上記未決事項参照）
