@@ -456,6 +456,17 @@ export class MixStream extends Readable {
     if (!this.#pendingRead || this.#destroyed) return;
 
     const frame = this.#readFrame();
+    // Codex review (PR #53, round 2, P2): #readFrame() can run a synchronous
+    // 'mixzoneevent' listener (via #readStemCrossfadeFrame() ->
+    // #fireDueMixZoneEvents()) that itself calls endMixer() — which sets
+    // #destroyed and already calls push(null) (EOF) before this read
+    // returns. Without this check, execution unwinds back here and falls
+    // through to push(frame ?? SILENCE_FRAME) below regardless, a push
+    // after EOF that Node turns into ERR_STREAM_PUSH_AFTER_EOF and destroys
+    // the stream over — same as the P1/P2 null-deref this method's own
+    // internals already guard against, just one frame later in the call
+    // chain, where `this` is still valid so nothing throws here directly.
+    if (this.#destroyed) return;
     if (frame === null) {
       // No PCM this tick. Keep delivering 20 ms silence so a piped opus
       // encoder stays readable: @discordjs/voice AudioPlayer.checkPlayable()

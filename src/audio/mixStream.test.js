@@ -1112,6 +1112,52 @@ test('MixStream startStemCrossfade survives a mixzoneevent listener that tears d
   }
 });
 
+test('MixStream startStemCrossfade does not push after EOF when a mixzoneevent listener calls endMixer() synchronously (Codex review, PR #53, round 2, P2)', async () => {
+  // endMixer() (unlike dropCurrent()) sets #destroyed and calls push(null)
+  // (EOF) itself. The previous fix stopped #fireDueMixZoneEvents() from
+  // throwing on a torn-down #stemCrossfade, but #readStemCrossfadeFrame()
+  // still runs to completion and returns a frame, which #tryPushFrame()
+  // then pushed unconditionally — a push AFTER the EOF endMixer() already
+  // sent, which Node turns into ERR_STREAM_PUSH_AFTER_EOF and destroys the
+  // stream over a downstream listener's own legitimate teardown.
+  const mix = new MixStream();
+  let caught = null;
+  mix.on('error', (err) => { caught = err; });
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 12;
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames + 20),
+    };
+    const plan = {
+      ...makeStemPlan(0.2),
+      mixZone: { startSec: 0, durationSec: 0.2, bars: 2, beatsPerBar: 4, targetBpm: 120 },
+      events: [
+        { bar: 0, action: 'incoming-instrumental-start' },
+        { bar: 1, action: 'bass-swap' },
+        { bar: 2, action: 'incoming-vocal-handoff' },
+      ],
+    };
+
+    mix.on('mixzoneevent', () => { mix.endMixer(); }); // synchronous teardown, first event, bar 0
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+    mix.on('data', () => {}); // keep the stream flowing so ticks actually happen
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(caught, null, 'must not have pushed after EOF (ERR_STREAM_PUSH_AFTER_EOF)');
+  } finally {
+    mix.endMixer();
+  }
+});
+
 test('MixStream startStemCrossfade drives its stem gains from events/mixZone, not plan.stems, when both are present (Codex review, PR #53, P1)', async () => {
   // If MixStream silently ignored events/mixZone and read plan.stems
   // instead (the exact bug Codex flagged), the schedule would only ever
