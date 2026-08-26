@@ -98,6 +98,129 @@ export function buildStemEnvelopes(outgoing, plan, {
 }
 
 /**
+ * Phase 9G (docs/mix-transition-phase9.md §9.1): TransitionPlan v3's
+ * `mixZone` descriptor — the overlap window expressed in bar/tempo terms
+ * instead of only raw seconds, so MixStream's bar clock (see mixStream.js's
+ * #tickStemCrossfade()) and downstream consumers (§9.2's event schedule,
+ * future Phase 9H/9I work) have one shared frame of reference.
+ * @param {object} plan a planBeatmixTransition()-shaped eligible plan
+ * @returns {{ startSec: number|null, durationSec: number|null, bars: number|null, beatsPerBar: number|null, targetBpm: number|null }}
+ */
+export function buildMixZone(plan) {
+  return {
+    startSec: plan.outgoing?.exitStartSec ?? null,
+    durationSec: plan.fadeSec ?? null,
+    bars: plan.sync?.bars ?? null,
+    beatsPerBar: plan.sync?.beatsPerBar ?? null,
+    targetBpm: plan.targetBpm ?? null,
+  };
+}
+
+/**
+ * Phase 9G §9.2: TransitionPlan v3's `events` array — the bar-timestamped
+ * schedule the per-stem envelope timings buildStemEnvelopes() already
+ * computes (startOffsetSec/fadeSec, in seconds) implicitly encode, made
+ * explicit and consumable by MixStream's bar clock instead of staying
+ * buried in raw seconds. MixStream's #tickStemCrossfade() reconstructs its
+ * actual per-tick gain envelopes FROM this array (see
+ * deriveStemEnvelopesFromEvents() below) rather than reading
+ * buildStemEnvelopes()'s raw seconds directly — this array is the thing
+ * that drives gain state, not a side-channel notification log layered on
+ * top of an unrelated computation (Codex review, PR #53, P1).
+ *
+ * §9.2's illustrative example also lists 'outgoing-instrumental-duck' —
+ * this envelope model has no separate pre-duck hold stage (outInstrumental
+ * fades from bar 0 the same as it always has), so that action is omitted
+ * rather than emitting a redundant same-bar duplicate of
+ * 'incoming-instrumental-start'.
+ *
+ * 'outgoing-vocal-release' marks the START of outVocal's fade (bar 0 today,
+ * since this envelope model has no hold phase yet — Phase 9H's own bar,
+ * once it introduces one), not its completion — "release" names the
+ * moment release BEGINS, matching §10.4's own "phrase終了→short release"
+ * planner sketch. A separate 'outgoing-vocal-silent' marks the bar outVocal
+ * actually reaches silence, for any consumer that needs that instant
+ * specifically (Codex review, PR #53, P2: the original version fired
+ * 'outgoing-vocal-release' only after the fade had already completed, so
+ * an automation consumer acting on it would have found the vocal already
+ * gone instead of just starting to leave).
+ * @param {object} plan a planBeatmixTransition()-shaped eligible plan
+ *   (needs `sync.beatsPerBar`, `targetBpm`, `eq.swapBar`)
+ * @param {object} stems buildStemEnvelopes()'s return value
+ * @returns {{ bar: number, action: string }[]} sorted ascending by bar
+ */
+export function buildTransitionEvents(plan, stems) {
+  const beatsPerBar = plan.sync?.beatsPerBar;
+  const targetBpm = plan.targetBpm;
+  const barSec = Number.isFinite(beatsPerBar) && targetBpm > 0
+    ? (60 / targetBpm) * beatsPerBar
+    : null;
+  if (!(barSec > 0)) return [];
+  // 6 decimal places (microsecond precision at realistic tempos) keeps
+  // deriveStemEnvelopesFromEvents()'s bar->seconds round-trip well under
+  // one audio sample's worth of drift from buildStemEnvelopes()'s own
+  // seconds-domain numbers.
+  const toBar = (sec) => Number((sec / barSec).toFixed(6));
+
+  const events = [
+    { bar: toBar(stems.inInstrumental.startOffsetSec), action: 'incoming-instrumental-start' },
+    { bar: toBar(stems.outVocal.startOffsetSec), action: 'outgoing-vocal-release' },
+    { bar: toBar(stems.outVocal.startOffsetSec + stems.outVocal.fadeSec), action: 'outgoing-vocal-silent' },
+    { bar: toBar(stems.inVocal.startOffsetSec), action: 'incoming-vocal-handoff' },
+  ];
+  if (Number.isFinite(plan.eq?.swapBar)) {
+    events.push({ bar: plan.eq.swapBar, action: 'bass-swap' });
+  }
+  return events.sort((a, b) => a.bar - b.bar);
+}
+
+function findEventBar(events, action, fallbackBar) {
+  const found = events.find((e) => e.action === action);
+  return found ? found.bar : fallbackBar;
+}
+
+/**
+ * Phase 9G (Codex review, PR #53, P1): the inverse of buildTransitionEvents()
+ * — reconstructs the four per-stem gain-envelope descriptors
+ * gainForStemPosition() needs FROM the events schedule (+ mixZone for the
+ * bar->seconds conversion), instead of reading buildStemEnvelopes()'s raw
+ * seconds directly. MixStream.startStemCrossfade() calls this whenever a
+ * plan carries events/mixZone, making the schedule the actual thing that
+ * drives gain state on every tick — not a side-channel notification stream
+ * layered on top of an unrelated computation. Falls back to bar 0 / the
+ * window's own start-or-end for any event this schedule doesn't carry
+ * (e.g. a hand-built plan missing one action), so a partial schedule still
+ * produces a usable (if degenerate) envelope rather than throwing.
+ * @param {{ bar: number, action: string }[]} events buildTransitionEvents()'s return value
+ * @param {{ bars: number, durationSec: number }} mixZone buildMixZone()'s return value
+ * @param {string} [curve]
+ * @returns {{ outVocal: object, outInstrumental: object, inInstrumental: object, inVocal: object }}
+ */
+export function deriveStemEnvelopesFromEvents(events, mixZone, curve = 'equal-power') {
+  const barSec = mixZone.durationSec / mixZone.bars;
+  const toSec = (bar) => bar * barSec;
+  const windowStartBar = findEventBar(events, 'incoming-instrumental-start', 0);
+  const windowEndBar = mixZone.bars;
+  const outVocalStartBar = findEventBar(events, 'outgoing-vocal-release', windowStartBar);
+  const outVocalEndBar = findEventBar(events, 'outgoing-vocal-silent', outVocalStartBar);
+  const inVocalStartBar = findEventBar(events, 'incoming-vocal-handoff', windowEndBar);
+
+  const windowStartSec = toSec(windowStartBar);
+  const windowFadeSec = Math.max(0, toSec(windowEndBar) - windowStartSec);
+  const outVocalStartSec = toSec(outVocalStartBar);
+  const outVocalFadeSec = Math.max(0, toSec(outVocalEndBar) - outVocalStartSec);
+  const inVocalStartSec = toSec(inVocalStartBar);
+  const inVocalFadeSec = Math.max(0, toSec(windowEndBar) - inVocalStartSec);
+
+  return {
+    outVocal: { role: 'out', curve, startOffsetSec: outVocalStartSec, fadeSec: outVocalFadeSec },
+    outInstrumental: { role: 'out', curve, startOffsetSec: windowStartSec, fadeSec: windowFadeSec },
+    inInstrumental: { role: 'in', curve, startOffsetSec: windowStartSec, fadeSec: windowFadeSec },
+    inVocal: { role: 'in', curve, startOffsetSec: inVocalStartSec, fadeSec: inVocalFadeSec },
+  };
+}
+
+/**
  * Phase 8's actual new capability: a transition where the outgoing track
  * still has vocals active at the exit point is not rejected outright the
  * way a plain beatmix transition must (docs/mix-transition-phase7.md 禁止5
@@ -161,5 +284,7 @@ export function planStemTransition(outgoing, incoming, options = {}) {
     ...plan,
     mode: 'stem-mix',
     stems,
+    mixZone: buildMixZone(plan),
+    events: buildTransitionEvents(plan, stems),
   };
 }

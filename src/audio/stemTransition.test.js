@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planStemTransition, buildStemEnvelopes, DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC } from './stemTransition.js';
+import {
+  planStemTransition, buildStemEnvelopes, buildMixZone, buildTransitionEvents,
+  deriveStemEnvelopesFromEvents,
+  DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC,
+} from './stemTransition.js';
 import { planBeatmixTransition } from './beatmixTransition.js';
 
 function richOutgoing(overrides = {}) {
@@ -168,6 +172,108 @@ test('buildStemEnvelopes: outVocal tail is converted from native to playback sec
   };
   const stems = buildStemEnvelopes(outgoing, plan);
   assert.equal(stems.outVocal.fadeSec, 7);
+});
+
+// --- Phase 9G §9.1/9.2: TransitionPlan v3 (mixZone/events) -------------
+
+test('buildMixZone expresses the overlap window in bar/tempo terms', () => {
+  const plan = {
+    fadeSec: 16,
+    outgoing: { exitStartSec: 182.4 },
+    sync: { bars: 8, beatsPerBar: 4 },
+    targetBpm: 120,
+  };
+  assert.deepEqual(buildMixZone(plan), {
+    startSec: 182.4, durationSec: 16, bars: 8, beatsPerBar: 4, targetBpm: 120,
+  });
+});
+
+test('buildMixZone fills missing fields with null rather than throwing on a bare/legacy plan', () => {
+  assert.deepEqual(buildMixZone({}), {
+    startSec: null, durationSec: null, bars: null, beatsPerBar: null, targetBpm: null,
+  });
+});
+
+test('buildTransitionEvents converts each stem envelope timestamp to its bar position, sorted ascending', () => {
+  // 120 BPM, 4 beats/bar -> barSec = 2s/bar.
+  const plan = { sync: { bars: 8, beatsPerBar: 4 }, targetBpm: 120, eq: { swapBar: 4 } };
+  const stems = {
+    inInstrumental: { startOffsetSec: 0 },
+    // release begins at 1s (bar 0.5), reaches silence at 4s (bar 2) — two
+    // distinct events, not one (Codex review, PR #53, P2).
+    outVocal: { startOffsetSec: 1, fadeSec: 3 },
+    inVocal: { startOffsetSec: 6 }, // bar 3
+  };
+  const events = buildTransitionEvents(plan, stems);
+  assert.deepEqual(events, [
+    { bar: 0, action: 'incoming-instrumental-start' },
+    { bar: 0.5, action: 'outgoing-vocal-release' },
+    { bar: 2, action: 'outgoing-vocal-silent' },
+    { bar: 3, action: 'incoming-vocal-handoff' },
+    { bar: 4, action: 'bass-swap' },
+  ]);
+});
+
+test('buildTransitionEvents omits bass-swap when the plan has no eq.swapBar (e.g. a non-beatmix caller)', () => {
+  const plan = { sync: { bars: 8, beatsPerBar: 4 }, targetBpm: 120 };
+  const stems = {
+    inInstrumental: { startOffsetSec: 0 },
+    outVocal: { startOffsetSec: 0, fadeSec: 0 },
+    inVocal: { startOffsetSec: 0 },
+  };
+  const events = buildTransitionEvents(plan, stems);
+  assert.ok(!events.some((e) => e.action === 'bass-swap'));
+});
+
+test('buildTransitionEvents returns an empty schedule when the plan has no bar-clock data (missing sync/targetBpm)', () => {
+  const stems = {
+    inInstrumental: { startOffsetSec: 0 },
+    outVocal: { startOffsetSec: 0, fadeSec: 4 },
+    inVocal: { startOffsetSec: 6 },
+  };
+  assert.deepEqual(buildTransitionEvents({}, stems), []);
+  assert.deepEqual(buildTransitionEvents({ sync: { beatsPerBar: 4 } }, stems), []); // targetBpm missing
+});
+
+test('planStemTransition attaches a populated mixZone/events schedule to an eligible plan', () => {
+  const outgoing = richOutgoing();
+  const incoming = richIncoming();
+  const stemPlan = planStemTransition(outgoing, incoming);
+  assert.equal(stemPlan.eligible, true);
+  assert.equal(stemPlan.mixZone.bars, stemPlan.sync.bars);
+  assert.equal(stemPlan.mixZone.startSec, stemPlan.outgoing.exitStartSec);
+  assert.ok(stemPlan.events.length > 0, 'expected at least one scheduled bar-event');
+  assert.ok(
+    stemPlan.events.every((e, i) => i === 0 || e.bar >= stemPlan.events[i - 1].bar),
+    'expected events sorted ascending by bar',
+  );
+});
+
+test('deriveStemEnvelopesFromEvents reconstructs the same stem envelope shape buildTransitionEvents was derived from (Codex review, PR #53, P1)', () => {
+  // Same fixture as the schedule test above: 120 BPM, 4 beats/bar -> barSec = 2s/bar.
+  const mixZone = { startSec: 0, durationSec: 16, bars: 8, beatsPerBar: 4, targetBpm: 120 };
+  const stems = {
+    inInstrumental: { startOffsetSec: 0 },
+    outVocal: { startOffsetSec: 1, fadeSec: 3 },
+    inVocal: { startOffsetSec: 6 },
+  };
+  const plan = { sync: { bars: mixZone.bars, beatsPerBar: mixZone.beatsPerBar }, targetBpm: mixZone.targetBpm };
+  const events = buildTransitionEvents(plan, stems);
+
+  const derived = deriveStemEnvelopesFromEvents(events, mixZone);
+
+  assert.ok(Math.abs(derived.outVocal.startOffsetSec - 1) < 1e-4);
+  assert.ok(Math.abs(derived.outVocal.fadeSec - 3) < 1e-4);
+  assert.ok(Math.abs(derived.outInstrumental.startOffsetSec - 0) < 1e-4);
+  assert.ok(Math.abs(derived.outInstrumental.fadeSec - mixZone.durationSec) < 1e-4);
+  assert.ok(Math.abs(derived.inInstrumental.startOffsetSec - 0) < 1e-4);
+  assert.ok(Math.abs(derived.inInstrumental.fadeSec - mixZone.durationSec) < 1e-4);
+  assert.ok(Math.abs(derived.inVocal.startOffsetSec - 6) < 1e-4);
+  assert.ok(Math.abs(derived.inVocal.fadeSec - (mixZone.durationSec - 6)) < 1e-4);
+  assert.equal(derived.outVocal.role, 'out');
+  assert.equal(derived.outInstrumental.role, 'out');
+  assert.equal(derived.inInstrumental.role, 'in');
+  assert.equal(derived.inVocal.role, 'in');
 });
 
 test('buildStemEnvelopes clamps inVocal to a zero-length window (not negative) when the vocal tail leaves no room at all', () => {
