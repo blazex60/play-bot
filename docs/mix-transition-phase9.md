@@ -2013,7 +2013,7 @@ round 1 のプッシュ後、さらに2件の指摘が見つかった。1件は 
 
 ### 未決事項 / 既知の制約
 
-- **ゲイン計算自体はまだ event-driven ではない**: 今回追加した `events`/`mixzoneevent` は「今どのbar-eventを通過したか」を外部に知らせる観測用のスケジュールであり、実際の音量計算（`gainForStemPosition()`）は引き続き Phase 8 の hold→fade 2区間モデルのままで、`events` を直接の入力として使っていない。将来的に §9.2 が意図する「1本のcurveを完全に廃止し、各eventがそれぞれ独自のaction（gain step/EQ切り替え等）を直接トリガーする」形に寄せるなら、`gainForStemPosition()` 自体を `events` ベースで再設計する必要がある——Phase 9H（vocal hold/release envelope）・9I（incoming vocal 独立タイムライン）はこの `events` schedule の上に構築できる設計にしてあるが、実際にそこまで踏み込むかは次フェーズの判断に委ねる。
+- ~~**ゲイン計算自体はまだ event-driven ではない**~~: round 1 の Codex レビュー対応で解消済み。下記「追記: Codex レビュー対応（PR #53, round 1）」参照——`deriveStemEnvelopesFromEvents()` が `events`/`mixZone` から `gainForStemPosition()` 用の4-stemエンベロープを直接再構築するようになり、`events` は単なる観測用通知ではなく実際のゲイン計算の入力になった。
 - **beatmix（非stem）経路は対象外**: 単一の equal-power crossfade（`mixPlan.curve`）を使う plain beatmix 遷移には `mixZone`/`events` を付与していない——beatmixには per-stem envelope が存在せず、bar-eventに分解する対象そのものがないため。stem-mix が利用可能な場合にのみ意味を持つ機能拡張として実装した。
 - **`outgoing-instrumental-duck` イベントは未実装**: §9.2 の例が挙げる5種類目のイベント。現行のenvelopeモデルにはoutInstrumentalの「duck」と「fade」を区別する独立した状態がないため、実装しないままにしてある（上記参照）。
 - **実運用での聴感評価は未実施**: 既存フェーズのノートと同様、`mixzoneevent` の発火タイミングが実際の楽曲・実運用でどれだけ「意味のある」bar位置に対応しているか（特にPhase 9H/9Iがこれを使い始めた際の効果）は実音源・実Discordセッションでの確認が必要で、本エージェント環境では実施できない。
@@ -2024,6 +2024,22 @@ round 1 のプッシュ後、さらに2件の指摘が見つかった。1件は 
 - [x] TransitionPlan v3 の `events` 配列（§9.2）を stem-mix plan に実装した（`buildTransitionEvents()`、bar-clockデータ欠如時は空配列にフォールバック）
 - [x] MixStream が bar clock を持ち、stem crossfade の進行に応じて `events` のスケジュールに沿って `'mixzoneevent'` を実際に発火する（`#fireDueMixZoneEvents()`）——「1本のequal-power crossfadeではなく、複数bar eventでtransitionが進行する」という完了条件を、実際に発火する観測イベント列として満たした
 - [x] 既存のゲイン計算（Phase 8）・既存テストへの regression が無いことを確認した（`bun run test:server`: 778件中770 pass、既知の4件のみ fail）
-- [ ] ゲイン計算そのものを `events` ベースで再設計する（上記未決事項参照、Phase 9H/9I 以降のスコープ）
+- [x] ゲイン計算そのものを `events` ベースで再設計する（round 1 の Codex レビュー対応で実施——下記参照）
 - [ ] `outgoing-instrumental-duck` イベントの実装（上記未決事項参照）
 - [ ] 実運用での聴感評価（上記未決事項参照）
+
+### 追記: Codex レビュー対応（PR #53, round 1）
+
+Codex から3件の指摘を受けた（P1が1件、P2が2件）。いずれも妥当な指摘と判断し、修正した。
+
+- **P1: `events`/`mixZone` が実際のゲイン計算を駆動していない**（前回ノートの「未決事項」で自ら認めていた制約そのもの）。`events` は `mixzoneevent` を発火するだけの観測レイヤーで、`#readStemCrossfadeFrame()` は相変わらず `plan.stems`（`buildStemEnvelopes()` の生の秒数）を直接読んでおり、`events` の値を変えても実際に混ざる音声は変化しなかった。`docs/mix-transition-phase9.md` 側で明示的に「未決事項」と書いていたが、指摘を受けて改めて検討した結果、既存の `gainForStemPosition()`（hold→fadeの2区間エンベロープ、Phase 8 で実装・検証済み）をそのまま使い続けられる安全な形で実装できると判断し、以下を追加した:
+  - `stemTransition.js` に `deriveStemEnvelopesFromEvents(events, mixZone, curve)`（新規）: `buildTransitionEvents()` の逆変換——`events` 配列 + `mixZone` から、`gainForStemPosition()` がそのまま消費できる4種類のstemエンベロープ記述子（`{role, curve, startOffsetSec, fadeSec}`）を再構築する。`incoming-instrumental-start`/`outgoing-vocal-release`/`outgoing-vocal-silent`/`incoming-vocal-handoff` の各イベントのbar位置を `findEventBar()`（新規ヘルパー、該当イベントが見つからなければ妥当なfallback bar——windowの開始または終了——を返す）で引き、`toSec(bar) = bar * (mixZone.durationSec / mixZone.bars)` で秒に変換する。
+  - `mixStream.js` の `startStemCrossfade()`: `#stemCrossfade.stems` を、`events`/`mixZone` が両方揃っている（`mixZone.bars > 0` かつ `mixZone.durationSec > 0`）ときは `deriveStemEnvelopesFromEvents()` の返り値から、それ以外（従来の stem-mix plan、`events` を持たない hand-built なテスト plan）では従来どおり `plan.stems` から組み立てるよう変更した。`gainForStemPosition()` 自体の実装・呼び出し箇所（`#readStemCrossfadeFrame()`）は一切変更していない——入力となるエンベロープの「出どころ」だけが `events` 経由に置き換わった。
+  - この設計により、`events`/`mixZone` を持たない全ての既存テスト・呼び出し元（beatmix、Phase 8 時代の hand-built test plan 等）は完全に従来どおりの経路（`plan.stems` 直読み）のまま動作する——後方互換を壊さない。
+  - 検証: `stemTransition.test.js` に `deriveStemEnvelopesFromEvents()` の round-trip テスト（既知のstemエンベロープから `buildTransitionEvents()` で `events` を作り、`deriveStemEnvelopesFromEvents()` で元の秒数値に戻ることを確認、誤差 1e-4 未満）を追加した。`mixStream.test.js` には `plan.stems` と `events`/`mixZone` が意図的に異なる値になるよう仕組んだ plan で `startStemCrossfade()` を実行し、実際にミックスされたPCMフレームが `deriveStemEnvelopesFromEvents()` 由来のゲイン（`plan.stems` 由来ではない）と一致することを直接検証するテストを追加した——`events`/`mixZone` が実際にゲイン計算を駆動していることの直接証拠。revert-test-restore: `stems` の代入を一時的に `plan.stems` 固定に戻すと、この新規テストが期待どおり失敗する（`gotFrame` が `expectedFromPlanStemsOnly` と一致してしまう）ことを確認したうえで復元した。
+
+- **P2: `outgoing-vocal-release` イベントのタイミングが不正確**。前回の実装では `outgoing-vocal-release` を outVocal の**フェードが完了した時点**（`startOffsetSec + fadeSec`）に配置していたが、イベント名の意味（「解放し始める」＝フェード**開始**）と食い違っていた——実際にはフェード開始時点を表すべきイベントが、フェード完了時点を指していた。修正として `outgoing-vocal-release` はフェード**開始**時点（`startOffsetSec`）に、新規イベント `outgoing-vocal-silent` をフェード**完了**時点（`startOffsetSec + fadeSec`）に分離した——「解放し始める」と「無音に達した」は別のbar位置になり得る（実際、多くのケースでなる）ため、2つの区別されたイベントとして表現する方が§9.2の意図に忠実と判断した。`stemTransition.test.js` の既存テスト（`buildTransitionEvents converts each stem envelope timestamp...`）のfixtureを、release開始とsilent到達が異なるbarになるよう更新し（`startOffsetSec:1, fadeSec:3` → release=bar 0.5, silent=bar 2）、両イベントがそれぞれ正しいbarで出力されることを確認した。revert-test-restore: `outgoing-vocal-release` のbar計算を一時的に旧来の「フェード完了時点」に戻すと、この更新後のテストと新規の round-trip テストの両方が期待どおり失敗することを確認したうえで復元した。
+
+- **P2: `#fireDueMixZoneEvents()` の null-deref クラッシュ**。旧実装は `nextEventIndex` を `this.#stemCrossfade` からループ開始時に取り出し、ループ中はローカル変数で回し、ループ終了後に `this.#stemCrossfade.nextEventIndex = index` として書き戻していた。しかし `this.emit('mixzoneevent', ...)` は同期的にリスナーを呼び出すため、そのリスナーが `dropCurrent()`/`endMixer()` 等を呼んで `#stemCrossfade` を `null` にした場合、ループ終了後の書き戻しが `null` に対するプロパティ代入となり `TypeError` で mixer stream 全体が落ちる——mixzoneevent を消費する側の正当な操作（例: このイベントをトリガに次の曲へスキップする、等）が mixer 自体をクラッシュさせてしまう。修正として `crossfade` オブジェクトの参照を最初に一度だけ捕まえ、以降は一貫してそのオブジェクトを直接ミューテートする（`this.#stemCrossfade` への書き戻しを二度と行わない）方式に変更し、加えて `nextEventIndex` の加算を `emit()` の**前**に行い（emit後に例外/再入があっても取りこぼしなく1回のみ発火したことになる）、`emit()` の直後に `this.#stemCrossfade !== crossfade` をチェックしてリスナーが同期的にcrossfadeを破棄した場合はループを即座に打ち切る（もはや存在しないcrossfadeについて記述し続けない）ガードを追加した。`mixStream.test.js` に、`mixzoneevent` リスナーの中で同期的に `mix.dropCurrent()` を呼ぶ回帰テストを追加し、（1）例外・`'error'` イベントが一切発生しないこと、（2）テアダウン後のイベントは発火せず、テアダウン時点で処理中だった1件のみが発火することを確認した。revert-test-restore: `#fireDueMixZoneEvents()` を旧来の「ループ後に書き戻す」実装に一時的に戻すと、この新規テストが `TypeError: null is not an object` で期待どおり失敗することを確認したうえで復元した。
+
+検証: `bun test src/audio/stemTransition.test.js`（17 pass / 0 fail、うち3件が今回追加）、`bun test src/audio/mixStream.test.js`（31 pass中24 pass・7 failは前回ノート記載済みの既知タイミング依存flake、うち2件が今回追加でともにpass）、`bun run test:server` を再実行し regression が無いことを確認した。

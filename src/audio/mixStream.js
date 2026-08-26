@@ -16,6 +16,7 @@ import {
   createIncomingBaseSwapProcessor,
 } from './eq.js';
 import { MAX_UNDERRUN_MS } from './config.js';
+import { deriveStemEnvelopesFromEvents } from './stemTransition.js';
 
 const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
 /**
@@ -287,18 +288,30 @@ export class MixStream extends Readable {
     this.#inVocal = incoming.vocal;
     this.#inInstrumental = incoming.instrumental;
     const baseSwap = plan.baseSwap === true;
+    // Phase 9G (docs/mix-transition-phase9.md §9): TransitionPlan v3's
+    // mixZone/events, when the planner could derive a bar clock (needs
+    // sync.bars/beatsPerBar/targetBpm — see stemTransition.js's
+    // buildTransitionEvents()). null/undefined for a plan without one.
+    const events = Array.isArray(plan.events) && plan.events.length > 0 ? plan.events : null;
+    const mixZone = plan.mixZone ?? null;
+    // Codex review (PR #53, P1): the events schedule must actually DRIVE
+    // gain state, not just fire notifications alongside an unrelated
+    // computation — every tick's stem envelopes are reconstructed FROM the
+    // schedule (deriveStemEnvelopesFromEvents()) whenever one is available,
+    // rather than reading plan.stems directly. Falls back to plan.stems for
+    // a plan with no bar-clock data (legacy caller, or a hand-built test
+    // plan) so #fireDueMixZoneEvents() no-ops and this stays exactly the
+    // pre-9G behavior.
+    const stems = (events && mixZone?.bars > 0 && mixZone?.durationSec > 0)
+      ? deriveStemEnvelopesFromEvents(events, mixZone, plan.curve)
+      : plan.stems;
     this.#stemCrossfade = {
       fadeSec: plan.fadeSec,
-      stems: plan.stems,
+      stems,
       baseSwap,
       eqRampSec: computeEqRampSec(plan),
-      // Phase 9G (docs/mix-transition-phase9.md §9): TransitionPlan v3's
-      // mixZone/events, when the planner could derive a bar clock (needs
-      // sync.bars/beatsPerBar/targetBpm — see stemTransition.js's
-      // buildTransitionEvents()). null/undefined for a plan without one;
-      // #fireDueMixZoneEvents() no-ops in that case.
-      events: Array.isArray(plan.events) ? plan.events : null,
-      mixZone: plan.mixZone ?? null,
+      events,
+      mixZone,
       nextEventIndex: 0,
     };
     this.#fadeElapsedSec = 0;
@@ -924,17 +937,31 @@ export class MixStream extends Readable {
    * defined over. No-op when the current stem crossfade has no events/
    * mixZone (the planner couldn't derive a bar clock — see
    * buildTransitionEvents()'s own guard).
+   *
+   * Codex review (PR #53, P2): a synchronous 'mixzoneevent' listener that
+   * itself changes crossfade state (dropCurrent(), endMixer(), a future
+   * planner recovery hook) can null #stemCrossfade before this returns —
+   * writing the advanced cursor back onto `this.#stemCrossfade` after such
+   * a listener ran would then throw on `null`, killing the mixer stream
+   * over a downstream listener's own unrelated action. `crossfade` is
+   * captured once and mutated directly (never re-read from
+   * `this.#stemCrossfade`), so a listener nulling the live field can never
+   * make this throw; the loop also stops firing further (now-stale) events
+   * the moment that happens, rather than continuing to describe a
+   * crossfade that no longer exists.
    */
   #fireDueMixZoneEvents() {
-    const { events, mixZone, nextEventIndex } = this.#stemCrossfade;
+    const crossfade = this.#stemCrossfade;
+    const { events, mixZone } = crossfade;
     if (!events || !(mixZone?.bars > 0) || !(mixZone?.durationSec > 0)) return;
     const barSec = mixZone.durationSec / mixZone.bars;
-    let index = nextEventIndex;
-    while (index < events.length && this.#fadeElapsedSec >= events[index].bar * barSec - 1e-6) {
-      this.emit('mixzoneevent', { ...events[index], mixZone });
-      index += 1;
+    while (crossfade.nextEventIndex < events.length
+      && this.#fadeElapsedSec >= events[crossfade.nextEventIndex].bar * barSec - 1e-6) {
+      const event = events[crossfade.nextEventIndex];
+      crossfade.nextEventIndex += 1; // advance before emit — see docstring
+      this.emit('mixzoneevent', { ...event, mixZone });
+      if (this.#stemCrossfade !== crossfade) return; // torn down by the listener
     }
-    this.#stemCrossfade.nextEventIndex = index;
   }
 
   #promoteStemIncoming() {

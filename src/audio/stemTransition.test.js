@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   planStemTransition, buildStemEnvelopes, buildMixZone, buildTransitionEvents,
+  deriveStemEnvelopesFromEvents,
   DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC,
 } from './stemTransition.js';
 import { planBeatmixTransition } from './beatmixTransition.js';
@@ -198,13 +199,16 @@ test('buildTransitionEvents converts each stem envelope timestamp to its bar pos
   const plan = { sync: { bars: 8, beatsPerBar: 4 }, targetBpm: 120, eq: { swapBar: 4 } };
   const stems = {
     inInstrumental: { startOffsetSec: 0 },
-    outVocal: { startOffsetSec: 0, fadeSec: 4 }, // reaches silence at 4s -> bar 2
+    // release begins at 1s (bar 0.5), reaches silence at 4s (bar 2) — two
+    // distinct events, not one (Codex review, PR #53, P2).
+    outVocal: { startOffsetSec: 1, fadeSec: 3 },
     inVocal: { startOffsetSec: 6 }, // bar 3
   };
   const events = buildTransitionEvents(plan, stems);
   assert.deepEqual(events, [
     { bar: 0, action: 'incoming-instrumental-start' },
-    { bar: 2, action: 'outgoing-vocal-release' },
+    { bar: 0.5, action: 'outgoing-vocal-release' },
+    { bar: 2, action: 'outgoing-vocal-silent' },
     { bar: 3, action: 'incoming-vocal-handoff' },
     { bar: 4, action: 'bass-swap' },
   ]);
@@ -243,6 +247,33 @@ test('planStemTransition attaches a populated mixZone/events schedule to an elig
     stemPlan.events.every((e, i) => i === 0 || e.bar >= stemPlan.events[i - 1].bar),
     'expected events sorted ascending by bar',
   );
+});
+
+test('deriveStemEnvelopesFromEvents reconstructs the same stem envelope shape buildTransitionEvents was derived from (Codex review, PR #53, P1)', () => {
+  // Same fixture as the schedule test above: 120 BPM, 4 beats/bar -> barSec = 2s/bar.
+  const mixZone = { startSec: 0, durationSec: 16, bars: 8, beatsPerBar: 4, targetBpm: 120 };
+  const stems = {
+    inInstrumental: { startOffsetSec: 0 },
+    outVocal: { startOffsetSec: 1, fadeSec: 3 },
+    inVocal: { startOffsetSec: 6 },
+  };
+  const plan = { sync: { bars: mixZone.bars, beatsPerBar: mixZone.beatsPerBar }, targetBpm: mixZone.targetBpm };
+  const events = buildTransitionEvents(plan, stems);
+
+  const derived = deriveStemEnvelopesFromEvents(events, mixZone);
+
+  assert.ok(Math.abs(derived.outVocal.startOffsetSec - 1) < 1e-4);
+  assert.ok(Math.abs(derived.outVocal.fadeSec - 3) < 1e-4);
+  assert.ok(Math.abs(derived.outInstrumental.startOffsetSec - 0) < 1e-4);
+  assert.ok(Math.abs(derived.outInstrumental.fadeSec - mixZone.durationSec) < 1e-4);
+  assert.ok(Math.abs(derived.inInstrumental.startOffsetSec - 0) < 1e-4);
+  assert.ok(Math.abs(derived.inInstrumental.fadeSec - mixZone.durationSec) < 1e-4);
+  assert.ok(Math.abs(derived.inVocal.startOffsetSec - 6) < 1e-4);
+  assert.ok(Math.abs(derived.inVocal.fadeSec - (mixZone.durationSec - 6)) < 1e-4);
+  assert.equal(derived.outVocal.role, 'out');
+  assert.equal(derived.outInstrumental.role, 'out');
+  assert.equal(derived.inInstrumental.role, 'in');
+  assert.equal(derived.inVocal.role, 'in');
 });
 
 test('buildStemEnvelopes clamps inVocal to a zero-length window (not negative) when the vocal tail leaves no room at all', () => {
