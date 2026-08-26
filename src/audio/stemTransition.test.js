@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import {
   planStemTransition, buildStemEnvelopes, buildMixZone, buildTransitionEvents,
   deriveStemEnvelopesFromEvents,
-  DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC,
+  DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC, DEFAULT_OUTVOCAL_RELEASE_SEC,
 } from './stemTransition.js';
 import { planBeatmixTransition } from './beatmixTransition.js';
+import { gainForStemPosition } from './fade.js';
 
 function richOutgoing(overrides = {}) {
   return {
@@ -131,7 +132,7 @@ test('planStemTransition returns null (no eligible flag confusion) when vocal an
   assert.deepEqual(stemPlan.reasons, ['no-exit-candidate']);
 });
 
-test('buildStemEnvelopes: outVocal fades out over exactly the remaining native vocal tail, converted to playback seconds', () => {
+test('buildStemEnvelopes: outVocal holds at full volume, then releases for only the last DEFAULT_OUTVOCAL_RELEASE_SEC before the remaining native vocal tail ends (Phase 9H)', () => {
   const outgoing = richOutgoing(); // lastVocalEndSec 165
   const plan = {
     fadeSec: 8,
@@ -139,14 +140,19 @@ test('buildStemEnvelopes: outVocal fades out over exactly the remaining native v
     outgoing: { exitStartSec: 158, tempoRatioApplied: 1 },
   };
   const stems = buildStemEnvelopes(outgoing, plan);
-  assert.equal(stems.outVocal.fadeSec, 7); // 165 - 158, ratio 1
-  assert.equal(stems.outVocal.startOffsetSec, 0);
+  // Hold spans the full 7s native tail (165 - 158, ratio 1) — outVocal
+  // stays fully unattenuated through its entire actual singing. The 0.5s
+  // release comes AFTER that (the 8s window has 1s of room past the hold),
+  // not carved out of the tail's last moments (Codex review, PR #54, P2).
+  assert.equal(stems.outVocal.startOffsetSec, 7);
+  assert.equal(stems.outVocal.fadeSec, 0.5);
   assert.equal(stems.outInstrumental.fadeSec, 8);
   assert.equal(stems.outInstrumental.startOffsetSec, 0);
   assert.equal(stems.inInstrumental.fadeSec, 8);
   assert.equal(stems.inInstrumental.startOffsetSec, 0);
-  assert.equal(stems.inVocal.startOffsetSec, 7 + DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC);
-  assert.equal(stems.inVocal.fadeSec, 8 - (7 + DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC));
+  // inVocal now waits for hold+release+margin, not just hold+margin.
+  assert.equal(stems.inVocal.startOffsetSec, 7 + 0.5 + DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC);
+  assert.equal(stems.inVocal.fadeSec, 8 - (7 + 0.5 + DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC));
 });
 
 test('buildStemEnvelopes: outVocal fadeSec is 0 (not negative) when the exit point is already past the last vocal frame', () => {
@@ -171,7 +177,71 @@ test('buildStemEnvelopes: outVocal tail is converted from native to playback sec
     outgoing: { exitStartSec: 158, tempoRatioApplied: 2 },
   };
   const stems = buildStemEnvelopes(outgoing, plan);
-  assert.equal(stems.outVocal.fadeSec, 7);
+  // Hold spans 7 playback seconds (same conversion as above); the 0.5s
+  // release still comes after it, not out of it.
+  assert.equal(stems.outVocal.startOffsetSec, 7);
+  assert.equal(stems.outVocal.fadeSec, 0.5);
+});
+
+// --- Phase 9H §10: outgoing vocal hold/release -------------------------
+
+test('buildStemEnvelopes: outVocal release is clamped when the vocal tail runs close to the edge of the transition window (Phase 9H)', () => {
+  // 7.9s of hold leaves only 0.1s of room in the 8s window for release.
+  const outgoing = richOutgoing({ lastVocalEndSec: 165.9 });
+  const plan = {
+    fadeSec: 8,
+    gain: { curve: 'equal-power' },
+    outgoing: { exitStartSec: 158, tempoRatioApplied: 1 },
+  };
+  const stems = buildStemEnvelopes(outgoing, plan);
+  assert.ok(Math.abs(stems.outVocal.startOffsetSec - 7.9) < 1e-9);
+  assert.ok(Math.abs(stems.outVocal.fadeSec - 0.1) < 1e-9);
+});
+
+test('buildStemEnvelopes: outVocal gets no release at all when the vocal tail already fills the whole transition window (Phase 9H)', () => {
+  // Same fixture as "clamps inVocal to a zero-length window" below: the
+  // 342s native tail clamps holdSec to the full 8s window, leaving zero
+  // room for any release — degrades to an instant cut at the edge rather
+  // than a negative hold.
+  const outgoing = richOutgoing({ lastVocalEndSec: 500 });
+  const plan = {
+    fadeSec: 8,
+    gain: { curve: 'equal-power' },
+    outgoing: { exitStartSec: 158, tempoRatioApplied: 1 },
+  };
+  const stems = buildStemEnvelopes(outgoing, plan);
+  assert.equal(stems.outVocal.startOffsetSec, 8);
+  assert.equal(stems.outVocal.fadeSec, 0);
+});
+
+test('buildStemEnvelopes: outVocal stays at full gain through the ENTIRE remaining vocal tail (including its last frame), only dropping in a short release strictly after that (Phase 9H)', () => {
+  // This is the actual §10.1 complaint made concrete: a plain continuous
+  // fade across the whole 7s window would already be audibly down (~30%,
+  // equal-power) by the 3.5s midpoint. Codex review (PR #54, P2) caught
+  // that an earlier version of this fix still carved the release out of
+  // the tail's own last 0.5s (silence exactly AT lastVocalEndSec) — full
+  // gain must hold all the way THROUGH lastVocalEndSec itself; the release
+  // only starts after it.
+  const outgoing = richOutgoing(); // lastVocalEndSec 165 -> 7s native tail
+  const plan = {
+    fadeSec: 8,
+    gain: { curve: 'equal-power' },
+    outgoing: { exitStartSec: 158, tempoRatioApplied: 1 },
+  };
+  const stems = buildStemEnvelopes(outgoing, plan);
+  assert.equal(stems.outVocal.startOffsetSec, 7);
+  assert.equal(stems.outVocal.fadeSec, DEFAULT_OUTVOCAL_RELEASE_SEC);
+  for (const positionSec of [0, 1, 3.5, 6, 6.99, 7]) {
+    assert.equal(
+      gainForStemPosition({ positionSec, ...stems.outVocal }), 1,
+      `expected full gain at ${positionSec}s, at/still inside the 7s hold (through the vocal's own last frame)`,
+    );
+  }
+  // Inside the 0.5s release window (strictly after lastVocalEndSec), strictly decreasing but not yet silent.
+  const midRelease = gainForStemPosition({ positionSec: 7.25, ...stems.outVocal });
+  assert.ok(midRelease > 0 && midRelease < 1, `expected a partial gain mid-release, got ${midRelease}`);
+  // At/after the release window's own end, fully silent.
+  assert.equal(gainForStemPosition({ positionSec: 7.5, ...stems.outVocal }), 0);
 });
 
 // --- Phase 9G §9.1/9.2: TransitionPlan v3 (mixZone/events) -------------
@@ -284,7 +354,9 @@ test('buildStemEnvelopes clamps inVocal to a zero-length window (not negative) w
     outgoing: { exitStartSec: 158, tempoRatioApplied: 1 },
   };
   const stems = buildStemEnvelopes(outgoing, plan);
-  assert.equal(stems.outVocal.fadeSec, 8); // clamped to the full window
+  // Hold clamps to the full 8s window, leaving no room for any release.
+  assert.equal(stems.outVocal.startOffsetSec, 8);
+  assert.equal(stems.outVocal.fadeSec, 0);
   assert.equal(stems.inVocal.startOffsetSec, 8); // clamped, never exceeds fadeSec
   assert.equal(stems.inVocal.fadeSec, 0);
 });

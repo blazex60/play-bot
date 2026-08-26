@@ -1517,7 +1517,14 @@ test('acceptance (mixer): TRACK loop mode\'s stem-mix -> bestNonStemPlan downgra
   const analysis = {
     version: ANALYSIS_VERSION,
     durationSec: 14,
-    lastVocalEndSec: 8.0,
+    // Phase 9H (docs/mix-transition-phase9.md §10): outVocal's release now
+    // comes AFTER the hold instead of being carved out of it, so
+    // estimateInVocalFadeSec() needs DEFAULT_OUTVOCAL_RELEASE_SEC (0.5s)
+    // MORE overlap room than before to keep exit=1.0 above
+    // MIN_MEANINGFUL_INVOCAL_FADE_SEC — shifted from 8.0 to 7.5 to restore
+    // the exact same 0.8s of spare margin the original fixture relied on
+    // (native tail 7.0s -> 6.5s, hold+release+margin 7.2s either way).
+    lastVocalEndSec: 7.5,
     firstVocalStartSec: 10.0,
     headVocalGaps: [],
     vocalConfidence: 0.85,
