@@ -292,6 +292,14 @@ export class MixStream extends Readable {
       stems: plan.stems,
       baseSwap,
       eqRampSec: computeEqRampSec(plan),
+      // Phase 9G (docs/mix-transition-phase9.md §9): TransitionPlan v3's
+      // mixZone/events, when the planner could derive a bar clock (needs
+      // sync.bars/beatsPerBar/targetBpm — see stemTransition.js's
+      // buildTransitionEvents()). null/undefined for a plan without one;
+      // #fireDueMixZoneEvents() no-ops in that case.
+      events: Array.isArray(plan.events) ? plan.events : null,
+      mixZone: plan.mixZone ?? null,
+      nextEventIndex: 0,
     };
     this.#fadeElapsedSec = 0;
     this.#incomingStemFramesRead = 0;
@@ -803,6 +811,7 @@ export class MixStream extends Readable {
     );
     this.#consumedBytes += FRAME_BYTES;
     this.#fadeElapsedSec += FRAME_MS / 1000;
+    this.#fireDueMixZoneEvents();
     // Counts every processed tick, including ticks held past fadeSec while
     // catching up #incoming — unlike a fadeSec-derived constant, this grows
     // by 1 on each such hold tick too, since a hold tick also advances the
@@ -899,6 +908,33 @@ export class MixStream extends Readable {
       }
     }
     return mixed;
+  }
+
+  /**
+   * Phase 9G (docs/mix-transition-phase9.md §9.2): fires 'mixzoneevent' for
+   * every scheduled bar-event #fadeElapsedSec has now reached or passed,
+   * exactly once each and in schedule order — the concrete mechanism by
+   * which this transition "progresses through multiple bar events" instead
+   * of existing only as one continuous equal-power curve. `barSec` is
+   * derived from mixZone.durationSec/bars (the exact same relationship
+   * planBeatmixTransition() used to compute fadeSec in the first place —
+   * see beatmixTransition.js's `barSec = (60/targetBpm)*beatsPerBar`,
+   * `fadeSec = barSec*bars`) rather than recomputed from targetBpm, so this
+   * can never drift from the window the gain envelopes themselves are
+   * defined over. No-op when the current stem crossfade has no events/
+   * mixZone (the planner couldn't derive a bar clock — see
+   * buildTransitionEvents()'s own guard).
+   */
+  #fireDueMixZoneEvents() {
+    const { events, mixZone, nextEventIndex } = this.#stemCrossfade;
+    if (!events || !(mixZone?.bars > 0) || !(mixZone?.durationSec > 0)) return;
+    const barSec = mixZone.durationSec / mixZone.bars;
+    let index = nextEventIndex;
+    while (index < events.length && this.#fadeElapsedSec >= events[index].bar * barSec - 1e-6) {
+      this.emit('mixzoneevent', { ...events[index], mixZone });
+      index += 1;
+    }
+    this.#stemCrossfade.nextEventIndex = index;
   }
 
   #promoteStemIncoming() {

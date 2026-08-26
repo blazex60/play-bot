@@ -205,6 +205,14 @@ function normalizeTransitionPlan(rawPlan) {
         sync: rawPlan.sync,
         eq: rawPlan.eq,
         stems: rawPlan.stems,
+        // Phase 9G (docs/mix-transition-phase9.md §9.1): TransitionPlan v3's
+        // mixZone/events — MixStream.startStemCrossfade() fires 'mixzoneevent'
+        // as playback crosses each scheduled bar (see mixStream.js's
+        // #tickStemCrossfade()). undefined (not an empty array) when the
+        // planner couldn't derive a bar clock (missing sync/targetBpm) so
+        // MixStream's own guard can tell "no schedule" apart from "empty".
+        mixZone: rawPlan.mixZone,
+        events: rawPlan.events?.length ? rawPlan.events : undefined,
       },
       exitStartSec: rawPlan.outgoing?.exitStartSec ?? null,
       entrySec: Math.max(0, rawPlan.incoming?.entrySec ?? 0),

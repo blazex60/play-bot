@@ -98,6 +98,68 @@ export function buildStemEnvelopes(outgoing, plan, {
 }
 
 /**
+ * Phase 9G (docs/mix-transition-phase9.md §9.1): TransitionPlan v3's
+ * `mixZone` descriptor — the overlap window expressed in bar/tempo terms
+ * instead of only raw seconds, so MixStream's bar clock (see mixStream.js's
+ * #tickStemCrossfade()) and downstream consumers (§9.2's event schedule,
+ * future Phase 9H/9I work) have one shared frame of reference.
+ * @param {object} plan a planBeatmixTransition()-shaped eligible plan
+ * @returns {{ startSec: number|null, durationSec: number|null, bars: number|null, beatsPerBar: number|null, targetBpm: number|null }}
+ */
+export function buildMixZone(plan) {
+  return {
+    startSec: plan.outgoing?.exitStartSec ?? null,
+    durationSec: plan.fadeSec ?? null,
+    bars: plan.sync?.bars ?? null,
+    beatsPerBar: plan.sync?.beatsPerBar ?? null,
+    targetBpm: plan.targetBpm ?? null,
+  };
+}
+
+/**
+ * Phase 9G §9.2: TransitionPlan v3's `events` array — the bar-timestamped
+ * schedule the per-stem envelope timings buildStemEnvelopes() already
+ * computes (startOffsetSec/fadeSec, in seconds) implicitly encode, made
+ * explicit and consumable by MixStream's bar clock instead of staying
+ * buried in raw seconds. This is purely a re-expression of the SAME
+ * timings already computed for stems — it does not change the underlying
+ * gain math (gainForStemPosition()) at all; it gives MixStream a schedule
+ * to fire discrete notifications against as the transition proceeds
+ * (docs/mix-transition-phase9.md's own completion criterion for this
+ * phase: "not a single equal-power crossfade, but a transition that
+ * progresses through multiple bar events").
+ *
+ * §9.2's illustrative example also lists 'outgoing-instrumental-duck' —
+ * this envelope model has no separate pre-duck hold stage (outInstrumental
+ * fades from bar 0 the same as it always has), so that action is omitted
+ * rather than emitting a redundant same-bar duplicate of
+ * 'incoming-instrumental-start'.
+ * @param {object} plan a planBeatmixTransition()-shaped eligible plan
+ *   (needs `sync.beatsPerBar`, `targetBpm`, `eq.swapBar`)
+ * @param {object} stems buildStemEnvelopes()'s return value
+ * @returns {{ bar: number, action: string }[]} sorted ascending by bar
+ */
+export function buildTransitionEvents(plan, stems) {
+  const beatsPerBar = plan.sync?.beatsPerBar;
+  const targetBpm = plan.targetBpm;
+  const barSec = Number.isFinite(beatsPerBar) && targetBpm > 0
+    ? (60 / targetBpm) * beatsPerBar
+    : null;
+  if (!(barSec > 0)) return [];
+  const toBar = (sec) => Number((sec / barSec).toFixed(3));
+
+  const events = [
+    { bar: toBar(stems.inInstrumental.startOffsetSec), action: 'incoming-instrumental-start' },
+    { bar: toBar(stems.outVocal.startOffsetSec + stems.outVocal.fadeSec), action: 'outgoing-vocal-release' },
+    { bar: toBar(stems.inVocal.startOffsetSec), action: 'incoming-vocal-handoff' },
+  ];
+  if (Number.isFinite(plan.eq?.swapBar)) {
+    events.push({ bar: plan.eq.swapBar, action: 'bass-swap' });
+  }
+  return events.sort((a, b) => a.bar - b.bar);
+}
+
+/**
  * Phase 8's actual new capability: a transition where the outgoing track
  * still has vocals active at the exit point is not rejected outright the
  * way a plain beatmix transition must (docs/mix-transition-phase7.md 禁止5
@@ -161,5 +223,7 @@ export function planStemTransition(outgoing, incoming, options = {}) {
     ...plan,
     mode: 'stem-mix',
     stems,
+    mixZone: buildMixZone(plan),
+    events: buildTransitionEvents(plan, stems),
   };
 }

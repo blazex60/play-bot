@@ -972,6 +972,89 @@ test('MixStream startStemCrossfade: inVocal contributes nothing before its own s
     'expected wildly different inVocal content to produce an IDENTICAL first frame, since inVocal gain is still 0 there');
 });
 
+test('MixStream startStemCrossfade fires mixzoneevent for each scheduled bar-event, once each, in schedule order (Phase 9G)', async () => {
+  // docs/mix-transition-phase9.md §9's completion criterion: not a single
+  // equal-power crossfade, but a transition that progresses through
+  // multiple bar events. This asserts the concrete mechanism: MixStream
+  // fires 'mixzoneevent' as #fadeElapsedSec crosses each of plan.events'
+  // scheduled bar positions (converted via mixZone.durationSec/bars),
+  // each exactly once, in ascending order.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 12; // fadeSec=0.2s -> 10 frames @20ms; a few spares past that.
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames + 20),
+    };
+    const plan = {
+      ...makeStemPlan(0.2),
+      // 2 bars over the 0.2s window -> barSec = 0.1s/bar (5 frames/bar).
+      mixZone: {
+        startSec: 0, durationSec: 0.2, bars: 2, beatsPerBar: 4, targetBpm: 120,
+      },
+      events: [
+        { bar: 0, action: 'incoming-instrumental-start' },
+        { bar: 1, action: 'bass-swap' },
+        { bar: 2, action: 'incoming-vocal-handoff' },
+      ],
+    };
+
+    const fired = [];
+    mix.on('mixzoneevent', (e) => fired.push(e.action));
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const promotedPromise = new Promise((resolve) => {
+      mix.on('trackend', (info) => { if (info?.promoted) resolve(); });
+    });
+    mix.on('data', () => {}); // keep the stream flowing so ticks actually happen
+    await promotedPromise;
+
+    assert.deepEqual(fired, ['incoming-instrumental-start', 'bass-swap', 'incoming-vocal-handoff']);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade fires no mixzoneevent when the plan carries no events/mixZone (legacy/non-beatmix plan)', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 12;
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames + 20),
+    };
+    const plan = makeStemPlan(0.2); // no mixZone/events, same as every other pre-9G test in this file.
+
+    const fired = [];
+    mix.on('mixzoneevent', (e) => fired.push(e));
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const promotedPromise = new Promise((resolve) => {
+      mix.on('trackend', (info) => { if (info?.promoted) resolve(); });
+    });
+    mix.on('data', () => {});
+    await promotedPromise;
+
+    assert.deepEqual(fired, []);
+  } finally {
+    mix.endMixer();
+  }
+});
+
 test('MixStream startStemCrossfade substitutes silence for a stem that ends early instead of aborting the transition', async () => {
   const mix = new MixStream();
   try {
