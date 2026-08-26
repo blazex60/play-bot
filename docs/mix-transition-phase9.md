@@ -2137,6 +2137,19 @@ round 1 のレビューで2件の指摘を受けた。
   - テスト: `mixStream.test.js`・`phase2.test.js`それぞれに新規1件追加——incoming側にのみ実際のLOW成分（一定値のPCM、DC相当）を持たせ、hold終盤（ちょうど`holdSec`直前）のフレーム振幅が、swap完了後のフレーム振幅の1/10未満であることを確認した（instrumental本体のgain envelopeだけでも振幅は時間とともに増加するため、閾値を緩く——`/3`など——取るとgain envelopeの自然な増加だけで見かけ上パスしてしまうことをrevert-test-restoreで確認済み。plain crossfade経路は特に、'in'側のgainがtに対してほぼ線形に増加する領域（equal-powerカーブの`sin(t)`、t→0付近）でチェックポイントを取らざるを得ず、gain自体の伸びがEQに依らず数倍の差を生むため、`/10`まで厳しくして初めてEQのgateそのものが差の主因であることを保証できた）。
   - revert-test-restore: `#inGateEq`を使わず旧来どおり生の`inFrame`/`inInst`をdry側に渡す一時的な変更に戻すと、両方の新規テストが期待どおり失敗する（stem経路: 5607 vs 7017で`/3`閾値さえ満たせない、plain crossfade経路: 21 vs 58で`/10`閾値を満たせない）ことを確認したうえで復元した。
 
+### 追記: Codex レビュー対応（PR #56, round 3）
+
+round 2 で追加した2件の新規テスト（P1修正の検証用）が、fixture縮小後もなお `mixStream.test.js` 単体で17.7秒/29.3秒かかっていた点を指摘された（P2）。
+
+原因はテストヘルパー`collectFrames()`側にあった: 目的の件数に達した時点で`'data'`リスナーを外すだけで、streamをflowingモードから明示的に抜けさせていなかった。これらのfixtureは`fadeSec: 800`（swapBarSecよりずっと長い、gainを平坦に保つための値）を使っており、かつMixStreamの内部push loopはこのテストの合成PcmSource fixtureに対しては実I/O待ちが一切ない完全同期処理のため、Node の Readable の内部flowループ（`while (state.flowing && stream.read() !== null)`）は、目的の220フレームに達したあとも**同じ同期的な流れの中で**（`collectFrames()`のPromiseが解決してテスト側に制御が戻るより前に）`fadeSec`が示唆する境地（800秒 = 40,000 tick）に向かって生成を続けてしまっていた。
+
+修正: `collectFrames()`が目的件数に達した時点で、リスナーを外すのに加えて明示的に`stream.pause()`を呼ぶようにした。`pause()`は`state.flowing`を`false`に落とし、Readableの内部flowループは自身の`while`条件を（この`'data'`ハンドラがreturnした直後に）再評価するため、次のtickへは進まなくなる——進行中の`#tryPushFrame()`呼び出し自体を中断するわけではないが、その次の呼び出しを止める。
+
+この変更は`collectFrames()`を使う他の13件のテスト全てに影響するため、特に懸念した2件（`collectFrames()`の解決後、追加で1 tick分の内部処理が自然に進むことを前提に`await setImmediate`ごしに`promoted===true`を確認している「promotes instead of hanging when incoming.full ends before catching up」等）についても、`mixStream.test.js`全体（34件）を実行してregressionが無いことを確認した。
+
+- テスト: 新規テストは追加していない（`collectFrames()`という既存の共有ヘルパー自体の修正のため）。
+- revert-test-restore: `stream.pause()`の呼び出しを一時的にコメントアウトすると、対象の2テストの実行時間がそれぞれ11.2秒/19.0秒に戻る（アサーション自体は元々パスしていたので、これは正誤ではなく速度のregression-test-restore——修正前後どちらでもテストの結果自体はpassするため、症状は「アサーション失敗」ではなく「実行時間」で確認した）ことを確認したうえで復元した。修正後は124ms/171ms。
+
 ### 未決事項 / 既知の制約
 
 - **真の周波数バンド分割（LOW/MID-HIGH crossover）は未実装**: §12.3 が示す `{type:'highpass-sweep', fromHz, toHz, startBar, endBar}` のようなfilter automationや、§12.2 の完全な2バンド独立制御は実装していない——今回はEQブレンドの**タイミング**を独立させただけで、フィルタそのもの（120Hz highpass/lowshelf、Phase 7C から不変）は変えていない。真のバンド分割を行うには、既存の `designHighpass()`/`designLowshelf()` を使って `original - highpassed`（LOW成分の抽出）のような complementary filter 構成を新たに設計し、LOW/MID-HIGHそれぞれに独立したgain envelopeを適用したうえで再合成するパイプラインが必要——音声処理経路の実質的な再設計であり、次フェーズ以降のスコープとした。

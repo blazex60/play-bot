@@ -21,6 +21,18 @@ function collectFrames(stream, count) {
       frames.push(chunk);
       if (frames.length >= count) {
         stream.off('data', onData);
+        // Codex (PR #56 round 3, P2): removing the last 'data' listener does
+        // NOT drop a Readable back out of flowing mode — MixStream's
+        // internal push loop is otherwise entirely synchronous (no real I/O
+        // wait between ticks for these in-memory PcmSource fixtures), so
+        // without this it keeps generating frames nobody reads, in the same
+        // synchronous flow loop, all the way toward whatever fadeSec implies
+        // (an 800s fixture is 40,000 ticks) before this callback even
+        // returns. pause() flips state.flowing to false, which the flow
+        // loop's own `while (state.flowing && ...)` check (evaluated right
+        // after this handler returns) stops on — it does not interrupt an
+        // already-started #tryPushFrame() call, only the next one.
+        stream.pause();
         resolve(frames);
       }
     };
