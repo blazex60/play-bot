@@ -10,10 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Server Test
-        run: bun test:server
-      - name: Web Test
-        run: bun test:web
+      - uses: oven-sh/setup-bun@v2 
+      - run: bun install
+      - name: Test
+        run: bun run check
   deploy:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
