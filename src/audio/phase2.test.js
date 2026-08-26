@@ -532,6 +532,68 @@ test('MixStream beatmix mode ramps the bass-swap EQ in over swapBar instead of a
   mix.endMixer();
 });
 
+test('MixStream beatmix mode holds the bass-swap EQ fully dry until shortly before swapBar, instead of ramping from t=0 (Phase 9J, §17 9J: "bass swap と instrumental blend が別々の時間軸で動作する")', async () => {
+  // Codex/docs §12.2's example: the swap itself only spans a couple of bars
+  // ENDING at swapBar (here: bars 7-8 of a much longer window), not the
+  // entire 0->swapBar range the old computeEqRampSec() used — instrumental's
+  // OWN gain envelope (unaffected here: fadeSec=800 keeps it ~flat across
+  // the sampled frames) keeps running on its own, separate timeline.
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const silent = Buffer.alloc(FRAME_BYTES);
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: 900 }, () => Buffer.from(loud)));
+  const incoming = PcmSource.fromBuffers(Array.from({ length: 900 }, () => Buffer.from(silent)));
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: 900 }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    mode: 'beatmix',
+    fadeSec: 800,
+    curve: 'equal-power',
+    baseSwap: true,
+    highpassHz: 120,
+    targetBpm: 120,
+    sync: { bars: 400, beatsPerBar: 4 },
+    // barSec=2s; swapBar 8 -> swapBarSec=16s; DEFAULT_EQ_RAMP_BARS(2 bars)
+    // -> rampSec=4s, holdSec=12s (600 frames @20ms) of room to verify hold.
+    eq: { type: 'bass-swap', swapBar: 8, highpassHz: 120 },
+  }), true);
+
+  const first = await readFramePaused(mix);
+  const expectedDry = mixFrames(
+    loud, silent,
+    gainForPosition({ positionSec: 0, fadeSec: 800, curve: 'equal-power', role: 'out' }),
+    gainForPosition({ positionSec: 0, fadeSec: 800, curve: 'equal-power', role: 'in' }),
+  );
+  assert.deepEqual(first, expectedDry,
+    'expected the very first frame to be fully dry (unfiltered) — no ramp-in from t=0');
+
+  // Still within the 12s hold (300 frames = 6s in) — still fully dry.
+  let midHoldFrame;
+  for (let i = 0; i < 300; i++) midHoldFrame = await readFramePaused(mix);
+  const expectedMidHold = mixFrames(
+    loud, silent,
+    gainForPosition({ positionSec: 6, fadeSec: 800, curve: 'equal-power', role: 'out' }),
+    gainForPosition({ positionSec: 6, fadeSec: 800, curve: 'equal-power', role: 'in' }),
+  );
+  assert.deepEqual(midHoldFrame, expectedMidHold,
+    'expected a frame still inside the 12s hold to remain fully dry');
+
+  // Well past swapBarSec (16s = 800 frames from start) — fully wet.
+  let later;
+  for (let i = 0; i < 550; i++) later = await readFramePaused(mix);
+  const laterView = new Int16Array(later.buffer, later.byteOffset, later.byteLength / 2);
+  const laterAbs = Math.max(...Array.from(laterView, Math.abs));
+  const firstView = new Int16Array(first.buffer, first.byteOffset, first.byteLength / 2);
+  const firstAbs = Math.max(...Array.from(firstView, Math.abs));
+  assert.ok(
+    firstAbs > laterAbs * 3,
+    `expected the swap to have completed well past swapBar (first=${firstAbs}, later=${laterAbs})`,
+  );
+  mix.endMixer();
+});
+
 test('MixStream cancels a beatmix outright if incoming PCM never buffers before the overlap starts', async () => {
   // Codex round-6 (follow-up on round-5): a beatmix's whole premise is that
   // outgoing's downbeat and incoming's (seeked) downbeat land together once

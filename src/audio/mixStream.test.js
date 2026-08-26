@@ -368,6 +368,54 @@ function makeStemPlan(fadeSec, overrides = {}) {
   };
 }
 
+test('MixStream startStemCrossfade holds the bass-swap EQ fully dry until shortly before swapBar, same as the plain-crossfade path (Phase 9J, §17 9J)', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 900 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Isolate outInstrumental: everything else silent (0).
+    const outInstValue = 8000;
+    const frames = 700; // 14s @20ms, well past swapBarSec below.
+    const outgoing = { vocal: stemSource(0, frames), instrumental: stemSource(outInstValue, frames) };
+    const incoming = {
+      vocal: stemSource(0, frames),
+      instrumental: stemSource(0, frames),
+      full: stemSource(0, frames),
+    };
+    const plan = {
+      ...makeStemPlan(800), // long fadeSec keeps outInstrumental's OWN gain ~flat across the sampled window
+      baseSwap: true,
+      highpassHz: 120,
+      targetBpm: 120,
+      sync: { bars: 400, beatsPerBar: 4 },
+      // barSec=2s; swapBar 4 -> swapBarSec=8s; DEFAULT_EQ_RAMP_BARS(2 bars)
+      // -> rampSec=4s, holdSec=4s (200 frames) of room to verify the hold.
+      eq: { type: 'bass-swap', swapBar: 4, highpassHz: 120 },
+    };
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const collected = await collectFrames(mix, 650);
+    const abs = (frame) => Math.max(...Array.from(pcmView(frame), Math.abs));
+
+    // First frame and a frame still inside the 4s hold (100 frames = 2s in)
+    // must be byte-identical — mixNFrames() applies its own OVERLAP_GAIN/
+    // soft-clip headroom regardless of the EQ blend, so this compares two
+    // dry (eqMix=0) frames against each other rather than against the raw
+    // input value, isolating just the "does the hold actually hold" claim.
+    assert.deepEqual(collected[100], collected[0],
+      'expected a frame still inside the 4s hold to be identical to the first (both fully dry)');
+    // Well past swapBarSec (8s = 400 frames): fully wet — a highpass driving
+    // a constant (DC) signal toward ~0 once its IIR history has settled.
+    assert.ok(abs(collected[600]) < abs(collected[0]) / 3,
+      `expected the swap to have completed well past swapBar (dry=${abs(collected[0])}, later=${abs(collected[600])})`);
+  } finally {
+    mix.endMixer();
+  }
+});
+
 test('MixStream startStemCrossfade mixes 4 stems then promotes to the incoming full-mix source', async () => {
   const mix = new MixStream();
   try {
