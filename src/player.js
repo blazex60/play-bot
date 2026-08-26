@@ -286,56 +286,6 @@ function normalizeTransitionPlan(rawPlan) {
   };
 }
 
-/**
- * Phase 9I (docs/mix-transition-phase9.md §11): where to seek the incoming
- * vocal stem's OWN file source, independent of instrumental's `entrySec`.
- *
- * §11.1's problem: today, incoming vocal is opened at the SAME `entrySec`
- * as instrumental and read every tick from crossfade-tick-0 regardless of
- * gain (gain stays 0 for `stems.inVocal.startOffsetSec` seconds — the hold
- * before it fades in). Its read position therefore advances that whole hold
- * duration BEFORE it ever becomes audible, so what's actually heard once it
- * fades in is whatever native content happened to land `holdSec` playback-
- * seconds past `entrySec` — arbitrary relative to the incoming track's own
- * vocal phrasing, and easily mid-word/mid-phrase ("歌詞の途中から急に聞こえる").
- *
- * Fix: seek the vocal source BACKWARD from its own natural onset
- * (`inAnalysis.firstVocalStartSec`, native seconds) by exactly the hold
- * duration converted to native seconds (`holdSec * tempoRatio` — the same
- * `native = playback * ratio` relationship `beatmixTransition.js` itself
- * uses for incoming-side room checks, e.g. `roomInIncomingPlayback`).
- * MixStream's existing lockstep read loop (unchanged — every stem read
- * every tick from crossfade-tick-0, Phase 8) then naturally arrives at
- * `firstVocalStartSec` itself the instant the hold ends and gain starts
- * ramping up: the SAME audible result docs/mix-transition-phase9.md §11.3's
- * "seek to the phrase boundary, don't read before audibleStartBar" model
- * describes, achieved without touching MixStream's per-tick reads at all —
- * a deliberately smaller, lower-risk change than gating when each stem
- * starts being consumed would have been (see the Phase 9I 実装ノート's
- * スコープの判断 section for the full reasoning).
- *
- * §11.4 asks for "nearest vocal phrase boundary" rather than
- * `firstVocalStartSec` specifically — `firstVocalStartSec` (the first
- * vocal-active frame in the head window) already IS that boundary for the
- * common case (a track's own first vocal phrase); snapping to some OTHER
- * (non-first) phrase boundary via `headVocalGaps` is not implemented — see
- * 未決事項.
- *
- * Falls back to `norm.entrySec` (matching instrumental — Phase 8's original
- * single-seek behavior) when there's no hold to compensate for or no
- * detected vocal onset to seek toward.
- * @param {object} inAnalysis incoming track's analysis (needs firstVocalStartSec)
- * @param {{ mixPlan: object, entrySec: number, sessionTempo: object }} norm normalizeTransitionPlan()'s output
- * @returns {number}
- */
-function incomingVocalSeekSec(inAnalysis, norm) {
-  const holdSec = norm.mixPlan?.stems?.inVocal?.startOffsetSec;
-  const firstVocalStartSec = inAnalysis?.firstVocalStartSec;
-  if (!(holdSec >= 0) || !Number.isFinite(firstVocalStartSec)) return norm.entrySec;
-  const tempoRatio = norm.sessionTempo?.tempoRatio ?? 1;
-  return Math.max(0, firstVocalStartSec - (holdSec * tempoRatio));
-}
-
 function analysisKilledError() {
   const err = new Error('analysis killed');
   err.code = 'ANALYSIS_KILLED';
@@ -2140,13 +2090,10 @@ export class GuildPlayer {
    * still goes through the existing #ensureIncomingPrep()/
    * #takePreparedIncoming() machinery (download/normalize/analysis-
    * scheduling already lives there; no need to duplicate it), spawned with
-   * the SAME startSec/tempoFilter so instrumental and the full-mix
-   * continuation decode in lockstep (see mixStream.js's
-   * startStemCrossfade() docstring). `vocal`, since Phase 9I
-   * (docs/mix-transition-phase9.md §11), seeks independently — see
-   * incomingVocalSeekSec()'s docstring for why.
+   * the SAME startSec/tempoFilter so all three incoming sources decode in
+   * lockstep (see mixStream.js's startStemCrossfade() docstring).
    */
-  async #ensureIncomingStemPrep(cached, videoId, { startSec = 0, vocalStartSec = null, tempoFilter = null } = {}) {
+  async #ensureIncomingStemPrep(cached, videoId, { startSec = 0, tempoFilter = null } = {}) {
     // Same rationale as #ensureOutgoingStemPrep() — reuse whichever measured
     // value the incoming full-mix prep has captured for this track so far,
     // and include it in the identity check so a later tick that sees
@@ -2154,20 +2101,15 @@ export class GuildPlayer {
     // still be resolving the first time this fires) re-preps with it
     // instead of permanently keeping an unmeasured pair.
     const measured = this.#incomingMeasured;
-    // Phase 9I: no vocal-specific seek was computed (missing vocal-start
-    // analysis, or a non-stem-mix caller) -> fall back to instrumental's own
-    // startSec, reproducing Phase 8's original single-seek behavior exactly.
-    const resolvedVocalStartSec = vocalStartSec ?? startSec;
     if (
       this.#preparedIncomingStems?.videoId === videoId
       && this.#preparedIncomingStems.prep?.startSec === startSec
-      && this.#preparedIncomingStems.prep?.vocalStartSec === resolvedVocalStartSec
       && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
       && this.#preparedIncomingStems.prep?.measured === measured
     ) return;
     // Dedup concurrent in-flight attempts — see #ensureOutgoingStemPrep()'s
     // matching comment (Codex).
-    const key = `${videoId}:${startSec}:${resolvedVocalStartSec}:${tempoFilter}:${measured}`;
+    const key = `${videoId}:${startSec}:${tempoFilter}:${measured}`;
     if (this.#preparingIncomingStemsKey === key) return;
     this.#preparingIncomingStemsKey = key;
     try {
@@ -2179,12 +2121,10 @@ export class GuildPlayer {
         this.#clearPreparedIncomingStems();
         return;
       }
-      const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec: resolvedVocalStartSec, tempoFilter, measured });
+      const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
       const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
       this.#clearPreparedIncomingStems();
-      this.#preparedIncomingStems = {
-        videoId, prep: { startSec, vocalStartSec: resolvedVocalStartSec, tempoFilter, measured }, vocal, instrumental,
-      };
+      this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
     } finally {
       // Always release the in-flight marker for THIS attempt — see
       // #ensureOutgoingStemPrep()'s matching comment (CodeRabbit).
@@ -2192,12 +2132,10 @@ export class GuildPlayer {
     }
   }
 
-  #takePreparedIncomingStems(videoId, { startSec = 0, vocalStartSec = null, tempoFilter = null } = {}) {
-    const resolvedVocalStartSec = vocalStartSec ?? startSec;
+  #takePreparedIncomingStems(videoId, { startSec = 0, tempoFilter = null } = {}) {
     if (
       this.#preparedIncomingStems?.videoId === videoId
       && this.#preparedIncomingStems.prep?.startSec === startSec
-      && this.#preparedIncomingStems.prep?.vocalStartSec === resolvedVocalStartSec
       && this.#preparedIncomingStems.prep?.tempoFilter === tempoFilter
       // #takePreparedIncoming() (the full-mix side) can resolve normalization
       // and populate #incomingMeasured within the SAME arm pass, after these
@@ -2724,7 +2662,6 @@ export class GuildPlayer {
             }).catch((err) => console.warn('[GuildPlayer] outgoing stem prep failed:', err.message));
             this.#ensureIncomingStemPrep(inCachedStems, next.videoId, {
               startSec: norm.entrySec,
-              vocalStartSec: incomingVocalSeekSec(inAnalysis, norm),
               tempoFilter: norm.tempoFilter,
             }).catch((err) => console.warn('[GuildPlayer] incoming stem prep failed:', err.message));
           }
@@ -2863,7 +2800,6 @@ export class GuildPlayer {
         });
         incomingStems = this.#takePreparedIncomingStems(next.videoId, {
           startSec: norm.entrySec,
-          vocalStartSec: incomingVocalSeekSec(inAnalysis, norm),
           tempoFilter: norm.tempoFilter,
         });
         if (!outgoingStems || !incomingStems) {
