@@ -2080,8 +2080,24 @@ round 1 の修正（commit `f87ad0e`）に対し、Codex から新たに2件の�
 ### 完了条件（§10/§17 9H 相当）
 
 - [x] outVocal envelope を `{ holdSec, releaseSec, curve }`（実装上は既存の `{ startOffsetSec, fadeSec, curve }` 形状のまま、意味論だけ hold/release に変更）に変更した
-- [x] hold は「無音に達するまでの残り時間」から release 分を引いた長さ、release は §10.3 の例に沿った固定 0.5秒（window が短い場合は window 全体へ縮退）
-- [x] 既存のゲイン計算関数（`gainForStemPosition()`）・incoming vocal のタイミングロジック（`inVocalDelaySec`/`estimateInVocalFadeSec()`）に regression が無いことを確認した（`bun run test:server`: 784件中776 pass、既知の4件のみ fail）
+- [x] hold は「無音に達するまでの残り時間（native vocal tail）」そのもの、release はその**後に**§10.3 の例に沿って固定 0.5秒追加（transition window の残り時間が足りない場合はその範囲へ縮退——round 2 で訂正、下記参照）
+- [x] 既存のゲイン計算関数（`gainForStemPosition()`）に regression が無いことを確認した。incoming vocal のタイミングロジック（`inVocalDelaySec`/`estimateInVocalFadeSec()`）は release 分を追加で考慮するよう更新し、`planStemTransition()` の candidate search（pairFilter）と最終envelopeビルドの両方が同じ計算を共有するようにした（round 2、下記参照）。`bun run test:server`: 785件中777 pass、既知の4件のみ fail
 - [ ] 「last vocal phrase start」の専用検出（上記未決事項参照、必要になれば次フェーズ以降）
 - [ ] release時間を楽曲ごとに可変にする（上記未決事項参照）
 - [ ] 実運用での聴感評価（上記未決事項参照）
+
+### 追記: Codex レビュー対応（PR #54, round 1）
+
+Codex から P2 の指摘を1件受けた——「outVocal は `lastVocalEndSec` 直前の `releaseSec` 分だけ、まだ実際に歌っている区間で減衰し始め、`lastVocalEndSec`（実際の歌唱終了と一致するタイムスタンプ）に到達した時点で既に無音に達している。これは §10.4 の『hold → phrase終了 → short release』という順序（release は phrase終了の**後**に来るべき）に反する」という指摘。
+
+これは正当な指摘だった。round 1 の実装は `outVocalWindowSec`（= "無音に達するまでの残り時間"、Phase 8 の `outVocalFadeSec` と数値的に同一）を hold と release に**分割**していたため、release の分だけ hold が短くなり、結果として無音に達する瞬間自体は変わらないまま（Phase 8 と同じ `lastVocalEndSec` の位置）——release区間がちょうど実際の歌唱の最後の0.5秒と重なってしまい、§10.1 が問題視していた「最後の歌唱が減衰して聞こえる」という欠陥を、期間を短くしただけで実質的に再現していた。
+
+修正: hold の長さを Phase 8 の `outVocalFadeSec` と同じ計算のまま（= 残り native vocal tail をそのまま）にし、release はその**後に追加**する時間として扱うよう変更した（`outVocalHoldRelease()` という共有ヘルパーに切り出し）。これにより無音に達する瞬間は `holdSec + releaseSec`（Phase 8 の元の時間より最大 `releaseSec` 分だけ後ろにずれる）となり、outVocal は実際の歌唱が終わる瞬間（`lastVocalEndSec`）まで完全に減衰なしで鳴り続ける。release は transition window（`fadeSec`）の残り時間でクランプされ、hold が window の端まで達している場合は release が 0 に縮退する（既存の Phase 8 クランプと同じ思想）。また、hold が 0（= exit point が既に vocal-safe で歌唱が残っていない）の場合は release も 0 にするガードを追加した——歌唱が無いのに release を追加すると inVocal の開始が無意味に遅れてしまうため（Phase 8 の「vocal-safe なら inVocal はほぼ即座に始められる」という挙動を保持）。
+
+無音に達する瞬間が後ろにずれたことに伴い、`inVocalDelaySec`（`buildStemEnvelopes()`）と `estimateInVocalFadeSec()`（`planStemTransition()` の pairFilter が候補探索時に使う、同じ計算の双子）の両方を `holdSec + releaseSec + vocalCrossoverMarginSec` を使うよう更新し、両者が同じ `outVocalHoldRelease()` ヘルパーを共有することで、探索時に検証した inVocal の余地と最終envelopeが食い違わないようにした。`planStemTransition()` にも `outVocalReleaseSec` オプションを追加し、`buildStemEnvelopes()` への forwarding と pairFilter 双方に一貫して渡るようにした。
+
+検証: `stemTransition.test.js` の既存6件のfixture/アサーションを新しいhold/releaseセマンティクスに合わせて更新し、新規2件（release が transition window の端でクランプされるケース、release の余地が全く無いケース）を追加した（計20件、全pass）。revert-test-restore: `outVocalHoldRelease()` を一時的に旧実装（release を hold から差し引く）に戻すと、更新後のテスト6件が期待どおり失敗することを確認したうえで復元した。
+
+副作用として、`player.acceptance.test.js` の既存回帰テスト（PR #46 round 6, "TRACK loop mode's stem-mix -> bestNonStemPlan downgrade..."）が1件レグレッションした——このテストは stem-mix の pairFilter が「際どく」通過するよう手動でチューニングされた fixture（inVocal の余地がちょうど閾値 `MIN_MEANINGFUL_INVOCAL_FADE_SEC` を僅かに超える程度）を使っており、release の追加分だけ余地が減ったことでその境界を割り込み、テストの前提（stem-mix が一旦選ばれてから downgrade する）自体が成立しなくなっていた。これはPhase 9Hの意図した挙動変化（vocalを完全に鳴らし切るには、以前より少し多くのオーバーラップ時間が必要になる）が正しく反映された結果であり、fixture の `lastVocalEndSec` を `8.0` から `7.5` に0.5秒(= release分)ずらすことで、テストが検証したかった余地（0.8秒）を回復し、テスト自体の意図（downgrade時のreport.exit再構築の検証）は変更せずに済ませた。
+
+検証: `bun test src/audio/stemTransition.test.js`（20/20 pass）、`node --test src/player.acceptance.test.js`（72 pass / 1 skip、0 fail）、`bun run test:server`（785件中777 pass、既知の4件のみ fail）。

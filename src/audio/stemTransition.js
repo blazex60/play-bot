@@ -42,13 +42,33 @@ function clamp(n, lo, hi) {
  * @param {number} vocalCrossoverMarginSec
  * @returns {number} inVocal's fadeSec for this pair
  */
-function estimateInVocalFadeSec(outgoing, { exitStartSec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec) {
+/**
+ * Phase 9H (docs/mix-transition-phase9.md §10): splits outVocal's total
+ * time-to-silence into hold (full volume) then release, shared by both
+ * estimateInVocalFadeSec() (pairFilter-time, during the search) and
+ * buildStemEnvelopes() (the final envelope) so the two can never disagree
+ * about how much room inVocal actually gets (Codex review, PR #54, P2).
+ * Release is gated on holdSec > 0 — when there is no vocal left to hold
+ * (the already-vocal-safe case, holdSec 0), there is nothing to release
+ * either; adding one anyway would only delay inVocal's own start for no
+ * audible reason, regressing Phase 8's original behavior for that case.
+ */
+function outVocalHoldRelease(outVocalTailNativeSec, outgoingRatio, fadeSec, outVocalReleaseSec) {
+  const holdSec = clamp(outVocalTailNativeSec / outgoingRatio, 0, fadeSec);
+  const releaseSec = holdSec > 0 ? clamp(outVocalReleaseSec, 0, fadeSec - holdSec) : 0;
+  return { holdSec, releaseSec };
+}
+
+function estimateInVocalFadeSec(
+  outgoing, { exitStartSec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec,
+  outVocalReleaseSec = DEFAULT_OUTVOCAL_RELEASE_SEC,
+) {
   const lastVocalEndSec = outgoing?.lastVocalEndSec;
   const outVocalTailNativeSec = Number.isFinite(lastVocalEndSec)
     ? Math.max(0, lastVocalEndSec - exitStartSec)
     : 0;
-  const outVocalFadeSec = clamp(outVocalTailNativeSec / outgoingRatio, 0, fadeSec);
-  const inVocalDelaySec = clamp(outVocalFadeSec + vocalCrossoverMarginSec, 0, fadeSec);
+  const { holdSec, releaseSec } = outVocalHoldRelease(outVocalTailNativeSec, outgoingRatio, fadeSec, outVocalReleaseSec);
+  const inVocalDelaySec = clamp(holdSec + releaseSec + vocalCrossoverMarginSec, 0, fadeSec);
   return Math.max(0, fadeSec - inVocalDelaySec);
 }
 
@@ -63,22 +83,28 @@ function estimateInVocalFadeSec(outgoing, { exitStartSec, outgoingRatio, fadeSec
  * a small margin), rather than needing the whole overlap to be vocal-free
  * on both sides the way a plain beatmix transition requires.
  *
- * Phase 9H (docs/mix-transition-phase9.md §10): outVocal HOLDS at full
- * volume for nearly the whole remaining-vocal window instead of fading
- * continuously from bar 0 — §10.1's complaint is that a fade spanning the
- * entire window already audibly weakens the last singing well before the
- * vocal itself ends (by its midpoint, an equal-power curve is already down
- * ~30%). §10.2/§10.3 replace that with hold-then-short-release: full
- * volume until `outVocalReleaseSec` before the vocal's own end, then only
- * that short (§10.4: 200-800ms) release — the same hold-then-fade shape
- * `gainForStemPosition()` already implements for inVocal's fade-IN
- * (`startOffsetSec` holds, then ramps over `fadeSec`), just applied on the
- * fade-OUT side here. The instant outVocal reaches silence
- * (`outVocalWindowSec`, i.e. hold+release) is unchanged from Phase 8's
- * original `outVocalFadeSec` — only how that same duration is split
- * between "held" and "releasing" changes — so `inVocalDelaySec`/
- * `estimateInVocalFadeSec()` (which only care about that instant, not how
- * outVocal spends the time before it) need no changes.
+ * Phase 9H (docs/mix-transition-phase9.md §10): outVocal HOLDS at full,
+ * unattenuated volume through its entire actual audible duration (through
+ * `lastVocalEndSec` itself) instead of fading continuously from bar 0 —
+ * §10.1's complaint is that a fade spanning the entire window already
+ * audibly weakens the last singing well before the vocal itself ends (by
+ * its midpoint, an equal-power curve is already down ~30%). §10.2/§10.4's
+ * "hold → phrase end → short release" sequence means the release comes
+ * strictly AFTER the vocal's own end, not carved out of its last moments
+ * (Codex review, PR #54, P2: an earlier version subtracted the release from
+ * the hold instead of adding it after, so the last `outVocalReleaseSec` of
+ * real singing was still measurably attenuated — the exact defect §10.1
+ * describes, just shrunk to a shorter window instead of eliminated). The
+ * release is clamped to whatever room remains in `fadeSec` after the hold
+ * — 0 when the vocal already runs to the edge of the transition window,
+ * same graceful degradation as Phase 8's own clamp. This pushes the instant
+ * outVocal reaches silence PAST Phase 8's original `outVocalFadeSec` (by up
+ * to `outVocalReleaseSec`), so `inVocalDelaySec` and
+ * `estimateInVocalFadeSec()` (the pairFilter-time twin of this
+ * computation, used during candidate search) both now add the release too
+ * — they must stay in sync with whatever this function actually produces,
+ * or a candidate the search accepted could end up with less inVocal room
+ * than it validated.
  * @param {object} outgoing analysis (needs lastVocalEndSec)
  * @param {object} plan a `planBeatmixTransition()`-shaped eligible plan
  *   (specifically `plan.outgoing.exitStartSec`/`tempoRatioApplied`,
@@ -104,18 +130,10 @@ export function buildStemEnvelopes(outgoing, plan, {
   const outVocalTailNativeSec = Number.isFinite(lastVocalEndSec)
     ? Math.max(0, lastVocalEndSec - exitStartSec)
     : 0;
-  // Total time-to-silence for outVocal — identical to Phase 8's
-  // outVocalFadeSec (same formula), now split below into hold+release
-  // instead of being the fade duration itself.
-  const outVocalWindowSec = clamp(outVocalTailNativeSec / outgoingRatio, 0, fadeSec);
-  // Never release longer than the window itself has room for (e.g. the
-  // vocal ends almost immediately after the exit point) — degrades to an
-  // immediate release, never a negative hold.
-  const releaseSec = clamp(outVocalReleaseSec, 0, outVocalWindowSec);
-  const holdSec = outVocalWindowSec - releaseSec;
-  const inVocalDelaySec = clamp(outVocalWindowSec + vocalCrossoverMarginSec, 0, fadeSec);
+  const { holdSec, releaseSec } = outVocalHoldRelease(outVocalTailNativeSec, outgoingRatio, fadeSec, outVocalReleaseSec);
+  const inVocalDelaySec = clamp(holdSec + releaseSec + vocalCrossoverMarginSec, 0, fadeSec);
   const inVocalFadeSec = estimateInVocalFadeSec(
-    outgoing, { exitStartSec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec,
+    outgoing, { exitStartSec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec, outVocalReleaseSec,
   );
 
   return {
@@ -278,6 +296,7 @@ export function deriveStemEnvelopesFromEvents(events, mixZone, curve = 'equal-po
  */
 export function planStemTransition(outgoing, incoming, options = {}) {
   const vocalCrossoverMarginSec = options.vocalCrossoverMarginSec ?? DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC;
+  const outVocalReleaseSec = options.outVocalReleaseSec ?? DEFAULT_OUTVOCAL_RELEASE_SEC;
   const plan = planBeatmixTransition(outgoing, incoming, {
     ...options,
     requireExitVocalSafe: false,
@@ -302,8 +321,12 @@ export function planStemTransition(outgoing, incoming, options = {}) {
     // ()'s generic pairFilter hook — a pair failing this check is simply
     // skipped, letting the search fall through to the next candidate/tier
     // instead of rejecting the whole plan outright.
+    // Codex review (PR #54, P2): must pass the same outVocalReleaseSec
+    // buildStemEnvelopes() below will end up using — otherwise a caller
+    // overriding it would have the search validate room against one
+    // release duration while the final envelope build uses another.
     pairFilter: ({ exit, fadeSec, outgoingRatio }) => estimateInVocalFadeSec(
-      outgoing, { exitStartSec: exit.sec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec,
+      outgoing, { exitStartSec: exit.sec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec, outVocalReleaseSec,
     ) >= MIN_MEANINGFUL_INVOCAL_FADE_SEC,
   });
   if (!plan.eligible) {
