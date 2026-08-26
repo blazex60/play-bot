@@ -2101,3 +2101,41 @@ Codex から P2 の指摘を1件受けた——「outVocal は `lastVocalEndSec`
 副作用として、`player.acceptance.test.js` の既存回帰テスト（PR #46 round 6, "TRACK loop mode's stem-mix -> bestNonStemPlan downgrade..."）が1件レグレッションした——このテストは stem-mix の pairFilter が「際どく」通過するよう手動でチューニングされた fixture（inVocal の余地がちょうど閾値 `MIN_MEANINGFUL_INVOCAL_FADE_SEC` を僅かに超える程度）を使っており、release の追加分だけ余地が減ったことでその境界を割り込み、テストの前提（stem-mix が一旦選ばれてから downgrade する）自体が成立しなくなっていた。これはPhase 9Hの意図した挙動変化（vocalを完全に鳴らし切るには、以前より少し多くのオーバーラップ時間が必要になる）が正しく反映された結果であり、fixture の `lastVocalEndSec` を `8.0` から `7.5` に0.5秒(= release分)ずらすことで、テストが検証したかった余地（0.8秒）を回復し、テスト自体の意図（downgrade時のreport.exit再構築の検証）は変更せずに済ませた。
 
 検証: `bun test src/audio/stemTransition.test.js`（20/20 pass）、`node --test src/player.acceptance.test.js`（72 pass / 1 skip、0 fail）、`bun run test:server`（785件中777 pass、既知の4件のみ fail）。
+
+
+## 実装ノート (Phase 9I)
+
+§11 の Incoming Vocal Independent Timeline を実装した。§11.1 の問題提起（incoming vocal が instrumental と同じタイムラインで再生され、gain=0 の間も PCM を消費するため、フェードインした瞬間に「歌詞の途中から急に聞こえる」）に対し、incoming vocal の file source だけを独立した位置に seek することで対処した。
+
+### スコープの判断
+
+§11.3 が示す完全な姿（`sourceSeekSec`/`audibleStartBar` を別々のフィールドとして持ち、`audibleStartBar` に達するまで vocal stem を一切 read しない）を素直に実装すると、MixStream の `#readStemCrossfadeFrame()` が全4stemを毎tick lockstep で読む——という、Phase 8 で何ラウンドものCodexレビューを経て固めてきた前提（catch-up drain、deficit tracking、promotion timing 等）に手を入れることになる。これは本エージェント環境で安全に検証しきれないリスクを伴う。
+
+そこで、**音として聞こえる結果は§11.3のモデルと完全に同一だが、MixStreamの読み取りループには一切触れない**別の実装方法を選んだ: incoming vocal の file source を、その"自然な発声開始位置"（`firstVocalStartSec`、native秒）から**hold時間ぶんだけ手前に**seekする。MixStreamは今までどおり毎tick、crossfadeの開始（tick 0）から連続して全stemを読み続ける（変更なし）——しかしvocalの読み取り開始位置がずれているため、hold時間が経過してgainが立ち上がる瞬間には、ちょうど`firstVocalStartSec`の位置に到達している。「`audibleStartBar`まで一切readしない」場合と、「hold時間ぶん手前からreadし続ける（gain=0で無音のまま）」場合とで、**gainが立ち上がった瞬間に聞こえる音は数学的に同一**（前者はreadを`audibleStartBar`まで遅延させて`sourceSeekSec`から、後者は`tick 0`から`sourceSeekSec - holdSec`を起点に連続readして`holdSec`経過後に`sourceSeekSec`へ到達——結果は同じ）であり、後者はMixStreamを一切変更しない分だけ安全である。
+
+### 実装箇所
+
+- `src/player.js`:
+  - `incomingVocalSeekSec(inAnalysis, norm)`（新規、モジュールレベル関数）: incoming vocal stem のseek位置を計算する。`holdSec = norm.mixPlan.stems.inVocal.startOffsetSec`（Phase 8/9Hで既に計算済みの、inVocalがフェードインし始めるまでの待機時間、playback秒）と `inAnalysis.firstVocalStartSec`（incoming track 自身の head window での最初のvocal onset、native秒）を使い、`firstVocalStartSec - holdSec * tempoRatio` を返す（`tempoRatio = norm.sessionTempo.tempoRatio`、`beatmixTransition.js` が incoming 側の room check（`roomInIncomingPlayback`）で使っているのと同じ `native = playback * tempoRatio` の関係を使って playback 秒→native 秒に変換）。0未満にはクランプする。`holdSec`が無い（非 stem-mix プラン）か`firstVocalStartSec`が無い（vocal解析データ欠如）場合は `norm.entrySec`（instrumentalと同じ、Phase 8の元の挙動）にフォールバックする。
+  - `#ensureIncomingStemPrep()`/`#takePreparedIncomingStems()`: 新しい `vocalStartSec` オプションを追加した。`vocal` の `createFileSourceFn()` 呼び出しにはこれを（`instrumental`には従来どおり`startSec`のまま）渡すよう変更した。prepared-pair の identity check（同一videoId/startSec/tempoFilter/measuredなら再spawnしない、というキャッシュ判定）にも `vocalStartSec` を含めた——さもないと、`#ensureIncomingStemPrep()`（prefetch時点）と `#takePreparedIncomingStems()`（実行時点）とで計算された`vocalStartSec`がわずかでも食い違うと（通常は同じ`inAnalysis`/`norm`から同じ関数で計算されるため起こらないはずだが、念のため）、キャッシュヒットの判定自体が壊れる。
+  - `incomingVocalSeekSec()` の呼び出し箇所は2箇所——`#ensureIncomingStemPrep()`を呼ぶprefetch側（stem prep が due になったtick）と、`#takePreparedIncomingStems()`を呼ぶ実行側（transition を実際にcommitする直前）——で、どちらも同じ`inAnalysis`/`norm`（同一tickのローカル変数）を渡しているため、計算結果は常に一致する。
+  - `instrumental`側は完全に無変更——§11.3の`instrumental: {sourceSeekSec:0, audibleStartBar:0}`に対応する、Phase 8から変わらない挙動。
+- テスト（`player.acceptance.test.js`）:
+  - 新規1件: `stemFixtures()`をベースに、outgoing の `lastVocalEndSec` と incoming の `firstVocalStartSec` を調整して hold/release/margin の合計（1.7秒）がきれいな数値になるようにしたfixtureで、実際に spawn された `createFileSourceFn` 呼び出しを検証——instrumental は `entrySec`（0.2秒）のまま、vocal は `firstVocalStartSec(10.0) - holdSec(1.7) = 8.3秒` に seek されており、両者が異なることを直接確認した。
+  - revert-test-restore: `incomingVocalSeekSec()` を一時的に `norm.entrySec` を返すだけの実装（Phase 8の元の挙動）に戻すと、この新規テストが期待どおり失敗する（vocal の startSec が instrumental と同じ 0.2 になってしまう）ことを確認したうえで復元した。
+
+### 未決事項 / 既知の制約
+
+- **「nearest vocal phrase boundary」ではなく `firstVocalStartSec`（最初のvocal onset）のみを使っている**: §11.4 は「`firstVocalStartSec` ではなく可能なら nearest vocal phrase boundary を使う」ことを示唆しているが、既存の解析パイプライン（`vocalActivity.js`）の head window は「最初のvocal onset」（`firstVocalStartSec`）と「その中の無音区間」（`headVocalGaps`）のみを提供し、2番目以降のphrase境界を明示的には持たない。今回は、incoming track が transition の head window（曲の先頭〜30秒）内で迎える"最初の"vocal onsetを"最寄りのphrase境界"の近似として扱った——実際、track の最初の登場するvocalは典型的にはverse/chorusの開始そのものであることが多く、多くのケースでこの近似は妥当と考えられる。`headVocalGaps`を使ったより一般的な（2番目以降の境界にも対応する）phrase境界検出は未実装。
+- **incoming側のtempo ratioの丸め**: `tempoRatio`（`norm.sessionTempo.tempoRatio`）を使ったnative秒への変換は、`beatmixTransition.js`が既に使っている同じ関係式を再利用しているが、実際に`tempoFilter`（rubberband等）がどれだけ正確にその比率どおりに動作するかは検証していない——既存のPhase 7/8の tempo-stretch 実装への信頼に依拠している。
+- **audibleStartBar 相当のMixStream側の変更は行っていない**: 上記「スコープの判断」のとおり、MixStreamの読み取りループ自体は変更していない——decode の無駄（gain=0の間もvocal streamを実際に読み進めている）は Phase 8 から変わらず残っている。音として聞こえる結果は§11.3のモデルと同一だが、CPU/decode効率の面では最適化されていない。
+- **実運用での聴感評価は未実施**: 既存フェーズのノートと同様、本エージェント環境では実施できない。
+
+### 完了条件（§11/§17 9I 相当）
+
+- [x] incoming instrumental と vocal で seek 位置を分離した（`incomingVocalSeekSec()`）——instrumental は従来どおり `entrySec`、vocal は `firstVocalStartSec - holdSec` へ独立して seek する
+- [x] vocal の音として聞こえる開始位置が、gainが立ち上がる瞬間に `firstVocalStartSec`（incoming track 自身の最初のvocal onset）と一致するようにした——「歌詞の途中から急に聞こえる」問題を、MixStreamの読み取りループを一切変更せずに解消した
+- [x] 既存のstem-mixテスト・acceptanceテストに regression が無いことを確認した（`bun run test:server`: 786件中778 pass、既知の4件のみ fail）
+- [ ] `headVocalGaps` を使った、2番目以降のphrase境界にも対応する「nearest vocal phrase boundary」検出（上記未決事項参照）
+- [ ] `audibleStartBar` 相当のMixStream側最適化（decode を実際に遅延させる）（上記未決事項参照、Phase 9J以降または将来のリファクタリングのスコープ）
+- [ ] 実運用での聴感評価（上記未決事項参照）
