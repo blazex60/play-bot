@@ -433,7 +433,7 @@ test('POST /internal/optimize-order probes the tempo backend once and threads it
   db.prepare(`
     INSERT INTO track_analysis (video_id, version, payload_json, analyzed_at)
     VALUES (?, ?, ?, ?)
-  `).run('anchor', 3, JSON.stringify({ version: 3, ...anchor }), Math.floor(Date.now() / 1000))
+  `).run('anchor', ANALYSIS_VERSION, JSON.stringify({ version: ANALYSIS_VERSION, ...anchor }), Math.floor(Date.now() / 1000))
 
   const Fastify = (await import('fastify')).default
   const { internalRoutes } = await import('./internal.js')

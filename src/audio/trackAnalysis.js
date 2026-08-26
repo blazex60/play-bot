@@ -1,17 +1,32 @@
 import { unlink } from 'node:fs/promises';
 import { BYTES_PER_SECOND } from './fade.js';
-import { analyzeVocalActivity, parseRmsLevels } from './vocalActivity.js';
+import { analyzeVocalActivity, parseRmsLevels, TAIL_WINDOW_SEC } from './vocalActivity.js';
 import { analyzeKeys } from './keyAnalysis.js';
 import { analyzeDownbeats } from './downbeatAnalysis.js';
 import { buildPhraseCandidates } from './phraseAnalysis.js';
 import { spawnCapture } from './spawnCapture.js';
 
-export const ANALYSIS_VERSION = 3;
+// Bumped 3->4 for Phase 9F (§8): the tail window widened from 45s to 60s,
+// so pre-existing version-3 cached payloads carry beat/phrase/vocal windows
+// that stop 15s short of what this phase's analysis now covers. Without the
+// bump, #getCachedAnalysis()/internal.js's `version < ANALYSIS_VERSION`
+// staleness check would keep serving those narrower cached windows forever,
+// silently defeating the widened search range for every already-analyzed
+// track (Codex review, PR #52).
+export const ANALYSIS_VERSION = 4;
 // Phase 7 §9.2 prefers entry points in the first 0-30s of the incoming
 // track; keep the BPM window and the vocal head window (vocalActivity.js
 // HEAD_WINDOW_SEC) the same length so beatGrid/vocal boundaries line up.
 export const HEAD_BPM_WINDOW_SEC = 30;
-export const TAIL_BPM_WINDOW_SEC = 45;
+// Derived from vocalActivity.js's TAIL_WINDOW_SEC (not a separately-tracked
+// duplicate): beatGrid.tail / phrases.tail (the pool findExitCandidates()
+// searches — see beatmixTransition.js) must reach exactly as far back as
+// vocal.lastVocalEndSec/vocalGaps do, or Phase 9F's widened tail window
+// (§8) would relax the vocal-safety floor's coverage without actually
+// growing the exit-candidate pool it gates, silently missing the phase's
+// completion criterion (a phrase boundary before the old 45s bound must
+// become selectable as exit).
+export const TAIL_BPM_WINDOW_SEC = TAIL_WINDOW_SEC;
 export const PHRASE_FEATURE_FRAME_SEC = 0.1;
 // astats' `reset` option is a frame count, not seconds — asetnsamples forces
 // one filter-frame per PHRASE_FEATURE_FRAME_SEC at a known rate so reset=1

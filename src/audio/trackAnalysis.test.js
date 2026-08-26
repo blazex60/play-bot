@@ -12,6 +12,8 @@ import {
   beatGridConfidence,
   isHalfDouble,
   dampIfHalfDouble,
+  analyzeTrackFile,
+  TAIL_BPM_WINDOW_SEC,
 } from './trackAnalysis.js'
 
 test('bpmTempPath distinguishes overlapping start offsets by window length', () => {
@@ -23,9 +25,10 @@ test('bpmTempPath distinguishes overlapping start offsets by window length', () 
 })
 
 test('bpmTempPath disambiguates identical startSec/windowSec via role (20-30s tracks: head === tail window)', () => {
-  // For a 25s track, HEAD_BPM_WINDOW_SEC=30 and TAIL_BPM_WINDOW_SEC=45 both
-  // clamp to the same [0, 25] window — without a role suffix the two
-  // parallel analyzeBpmWindow() calls would race on one temp file.
+  // For a 25s track, HEAD_BPM_WINDOW_SEC=30 and TAIL_BPM_WINDOW_SEC (60 as
+  // of Phase 9F) both clamp to the same [0, 25] window — without a role
+  // suffix the two parallel analyzeBpmWindow() calls would race on one temp
+  // file.
   const head = bpmTempPath('/tmp/track.m4a', 0, 25, 'head')
   const tail = bpmTempPath('/tmp/track.m4a', 0, 25, 'tail')
   assert.notEqual(head, tail)
@@ -52,6 +55,41 @@ test('analyzeKeys extracts PCM through the provided spawnFn', async () => {
   assert.equal(keys.headKey, 'C major')
   assert.equal(keys.tailKey, 'G major')
 })
+
+// --- Phase 9F §8: exit candidate search window expansion ---------------
+
+test('analyzeTrackFile widens beatGrid.tail/phrases.tail reach in lockstep with TAIL_WINDOW_SEC', async () => {
+  // Phase 9F widened vocalActivity.js's TAIL_WINDOW_SEC from 45s to 60s so
+  // exit candidates further from EOF become reachable — but the actual pool
+  // findExitCandidates() searches (beatGrid.tail / phrases.tail, sized here
+  // by TAIL_BPM_WINDOW_SEC) used to be a SEPARATELY hardcoded 45s constant.
+  // Before this phase's fix the two windows could silently diverge: a 70s
+  // track would extend vocal analysis back to 10s (70-60) while still
+  // capping the phrase/beat candidate pool at 25s (70-45), leaving Phase
+  // 9F's own completion criterion ("a phrase boundary before 45s-from-end
+  // can be selected as exit") unmet despite the constant bump.
+  // TAIL_BPM_WINDOW_SEC is now derived from TAIL_WINDOW_SEC so they can't
+  // re-diverge.
+  const spawnFn = (cmd) => {
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.kill = () => {};
+    // 'bash' probes for aubiotrack; reporting it missing short-circuits the
+    // BPM/beat pipeline early (available:false) without needing a full
+    // ffmpeg/aubiotrack fixture — tailStart is computed before any of that
+    // and is what this test actually verifies.
+    queueMicrotask(() => proc.emit('close', cmd === 'bash' ? 1 : 0));
+    return proc;
+  };
+
+  const result = await analyzeTrackFile('/tmp/fake-9f.wav', { durationSec: 70, spawnFn });
+  assert.equal(result.beatGrid.tail.startSec, 70 - TAIL_BPM_WINDOW_SEC);
+  assert.ok(
+    result.beatGrid.tail.startSec < 70 - 45,
+    `expected the tail window to reach further back than the pre-Phase-9F 45s bound, got startSec=${result.beatGrid.tail.startSec}`,
+  );
+});
 
 // --- Phase 7 §5: beat grid ---------------------------------------------
 

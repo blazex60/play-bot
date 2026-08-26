@@ -197,6 +197,7 @@ test('analyzeVocalActivity slices the overlap-branch envelope to each window (me
 
   const result = await analyzeVocalActivity('/tmp/fake-medium.wav', {
     durationSec: 60,
+    tailWindowSec: 45, // pinned: decouples this test's geometry from TAIL_WINDOW_SEC's default
     spawnFn: fakeVocalSpawn({
       vocalsStderr: levelsToStderr(vocalsLevels),
       mixStderr: levelsToStderr(mixLevels),

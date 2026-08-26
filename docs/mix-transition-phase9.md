@@ -1926,3 +1926,57 @@ round 6 のプッシュ後、さらに2件の指摘が見つかった。いず�
   - 修正: marginal-tempo のスコアチェックを tier ループの**内側**、各ペアのスコア計算直後に移動した（`match.tier === 'marginal' && score < MARGINAL_TEMPO_MIN_SCORE` なら `continue`）。`planBeatmixTransition()` 自身の `anyMarginalRejected` と全く同じ意味論——閾値未満のペアはそのtier内の他のペア、そして必要ならより狭いtierへと、探索を止めずにスキップされる。ループ後の後付けチェックは（閾値未満のペアがそもそも `bestAtTier`/`bestScore` に反映されなくなったため）冗長になったので削除した——`bestScore` が 0 のまま残るケース（marginal 理由であれ room 不足であれ）は既存の `return 1 - bestScore`（`1 - 0 = 1 = BEATMIX_INFEASIBLE_COST`）がそのまま同じ値を返す。
   - テスト: 20s の room を持つ exit（marginal tempo 込みでスコアが 0.7 未満、8-bar tier を余裕でクリア）と、10s の room しかない exit（スコア 0.7 超、4-bar tier しかクリアしない）を両方候補として与え、`transitionCost()` の結果が「10s の exit だけを候補にした場合」と完全に一致する（＝20s の exit の閾値未満スコアが tier をブロックしない）ことを確認するテストを追加した。数値は `scoreTransitionPair()` を直接呼ぶデバッグスクリプトで実測して較正した（entry 側の phrase score を通常の 0.9 から 0.2 に下げないと、20s の exit のスコアが偶然 0.7 をわずかに上回ってしまい閾値の差が生まれなかったため）。修正を revert すると、期待どおり 20s の exit のスコアがそのまま使われてコストが悪化することを確認済み。
 - テスト: `bun run test:server` を再実行し、`silenceTrim.test.js` の既知の4件（ffmpeg 未インストール）以外に regression が無いことを確認した。
+
+## 実装ノート (Phase 9F)
+
+§8 の Exit Candidate 探索範囲拡張を実装した。tail 解析窓を 45 秒から §8.2 の指定レンジ（60-90秒）の下限である 60 秒へ広げ、findExitCandidates() が実際に探索する候補プールをその新しい窓幅まで届かせた。
+
+### 実装箇所
+
+- `src/audio/vocalActivity.js`: `TAIL_WINDOW_SEC` を 45→60 に変更した。60 秒（レンジの下限）を選んだ理由: 64 BPM/4-beat での 16 bars がちょうど 60 秒（`60 / 64 * 4 * 16 = 60`）になるため、Phase 9E で導入した extended tier（16 bars）が現実的なミキシングテンポ域の下限付近までフルに届くようになる一方、Demucs のtail解析コストの増分は 90 秒（約100%増）よりずっと小さい約33%増（45→60秒）に抑えられる。`analyzeVocalActivity()` 自体は既に `tailWindowSec` を引数として受け取っていたため、コード変更はこの定数1箇所のみ。
+- `src/audio/trackAnalysis.js`: **本 phase で見つかった潜在バグの修正が実装の核心**。`findExitCandidates()`（`beatmixTransition.js`）が実際に検索する候補プール（`phrases.tail`/`downbeatGrid.tail`）は `vocalActivity.js` の `TAIL_WINDOW_SEC` ではなく、`trackAnalysis.js` に**別々に**ハードコードされていた `TAIL_BPM_WINDOW_SEC`（同じく 45）というもう1つの定数でサイズが決まっていた。両者は同じ「tail 解析窓」という概念を指しているにもかかわらず、コード上は完全に独立した2つの定数として存在しており、`TAIL_WINDOW_SEC` だけを広げても `analyzeTrackFile()` が構築する beatGrid.tail/phrases.tail の実際の到達距離（＝ findExitCandidates() が探索できる範囲）は 45 秒のまま変わらない——Demucs のボーカル解析窓（`vocal.lastVocalEndSec`/`vocalGaps` の計算範囲）だけが広がり、完了条件が要求する「phrase boundary 自体を45秒より前から選択可能にする」という実際の効果は一切得られない、という状態になっていた。`TAIL_BPM_WINDOW_SEC` を独立した値ではなく `TAIL_WINDOW_SEC`（`vocalActivity.js` からインポート）からの派生値に変更し、この2つの窓が今後も再び乖離しないようにした。
+- `src/player.js`: `MAX_TRANSITION_LEAD_SEC`（`= TAIL_WINDOW_SEC`）周りの既存コメント（60秒への変更を反映、旧45秒ベースの具体例を更新）と、prep ゲートの早期リターン閾値まわりのコメントを更新した。ロジック自体の変更はなし（`MAX_TRANSITION_LEAD_SEC` は既に `TAIL_WINDOW_SEC` のエイリアスだったため、定数の値が変わるだけでゲートの閾値は自動的に 75 秒（`CROSSFADE_PREP_LEAD_SEC(15) + TAIL_WINDOW_SEC(60)`）に追従する)。
+- テスト:
+  - `src/audio/vocalActivity.test.js`: 「overlap-branch envelope slicing」テスト（60秒トラック、head/tail 窓の重なり境界を検証するテスト）が `tailWindowSec` のデフォルト値に暗黙に依存していたため、`tailWindowSec: 45` を明示的に渡すよう修正し、このテストの意図したシナリオ（`tailStart = max(0, 60-45) = 15` での head/tail overlap）をデフォルト値の変更から切り離した。
+  - `src/audio/trackAnalysis.test.js`: 新規テスト「analyzeTrackFile widens beatGrid.tail/phrases.tail reach in lockstep with TAIL_WINDOW_SEC」を追加。70秒のフェイクトラックで `analyzeTrackFile()` を呼び、`beatGrid.tail.startSec` が新しい `TAIL_BPM_WINDOW_SEC`（60秒）ぶん後退していること（`70-60=10`）、かつ旧45秒境界（`70-45=25`)より前に到達していることを確認する。`TAIL_BPM_WINDOW_SEC = TAIL_WINDOW_SEC` の派生を外して 45 に固定し戻すと、このテストは `startSec=25`（期待は10未満）で期待どおり失敗することを確認済み（revert-test-restore で検証)。ffmpeg/aubiotrack のフル実行は不要——`bash -lc 'command -v aubiotrack'` の応答を「見つからない」にすることで BPM/beat パイプラインを `available:false` で早期終了させ、`tailStart` の計算（これが検証対象そのもの）だけを純粋に検証している。
+  - `src/player.acceptance.test.js`: 「crossfade timer defers analysis until the transition window」テストのコメントを、新しい75秒境界（旧60秒）を反映するよう更新した（アサーション自体は90秒のトラック長がどちらの境界でも変わらず閾値を超えるため無変更)。
+  - `bun run test:server` を再実行し、regression が無いことを確認した: 768件中 760 pass / 4 fail（`silenceTrim.test.js` の ffmpeg 未インストールによる既知の失敗のみ、Phase 9A-9E のノートに記載されているものと同一）/ 4 skip。`player.acceptance.test.js` 単体実行では稀に2件（"chained beatmix transition" と "stem-mix pair marked unavailable" のタイムアウト系）が本 phase の変更と無関係に落ちることがあるが、この worktree で Phase 9F の変更を `git stash` して確認したところベースライン（Phase 9E マージ済みの状態）でも同じ2件が同じ理由（5000msタイムアウト、サンドボックス環境のリソース状況に依存する既知のフレーク）で落ちることを確認済み。
+
+### 未決事項 / 既知の制約
+
+- **§8.2 が明示する 60-90 秒レンジのうち、今回は下限の60秒のみを採用した**: §8.2 自身が「将来的には固定秒数ではなくphrase境界リストベースの探索にすべき」としており、固定秒数のレンジ内でどこを選ぶかは本質的にコストとカバレッジのトレードオフでしかない。60秒は「BPM 64 以上なら16-bar extended tierがフルに届く」水準であり、これを下回るテンポ（バラードなど、より遅いテンポの楽曲）では引き続き extended tier の到達距離が窓の外にはみ出しうる。より広い窓（例えば90秒）へ拡張する、あるいは§8.2が示唆する phrase-boundary-list ベースの探索へ移行するかは、Phase 9A-9E のノートが繰り返し指摘している「実運用でどれだけの割合の遷移が extended tier に到達するか」の実測結果を踏まえて次フェーズ以降で判断すべき事項として保留した。
+- **Demucs tail解析コストの実測は未実施**: 45→60秒への変更が実際の解析時間・CPU負荷にどの程度影響するかは、本エージェント環境では実測できていない（tail窓の長さ増分から比例的に見積もった約33%増という数字は概算）。
+- **実測評価は未実施**: Phase 9A-9E のノートが繰り返し書いている制約と同じく、拡張された tail 窓が実際の楽曲・実運用でどれだけの割合の遷移を「以前は届かなかった exit candidate」まで到達させるかは、実音源・実 Discord セッションでの確認が必要で、本エージェント環境では実施できない。
+
+### 完了条件（§8/§17 9F 相当）
+
+- [x] `TAIL_WINDOW_SEC`（`vocalActivity.js`）を 45→60 秒に拡張した（§8.2 の 60-90 秒レンジの下限)
+- [x] `findExitCandidates()` が実際に検索する候補プール（`phrases.tail`/`downbeatGrid.tail`、`TAIL_BPM_WINDOW_SEC` でサイズが決まる）も同じ幅まで拡張し、2つの独立した「tail窓」定数が乖離していた潜在バグを修正した——これが無いと定数を広げても完了条件の実効果が得られないことをテストで確認済み
+- [x] 「曲末45秒より前のphrase boundaryをexitとして選択可能」（§17 9F の完了条件）を、`analyzeTrackFile()` の `beatGrid.tail.startSec` が新しい60秒窓ぶん後退することを検証するテストで構造的に確認した
+- [x] `bun run test:server` で Phase 7-9E の既存挙動が変わっていないことを確認した（768件中 760 pass / 4 fail はいずれも ffmpeg 未インストールによる既知の失敗のみ / 4 skip）
+- [ ] 60-90秒レンジ内でのより広い値（例: 90秒）への拡張、または phrase-boundary-list ベースの探索への移行（上記未決事項参照、次フェーズ以降）
+- [ ] 拡張された tail 窓の実運用での効果測定（extended tier 到達率の変化、Demucs解析コストの実測）（上記未決事項参照）
+
+### 追記: Codex レビュー対応（PR #52, round 1）
+
+初回実装後の Codex レビューで2件の指摘が見つかった。いずれも tail 窓拡張そのものではなく、拡張の副作用として新たに顕在化した既存の潜在バグ。
+
+- **P1: 解析キャッシュのバージョンを上げていなかった** — `src/web/server/routes/internal.js` と `player.js` の `#getCachedAnalysis()` はどちらも `(row.version ?? 1) < ANALYSIS_VERSION` で解析結果の再利用可否を判定している。`ANALYSIS_VERSION`（`trackAnalysis.js`）を据え置いたまま tail 窓だけ広げると、アップグレード前に version 3 で解析済みの既存トラックは version チェックを素通りしてキャッシュがそのまま使われ続け、45秒窓のままの beat/phrase/vocal データを無期限に返し続ける——新しい60秒解析は「これから初めて解析される」トラックにしか効かず、既存トラックには何の効果もないまま出荷されてしまう。
+  - 修正: `ANALYSIS_VERSION` を 3→4 に上げた。既存の 1→2、2→3 の前例と同じ扱い（解析結果のペイロード内容が実質的に変わる変更は毎回この定数を上げる、というこのコードベースの既存の規約）。
+  - テスト: `src/web/server/routes/internal.test.js` の `POST /internal/optimize-order probes the tempo backend once and threads it through to ordering` が、アンカートラックの解析行を `version: 3` に決め打ちして DB に挿入していたため、`ANALYSIS_VERSION` が4になった時点でこの行が「古すぎる」と判定されて無視されるようになり、テストの意図（beatmix 項が実際に効いていることの確認）が壊れて失敗するようになった——これは新しい回帰ではなく、このテスト自身が既に自分自身のコメントで警告していた失敗モード（アンカーが解決できないとテストが「間違った理由で」パスしてしまう）がバージョンチェックの片側で表面化したもの。ハードコードされた `3` を `ANALYSIS_VERSION`（既にこのテストファイルの他の箇所でインポート済み）からの参照に変更し、以後この定数が変わってもこのテストが自動的に追従するようにした。
+- **P2: プロモート済みトラックの exit 候補プールが自分自身の entry offset を考慮していなかった** — A→B の beatmix/phrase/stem-mix 昇格で B が nonzero な `#currentEntrySec`（ネイティブ・シーク位置）を持って `#current` になったあと、B 自身の B→C exit 候補プール（`findExitCandidates()` が検索する `phrases.tail`/`downbeatGrid.tail.downbeatsSec`）はファイルの絶対タイムライン上に構築されており、この実行時オフセットを一切知らない。本 phase の tail 窓拡張（45→60秒）により、75-90秒程度の長さのトラックでこのプールが `#currentEntrySec` より前の候補を含みうるようになった——45秒窓では通常そこまで手前に候補が伸びなかった。ランカーがそのような候補を選んでしまうと、`#maybeStartCrossfade()` の `Math.max(0, exitStartSec - currentEntrySec)` によって `startSec` が0にクランプされ、B→C の遷移がプロモート直後に即座に due になり、トラックのほぼ全体をスキップしてしまう。
+  - 修正: `player.js` に `excludeExitCandidatesBeforeEntry(analysis, currentEntrySec)`（新規、非公開関数）を追加し、`#maybeStartCrossfade()` が `outAnalysis` をランキングに渡す直前に、`phrases.tail`/`downbeatGrid.tail.downbeatsSec` から `sec <= currentEntrySec` の候補を除外するようにした。`currentEntrySec === 0`（プロモートされていない通常の現在トラック）のときは早期リターンし、余計なオブジェクト生成を避ける。
+  - テスト: `src/player.acceptance.test.js` に、A→B で B を nonzero entry(5.0s) で昇格させたあと、B 自身の tail 候補プールに entry より手前(2.0s、高スコア)の候補と entry より後ろ(21.5s、低スコア)の唯一の有効な候補を両方仕込み、フィルタが無ければスコアの高い手前の候補が勝つ（`rankTransitionCandidates()` を直接叩くデバッグスクリプトで実測・較正済み——`scoreTransitionPair()` の `vocalSafety` 項が exit 位置とボーカルフロアとの間の margin もスコアするため、フィルタ対象の候補が実際にボーカル安全フィルタと得点の両方をすり抜けるよう `lastVocalEndSec=0` に調整する必要があった）ことを利用した回帰テストを追加した。アサーションは「一定時間内に発火しないこと」のようなタイミング依存ではなく、実際に発火した `crossfadestart` の `mixPlan.startSec`（採用された exit 候補の絶対ネイティブ秒——`normalizeTransitionPlan()` の `beatmix` 分岐参照）が有効な候補(21.5)と一致し、無効な候補(2.0)でないことを直接検証する——このテストの開発中、`bun test` 単体実行でのタイミングベースの初期設計（アーム・ループの200msタイマー発火が、フレーム読み取りの同期ループ中は完全にブロックされ、`await` で明け渡した瞬間まで先延ばしされるという、このサンドボックス環境固有の挙動により、いつ・どのポジションで最初の評価が起きるか予測できないこと）が判明したため、タイミングに依存しない形に設計し直した。修正を revert すると、期待どおり `startSec=2`(無効な候補)で失敗することを確認済み（revert-test-restore）。
+- テスト: `bun run test:server` を再実行し、regression が無いことを確認した（769件中 761 pass / 4 fail はいずれも ffmpeg 未インストールによる既知の失敗のみ / 4 skip）。
+
+### 追記: Codex レビュー対応（PR #52, round 2）
+
+round 1 のプッシュ後、さらに2件の指摘が見つかった。1件は round 1 自身の P2 修正の見落とし、もう1件は round 1 の P1 修正と同じ「stale cache」パターンの別ルートでの再発。
+
+- **P2: `excludeExitCandidatesBeforeEntry()` のフロアが `#currentEntrySec` だけでは不十分だった** — `MixStream.setCurrent()`（`mixStream.js`、beatmix/stem-mix プロモート時）は `positionSec` を0ではなく、そのクロスフェード中に既に消費した overlap 分（`fadeElapsedSec + incomingSkippedSec`）で初期化する。round 1 の修正は `#currentEntrySec`（ネイティブ・シーク位置）だけをフロアにしていたため、「entry offset より後だが、プロモート時点で既に overlap 消費済みの区間」にある候補を除外し損ねていた——そのような候補が選ばれると、結局同じ「即座に due になりトラックの大半をスキップする」症状が再発する。
+  - 修正: 新しいプライベートフィールド `#currentEntryOverlapConsumedSec`（デフォルト0）を追加し、`#onCrossfadePromoted()`（本物のクロスフェード完了パス）でのみ、`this.#sessionTempo`（プロモート先トラックの tempo state に確定した直後）を使って `positionSec * tempoRatio`（ネイティブ秒に変換）を一度だけスナップショットする。他の2つの `#currentEntrySec` 代入箇所（`#playNextMixer()` の新規フレッシュ開始、snap-handoff——いずれも overlap を経由しないパス）は明示的に0のままにする。フロア自体はライブな `positionSec` から毎tick再計算するのではなく、`#currentEntrySec` と同様「プロモート時に一度だけ確定させる」設計にした——最初に試みたライブ再計算版（`currentEntrySec + 現在のpositionSec*ratio`）は、非プロモート（通常再生開始からの）トラック自身の候補にも同じフィルタを適用してしまい、このコードベースが元々許容している「アーム・ループの評価が多少遅れても、気づいた時点ですぐ発火する」という既存の設計（"a chained beatmix transition..." テストなど、複数の既存テストが依拠している挙動）を壊してしまうことが判明した（実装中に自分のテストの A→B レグ自体が発火しなくなる形で発覚）。
+  - テスト: 既存の「a promoted track's exit-candidate pool excludes candidates before its own entry offset」テストに、entry offset(5.0s) より後だが overlap 消費区間(約8.02s、4-bar/8sのフェードにほぼ一致)より前にある3つ目の候補 `midConsumedInvalid`(8.0s, score 0.7) を追加した。この候補は round 1 のフィルタ（entry offsetのみ）を素通りしつつ、有効な唯一の候補(21.5s, score 0.5)より高スコアなので、round 1 だけでは依然としてこれが勝ってしまう。修正を revert（`#currentEntryOverlapConsumedSec` を常に0に固定）すると、期待どおり `startSec=8`（`midConsumedInvalid`）で失敗することを確認した（revert-test-restore）。
+- **P2: `/api/playlists/mine/generate` が version チェックなしにキャッシュ済み解析を読んでいた** — round 1 で `ANALYSIS_VERSION` を上げた際、`internal.js`（`/internal/optimize-order` など）側の `loadAnalysis()` は既に `version < ANALYSIS_VERSION` を弾いていたが、`src/web/server/routes/playlists.js` の同名の別実装（MIX プレイリスト生成が `optimizeTrackOrder()` に渡す解析を読む側）にはこのチェックが一切なく、アップグレード前の version 3 の行を無期限に信用し続けてしまっていた。
+  - 修正: `internal.js` の既存の predicate（`(parsed.version ?? 1) < ANALYSIS_VERSION` なら `null` を返す）をそのまま `playlists.js` の `loadAnalysis` にも適用した。
+  - テスト: `playlists.test.js` に、stale な version（`ANALYSIS_VERSION - 1`）の行を仕込んでも `/api/playlists/mine/generate` が通常どおり成功することを確認するテストを追加した。ただし、このルートは `/internal/optimize-order`（`internal.test.js` の "probes the tempo backend once..." テストが使っている）と異なり、tempo backend の probe をルート経由で差し替えられる DI フックを持たないため、実際に順序が変わることまでは（本 PR の範囲では）検証していない——このテストが保証するのは「stale な行があってもクラッシュせず正常応答する」ことのみで、predicate 自体の正しさは `internal.js` 側の既存テストで証明済みのものを流用している。
+- テスト: `bun run test:server` を再実行し、regression が無いことを確認した（770件中 762 pass / 4 fail はいずれも ffmpeg 未インストールによる既知の失敗のみ / 4 skip）。
