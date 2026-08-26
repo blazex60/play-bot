@@ -92,6 +92,7 @@ export class MixStream extends Readable {
   #fadeElapsedSec = 0;
   #outEq = null;
   #inEq = null;
+  #inGateEq = null;
   /** @type {WeakMap<object, Buffer>} partial PCM kept across underruns per source */
   #pendingExact = new WeakMap();
   /** Held partner frame when only one side of a crossfade frame is ready */
@@ -192,6 +193,7 @@ export class MixStream extends Readable {
     this.#fadeElapsedSec = 0;
     this.#outEq = null;
     this.#inEq = null;
+    this.#inGateEq = null;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;
     this.#incomingSkipSec = 0;
@@ -255,6 +257,18 @@ export class MixStream extends Readable {
       : null;
     this.#inEq = this.#crossfade.baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
+      : null;
+    // Phase 9J round-2 (Codex, PR #56 P1): eqMix==0 used to select the dry
+    // incoming frame — full LOW energy, not the "B LOW 0%" §12.2 requires —
+    // so incoming's bass rose with the ordinary instrumental gain envelope
+    // throughout eqHoldSec instead of staying gated. #inGateEq is its own
+    // highpass instance (same cutoff as #outEq, independent filter state
+    // since it runs on a different signal) blended in at eqMix==0 in place
+    // of the dry incoming frame; blendFrame() at eqMix==1 still returns
+    // #inEq's wet frame untouched, so the non-scheduled (eqMix always 1)
+    // path is unaffected.
+    this.#inGateEq = this.#crossfade.baseSwap
+      ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120)
       : null;
 
     source.on('data', () => this.#wakeConsumer());
@@ -349,6 +363,9 @@ export class MixStream extends Readable {
     this.#inEq = baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
       : null;
+    // Phase 9J round-2 (Codex, PR #56 P1): see the matching #inGateEq comment
+    // in startCrossfade() — same fix, stem-mix path.
+    this.#inGateEq = baseSwap ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120) : null;
 
     for (const s of allSources) {
       s.on('data', () => this.#wakeConsumer());
@@ -762,8 +779,14 @@ export class MixStream extends Readable {
     const processedOut = this.#outEq
       ? blendFrame(outFrame, this.#outEq(Buffer.from(outFrame)), eqMix)
       : outFrame;
+    // Phase 9J round-2 (Codex, PR #56 P1): the dry side here used to be the
+    // raw inFrame (full LOW energy) — at eqMix==0 that let incoming's bass
+    // rise on the ordinary instrumental gain envelope instead of staying at
+    // "B LOW 0%" (§12.2). #inGateEq (highpass, same as #outEq) gates it
+    // instead; blendFrame() at eqMix==1 still returns #inEq's wet frame
+    // untouched, so behavior above eqMix==0 is unchanged.
     const processedIn = this.#inEq
-      ? blendFrame(inFrame, this.#inEq(Buffer.from(inFrame)), eqMix)
+      ? blendFrame(this.#inGateEq(Buffer.from(inFrame)), this.#inEq(Buffer.from(inFrame)), eqMix)
       : inFrame;
 
     const outGain = gainForPosition({
@@ -847,8 +870,10 @@ export class MixStream extends Readable {
     const processedOutInst = this.#outEq
       ? blendFrame(outInst, this.#outEq(Buffer.from(outInst)), eqMix)
       : outInst;
+    // Phase 9J round-2 (Codex, PR #56 P1): see the matching comment in
+    // #readCrossfadeFrame() — same #inGateEq fix, stem path.
     const processedInInst = this.#inEq
-      ? blendFrame(inInst, this.#inEq(Buffer.from(inInst)), eqMix)
+      ? blendFrame(this.#inGateEq(Buffer.from(inInst)), this.#inEq(Buffer.from(inInst)), eqMix)
       : inInst;
 
     const outVocalGain = gainForStemPosition({ positionSec: this.#fadeElapsedSec, ...stems.outVocal });
@@ -1007,6 +1032,7 @@ export class MixStream extends Readable {
     this.#clearStemSources();
     this.#outEq = null;
     this.#inEq = null;
+    this.#inGateEq = null;
     this.#fadeElapsedSec = 0;
 
     if (this.#current) {
@@ -1066,6 +1092,7 @@ export class MixStream extends Readable {
     this.#crossfade = null;
     this.#outEq = null;
     this.#inEq = null;
+    this.#inGateEq = null;
     this.#fadeElapsedSec = 0;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;
@@ -1111,6 +1138,7 @@ export class MixStream extends Readable {
     this.#crossfade = null;
     this.#outEq = null;
     this.#inEq = null;
+    this.#inGateEq = null;
     this.#fadeElapsedSec = 0;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;

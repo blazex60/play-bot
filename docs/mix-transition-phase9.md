@@ -2127,6 +2127,16 @@ Codex から P2 の指摘を1件受けた——「outVocal は `lastVocalEndSec`
   - `mixStream.test.js`: 新規1件——stem-mix経路（`#readStemCrossfadeFrame()`）でも同じhold挙動が機能することを、outInstrumentalを単独で分離した fixture で確認した。`mixNFrames()` が `OVERLAP_GAIN` とcubic soft-clipを常に適用するため、生の入力値との厳密等価ではなく、hold区間内の2フレーム同士（tick 0とtick 100）が完全に一致すること、およびswapBar通過後は大幅に減衰していることを確認する形にした（開発中、生の入力値と比較するテストを書いて誤って失敗させ、原因が`mixNFrames`の既存の headroom/soft-clip 処理であって Phase 9J のロジック自体は正しく動作していることをデバッグスクリプトで確認したうえで、テストの期待値を修正した)。
   - revert-test-restore: `computeEqSchedule()` を一時的に旧来の `{holdSec:0, rampSec:swapBarSec}`（=tick 0から連続ランプ）に戻すと、両方の新規テストが期待どおり失敗することを確認したうえで復元した。
 
+### 追記: Codex レビュー対応（PR #56, round 2）
+
+round 1 のレビューで2件の指摘を受けた。
+
+- **P2（テストfixtureが大きすぎる）**: `mixStream.test.js`の650フレーム収集テストが単体で約23秒、`phase2.test.js`の850フレーム相当のテストがさらに約4秒——bass-swap EQのhold/ramp計算式自体はBPMに依存しない検証なのに、サーバーテスト全体に毎回30秒近く上乗せしていた。両テストとも `targetBpm` を120→240に上げて `barSec` を1秒に縮め（`swapBar`/`DEFAULT_EQ_RAMP_BARS`の計算式自体は変えず、単に時間スケールを圧縮）、hold中/swap後のチェックポイントを維持したまま総フレーム数を大幅に削減した（650→220、850→約210）。
+- **P1（本質的、最も重要）: incoming の LOW が実際にはgateされていなかった**: `eqMix===0`（hold中）のとき、旧実装は `blendFrame(dry, wet, 0)` で **incoming側もdryの生フレームをそのまま選択**していた——outgoing側（highpass）はdry=フィルタなし=LOWそのまま、というのが正しい「A LOW 100%」の状態だが、incoming側で同じ「dry=フィルタなし」を選ぶと、incomingのLOWも**hold中から満額聞こえてしまう**（instrumental本体のgain envelopeに乗って自然に上がっていくだけになる）。§12.2 の例が求める「B LOW 0%」（bar 1-2ではincomingのLOWは完全にゼロ）を満たしていなかった——スコープの判断を誤り、§12.3が許容する最小構成「LOW gain envelope + 既存HPF」の"LOW gain envelope"の部分（=incoming側にも独立した抑制/解放の仕組みが要る）を実装し損ねていた。
+  - 修正: incoming側専用に、outgoingと同じhighpassフィルタのインスタンス（`#inGateEq`、`#outEq`とは独立したフィルタ状態を持つ別インスタンス）を新設し、`processedIn`/`processedInInst`の"dry"側をこれに差し替えた——`blendFrame(#inGateEq(inFrame), #inEq(inFrame), eqMix)`。`eqMix===0`（hold中）では highpassでLOWを抑制した信号が選ばれ（§12.2の「B LOW 0%」）、`eqMix===1`（swap完了後）では既存の lowshelf-boost（`#inEq`）が選ばれる（blendFrameは`mix>=1`で常にwet側をそのまま返すため、既存の「swap完了後」の挙動は完全に不変）。outgoing側（`processedOut`）はdryのままLOWを保持するのが元々正しい挙動だったため無変更。
+  - テスト: `mixStream.test.js`・`phase2.test.js`それぞれに新規1件追加——incoming側にのみ実際のLOW成分（一定値のPCM、DC相当）を持たせ、hold終盤（ちょうど`holdSec`直前）のフレーム振幅が、swap完了後のフレーム振幅の1/10未満であることを確認した（instrumental本体のgain envelopeだけでも振幅は時間とともに増加するため、閾値を緩く——`/3`など——取るとgain envelopeの自然な増加だけで見かけ上パスしてしまうことをrevert-test-restoreで確認済み。plain crossfade経路は特に、'in'側のgainがtに対してほぼ線形に増加する領域（equal-powerカーブの`sin(t)`、t→0付近）でチェックポイントを取らざるを得ず、gain自体の伸びがEQに依らず数倍の差を生むため、`/10`まで厳しくして初めてEQのgateそのものが差の主因であることを保証できた）。
+  - revert-test-restore: `#inGateEq`を使わず旧来どおり生の`inFrame`/`inInst`をdry側に渡す一時的な変更に戻すと、両方の新規テストが期待どおり失敗する（stem経路: 5607 vs 7017で`/3`閾値さえ満たせない、plain crossfade経路: 21 vs 58で`/10`閾値を満たせない）ことを確認したうえで復元した。
+
 ### 未決事項 / 既知の制約
 
 - **真の周波数バンド分割（LOW/MID-HIGH crossover）は未実装**: §12.3 が示す `{type:'highpass-sweep', fromHz, toHz, startBar, endBar}` のようなfilter automationや、§12.2 の完全な2バンド独立制御は実装していない——今回はEQブレンドの**タイミング**を独立させただけで、フィルタそのもの（120Hz highpass/lowshelf、Phase 7C から不変）は変えていない。真のバンド分割を行うには、既存の `designHighpass()`/`designLowshelf()` を使って `original - highpassed`（LOW成分の抽出）のような complementary filter 構成を新たに設計し、LOW/MID-HIGHそれぞれに独立したgain envelopeを適用したうえで再合成するパイプラインが必要——音声処理経路の実質的な再設計であり、次フェーズ以降のスコープとした。
@@ -2135,9 +2145,9 @@ Codex から P2 の指摘を1件受けた——「outVocal は `lastVocalEndSec`
 
 ### 完了条件（§12/§17 9J 相当）
 
-- [x] bass swap（LOWの扱い）と instrumental blend が別々の時間軸で動作するようにした——bass-swap EQ は `swapBar` 到達までの残り時間から独立した `holdSec`/`rampSec` を持ち、instrumental本体のgain envelope（`fadeSec`起点のtick 0から連続）とはもはや同じ起点を共有しない
-- [x] §12.3 の許容する最小構成（LOW gain envelope + 既存HPF）で実装し、フィルタ自体（`eq.js`）は無変更に保った
-- [x] plain crossfade・stem-mix の両経路で regression が無いことを確認した（`bun run test:server`: 787件中779 pass、既知の4件のみ fail）
+- [x] bass swap（LOWの扱い）と instrumental blend が別々の時間軸で動作するようにした——bass-swap EQ は `swapBar` 到達までの残り時間から独立した `holdSec`/`rampSec` を持ち、instrumental本体のgain envelope（`fadeSec`起点のtick 0から連続）とはもはや同じ起点を共有しない。round 2 の修正で、incoming側も`#inGateEq`によりhold中は実際にLOWがゼロへ抑制されるようになった（round 1時点では、incoming側はhold中もdry＝LOW満額のままinstrumental本体のgain envelopeに乗っていた——§12.2の「B LOW 0%」を満たしていなかった）
+- [x] §12.3 の許容する最小構成（LOW gain envelope + 既存HPF）で実装し、フィルタ自体（`eq.js`）は無変更に保った——`#inGateEq`も既存の`createOutgoingBaseSwapProcessor()`（highpass）をincoming側に再適用しただけで、新しいフィルタ設計は追加していない
+- [x] plain crossfade・stem-mix の両経路で regression が無いことを確認した（`bun run test:server`: round 2時点で789件中781 pass、既知の4件のみ fail——`ffmpeg`バイナリが本エージェント環境に存在しないことによる`silenceTrim.test.js`のENOENT、Phase 9Jの変更とは無関係）
 - [ ] 真の周波数バンド分割（LOW/MID-HIGH crossover）・filter automation（`highpass-sweep`等）（上記未決事項参照、次フェーズ以降のスコープ）
 - [ ] `DEFAULT_EQ_RAMP_BARS` を楽曲/tierごとに可変にする（上記未決事項参照）
 - [ ] 実運用での聴感評価（上記未決事項参照）
