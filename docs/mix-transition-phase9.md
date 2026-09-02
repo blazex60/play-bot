@@ -2103,6 +2103,52 @@ Codex から P2 の指摘を1件受けた——「outVocal は `lastVocalEndSec`
 検証: `bun test src/audio/stemTransition.test.js`（20/20 pass）、`node --test src/player.acceptance.test.js`（72 pass / 1 skip、0 fail）、`bun run test:server`（785件中777 pass、既知の4件のみ fail）。
 
 
+
+## 実装ノート (Phase 9I) — 実装を見送り、調査結果のみ記録
+
+§11 の Incoming Vocal Independent Timeline を実装したが、Codex レビュー（PR #55）で3件の構造的な問題（P1が3件）を指摘され、そのうち1件（後述の「問題2」）は小さなパッチでは解決できない、実装方式そのものに起因する根本的な矛盾であると判断したため、**コード変更を全て revert し、調査結果と設計上の制約のみをここに記録する**。Phase 9I は未完了のまま次フェーズ（9J）に進む。
+
+### 試した実装
+
+§11.1 の問題提起（incoming vocal が instrumental と同じタイムラインで再生され、gain=0 の間も PCM を消費するため、フェードインした瞬間に「歌詞の途中から急に聞こえる」）に対し、incoming vocal の file source だけを、その"自然な発声開始位置"（`firstVocalStartSec`、native秒）から hold 時間ぶんだけ手前に seek する方式を実装した（`incomingVocalSeekSec()`、`src/player.js`）。instrumental・`incoming.full`（stem window終了後の継続ソース）は変更せず、従来どおり `entrySec` に seek する。MixStream の読み取りループ自体は変更していない——4stem 全てを毎tick、crossfade開始（tick 0）から連続して読み続ける Phase 8 の挙動をそのまま利用し、vocal だけ読み取り開始位置をずらすことで、hold 時間が経過してgainが立ち上がる瞬間にちょうど `firstVocalStartSec` の位置に到達するようにした。
+
+### Codex レビューで指摘された3件の問題（PR #55）
+
+- **問題1（P1）: seek後にfadeウィンドウ全体をカバーするだけのnative音声が残っている保証がない**。`firstVocalStartSec` が track の終盤に近いと、そこから `durationSec` までの残り時間が `(fadeSec - holdSec) * tempoRatio` より短くなり得る（実際、このPRが追加したテストのfixture自体がこの状況——12秒のtrackを8.3秒にseekし、8秒のfadeを要求——を再現していた）。この場合、vocal stream はwindowの途中でEOFに達し、Phase 8 の既存の per-stem exhaustion handling（`#readStemCrossfadeFrame()` のsilence置換）が発動して、promotionの前に vocal が再び無音になってしまう。
+- **問題3（P1）: backward seekがunderflow（0にクランプ）したときvocalの開始位置がずれる**。`firstVocalStartSec < holdSec * tempoRatio` の場合、`max(0, ...)` によってseek位置が0にクランプされるが、MixStreamは相変わらずtick 0から連続してvocalを読み続けるため、hold終了時点での読み取り位置は `0 + holdSec * tempoRatio`（native）——`firstVocalStartSec` を通り過ぎてしまっている。結局「歌詞の途中から聞こえる」問題を、位置は違えど再現してしまう。
+- **問題2（P1、最も本質的）: `incoming.full`（promotion後の継続ソース）とvocal stemのnativeタイムラインが乖離し、promotion（stem-mixからincoming.fullへの切り替え）の瞬間に歌詞が飛ぶ/繰り返す**。`incoming.full` は `entrySec` にseekされ、stem windowの間ずっと（`#readStemCrossfadeFrame()` から）他の3stemとは独立して継続的にdrainされ続ける（`mixStream.js`の`#incomingStemFramesRead`まわり）。promotion時、`#current` はこの「ずっと自走していた」`incoming.full` にそのまま差し替わる。vocal stemも（gain=0のhold中を含め）tick 0から毎tick連続してreadされ続ける実装だったため、promotion時点でのvocalのnative位置は `vocalSeekSec + fadeSec*tempoRatio`（hold中もreadし続けている以上、`fadeSec`全体ぶん——`fadeSec-holdSec`ではない）——これは `incoming.full` のnative位置（`entrySec + fadeSec*tempoRatio` 相当）と一致しない。両者が一致するのは `vocalSeekSec === entrySec`（=独立seekを行わない、Phase 8そのまま）のときだけ——つまり、このPhase 9Iが実現しようとした「独立タイムライン」という発想自体が、promotion後にそれを一本の継続ソースへ回収する既存アーキテクチャと本質的に衝突している。
+
+### なぜ小さなパッチで直せないか
+
+問題1・3はそれぞれ独立に対処可能に見えるが、単独では不十分な点がある: 問題1は room check を足せば防げる。問題3（backward seekのunderflow）は、MixStream 側で "audibleStartBar まで一切readしない" よう変更するだけでは直らない——read を遅延させるだけでは、read開始時点でのsource位置は（read不足分を消費していないため）依然として `firstVocalStartSec` ではなく `max(0, firstVocalStartSec - holdSec*tempoRatio)` のまま——「read開始を遅らせる」変更と「readが実際に始まる瞬間、正しく `firstVocalStartSec` へseekし直す（またはそれと等価な、activation時点でのskip）」変更の両方が必要になる（Codexレビュー、round 2）。
+
+いずれにせよ問題2はこれらの対処をしても解消しない。検討した代替案:
+
+- **vocal を entrySec にseekしたまま、hold中は"discard-catch-up"（読み捨てて先送りする）方式にする**: `vocalSeekSec >= entrySec`（目標位置がentrySec以降）の場合に限り、数式上は元の"backward seek"と最終的に到達するnative位置が同一になる（`entrySec` から `firstVocalStartSec - holdSec*tempoRatio` まで読み捨てるのと、最初からその位置にseekするのとで、promotion時点のnative位置は変わらない）。ただし discard は前方（native位置が増える方向）にしか進めないため、`vocalSeekSec < entrySec`（`headVocalGaps` 由来の遅いentry候補などで起こり得る）の場合はこの等価性自体が成立せず、entrySecから読み捨てるだけでは目標位置に到達できない——別途、明示的な事前seekが必要になる（Codexレビュー、round 2）。この代替案自体、いずれにせよ問題2（promotion時のnativeタイムライン不整合）は解消しない。
+- **`incoming.full` の側をvocalのnative位置に合わせてseekし直す**: `incoming.full` は vocal と instrumental の両方を含む完全なmixなので、これをvocal側の位置に合わせると、今度は instrumental 側が同じ問題（乖離・ジャンプ）を起こす——問題をvocalからinstrumentalへ移すだけで、根本解決にならない。
+- **hold区間でvocalに micro-tempo（速度の微調整）をかけてpromotion時点までにネイティブ位置を追いつかせる**: `firstVocalStartSec <= entrySec + fadeSec*tempoRatio`（=vocalが聞こえ始める位置が、promotion時点で`incoming.full`が到達している位置より手前）の場合に限り理論上両立可能——時間を"進める"方向の微調整だけで追いつかせられる。しかし逆に `firstVocalStartSec` の方が後ろにある場合（このPRのreverted fixtureがまさにこのケース——`firstVocalStartSec=10.0`に対し `entrySec(0.2) + fadeSec*tempoRatio`は約8.2秒）、vocalは聞こえ始めた時点で既に`incoming.full`の将来位置を追い越しており、"前方にしか進めない"tempo調整では巻き戻すことができない——この場合はtempo catch-up自体が成立せず、そもそもそのような候補（entry/exitペア、あるいはfadeSecの選び方）を採用しないようにする、または promotion位置の決め方自体を変える、といった別の対処が必要になる（Codexレビュー、round 2）。仮に適用可能なケースに限定しても、既存の macro tempoFilter（rubberband等）の上にさらに動的な速度変化を重ねる必要があり、ピッチ/アーティファクトの制御を含めて実装・検証コストが大きく、本エージェント環境で安全に検証しきれる範囲を超える。
+
+いずれも、Phase 8で慎重に積み上げてきた MixStream の lockstep 前提（`incoming.full` を含む全ソースが「promotion時点で自然に synchronize している」という暗黙の不変条件）そのものに手を入れる必要があり、"seekだけを変える"という当初のリスク低減方針では実現できないと判断した。
+
+### revert した内容
+
+- `src/player.js`: `incomingVocalSeekSec()`、`#ensureIncomingStemPrep()`/`#takePreparedIncomingStems()` への `vocalStartSec` オプション追加、呼び出し2箇所——全て revert し、Phase 8 の元の実装（instrumental と vocal が同じ `startSec` で spawn される）に戻した。
+- `src/player.acceptance.test.js`: 新規追加した回帰テスト（vocal と instrumental が異なる `startSec` で spawn されることを検証するテスト）を削除した。
+- 検証: revert 後、`node --test src/player.acceptance.test.js`（72 pass / 1 skip、0 fail、Phase 9H merge直後の baseline と完全一致）を確認した。
+
+### 未決事項 / 将来の実装に向けて
+
+- **§11 を安全に実現するには、promotion時点でのタイムライン整合を保証する仕組みが不可欠**——vocal を独立timelineにする以上、`incoming.full`（あるいはpromotion機構そのもの）がその独立timelineを認識し、乖離を吸収する必要がある。候補は上記「micro-tempo catch-up」、または「promotion直前に短い二次クロスフェードを挟んでvocalのnative位置をincoming.fullへ滑らかに合流させる」等——いずれも Phase 8 の MixStream 中核ロジックへの本格的な設計変更を要する。
+- **問題1（room check）・問題3（underflow時のalignment）は、上記アーキテクチャ変更とセットでなければ意味を持たない**——vocal のみを独立させても promotion で結局ズレる以上、単独で直す理由がない。
+- **実運用での聴感評価は未実施**（そもそも実装を revert したため対象外）。
+
+### 完了条件（§11/§17 9I 相当）
+
+- [ ] incoming instrumental と vocal で seek 位置を分離する——実装したが、promotion時のタイムライン不整合（上記問題2）により revert
+- [ ] vocal の音として聞こえる開始位置を `firstVocalStartSec` と一致させる——同上、根本対処には至らず
+- [ ] promotion時のタイムライン整合を保証する仕組み（未決事項参照、將来のフェーズまたは大規模リファクタリングのスコープ）
+- [ ] 実運用での聴感評価（上記未決事項参照）
+
 ## 実装ノート (Phase 9J)
 
 §12 の Frequency Automation を、§12.3 が明示的に許容する最小構成——「LOW gain envelope + 既存HPF」——で実装した。完了条件（§17 9J）「bass swap と instrumental blend が別々の時間軸で動作する」を、bass-swap EQ ランプ自体に独立した hold/ramp スケジュールを持たせることで満たした。
