@@ -21,6 +21,18 @@ function collectFrames(stream, count) {
       frames.push(chunk);
       if (frames.length >= count) {
         stream.off('data', onData);
+        // Codex (PR #56 round 3, P2): removing the last 'data' listener does
+        // NOT drop a Readable back out of flowing mode — MixStream's
+        // internal push loop is otherwise entirely synchronous (no real I/O
+        // wait between ticks for these in-memory PcmSource fixtures), so
+        // without this it keeps generating frames nobody reads, in the same
+        // synchronous flow loop, all the way toward whatever fadeSec implies
+        // (an 800s fixture is 40,000 ticks) before this callback even
+        // returns. pause() flips state.flowing to false, which the flow
+        // loop's own `while (state.flowing && ...)` check (evaluated right
+        // after this handler returns) stops on — it does not interrupt an
+        // already-started #tryPushFrame() call, only the next one.
+        stream.pause();
         resolve(frames);
       }
     };
@@ -367,6 +379,115 @@ function makeStemPlan(fadeSec, overrides = {}) {
     },
   };
 }
+
+test('MixStream startStemCrossfade holds the bass-swap EQ fully dry until shortly before swapBar, same as the plain-crossfade path (Phase 9J, §17 9J)', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 900 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Isolate outInstrumental: everything else silent (0).
+    const outInstValue = 8000;
+    // 240BPM keeps barSec at 1s (vs. the doc examples' typical 120BPM) purely
+    // to shrink this fixture (Codex, PR #56 P2: the original 120BPM/700-frame
+    // version added ~23s to every server test run) — the hold/ramp formula
+    // itself is BPM-agnostic, so this exercises identical logic in less time.
+    const frames = 230; // 4.6s @20ms, well past swapBarSec below.
+    const outgoing = { vocal: stemSource(0, frames), instrumental: stemSource(outInstValue, frames) };
+    const incoming = {
+      vocal: stemSource(0, frames),
+      instrumental: stemSource(0, frames),
+      full: stemSource(0, frames),
+    };
+    const plan = {
+      ...makeStemPlan(800), // long fadeSec keeps outInstrumental's OWN gain ~flat across the sampled window
+      baseSwap: true,
+      highpassHz: 120,
+      targetBpm: 240,
+      sync: { bars: 400, beatsPerBar: 4 },
+      // barSec=1s; swapBar 4 -> swapBarSec=4s; DEFAULT_EQ_RAMP_BARS(2 bars)
+      // -> rampSec=2s, holdSec=2s (100 frames) of room to verify the hold.
+      eq: { type: 'bass-swap', swapBar: 4, highpassHz: 120 },
+    };
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const collected = await collectFrames(mix, 220);
+    const abs = (frame) => Math.max(...Array.from(pcmView(frame), Math.abs));
+
+    // First frame and a frame still inside the 2s hold (50 frames = 1s in)
+    // must be byte-identical — mixNFrames() applies its own OVERLAP_GAIN/
+    // soft-clip headroom regardless of the EQ blend, so this compares two
+    // dry (eqMix=0) frames against each other rather than against the raw
+    // input value, isolating just the "does the hold actually hold" claim.
+    assert.deepEqual(collected[50], collected[0],
+      'expected a frame still inside the 2s hold to be identical to the first (both fully dry)');
+    // Well past swapBarSec (4s = 200 frames): fully wet — a highpass driving
+    // a constant (DC) signal toward ~0 once its IIR history has settled.
+    assert.ok(abs(collected[210]) < abs(collected[0]) / 3,
+      `expected the swap to have completed well past swapBar (dry=${abs(collected[0])}, later=${abs(collected[210])})`);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade gates incoming LOW during the EQ hold instead of letting it ride the instrumental gain envelope (Codex, PR #56 P1)', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 900 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Isolate inInstrumental: everything else silent (0), including the
+    // outgoing side — this test is only about whether INCOMING's own LOW
+    // content is suppressed while eqMix==0, not about the outgoing highpass
+    // (already covered by the test above).
+    const inInstValue = 8000;
+    const frames = 230;
+    const outgoing = { vocal: stemSource(0, frames), instrumental: stemSource(0, frames) };
+    const incoming = {
+      vocal: stemSource(0, frames),
+      instrumental: stemSource(inInstValue, frames),
+      full: stemSource(0, frames),
+    };
+    const plan = {
+      // inInstrumental's OWN gain envelope saturates to full within 0.2s —
+      // far ahead of the 2s EQ hold below — so that by the 1s "still in
+      // hold" checkpoint, a full-amplitude incoming signal is actually
+      // available to be gated (or not). This is the crux of the P1 finding:
+      // bass swap and instrumental blend must run on separate timelines
+      // (§17 9J), so instrumental gain reaching full quickly must NOT also
+      // mean incoming's LOW is already audible.
+      ...makeStemPlan(800, {
+        inInstrumental: { role: 'in', fadeSec: 0.2, curve: 'equal-power', startOffsetSec: 0 },
+      }),
+      baseSwap: true,
+      highpassHz: 120,
+      targetBpm: 240,
+      sync: { bars: 400, beatsPerBar: 4 },
+      // barSec=1s; swapBar 4 -> swapBarSec=4s; rampSec=2s, holdSec=2s.
+      eq: { type: 'bass-swap', swapBar: 4, highpassHz: 120 },
+    };
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const collected = await collectFrames(mix, 220);
+    const abs = (frame) => Math.max(...Array.from(pcmView(frame), Math.abs));
+
+    // 1s in: still well inside the 2s hold, but inInstrumental's own gain
+    // has long since reached full — before the fix, this frame was the raw
+    // dry incoming frame (full LOW energy); now it must be highpass-gated
+    // (near silent), not merely attenuated by the (already-saturated) gain.
+    const midHold = abs(collected[50]);
+    // Well past swapBarSec (4s = 200 frames): fully wet — LOW handed over.
+    const afterSwap = abs(collected[210]);
+    assert.ok(midHold < afterSwap / 3,
+      `expected incoming LOW to still be gated 1s into the hold, well below its post-swap level (midHold=${midHold}, afterSwap=${afterSwap})`);
+  } finally {
+    mix.endMixer();
+  }
+});
 
 test('MixStream startStemCrossfade mixes 4 stems then promotes to the incoming full-mix source', async () => {
   const mix = new MixStream();
