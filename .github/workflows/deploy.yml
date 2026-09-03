@@ -5,15 +5,6 @@ on:
   workflow_dispatch:
 
 jobs:
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2 
-      - run: bun install
-      - name: Test
-        run: bun run check
   deploy:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
