@@ -9,7 +9,25 @@ log() {
   printf '[claude-cloud-setup] %s\n' "$*"
 }
 
+disable_unreachable_launchpad_sources() {
+  local source_file
+  local disabled_file
+
+  for source_file in /etc/apt/sources.list.d/*; do
+    [[ -f "${source_file}" ]] || continue
+    [[ "${source_file}" == *.disabled-by-cloud-setup ]] && continue
+    if ! grep -Eq 'https?://ppa\.launchpadcontent\.net/' "${source_file}"; then
+      continue
+    fi
+
+    disabled_file="${source_file}.disabled-by-cloud-setup"
+    log "disabling unreachable apt source: ${source_file}"
+    mv -- "${source_file}" "${disabled_file}"
+  done
+}
+
 log 'installing system tools used by music-bot development and tests'
+disable_unreachable_launchpad_sources
 apt-get update
 apt-get install -y --no-install-recommends \
   aubio-tools \

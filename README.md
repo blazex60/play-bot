@@ -109,6 +109,8 @@ Cloud environment の **Setup script** には、`scripts/claude-code-cloud-setup
 
 Claude Code Cloud では Bun のパッケージ取得がプロキシの影響で失敗する場合がある。その場合だけ、SessionStart scriptは `npm install --no-package-lock` に切り替え、追跡対象のlockfileを変更せずに `node_modules` を作成する。
 
+Trustedネットワークから到達できないLaunchpad PPAが標準VMに登録されている場合、Setup scriptはそのPPAファイルを`.disabled-by-cloud-setup`へ退避してから`apt-get update`を実行する。Ubuntu公式リポジトリは無効化しない。
+
 両方のセットアップで以下を準備する。
 
 - `ffmpeg` / `aubio-tools` / Python / native addon向けビルドツール

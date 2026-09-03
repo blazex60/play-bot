@@ -22,6 +22,23 @@ run_as_root() {
   fi
 }
 
+disable_unreachable_launchpad_sources() {
+  local source_file
+  local disabled_file
+
+  for source_file in /etc/apt/sources.list.d/*; do
+    [[ -f "${source_file}" ]] || continue
+    [[ "${source_file}" == *.disabled-by-cloud-setup ]] && continue
+    if ! grep -Eq 'https?://ppa\.launchpadcontent\.net/' "${source_file}"; then
+      continue
+    fi
+
+    disabled_file="${source_file}.disabled-by-cloud-setup"
+    log "disabling unreachable apt source: ${source_file}"
+    run_as_root mv -- "${source_file}" "${disabled_file}"
+  done
+}
+
 install_system_packages() {
   if ! command -v apt-get >/dev/null 2>&1; then
     log "apt-get is unavailable; skipping Ubuntu package installation"
@@ -29,6 +46,7 @@ install_system_packages() {
   fi
 
   log "installing system packages"
+  disable_unreachable_launchpad_sources
   run_as_root apt-get update
   run_as_root apt-get install -y --no-install-recommends \
     aubio-tools \
