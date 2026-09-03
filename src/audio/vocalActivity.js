@@ -9,7 +9,14 @@ import { spawnCapture } from './spawnCapture.js';
 export const VOCAL_RELATIVE_DB = 25;
 /** Absolute floor — below this, treat as silence even if close to a quiet mix. */
 export const VOCAL_ABS_DB = -50;
-export const TAIL_WINDOW_SEC = 45;
+// Phase 9F §8.2: widen the tail analysis window from the original 45s into
+// the spec's 60-90s range so exit candidates further from EOF (e.g. a
+// phrase-boundary 16 bars out at a slow tempo, which can exceed 45s) become
+// reachable. 60s (the low end of the range) is a deliberate choice: it's the
+// minimum needed for a full 16-bar reach down to ~64 BPM (16 bars @ 4/4 =
+// 60s at 64 BPM), while keeping the added Demucs tail-window compute cost to
+// ~33% instead of the ~100% a 90s window would add per track analyzed.
+export const TAIL_WINDOW_SEC = 60;
 /** Phase 7 §2.4: entry-point search needs to know where singing starts. */
 export const HEAD_WINDOW_SEC = 30;
 export const VOCAL_FRAME_SEC = 0.1;

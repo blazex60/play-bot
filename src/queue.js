@@ -87,6 +87,30 @@ export class GuildQueue {
     return this.#tracks.slice(this.#currentIndex + 1);
   }
 
+  /**
+   * Like upcoming(), but in QUEUE loop mode wraps around to the front of
+   * the queue once upcoming() runs out — mirroring what next() actually
+   * does at the boundary. Codex review (PR #44): a plain upcoming().slice()
+   * gave the last track no lookahead at all, and the penultimate track a
+   * truncated one, even though QUEUE loop mode means both DO have a real
+   * next track. Never re-includes the current track (stops before a full
+   * lap), so a 1-track QUEUE-loop queue returns [] here just like
+   * upcoming() does.
+   * @param {number} count
+   */
+  wrappedUpcoming(count) {
+    const tail = this.upcoming();
+    if (tail.length >= count || this.loopMode !== LoopMode.QUEUE) {
+      return tail.slice(0, count);
+    }
+    const window = [...tail];
+    for (let i = 0; i < this.#tracks.length && window.length < count; i += 1) {
+      if (i === this.#currentIndex) break;
+      window.push(this.#tracks[i]);
+    }
+    return window;
+  }
+
   #upcomingToAbsolute(upcomingIndex) {
     const abs = this.#currentIndex + 1 + upcomingIndex;
     if (upcomingIndex < 0 || abs >= this.#tracks.length) return null;

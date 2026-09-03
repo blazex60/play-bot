@@ -18,15 +18,16 @@ import { shouldReconnectRetry } from './player/playbackPolicy.js';
 import { MixStream } from './audio/mixStream.js';
 import { createStreamSource, createFileSource } from './audio/pcmSource.js';
 import { analyzeTrackFile, ANALYSIS_VERSION } from './audio/trackAnalysis.js';
-import { planBeatSyncedTransition } from './audio/beatmixTransition.js';
+import { rankTransitionCandidates } from './audio/transitionCandidates.js';
 import { probeDurationSec } from './audio/duration.js';
 import { createSessionTempoState, resetSessionTempo, probeTempoBackend, compensateDurationSec, buildTempoFilter } from './audio/tempo.js';
 import { TAIL_WINDOW_SEC } from './audio/vocalActivity.js';
 import { LoopMode } from './queue.js';
-import { getAnalysisQueue } from './audio/analysisQueue.js';
+import { getAnalysisQueue, getStemPreparationQueue } from './audio/analysisQueue.js';
 import { getCachedStems, separateTrackStems } from './audio/stemCache.js';
 import { planStemTransition } from './audio/stemTransition.js';
-import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition } from './audio/transitionLog.js';
+import { buildTransitionPlanReport, logTransitionPlan, logGaplessTransition, exitInfo } from './audio/transitionLog.js';
+import { StemPreparationState, StemPrefetchPriority, StemPrefetchTracker } from './audio/stemPrefetch.js';
 
 const WATCHDOG_INTERVAL = 10_000;
 const CROSSFADE_ARM_INTERVAL_MS = 200;
@@ -37,7 +38,8 @@ const MAX_CROSSFADE_SEC = 6;
  * Phase 7D: covers the arm loop's early-return gate for both legacy
  * crossfade (MAX_CROSSFADE_SEC) and beatmix/phrase-crossfade. Exit
  * candidates come from findExitCandidates()'s search over the tail analysis
- * window (TAIL_WINDOW_SEC, e.g. 45s before EOF, §5) — the gate must open
+ * window (TAIL_WINDOW_SEC, e.g. 60s before EOF as of Phase 9F §8, §5) — the
+ * gate must open
  * before `remaining` drops below the earliest possible candidate position,
  * or planning (and therefore #ensureIncomingPrep) never runs early enough:
  * by the time the gate finally opened, positionSec could already be PAST a
@@ -111,6 +113,58 @@ function fallbackAnalysis(track) {
   };
 }
 
+/**
+ * Phase 9F Codex review (PR #52, P2, round 2): #current's decoder is
+ * native-timeline positioned at #currentEntrySec, not 0, when #current was
+ * itself promoted from a seeked beatmix/phrase/stem-mix source (see
+ * #currentEntrySec's own comment, and #maybeStartCrossfade's currentEntrySec
+ * usage below). The exit-candidate pool findExitCandidates()
+ * (beatmixTransition.js) searches — outgoing.phrases.tail /
+ * outgoing.downbeatGrid.tail.downbeatsSec — has no notion of that runtime
+ * offset; it's built purely from the file's own absolute timeline. Phase
+ * 9F's widened tail window makes it newly possible for that pool to contain
+ * a candidate before that position on a 75-90s-ish track (old 45s window:
+ * tailStart >= 30s typically kept the pool past any plausible entrySec; 60s
+ * window: tailStart can now dip below it). If the ranker picks such a
+ * candidate, #maybeStartCrossfade's `Math.max(0, exitStartSec - ...)` clamps
+ * the resulting startSec to 0 — "due immediately" — firing the next
+ * transition right after promotion and skipping nearly the whole track.
+ * Filtering the pool here, before ranking, keeps every candidate
+ * #maybeStartCrossfade could ever select strictly reachable from wherever
+ * #current's decoder actually starts.
+ *
+ * round 1 of this fix floored candidates at #currentEntrySec alone — missing
+ * that MixStream.setCurrent() initializes positionSec to the overlap
+ * already consumed DURING the crossfade (fadeElapsedSec +
+ * incomingSkippedSec — see mixStream.js's promote path), not 0. A candidate
+ * between the entry offset and (entry offset + that consumed overlap,
+ * converted to native seconds) had therefore already played out by the
+ * time #current became current, and round 1 still let it through.
+ * `minReachableNativeSec` (the caller's #currentEntrySec +
+ * #currentEntryOverlapConsumedSec — see that field's own comment for why it
+ * must be a fixed snapshot, not the live/ever-growing positionSec) is that
+ * corrected floor.
+ */
+function excludeExitCandidatesBeforeEntry(analysis, minReachableNativeSec) {
+  if (!(minReachableNativeSec > 0)) return analysis;
+  const tailPhrases = analysis.phrases?.tail;
+  const tailDownbeats = analysis.downbeatGrid?.tail?.downbeatsSec;
+  const filteredPhrases = Array.isArray(tailPhrases)
+    ? tailPhrases.filter((c) => c.sec > minReachableNativeSec)
+    : tailPhrases;
+  const filteredDownbeats = Array.isArray(tailDownbeats)
+    ? tailDownbeats.filter((sec) => sec > minReachableNativeSec)
+    : tailDownbeats;
+  if (filteredPhrases === tailPhrases && filteredDownbeats === tailDownbeats) return analysis;
+  return {
+    ...analysis,
+    phrases: analysis.phrases ? { ...analysis.phrases, tail: filteredPhrases } : analysis.phrases,
+    downbeatGrid: analysis.downbeatGrid
+      ? { ...analysis.downbeatGrid, tail: { ...analysis.downbeatGrid.tail, downbeatsSec: filteredDownbeats } }
+      : analysis.downbeatGrid,
+  };
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -151,6 +205,14 @@ function normalizeTransitionPlan(rawPlan) {
         sync: rawPlan.sync,
         eq: rawPlan.eq,
         stems: rawPlan.stems,
+        // Phase 9G (docs/mix-transition-phase9.md §9.1): TransitionPlan v3's
+        // mixZone/events — MixStream.startStemCrossfade() fires 'mixzoneevent'
+        // as playback crosses each scheduled bar (see mixStream.js's
+        // #tickStemCrossfade()). undefined (not an empty array) when the
+        // planner couldn't derive a bar clock (missing sync/targetBpm) so
+        // MixStream's own guard can tell "no schedule" apart from "empty".
+        mixZone: rawPlan.mixZone,
+        events: rawPlan.events?.length ? rawPlan.events : undefined,
       },
       exitStartSec: rawPlan.outgoing?.exitStartSec ?? null,
       entrySec: Math.max(0, rawPlan.incoming?.entrySec ?? 0),
@@ -304,6 +366,22 @@ export class GuildPlayer {
    * transition (Codex round-3 P1).
    */
   #currentEntrySec = 0;
+  /**
+   * Phase 9F Codex review (PR #52, P2, round 2): additional native seconds
+   * already consumed from #current BEFORE it even became #current — the
+   * overlap portion a beatmix/stem-mix crossfade already played through
+   * during the fade (MixStream.setCurrent() initializes positionSec to
+   * fadeElapsedSec + incomingSkippedSec, not 0, on a real promotion — see
+   * mixStream.js's promote path). 0 for a fresh/legacy start or a
+   * snap-adopted handoff (neither ever ran an overlap). Set once, at
+   * promotion, alongside #currentEntrySec — NOT re-derived from the live,
+   * ever-growing positionSec on every arm-loop tick, which would also catch
+   * ordinary arm-loop evaluation lag this codebase already tolerates (fires
+   * as soon as it notices, rather than requiring every candidate to still
+   * be strictly in the future). #currentEntrySec + this is the true
+   * absolute floor for #maybeStartCrossfade's excludeExitCandidatesBeforeEntry().
+   */
+  #currentEntryOverlapConsumedSec = 0;
   #probeTempoBackendFn;
   #createPcmSourceFn;
   #incomingTempFile = null;
@@ -355,6 +433,17 @@ export class GuildPlayer {
   #putTrackAnalysisFn;
   #analyzeTrackFileFn;
   #analysisQueue;
+  /**
+   * Phase 9C (docs/mix-transition-phase9.md §5): dedicated pausable serial
+   * queue for full-track Demucs only (Phase 8's outgoing-track separation
+   * and Phase 9B's next/next+1 prefetch), kept separate from
+   * #analysisQueue so a long-running Demucs job can never sit in front of
+   * (or share pause/kill state with) realtime BPM/downbeat/phrase/key/
+   * vocal-activity analysis for an unrelated track. Same DI convention as
+   * #analysisQueue: null falls back to the process-wide
+   * getStemPreparationQueue() singleton via #stemQ().
+   */
+  #stemQueue;
   /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
   #queueRefill = null;
   #prefetchTrackFn;
@@ -411,18 +500,28 @@ export class GuildPlayer {
   /** Identity key of an in-flight #ensureIncomingStemPrep() cache-revalidation await, or null — same rationale as #preparingOutgoingStemsKey. */
   #preparingIncomingStemsKey = null;
   /**
-   * Phase 8 (Codex): memoizes a POSITIVE stem-cache lookup for the current
-   * (current,next) pair — #maybeStartCrossfade() re-runs the eligibility
-   * check on every CROSSFADE_ARM_INTERVAL_MS tick for up to the whole lead
-   * window, and getCachedStems() touches the entry's mtime on every hit, so
-   * without this a single transition attempt generates hundreds of
-   * redundant metadata writes once both sides are already cached. Only
-   * positive results are memoized — a miss must keep re-checking every
-   * tick, since background separation completing mid-window is the whole
-   * point of prepping this early, and a miss never touches mtime anyway.
-   * @type {{ key: string, outCachedStems: object, inCachedStems: object } | null}
+   * Phase 8 (Codex), Phase 9D round 3 (Codex): memoizes a POSITIVE
+   * stem-cache lookup, independently per side (outgoing/incoming) —
+   * #maybeStartCrossfade() re-runs the eligibility check on every
+   * CROSSFADE_ARM_INTERVAL_MS tick for up to the whole lead window, and
+   * getCachedStems() touches the entry's mtime on every hit, so without
+   * this a single transition attempt generates hundreds of redundant
+   * metadata writes. Originally memoized only once BOTH sides hit — but
+   * the far more common transient state is one side (usually outgoing,
+   * separated earlier) already cached while the other's separation is
+   * still in flight, and that case got zero benefit from a same-pair-only
+   * memo keyed on both sides at once. Each side is now keyed on its own
+   * track identity (#prefetchKey()) alone, so a positive outgoing hit
+   * stays memoized across ticks regardless of which `next` it's currently
+   * paired with. Only positive results are memoized per side — a miss
+   * must keep re-checking every tick, since background separation
+   * completing mid-window is the whole point of prepping this early, and
+   * a miss never touches mtime anyway.
+   * @type {{ key: string, stems: object } | null}
    */
-  #stemCacheHit = null;
+  #outStemCacheHit = null;
+  /** @type {{ key: string, stems: object } | null} */
+  #inStemCacheHit = null;
   /**
    * videoId:videoId key of a (current, next) pair whose stem-mix attempt
    * was aborted at take time (spawn/prep failure, drift, or an unhonored
@@ -430,7 +529,7 @@ export class GuildPlayer {
    * cache lookup and `planStemTransitionFn()` above are independent of
    * spawn success, leaving this unset would have every subsequent ~200ms
    * arm tick re-select the SAME relaxed stem-mix plan, abort it again, and
-   * never let rawPlan's own plain-crossfade fallback run at all (Codex).
+   * never let the ranker's other candidates run at all (Codex).
    * Checked at plan-selection time to skip stem-mix for this exact pair.
    * Explicitly cleared in #onCrossfadePromoted() once that pair's
    * transition attempt actually concludes — comparing against the CURRENT
@@ -442,6 +541,28 @@ export class GuildPlayer {
    * @type {string | null}
    */
   #stemMixUnavailableKey = null;
+  /**
+   * Phase 9B (docs/mix-transition-phase9.md §4): per-videoId prefetch
+   * bookkeeping for next (HIGH) / next+1 (LOW), driven from
+   * #prefetchUpcoming(). Purely observational for the HIGH lane (B already
+   * gets a real download+separate pass from Phase 8's own
+   * #ensureFullPrefetch()/#scheduleAnalysis() pipeline regardless of this
+   * tracker's existence); for the LOW lane (C) it also drives the actual
+   * dispatch, since nothing else in the pipeline keeps C's audio around
+   * long enough for Demucs — see #ensureStemPrefetch()/#runLowPriorityStemPrefetch().
+   */
+  #stemPrefetchTracker = new StemPrefetchTracker();
+  /** Dedup guard for #runLowPriorityStemPrefetch() — same rationale as #scheduledAnalysisTokens, but keyed by videoId presence only since this path has no killed-job/stale-token race to guard against (it never gets restarted mid-flight, only skipped while already in the Set). */
+  #lowPriorityStemPrefetch = new Set();
+  /**
+   * Codex review (PR #44, P2): videoIds whose #scheduleAnalysis() job has
+   * already been retried once after an ANALYSIS_KILLED abort — caps the
+   * retry to a single attempt per videoId so a guild under sustained CPU
+   * pressure can't loop forever re-scheduling the same doomed job. Pruned
+   * alongside #stemPrefetchTracker in #prefetchUpcoming() once a videoId
+   * leaves the active prefetch window.
+   */
+  #stemPrefetchRetriedAfterKill = new Set();
 
   constructor({
     guildId,
@@ -470,6 +591,7 @@ export class GuildPlayer {
     putTrackAnalysisFn = null,
     analyzeTrackFileFn = analyzeTrackFile,
     analysisQueue = null,
+    stemQueue = null,
     prefetchTrackFn = prefetchTrack,
     probeTempoBackendFn = probeTempoBackend,
     stageTempFileCopyFn = stageTempFileCopy,
@@ -497,6 +619,7 @@ export class GuildPlayer {
     this.#putTrackAnalysisFn = putTrackAnalysisFn;
     this.#analyzeTrackFileFn = analyzeTrackFileFn;
     this.#analysisQueue = analysisQueue;
+    this.#stemQueue = stemQueue;
     this.#prefetchTrackFn = prefetchTrackFn;
     this.#probeTempoBackendFn = probeTempoBackendFn;
     this.#stageTempFileCopyFn = stageTempFileCopyFn;
@@ -541,6 +664,13 @@ export class GuildPlayer {
       this.#hadError = true;
       this.#abortSourceAudioWait();
       this.#mixStream?.dropCurrent();
+      // Codex review (PR #45, P1): dropCurrent() resets MixStream's own
+      // underrun state WITHOUT emitting 'underrunClear' — if this player
+      // had a stem-queue pause source registered (mid-underrun when this
+      // error hit), nothing would ever clear it otherwise, indefinitely
+      // SIGSTOPping the shared process-wide stem queue's current job for
+      // every guild. See #initMixerPipeline()'s 'underrun' wiring.
+      this.#stemQ().noteUnderrunCleared(this);
     });
 
     // AutoPaused means playable.length === 0. Re-subscribe so a Ready
@@ -573,7 +703,7 @@ export class GuildPlayer {
   async playNext(gaplessFrom = null) {
     const track = this.#queue.current;
     if (!track) {
-      await this.#onDisconnect();
+      await this.#disconnect();
       return;
     }
     const pending = this.#pendingGaplessFrom;
@@ -604,7 +734,7 @@ export class GuildPlayer {
     if (this.#queue.current !== track) {
       source.destroy();
       await this.#cleanupCurrentTempFile();
-      if (!this.#queue.current) await this.#onDisconnect();
+      if (!this.#queue.current) await this.#disconnect();
       return;
     }
     if (this.#forceSkip) {
@@ -613,7 +743,7 @@ export class GuildPlayer {
       this.#forceSkip = false;
       const nextTrack = this.#queue.next({ forceAdvance: true });
       if (nextTrack === null) {
-        await this.#onDisconnect();
+        await this.#disconnect();
       } else {
         await this.playNext();
       }
@@ -688,6 +818,7 @@ export class GuildPlayer {
     this.#pendingSessionTempo = null;
     this.#pendingIncomingEntrySec = 0;
     this.#currentEntrySec = 0;
+    this.#currentEntryOverlapConsumedSec = 0;
     this.#startCrossfadeArm();
     this.#prefetchUpcoming();
     this.#ensureIncomingPrepForUpcoming();
@@ -732,6 +863,10 @@ export class GuildPlayer {
       this.#hadError = true;
       this.#abortSourceAudioWait();
       this.#mixStream.dropCurrent();
+      // Codex review (PR #45, P1): see the audioPlayer 'error' handler's
+      // identical comment above — dropCurrent() here has the same silent
+      // underrun-state reset.
+      this.#stemQ().noteUnderrunCleared(this);
     });
     this.#mixStream.on('incomingerror', (err) => {
       // Mid-fade incoming failure: MixStream already cleared overlap and kept
@@ -757,14 +892,37 @@ export class GuildPlayer {
     });
     this.#mixStream.on('underrun', () => {
       this.#analysisQ().noteUnderrun(this);
+      // Phase 9C §5.4 "Playback Safety": a Demucs job actively running
+      // during a live mixer underrun is exactly the CPU pressure the
+      // stem-preparation queue's pause() exists to relieve — forward the
+      // same underrun signal to it. This is the only automatic trigger for
+      // StemQueue.pause(); no separate CPU-monitoring signal exists yet.
+      //
+      // Codex review (PR #45): routed through noteUnderrun() (debounced —
+      // only actually pauses once the underrun has persisted past
+      // pauseAfterUnderrunMs), matching the realtime queue's own line
+      // above, NOT the immediate pause() command. A raw underrun event can
+      // be jittery (several isolated one-frame stalls in quick succession);
+      // charging each one straight against pause()'s pauseCount could hit
+      // MAX_PAUSES and kill a long-running Demucs job over transient noise
+      // the realtime queue itself is built to ignore. pause()/resume()
+      // remain available as an explicit, non-debounced command for a
+      // future direct/CPU-monitoring trigger — just not this one.
+      this.#stemQ().noteUnderrun(this);
     });
     this.#mixStream.on('underrunClear', () => {
       this.#analysisQ().noteUnderrunCleared(this);
+      this.#stemQ().noteUnderrunCleared(this);
     });
   }
 
   #analysisQ() {
     return this.#analysisQueue ?? getAnalysisQueue();
+  }
+
+  /** Phase 9C (docs/mix-transition-phase9.md §5): the dedicated StemPreparationQueue — see #stemQueue's own docstring. */
+  #stemQ() {
+    return this.#stemQueue ?? getStemPreparationQueue();
   }
 
   async #onSnapHandoff(adopt) {
@@ -866,6 +1024,9 @@ export class GuildPlayer {
     this.#pendingSessionTempo = null;
     this.#pendingIncomingEntrySec = 0;
     this.#currentEntrySec = entrySec;
+    // No overlap ran on this path (a prepared source simply won the race to
+    // EOF — see this function's own docstring), so positionSec starts at 0.
+    this.#currentEntryOverlapConsumedSec = 0;
     this.#clearCrossfadeArm();
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
@@ -1060,7 +1221,7 @@ export class GuildPlayer {
     const nextTrack = this.#queue.current;
     if (!nextTrack) {
       if (outgoingTemp) await cleanupTempFile(outgoingTemp);
-      await this.#onDisconnect();
+      await this.#disconnect();
       return;
     }
 
@@ -1087,6 +1248,14 @@ export class GuildPlayer {
     } else {
       this.#resetSessionTempoFor(nextTrack);
     }
+    // Codex review (PR #52, P2, round 2): MixStream.setCurrent() (mixStream.js)
+    // already initialized positionSec to the overlap portion just consumed
+    // (fadeElapsedSec + incomingSkippedSec) by the time this synchronous
+    // handler runs — snapshot it now, in native seconds, before any further
+    // playback advances it. See #currentEntryOverlapConsumedSec's own
+    // comment for why this must be captured once here rather than derived
+    // live from positionSec on every later arm-loop tick.
+    this.#currentEntryOverlapConsumedSec = (this.#mixStream?.positionSec ?? 0) * this.#sessionTempo.tempoRatio;
     // The incoming source was seeked forward by promotedEntrySec (native
     // seconds) at spawn — its remaining native content is only
     // (duration - promotedEntrySec), not the full native duration. Convert
@@ -1120,6 +1289,17 @@ export class GuildPlayer {
 
   get sessionTempo() {
     return this.#sessionTempo;
+  }
+
+  /**
+   * Phase 9B (docs/mix-transition-phase9.md §4): read-only snapshot of the
+   * stem prefetch tracker, for tests/observability. Not consumed by any
+   * playback decision — transition mode selection stays exactly what it
+   * was (that's Phase 9D's job), this only reports what #prefetchUpcoming()
+   * has learned so far about next/next+1's stem-separation progress.
+   */
+  get stemPrefetchStatus() {
+    return this.#stemPrefetchTracker.snapshot();
   }
 
   #resetSessionTempoFor(track) {
@@ -1189,6 +1369,32 @@ export class GuildPlayer {
     this.#forceSkip = true;
     this.#abortSourceAudioWait();
     this.#mixStream?.dropCurrent();
+    // Codex review (PR #45, P1): same silent underrun-state reset as the
+    // other dropCurrent() call sites — a /skip landing mid-underrun must
+    // not leave this player's stem-queue pause source stuck forever.
+    this.#stemQ().noteUnderrunCleared(this);
+    // Codex review (PR #43, round 10): a skip abandons whatever pair was
+    // just evaluated/stashed for the skipped track, same reasoning as
+    // stop()'s own clear above — without this, a later recurrence of the
+    // same pair within the 30s freshness window (e.g. QUEUE loop) could
+    // attribute a stale evaluation to a hard handoff that never actually
+    // evaluated it.
+    this.#lastEvaluatedTransitionReport = null;
+  }
+
+  /**
+   * Codex review (PR #45, P1): several normal paths (queue exhaustion with
+   * no autoplay handler, a track failing to start, etc.) call the injected
+   * #onDisconnect callback directly, without going through stop() first —
+   * stop()'s own noteUnderrunCleared()/resume() calls only run when it's
+   * actually invoked. Every #onDisconnect() call site in this file goes
+   * through this wrapper instead, so a player that disconnects mid-underrun
+   * always releases its stem-queue pause source too, not just on an
+   * explicit /leave or /stop.
+   */
+  async #disconnect() {
+    this.#stemQ().noteUnderrunCleared(this);
+    await this.#onDisconnect();
   }
 
   async stop() {
@@ -1206,6 +1412,10 @@ export class GuildPlayer {
     this.#pendingGaplessFrom = null;
     this.#lastEvaluatedTransitionReport = null;
     this.#analysisQ().noteUnderrunCleared(this);
+    // Symmetric with the underrunClear wiring above (#initMixerPipeline) —
+    // release this player's pause source on the stem queue too, so a
+    // stopped guild never leaves it stuck paused for other guilds.
+    this.#stemQ().resume(this);
     await this.#cleanupCurrentTempFile();
     await this.#cleanupIncomingTempFile();
     this.#discardPrefetch();
@@ -1313,7 +1523,7 @@ export class GuildPlayer {
       // null = another round already owns the autoplay lock; do not disconnect.
       if (handled !== false) return;
       this.#pendingGaplessFrom = null;
-      await this.#onDisconnect();
+      await this.#disconnect();
     } else {
       // Codex review (PR #43): a "hard handoff" — no crossfade was armed AND
       // #onSnapHandoff() either never ran or its prepared source was missing/
@@ -1437,24 +1647,44 @@ export class GuildPlayer {
     // filePath for stem separation NOW, before this job is even enqueued —
     // several unrelated call sites (track promotion/stop/skip/prefetch
     // discard) can delete filePath at any point once this method returns,
-    // including the entire time this job sits waiting its turn on the
-    // shared analysisQueue (which a single full-track Demucs job can
-    // occupy for minutes — docs/mix-transition-phase8.md §9). Copying
-    // later, e.g. as the first statement inside the enqueued callback,
-    // would already be too late in exactly that scenario. Best-effort: if
-    // staging fails, separation for this track is simply skipped below.
+    // including the entire time this job sits waiting its turn on a shared
+    // queue (which a single full-track Demucs job can occupy for minutes —
+    // docs/mix-transition-phase8.md §9, mitigated but not eliminated by
+    // Phase 9C's queue split below). Copying later, e.g. as the first
+    // statement inside the enqueued callback, would already be too late in
+    // exactly that scenario. Best-effort: if staging fails, separation for
+    // this track is simply skipped below.
     const stagedPathPromise = this.#stageTempFileCopyFn(filePath).catch((err) => {
       console.warn('[GuildPlayer] failed to stage file for stem separation:', err.message);
       return null;
     });
+
+    // Phase 9C (docs/mix-transition-phase9.md §5): releases
+    // #scheduledAnalysisTokens's dedup guard and cleans up the staged
+    // copy. Whichever branch below actually owns the staged file's
+    // lifetime for this attempt — "no separation dispatched" (aborted, or
+    // staging itself failed) vs. "separation dispatched on the stem
+    // queue" — calls this exactly once, so the guard/cleanup logic isn't
+    // duplicated per branch. Same compare-and-delete rationale as before
+    // the split (Codex): analysisQueue.kill()/noteUnderrun() rejects via
+    // Promise.race() the instant a job is killed, possibly before this
+    // ever runs; if a newer attempt for this videoId already replaced the
+    // token in that gap, leave it alone.
+    const finishAnalysisAttempt = (stagedPath) => {
+      if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
+      if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
+        this.#scheduledAnalysisTokens.delete(track.videoId);
+      }
+    };
+
     this.#analysisQ().enqueue(async ({ spawnNice, signal } = {}) => {
       // CodeRabbit (PR #39 round-15): the staged copy must be cleaned up
-      // whether THIS job succeeds, fails at any step, or is cancelled —
+      // whether analysis succeeds, fails at any step, or is cancelled —
       // #lookupPersistentAnalysis()/#runAnalysis() rejecting (including an
-      // ANALYSIS_KILLED abort) must not skip cleanup just because it
-      // happens before the separation step below. The try/finally wraps
-      // the whole callback, not just the separation call, so every exit
-      // path removes it regardless of outcome.
+      // ANALYSIS_KILLED abort) must not skip cleanup. The try/catch below
+      // routes every exit path through finishAnalysisAttempt() exactly
+      // once (either here, on failure/no-dispatch, or later inside the
+      // stem-queue job's own .finally() once separation settles).
       //
       // Codex (PR #39 round-17): #runAnalysis() itself must also read from
       // the staged copy, not the original filePath — the whole reason
@@ -1473,24 +1703,122 @@ export class GuildPlayer {
         // stem-mix eligible, the existing beatmix/phrase-crossfade/legacy
         // ladder is untouched either way.
         // Skip rather than start a many-minute Demucs run against a job
-        // the queue already decided to cancel (e.g. a mixer underrun
-        // killed this job right as #runAnalysis finished).
+        // the (realtime) queue already decided to cancel (e.g. a mixer
+        // underrun killed this job right as #runAnalysis finished).
         if (!signal?.aborted && stagedPath) {
-          await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal }).catch((err) => {
-            console.warn('[GuildPlayer] stem separation failed:', err.message);
-          });
+          // Phase 9C (docs/mix-transition-phase9.md §5): dispatch the
+          // heavy full-track Demucs step on the dedicated
+          // StemPreparationQueue instead of this (realtime) queue —
+          // deliberately NOT awaited here. Awaiting would keep this
+          // realtime job "running" for as long as Demucs takes, blocking
+          // BPM/downbeat/phrase/key/vocal-activity analysis for the next
+          // queued track behind it — exactly the §9 problem this phase
+          // fixes. The stem job's own .finally() below owns
+          // cleanup/token-release for this attempt once separation
+          // actually settles; this realtime job returns immediately.
+          // Codex review (PR #45, P1): give this a real priority instead of
+          // implicit call-order-only FIFO — B (HIGH, tracked by
+          // #stemPrefetchTracker) must not sit behind an already-pending
+          // LOW (C) job. A (the currently-playing track, untracked here —
+          // §4.2 deliberately keeps A outside #stemPrefetchTracker) stays
+          // at the default 'normal' priority, unchanged from pre-9C
+          // behavior.
+          const stemJobPriority = this.#stemPrefetchTracker.get(track.videoId)?.priority === StemPrefetchPriority.HIGH
+            ? 'high'
+            : 'normal';
+          // Codex review (PR #45, P2, round 2): retry directly from THIS
+          // staged copy instead of re-staging from `filePath` via a fresh
+          // #scheduleAnalysis(track, filePath) call — by the time a
+          // stem-queue-level kill happens, `filePath` (the original
+          // normalized file) may already be gone via track promotion/end
+          // cleanup, since the split stem queue can now hold this job
+          // independently for minutes. `runSeparation` is recursive so the
+          // one retry it allows reuses the exact same still-on-disk staged
+          // file rather than depending on anything that could have been
+          // cleaned up in between. Cleanup of `stagedPath` and release of
+          // this attempt's #scheduledAnalysisTokens entry are decoupled:
+          // the former only happens once every attempt (original + at most
+          // one retry) has truly settled, the latter happens exactly once
+          // regardless of how many attempts ran.
+          // Codex review (PR #45, P2, round 3): stemCache.js's default
+          // separateTrackStems() dedups per-videoId via its own module-level
+          // `inFlight` Map, cleared only once that specific call's own
+          // promise settles — the stem queue's kill only rejects the OUTER
+          // race in analysisQueue.js's pump(), it does not cancel or clear
+          // this inner call. `currentAttemptSeparation` captures that inner
+          // promise so a retry can await it settling (swallowing whatever
+          // it resolves/rejects to — it's about to be discarded either way)
+          // before dispatching the replacement attempt; otherwise
+          // separateTrackStems()'s own dedup check would just hand the
+          // retry back this same doomed (killed → resolves null) promise,
+          // silently burning the one retry for nothing.
+          let currentAttemptSeparation = null;
+          const runSeparation = (allowRetry) => this.#stemQ().enqueue(async ({ spawnNice: stemSpawnNice, signal: stemSignal } = {}) => {
+            if (stemSignal?.aborted) return null;
+            currentAttemptSeparation = this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: stemSpawnNice, signal: stemSignal });
+            return currentAttemptSeparation;
+          }, { priority: stemJobPriority }).then(
+            (stems) => {
+              // Phase 9B: this is the one place that actually learns when a
+              // HIGH-priority (B) stem prefetch finishes — #ensureStemPrefetch()
+              // itself only re-polls getCachedStemsFn() on the NEXT
+              // #prefetchUpcoming() checkpoint, which for B may not come
+              // again before it becomes the current track and drops out of
+              // that method's purview entirely. Only touches the tracker if
+              // this videoId is actually being tracked (#ensureStemPrefetch()
+              // was called for it) — #scheduleAnalysis() runs for every
+              // normalized track, current (A) included, and A must stay
+              // untouched by this (§4.2: 9B doesn't change #ensureOutgoingStemPrep()'s
+              // existing treatment of A).
+              if (this.#stemPrefetchTracker.get(track.videoId)) {
+                if (stems) this.#stemPrefetchTracker.markReady(track.videoId);
+                else this.#stemPrefetchTracker.markFailed(track.videoId);
+              }
+            },
+            (err) => {
+              console.warn('[GuildPlayer] stem separation failed:', err.message);
+              if (this.#stemPrefetchTracker.get(track.videoId)) {
+                this.#stemPrefetchTracker.markFailed(track.videoId);
+              }
+              // Codex review (PR #45, P2): a stem-queue-level ANALYSIS_KILLED
+              // (this queue's own pause/kill machinery preempting the job,
+              // e.g. maxPauses exceeded during a sustained underrun) rejects
+              // here, one level below the realtime #analysisQ() job that
+              // dispatched it — that job already resolved by the time this
+              // rejects (the dispatch above is deliberately not awaited), so
+              // the outer .catch()'s own ANALYSIS_KILLED retry (below) is
+              // never reached for this kind of kill. Same bounded-once-per-
+              // videoId retry as that outer catch.
+              if (
+                allowRetry
+                && err?.code === 'ANALYSIS_KILLED'
+                && this.#stemPrefetchTracker.get(track.videoId)
+                && !this.#stemPrefetchRetriedAfterKill.has(track.videoId)
+              ) {
+                this.#stemPrefetchRetriedAfterKill.add(track.videoId);
+                return (currentAttemptSeparation ?? Promise.resolve()).catch(() => {}).then(() => runSeparation(false));
+              }
+            },
+          );
+          runSeparation(true).finally(() => finishAnalysisAttempt(stagedPath));
+          return analysis;
+        } else if (this.#stemPrefetchTracker.get(track.videoId)) {
+          // Codex review (PR #44, carried into Phase 9C's stem-queue
+          // restructure): staging failed (stagedPath null), or this job
+          // was aborted before separation was even attempted — either way
+          // it's exiting without ever reaching the stem-queue dispatch
+          // above, so the markReady/markFailed pair there never runs. Mark
+          // it failed here instead of leaving the tracked entry stuck
+          // reporting PROCESSING forever (prune() deliberately never
+          // collects a PROCESSING/QUEUED entry) — a later
+          // #prefetchUpcoming() checkpoint will retry it.
+          this.#stemPrefetchTracker.markFailed(track.videoId);
         }
+        finishAnalysisAttempt(stagedPath);
         return analysis;
-      } finally {
-        if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
-        // Compare-and-delete: analysisQueue.kill()/noteUnderrun() rejects
-        // via Promise.race() the instant a job is killed, well before this
-        // callback's own finally can run (Codex). If a newer attempt for
-        // this same videoId already replaced our entry in that gap, its
-        // token won't match ours — leave it alone.
-        if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
-          this.#scheduledAnalysisTokens.delete(track.videoId);
-        }
+      } catch (err) {
+        finishAnalysisAttempt(stagedPath);
+        throw err;
       }
     }).catch((err) => {
       // Belt-and-suspenders: the finally above already removes this on
@@ -1499,8 +1827,33 @@ export class GuildPlayer {
       if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
         this.#scheduledAnalysisTokens.delete(track.videoId);
       }
+      // Codex review (PR #44): #lookupPersistentAnalysis()/#runAnalysis()
+      // throwing (including an ANALYSIS_KILLED abort) before ever reaching
+      // the separation step above means neither markReady/markFailed branch
+      // there ran either — same "don't leave it stuck at PROCESSING
+      // forever" reasoning.
+      const tracked = this.#stemPrefetchTracker.get(track.videoId);
+      if (tracked) {
+        this.#stemPrefetchTracker.markFailed(track.videoId);
+      }
       if (err?.code === 'ANALYSIS_KILLED') {
         console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
+        // Codex review (PR #44, P2): specifically an ANALYSIS_KILLED abort
+        // (a real-time-pressure preemption, e.g. a mixer underrun stopping
+        // this job mid-run) is the transient case worth retrying — unlike
+        // separateTrackStemsFn() resolving a clean `null` (a genuine "this
+        // track has no separable stems" outcome the existing Phase 8 tests
+        // rely on staying a one-shot attempt), a kill says nothing about
+        // whether the track is actually separable. filePath is still the
+        // one this call was given, not a staged copy — the file this HIGH
+        // track's full-prefetch download resolved to, still present since
+        // it hasn't been promoted/consumed yet. Retried at most once per
+        // videoId (#stemPrefetchRetriedAfterKill) to avoid looping forever
+        // against a guild that's continuously CPU-starved.
+        if (tracked && !this.#stemPrefetchRetriedAfterKill.has(track.videoId)) {
+          this.#stemPrefetchRetriedAfterKill.add(track.videoId);
+          this.#scheduleAnalysis(track, filePath);
+        }
         return;
       }
       console.warn('[GuildPlayer] analysis failed:', err.message);
@@ -1668,7 +2021,7 @@ export class GuildPlayer {
       // Revalidate against the live cache right before actually spawning —
       // this only runs on a genuine (re)prep, i.e. rarely, not on the
       // steady-state no-op ticks above, so it doesn't reintroduce the
-      // per-tick fs cost player.js's #stemCacheHit memo exists to avoid.
+      // per-tick fs cost player.js's #outStemCacheHit/#inStemCacheHit memo exists to avoid.
       // `cached` (the caller's argument) may be a memoized lookup from
       // several arm-ticks ago; pruneStemCache() can evict the entry any
       // time in the background, and a stale path here would spawn ffmpeg
@@ -1972,9 +2325,17 @@ export class GuildPlayer {
       }
       if (remaining == null) return;
       // Analysis determines the exact overlap. Legacy crossfade caps at
-      // MAX_CROSSFADE_SEC, but a beatmix overlap (up to BEATMIX_OVERLAP_BARS
-      // bars) can run longer at slower tempos — MAX_TRANSITION_LEAD_SEC must
-      // cover both, or a slow-tempo beatmix's prep window never opens.
+      // MAX_CROSSFADE_SEC, but a beatmix/stem-mix overlap (up to
+      // MIX_BARS.extended = 16 bars as of Phase 9E, docs/mix-transition-
+      // phase9.md §7.2) can run longer at slower tempos — MAX_TRANSITION_LEAD_SEC
+      // must cover both, or a slow-tempo beatmix's prep window never opens.
+      // MAX_TRANSITION_LEAD_SEC is still TAIL_WINDOW_SEC — Phase 9F (§8)
+      // widened it from 45s to 60s specifically so a full 16-bar reach at
+      // slower tempos (e.g. 16 bars at 64 BPM/4-beat is 60s) stays within
+      // both this gate's open point AND findExitCandidates()'s candidate
+      // pool. Below ~64 BPM a 16-bar reach can still exceed the window; see
+      // docs/mix-transition-phase9.md's Phase 9F implementation notes for
+      // the known remaining limitation.
       if (remaining > CROSSFADE_PREP_LEAD_SEC + MAX_TRANSITION_LEAD_SEC) return;
       // TRACK loop must re-arm the same track; upcoming()[0] would advance on promote.
       const next = this.#queue.loopMode === LoopMode.TRACK
@@ -1991,13 +2352,22 @@ export class GuildPlayer {
         return;
       }
 
-      const outAnalysis = (await this.#getCachedAnalysis(current)) ?? fallbackAnalysis(current);
+      // Codex review (PR #52, P2, round 2): the floor for excludeExitCandidatesBeforeEntry()
+      // must include the overlap #current already consumed before becoming
+      // #current (#currentEntryOverlapConsumedSec's own comment) on top of
+      // its entry offset — not just the entry offset alone.
+      const minReachableNativeSec = (this.#currentEntrySec ?? 0) + (this.#currentEntryOverlapConsumedSec ?? 0);
+      const rawOutAnalysis = (await this.#getCachedAnalysis(current)) ?? fallbackAnalysis(current);
+      const outAnalysis = excludeExitCandidatesBeforeEntry(rawOutAnalysis, minReachableNativeSec);
       const inAnalysis = (await this.#getCachedAnalysis(next)) ?? fallbackAnalysis(next);
       const outgoingPlaybackBpm = this.#sessionTempo.playbackBpm ?? outAnalysis.bpm ?? null;
-      // planBeatmixTransition rejects before ever touching the backend when
-      // either side lacks a usable BPM (the common case — most analyses are
-      // fallbackAnalysis() or simply BPM-less) — skip the real ffmpeg -filters
-      // probe entirely then, rather than spawning it every 200ms arm tick.
+      // planBeatmixTransition/planStemTransition both reject before ever
+      // touching the tempo backend when either side lacks a usable BPM (the
+      // common case — most analyses are fallbackAnalysis() or simply
+      // BPM-less) — skip the real ffmpeg -filters probe (and the stem-cache
+      // fs lookup below) entirely then, rather than spawning either every
+      // 200ms arm tick for a pair that can never be beatmix/stem-mix
+      // eligible anyway.
       const mightBeatmix = outAnalysis.bpm > 0 && (inAnalysis.headBpm ?? inAnalysis.bpm) > 0;
       // 'rubberband' is only a placeholder for the branch where no probe ran
       // at all (planBeatmixTransition rejects on bpm-unavailable before ever
@@ -2007,37 +2377,25 @@ export class GuildPlayer {
       // backend is available when it isn't, producing a filter string ffmpeg
       // can't actually apply.
       const tempoBackend = mightBeatmix ? await this.#probeTempoBackendFn() : 'rubberband';
-      const rawPlan = planBeatSyncedTransition(outAnalysis, inAnalysis, {
-        outgoingPlaybackBpm,
-        tempoBackend,
-        maxOverlapSec: MAX_CROSSFADE_SEC,
-      });
 
-      // Phase 8 (docs/mix-transition-phase8.md): only attempted when plain
-      // tier-1 beatmix did NOT win the fallback ladder (mode !== 'beatmix')
-      // — stem-mix reuses 100% of beatmix's tempo/downbeat/meter gating (via
-      // planStemTransition()'s relaxed-flag options into
-      // planBeatmixTransition()), so if beatmix already succeeded there is
-      // nothing for it to improve on; it exists specifically to rescue the
-      // case where only the whole-overlap vocal-safety requirement stood in
-      // the way. Gated on stems already being cached (a cheap fs check) so
-      // this never triggers separation itself — #scheduleAnalysis() already
-      // does that in the background, well before a transition is imminent.
-      // Looked up once here and reused at both the prepDue and readyToFade
-      // points below — a second fs check right before spawning would risk
-      // observing a DIFFERENT cache state than what eligibility was actually
-      // decided against a few lines up.
-      //
-      // Tried BEFORE rawPlan's own gapless/no-fade early return (not after)
-      // — planStemTransition() is derived independently from outAnalysis/
-      // inAnalysis, not from rawPlan, so a rawPlan that fell all the way to
-      // 'gapless' (e.g. low aggregate/vocal confidence even with strong
-      // beat/downbeat analysis) must not preempt an otherwise-eligible
-      // stem-mix plan (Codex).
+      // Phase 9D (docs/mix-transition-phase9.md §6): beatmix / stem-mix /
+      // phrase-crossfade are evaluated as independent candidates —
+      // rankTransitionCandidates() plans all of them regardless of whether
+      // the others are eligible, then picks a winner by score +
+      // transitionModeBonus() (§6.4) rather than the pre-Phase-9D waterfall
+      // (tier 1 beatmix winning outright, stem-mix only attempted when it
+      // didn't). The stem-cache lookup below therefore always runs (subject
+      // only to the mightBeatmix/`#stemMixUnavailableKey` gates above/below,
+      // not to whether beatmix already "won") — gated on stems already
+      // being cached (a cheap fs check) so this never triggers separation
+      // itself; #scheduleAnalysis() already does that in the background,
+      // well before a transition is imminent. Looked up once here and
+      // reused at both the prepDue and readyToFade points below — a second
+      // fs check right before spawning would risk observing a DIFFERENT
+      // cache state than what eligibility was actually decided against a
+      // few lines up.
       let outCachedStems = null;
       let inCachedStems = null;
-      let norm = null;
-      let stemPlan = null;
       // Codex review (PR #43, round 9): videoId-less tracks (the playlist
       // route explicitly allows this) previously all collapsed to the same
       // ":" key here — an evaluated A→B pair's stash would then get
@@ -2048,34 +2406,69 @@ export class GuildPlayer {
       const stemCacheLookupKey = `${this.#prefetchKey(current) ?? ''}:${this.#prefetchKey(next) ?? ''}`;
       // Phase 9A (docs/mix-transition-phase9.md §3): whether the stem-cache
       // lookup below actually ran this tick — distinguishes a genuine
-      // HIT/MISS from "never checked" (beatmix already won, or this pair is
-      // marked #stemMixUnavailableKey) for the [MIX PLAN] log/metrics built
-      // further down. Read-only bookkeeping; does not affect selection.
-      const stemCacheAttempted = rawPlan.mode !== 'beatmix' && this.#stemMixUnavailableKey !== stemCacheLookupKey;
+      // HIT/MISS from "never checked" (this pair is marked
+      // #stemMixUnavailableKey, or stem-mix could never be eligible anyway)
+      // for the [MIX PLAN] log/metrics built further down. Read-only
+      // bookkeeping; does not affect selection.
+      const stemCacheAttempted = mightBeatmix && this.#stemMixUnavailableKey !== stemCacheLookupKey;
       if (stemCacheAttempted) {
-        if (this.#stemCacheHit?.key === stemCacheLookupKey) {
-          ({ outCachedStems, inCachedStems } = this.#stemCacheHit);
-        } else {
-          [outCachedStems, inCachedStems] = await Promise.all([
-            this.#getCachedStemsFn(current.videoId),
-            this.#getCachedStemsFn(next.videoId),
+        // Codex review (PR #46, round 3, P2): each side is checked/memoized
+        // independently — a positive outgoing hit from an earlier tick (or
+        // an earlier pairing entirely, keyed on the track alone) is reused
+        // without re-touching the filesystem, and only the side(s) still
+        // missing actually call getCachedStemsFn() this tick.
+        const outKey = this.#prefetchKey(current);
+        const inKey = this.#prefetchKey(next);
+        outCachedStems = this.#outStemCacheHit?.key === outKey ? this.#outStemCacheHit.stems : null;
+        inCachedStems = this.#inStemCacheHit?.key === inKey ? this.#inStemCacheHit.stems : null;
+        const needOut = !outCachedStems;
+        const needIn = !inCachedStems;
+        if (needOut || needIn) {
+          const [freshOut, freshIn] = await Promise.all([
+            needOut ? this.#getCachedStemsFn(current.videoId) : Promise.resolve(outCachedStems),
+            needIn ? this.#getCachedStemsFn(next.videoId) : Promise.resolve(inCachedStems),
           ]);
+          outCachedStems = freshOut;
+          inCachedStems = freshIn;
+          if (needOut && outCachedStems) this.#outStemCacheHit = { key: outKey, stems: outCachedStems };
+          if (needIn && inCachedStems) this.#inStemCacheHit = { key: inKey, stems: inCachedStems };
+          // Codex review (PR #46, round 4): a side reused from memo above
+          // (not freshly checked THIS tick) must still be revalidated once,
+          // right here, the moment the OTHER side just landed and the pair
+          // is about to be reported complete for the first time —
+          // pruneStemCache() can evict a memoized hit's files at any point
+          // in the background, and without this the newly-complete pair
+          // would report stemsAvailable:true off a memo that may have
+          // already gone stale, potentially displacing an already-ready
+          // beatmix candidate for a stem-mix plan whose OWN prep-time
+          // revalidation (#ensureOutgoingStemPrep()/#ensureIncomingStemPrep())
+          // only discovers the missing file much later, after the ranker's
+          // choice already stuck. Only fires on this "just became complete"
+          // transition — ordinary "still waiting" ticks (the other side
+          // stays missing) and the steady both-hit state (the outer
+          // `needOut || needIn` check above is false, skipping this whole
+          // block every tick) are unaffected, so this doesn't reintroduce
+          // the per-tick fs cost the memoization itself exists to avoid.
           if (outCachedStems && inCachedStems) {
-            this.#stemCacheHit = { key: stemCacheLookupKey, outCachedStems, inCachedStems };
-          }
-        }
-        if (outCachedStems && inCachedStems) {
-          stemPlan = this.#planStemTransitionFn(outAnalysis, inAnalysis, {
-            outgoingPlaybackBpm,
-            tempoBackend,
-            maxOverlapSec: MAX_CROSSFADE_SEC,
-          });
-          if (stemPlan.eligible) {
-            norm = normalizeTransitionPlan(stemPlan);
+            if (needIn && !needOut) {
+              outCachedStems = await this.#getCachedStemsFn(current.videoId);
+              this.#outStemCacheHit = outCachedStems ? { key: outKey, stems: outCachedStems } : null;
+            } else if (needOut && !needIn) {
+              inCachedStems = await this.#getCachedStemsFn(next.videoId);
+              this.#inStemCacheHit = inCachedStems ? { key: inKey, stems: inCachedStems } : null;
+            }
           }
         }
       }
-      // Phase 9A: snapshot the ladder's decision (before any later downgrade
+
+      const { candidates, selectedPlan, bestNonStemPlan } = rankTransitionCandidates(outAnalysis, inAnalysis, {
+        outgoingPlaybackBpm,
+        tempoBackend,
+        maxOverlapSec: MAX_CROSSFADE_SEC,
+        stemsAvailable: Boolean(outCachedStems && inCachedStems),
+        planStemTransitionFn: this.#planStemTransitionFn,
+      });
+      // Phase 9A: snapshot the ranker's decision (before any later downgrade
       // — TRACK loop mode / an incoming source that can't honor a seek or
       // stretch) into a log report. `selected`/`downgradedFrom` are
       // finalized right before the actual startCrossfade()/
@@ -2084,23 +2477,23 @@ export class GuildPlayer {
       //
       // Codex review (PR #43, round 6): built and stashed BEFORE the
       // gapless/no-fade early return below (moved up from after it) — a
-      // 'gapless' rawPlan still means beatmix/stem-mix/phrase-crossfade
+      // 'gapless' selectedPlan still means beatmix/stem-mix/phrase-crossfade
       // were genuinely evaluated and rejected just now, and the eventual
       // hard-handoff log (via #takeMatchingEvaluatedTransition()) should
       // report those real rejection reasons instead of falling back to the
       // generic "no candidate evaluation" stub for every gapless case.
-      const plannedMode = stemPlan?.eligible ? 'stem-mix' : rawPlan.mode;
+      const plannedMode = selectedPlan.mode;
       const transitionPlanReport = buildTransitionPlanReport({
         outgoingTrack: current,
         incomingTrack: next,
         outgoingAnalysis: outAnalysis,
         incomingAnalysis: inAnalysis,
-        rawPlan,
-        stemPlan,
+        candidates,
         stemCacheAttempted,
         outgoingStemsCached: Boolean(outCachedStems),
         incomingStemsCached: Boolean(inCachedStems),
         plannedMode,
+        selectedPlan,
         // Codex review (PR #43, round 5): read directly off #sessionTempo
         // rather than waiting for the local `outgoingTempoRatio` const
         // further down — same instance field, same tick, nothing mutates
@@ -2130,10 +2523,16 @@ export class GuildPlayer {
       // can't retroactively change what was stashed for this tick.
       this.#stashLastEvaluatedTransition(stemCacheLookupKey, transitionPlanReport);
 
-      if (!norm) {
-        if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
-        norm = normalizeTransitionPlan(rawPlan);
-      }
+      if (selectedPlan.mode === 'gapless' || !(selectedPlan.fadeSec > 0)) return;
+      let norm = normalizeTransitionPlan(selectedPlan);
+      // Codex review (PR #46, round 5): which RAW (pre-normalizeTransitionPlan)
+      // mode `norm` currently reflects — normalizeTransitionPlan() flattens
+      // both 'beatmix' and 'phrase-crossfade' into mixPlan.mode: 'crossfade'/
+      // 'beatmix' respectively at different points, so `norm.mixPlan.mode`
+      // alone can't distinguish a phrase-crossfade plan from a legacy one
+      // below. Reassigned alongside `norm` itself whenever it's rebuilt from
+      // a different rawPlan (the stem-mix -> bestNonStemPlan re-plan below).
+      let normRawMode = selectedPlan.mode;
 
       let modeDowngraded = false;
 
@@ -2145,8 +2544,9 @@ export class GuildPlayer {
       // re-arms with the same nonzero entrySec (Codex round-5). The outgoing
       // exit point is still meaningful (fade the ending into the beginning),
       // so only the entry side is forced back to a true restart; downgrade
-      // out of beatmix since its bar envelope assumed the original,
-      // downbeat-aligned candidate rather than the file's real start.
+      // out of beatmix/phrase-crossfade since both assumed the original
+      // selected boundary (bar-aligned or phrase-aligned) rather than the
+      // file's real start.
       if (next === current) {
         if (norm.mixPlan.mode === 'stem-mix') {
           // stem-mix's own exitStartSec was chosen with vocal-safety
@@ -2154,22 +2554,44 @@ export class GuildPlayer {
           // — reusing it for a plain (non-separated) crossfade can violate
           // 禁止5 (vocal-on-vocal collision), since without the per-stem
           // envelope there's nothing keeping the outgoing vocal tail clear
-          // of the incoming track's own start. Re-plan from rawPlan (the
-          // ordinary, non-relaxed fallback-ladder result) instead of merely
-          // stripping stems from the relaxed plan (Codex) — matches the
-          // same beatmix/plain-crossfade downgrade this loop-mode override
-          // already performs safely for non-stem plans.
-          if (rawPlan.mode === 'gapless' || !(rawPlan.fadeSec > 0)) return;
-          norm = normalizeTransitionPlan(rawPlan);
+          // of the incoming track's own start. Re-plan from bestNonStemPlan
+          // (the ranker's best of beatmix/phrase-crossfade/legacy, i.e. the
+          // ordinary, non-relaxed candidates) instead of merely stripping
+          // stems from the relaxed plan (Codex) — matches the same beatmix/
+          // plain-crossfade downgrade this loop-mode override already
+          // performs safely for non-stem plans.
+          if (bestNonStemPlan.mode === 'gapless' || !(bestNonStemPlan.fadeSec > 0)) return;
+          norm = normalizeTransitionPlan(bestNonStemPlan);
+          normRawMode = bestNonStemPlan.mode;
           // Phase 9A: the mode actually used just changed away from the
           // planned 'stem-mix' — see transitionPlanReport's finalization
           // below.
           modeDowngraded = true;
+          // Codex review (PR #46, round 6): transitionPlanReport.exit was
+          // built (above, at report-construction time) from the ORIGINAL
+          // selectedPlan (stem-mix) — bestNonStemPlan's own ranker-selected
+          // exit/entry pair need not be the same one, since it comes from
+          // an entirely independent (stricter, non-relaxed) candidate
+          // search. Without recomputing here, a committed [MIX PLAN] log
+          // for this downgrade could report the stem-mix plan's exit
+          // second/bar/vocalActive state while the audio actually executed
+          // bestNonStemPlan's different exit — the existing entry-side
+          // reconciliation below (pendingEntrySec) only fixes entry, not
+          // exit.
+          transitionPlanReport.exit = exitInfo(bestNonStemPlan, outAnalysis, this.#sessionTempo.tempoRatio ?? 1);
         }
         norm.entrySec = 0;
         norm.tempoFilter = null;
         norm.sessionTempo = null;
-        if (norm.mixPlan.mode === 'beatmix') {
+        // Codex review (PR #46, round 5): with the independent ranker
+        // (Phase 9D), a phrase-crossfade plan (baseSwap:true, EQ chosen for
+        // its own selected phrase boundary) can win even while beatmix is
+        // eligible — previously only checking `mode === 'beatmix'` here left
+        // a phrase-crossfade's boundary-dependent EQ/baseSwap applied to
+        // audio that TRACK loop just reset to entrySec 0, the same class of
+        // bug the forcePlainCrossfade downgrade below already guards
+        // against for an unhonored source seek.
+        if (norm.mixPlan.mode === 'beatmix' || normRawMode === 'phrase-crossfade') {
           norm.mixPlan = {
             ...norm.mixPlan, mode: 'crossfade', sync: null, eq: null, targetBpm: null, baseSwap: false, stems: null,
           };
@@ -2311,10 +2733,10 @@ export class GuildPlayer {
           // the incoming track's own start — a plain crossfade has no such
           // envelope, so this can violate 禁止5 (vocal-on-vocal collision).
           // Abort this attempt entirely rather than downgrade the window
-          // (Codex); mark the pair unavailable so the NEXT arm tick's plan
-          // selection above falls through to rawPlan's own, non-relaxed
-          // selection instead of re-picking this same relaxed stem plan
-          // and looping on this same abort forever (Codex round-9 follow-up).
+          // (Codex); mark the pair unavailable so the NEXT arm tick's
+          // ranker call above evaluates with stemsAvailable: false instead
+          // of re-picking this same relaxed stem plan and looping on this
+          // same abort forever (Codex round-9 follow-up).
           this.#stemMixUnavailableKey = stemCacheLookupKey;
           source.destroy();
           await this.#cleanupIncomingTempFile();
@@ -2391,8 +2813,8 @@ export class GuildPlayer {
           // planStemTransitionFn() above are independent of spawn success,
           // so every subsequent arm tick would re-select this same relaxed
           // stem plan and abort again here — retrying until the outgoing
-          // track reaches EOF and never letting rawPlan's plain-crossfade
-          // fallback run at all (Codex round-9 follow-up).
+          // track reaches EOF and never letting the ranker's other
+          // candidates run at all (Codex round-9 follow-up).
           this.#stemMixUnavailableKey = stemCacheLookupKey;
           source.destroy();
           await this.#cleanupIncomingTempFile();
@@ -2502,9 +2924,14 @@ export class GuildPlayer {
   }
 
   #prefetchUpcoming() {
+    // Codex review (PR #44): wrappedUpcoming() (not upcoming().slice()) so
+    // QUEUE loop mode's last track still gets a HIGH stem-prefetch/full
+    // prefetch pass and the penultimate track still gets its LOW/lookahead
+    // pass, instead of both silently missing lookahead right at the loop
+    // boundary even though next() really does wrap there.
     const upcoming = this.#queue.loopMode === LoopMode.TRACK
       ? (this.#queue.current ? [this.#queue.current] : [])
-      : this.#queue.upcoming().slice(0, 3);
+      : this.#queue.wrappedUpcoming(3);
 
     const keep = new Set(upcoming.map((t) => this.#prefetchKey(t)).filter(Boolean));
     for (const key of [...this.#prefetchEntries.keys()]) {
@@ -2520,6 +2947,195 @@ export class GuildPlayer {
         this.#ensureAnalysisPrefetch(track);
       }
     }
+
+    // Phase 9B (docs/mix-transition-phase9.md §4.2): next (B) gets HIGH
+    // stem prefetch, next+1 (C) gets LOW. next+2 (D) and beyond stay
+    // untouched by this — only the two loops above (full prefetch for the
+    // track that's about to become current, lightweight BPM/phrase
+    // lookahead for the rest) apply to them, exactly as before Phase 9B.
+    const second = upcoming[1];
+    if (first && isNormalizeDurationAllowed(first)) {
+      this.#ensureStemPrefetch(first, StemPrefetchPriority.HIGH);
+    }
+    if (second && isNormalizeDurationAllowed(second)) {
+      this.#ensureStemPrefetch(second, StemPrefetchPriority.LOW);
+    }
+    const activeVideoIds = new Set(upcoming.map((t) => t?.videoId).filter(Boolean));
+    this.#stemPrefetchTracker.prune(activeVideoIds);
+    for (const videoId of [...this.#stemPrefetchRetriedAfterKill]) {
+      if (!activeVideoIds.has(videoId)) this.#stemPrefetchRetriedAfterKill.delete(videoId);
+    }
+  }
+
+  /**
+   * Phase 9B (docs/mix-transition-phase9.md §4): registers/refreshes this
+   * videoId's stem-prefetch bookkeeping and, on a cache miss, makes sure
+   * the actual separation work is (or gets) dispatched.
+   *
+   * HIGH (B, next): purely observational beyond registering intent — B
+   * already gets a full download+normalize+analyze pass for real playback
+   * prep (#ensureFullPrefetch() -> #scheduleAnalysis(), Phase 8's existing
+   * pipeline), which itself ends by calling separateTrackStemsFn(). This
+   * piggybacks on that pipeline's own dedup (#prefetchEntries by key,
+   * #scheduledAnalysisTokens by videoId, stemCache.js's own per-videoId
+   * in-flight map) instead of opening a second, redundant download path
+   * for the same file — so this method never itself calls
+   * #prefetchTrackFn for a HIGH-priority track.
+   *
+   * LOW (C, next+1): drives the download + staged-copy + separation
+   * directly via #runLowPriorityStemPrefetch(), because nothing else in
+   * the existing pipeline keeps C's audio around long enough for Demucs —
+   * #ensureAnalysisPrefetch()'s own lookahead deletes its temp file the
+   * instant BPM/phrase analysis finishes (by design, phase8.md §21: running
+   * full-track Demucs against an unconfirmed 2-3-tracks-ahead candidate was
+   * judged disproportionate — Phase 9B narrows that specifically to next+1).
+   * This is independent of the BPM-analysis cache: a track can have
+   * analysis cached from an earlier play while still missing its Demucs
+   * stems, so #ensureAnalysisPrefetch()'s own persisted-analysis
+   * short-circuit must not also gate stem prefetch.
+   *
+   * Either way, dispatch happens only after #getCachedStemsFn() confirms a
+   * miss — a cache HIT just (re-)marks the entry READY. Unlike
+   * #outStemCacheHit/#inStemCacheHit's own "only positive results are
+   * memoized", READY is NOT sticky here: every #prefetchUpcoming() call
+   * re-probes the cache regardless of the entry's current state
+   * (background separation completing mid-window is the whole point for a
+   * MISS, and a previously cached pair can be evicted later by
+   * pruneStemCache() — see the Codex review note at this method's
+   * cache-probe call site).
+   * Nothing here is awaited by #maybeStartCrossfade() or anything else on
+   * the realtime playback path — every call this method makes is
+   * fire-and-forget from that path's perspective (§5.4 "Playback Safety",
+   * in spirit — the dedicated pausable priority queue itself is Phase 9C's
+   * job).
+   */
+  #ensureStemPrefetch(track, priority) {
+    const videoId = track?.videoId;
+    if (!videoId) return;
+
+    const entry = this.#stemPrefetchTracker.queue(videoId, priority);
+    // Codex review (PR #44, round 3, P2): READY used to be treated as
+    // permanently sticky (an early return here, skipping the cache probe
+    // below entirely) — but stemCache.js's pruneStemCache() can evict a
+    // previously-separated pair's files later (LRU eviction once the shared
+    // 2GB cache fills, driven by unrelated guilds' separations), and nothing
+    // ever told this tracker its READY entry had gone stale. The real
+    // transition path re-`access()`s the files at take time and falls back
+    // safely when they're gone, so eviction was never a playback bug — but
+    // this prefetch status would stay stuck reporting READY forever for
+    // that pair, never re-dispatching a fresh separation. Falling through
+    // to the same getCachedStemsFn() probe every MISS entry already gets
+    // re-checks READY entries too; a HIT just re-confirms READY (no-op), a
+    // MISS now correctly falls into the same HIGH/LOW re-dispatch logic
+    // below that a fresh MISS uses.
+    this.#getCachedStemsFn(videoId).then((cached) => {
+      if (cached) {
+        this.#stemPrefetchTracker.markReady(videoId);
+        return;
+      }
+
+      if (entry.priority === StemPrefetchPriority.HIGH) {
+        const key = this.#prefetchKey(track);
+        const prefetchEntry = key ? this.#prefetchEntries.get(key) : null;
+        if (prefetchEntry?.kind === 'full' && prefetchEntry.track === track) {
+          this.#stemPrefetchTracker.markProcessing(videoId);
+          prefetchEntry.promise.then((result) => {
+            // A resolved value only means the DOWNLOAD/normalize step
+            // succeeded — separation itself runs asynchronously afterward
+            // inside #scheduleAnalysis()'s own analysisQueue job, which
+            // has no promise this method can await. The next
+            // #prefetchUpcoming() tick's getCachedStemsFn() probe (above)
+            // is what actually detects real separation completion; this
+            // only catches the one failure mode visible from here.
+            if (result?.error) this.#stemPrefetchTracker.markFailed(videoId);
+          });
+        }
+        return;
+      }
+
+      if (this.#lowPriorityStemPrefetch.has(videoId)) return;
+      this.#lowPriorityStemPrefetch.add(videoId);
+      this.#stemPrefetchTracker.markProcessing(videoId);
+      this.#runLowPriorityStemPrefetch(track)
+        .then((stems) => {
+          if (stems) this.#stemPrefetchTracker.markReady(videoId);
+          else this.#stemPrefetchTracker.markFailed(videoId);
+        })
+        .catch((err) => {
+          if (err?.code === 'ANALYSIS_KILLED') {
+            console.warn('[GuildPlayer] low-priority stem prefetch yielded to mixer:', err.message);
+          } else {
+            console.warn('[GuildPlayer] low-priority stem prefetch failed:', err.message);
+          }
+          this.#stemPrefetchTracker.markFailed(videoId);
+        })
+        .finally(() => this.#lowPriorityStemPrefetch.delete(videoId));
+    }).catch((err) => {
+      console.warn('[GuildPlayer] stem prefetch cache check failed:', err.message);
+    });
+  }
+
+  /**
+   * Phase 9B: LOW-priority stem prefetch for next+1 (C). Mirrors
+   * #scheduleAnalysis()'s own staged-copy dance (stage an independent copy
+   * before separation so unrelated cleanup elsewhere can't delete the file
+   * mid-Demucs-run, docs/mix-transition-phase8.md Step 8.5) but owns its
+   * own short-lived download via #prefetchTrackFn, since — unlike A/B —
+   * nothing else in the pipeline downloads C's audio at all outside this
+   * method.
+   *
+   * Phase 9C (docs/mix-transition-phase9.md §5): routed through the
+   * dedicated StemPreparationQueue (#stemQ()), not the realtime analysis
+   * queue — this whole job (download + stage + Demucs) exists only to
+   * prepare C's stems, same as #scheduleAnalysis()'s own separation step,
+   * so it belongs on the same lane and must not be able to sit in front of
+   * an unrelated track's BPM/phrase job. A mixer underrun still
+   * SIGSTOPs/kills it exactly like every other queued job (§5.4 "Playback
+   * Safety") — now via the stem queue's own pause/kill state, forwarded
+   * from the realtime queue's underrun event (see #initMixerPipeline()).
+   */
+  async #runLowPriorityStemPrefetch(track) {
+    return this.#stemQ().enqueue(async ({ spawnNice, signal } = {}) => {
+      throwIfAborted(signal);
+      // Codex review (PR #44, P2): recheck the stem cache now that this LOW
+      // job has actually reached the front of the (possibly minutes-long,
+      // serial) queue — #ensureStemPrefetch() only observed a miss back
+      // when this job was first enqueued. If another guild's playback or
+      // an earlier HIGH job separated this same track while this job
+      // waited, the full download/trim/loudness/staging pipeline below is
+      // pure waste; the real separateTrackStems() already rechecks the
+      // cache too, but only after all of that expensive work is done.
+      const alreadyCached = await this.#getCachedStemsFn(track.videoId).catch(() => null);
+      if (alreadyCached) return alreadyCached;
+      throwIfAborted(signal);
+      // Codex review (PR #44, P1): without spawnFn, prefetchTrackFn's
+      // default implementation (normalize.js's prefetchTrack) spawns
+      // yt-dlp/ffmpeg via the module-level `spawn`, entirely untracked by
+      // this queue's pause/kill machinery — a mixer underrun during this
+      // download would have nothing to actually SIGSTOP. Passing spawnNice
+      // routes those subprocesses through the same register()/children Set
+      // every other job in this queue already uses.
+      const downloaded = await this.#prefetchTrackFn(track, { spawnFn: spawnNice, signal });
+      try {
+        throwIfAborted(signal);
+        const stagedPath = await this.#stageTempFileCopyFn(downloaded.filePath).catch((err) => {
+          console.warn('[GuildPlayer] failed to stage file for low-priority stem prefetch:', err.message);
+          return null;
+        });
+        if (!stagedPath) return null;
+        throwIfAborted(signal);
+        try {
+          return await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal });
+        } finally {
+          cleanupTempFile(stagedPath).catch(() => {});
+        }
+      } finally {
+        await cleanupTempFile(downloaded.filePath);
+      }
+    // Codex review (PR #45, P1): explicit LOW priority so a HIGH (B) job
+    // requested afterward can still jump ahead of this one in the pending
+    // queue instead of only ever winning by coincidence of call order.
+    }, { priority: 'low' });
   }
 
   #ensureFullPrefetch(track) {
@@ -2738,6 +3354,9 @@ export class GuildPlayer {
       console.warn('[GuildPlayer] watchdog: stall detected');
       this.#hadError = true;
       this.#mixStream?.dropCurrent();
+      // Codex review (PR #45, P1): same silent underrun-state reset as the
+      // other dropCurrent() call sites.
+      this.#stemQ().noteUnderrunCleared(this);
     }, WATCHDOG_INTERVAL);
   }
 

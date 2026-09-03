@@ -16,6 +16,7 @@ import {
   createIncomingBaseSwapProcessor,
 } from './eq.js';
 import { MAX_UNDERRUN_MS } from './config.js';
+import { deriveStemEnvelopesFromEvents } from './stemTransition.js';
 
 const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
 /**
@@ -45,9 +46,24 @@ function clamp01(n) {
  * `targetBpm` (the session tempo both sides play the overlap at) give the
  * real bar length; any other mode (plain crossfade, phrase-crossfade) keeps
  * the existing instant on/off EQ, so this returns null for them.
- * @returns {number|null} ramp duration in seconds, or null for "apply fully".
+ *
+ * Phase 9J (docs/mix-transition-phase9.md §12, completion criterion §17 9J:
+ * "bass swap と instrumental blend が別々の時間軸で動作する"): the ramp used to
+ * span the ENTIRE 0->swapBar range — the same zero point instrumental's own
+ * gain fade starts from, coupling the two even though their durations
+ * already differed (swapBar is normally about half the window). Now it
+ * holds fully dry until `holdSec`, then ramps to fully wet over a short
+ * `rampSec` window ENDING at swapBar (unchanged: still "when bass is fully
+ * swapped") — matching §12.2's example, where the swap itself only spans
+ * bars 3-4 of an 8-bar window, not bars 1-4. `rampSec` is clamped to
+ * swapBar's own duration so an early swapBar (a short 4-bar window)
+ * degrades gracefully to holdSec=0 — Phase 7C's original from-t=0 ramp,
+ * reproduced exactly.
+ * @returns {{ holdSec: number, rampSec: number }|null} null for "apply fully" (non-beatmix/stem-mix, or missing bar data).
  */
-function computeEqRampSec(plan) {
+const DEFAULT_EQ_RAMP_BARS = 2;
+
+function computeEqSchedule(plan) {
   // stem-mix plans carry the same sync/eq/targetBpm fields as the beatmix
   // plan they were derived from (planStemTransition() spreads it through)
   // — the bar-timed ramp applies identically to the instrumental pair.
@@ -57,7 +73,10 @@ function computeEqRampSec(plan) {
   const swapBar = plan.eq?.swapBar;
   if (!(targetBpm > 0) || !(beatsPerBar > 0) || !(swapBar > 0)) return null;
   const barSec = (60 / targetBpm) * beatsPerBar;
-  return barSec > 0 ? barSec * swapBar : null;
+  if (!(barSec > 0)) return null;
+  const swapBarSec = barSec * swapBar;
+  const rampSec = Math.min(swapBarSec, barSec * DEFAULT_EQ_RAMP_BARS);
+  return { holdSec: swapBarSec - rampSec, rampSec };
 }
 
 export class MixStream extends Readable {
@@ -73,6 +92,7 @@ export class MixStream extends Readable {
   #fadeElapsedSec = 0;
   #outEq = null;
   #inEq = null;
+  #inGateEq = null;
   /** @type {WeakMap<object, Buffer>} partial PCM kept across underruns per source */
   #pendingExact = new WeakMap();
   /** Held partner frame when only one side of a crossfade frame is ready */
@@ -173,6 +193,7 @@ export class MixStream extends Readable {
     this.#fadeElapsedSec = 0;
     this.#outEq = null;
     this.#inEq = null;
+    this.#inGateEq = null;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;
     this.#incomingSkipSec = 0;
@@ -212,13 +233,15 @@ export class MixStream extends Readable {
     }
 
     const mode = plan.mode === 'tail-fade' ? 'tail-fade' : 'crossfade';
+    const eqSchedule = computeEqSchedule(plan);
     this.#incoming = source;
     this.#crossfade = {
       fadeSec: plan.fadeSec,
       curve: plan.curve ?? 'equal-power',
       baseSwap: plan.baseSwap === true && mode !== 'tail-fade',
       mode,
-      eqRampSec: computeEqRampSec(plan),
+      eqHoldSec: eqSchedule?.holdSec ?? null,
+      eqRampSec: eqSchedule?.rampSec ?? null,
       // plan.mode itself collapses to 'crossfade' in #crossfade.mode above
       // (MixStream doesn't otherwise distinguish beatmix from a plain
       // crossfade) — remembered separately so a later stall-cancel decision
@@ -234,6 +257,18 @@ export class MixStream extends Readable {
       : null;
     this.#inEq = this.#crossfade.baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
+      : null;
+    // Phase 9J round-2 (Codex, PR #56 P1): eqMix==0 used to select the dry
+    // incoming frame — full LOW energy, not the "B LOW 0%" §12.2 requires —
+    // so incoming's bass rose with the ordinary instrumental gain envelope
+    // throughout eqHoldSec instead of staying gated. #inGateEq is its own
+    // highpass instance (same cutoff as #outEq, independent filter state
+    // since it runs on a different signal) blended in at eqMix==0 in place
+    // of the dry incoming frame; blendFrame() at eqMix==1 still returns
+    // #inEq's wet frame untouched, so the non-scheduled (eqMix always 1)
+    // path is unaffected.
+    this.#inGateEq = this.#crossfade.baseSwap
+      ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120)
       : null;
 
     source.on('data', () => this.#wakeConsumer());
@@ -287,11 +322,33 @@ export class MixStream extends Readable {
     this.#inVocal = incoming.vocal;
     this.#inInstrumental = incoming.instrumental;
     const baseSwap = plan.baseSwap === true;
+    // Phase 9G (docs/mix-transition-phase9.md §9): TransitionPlan v3's
+    // mixZone/events, when the planner could derive a bar clock (needs
+    // sync.bars/beatsPerBar/targetBpm — see stemTransition.js's
+    // buildTransitionEvents()). null/undefined for a plan without one.
+    const events = Array.isArray(plan.events) && plan.events.length > 0 ? plan.events : null;
+    const mixZone = plan.mixZone ?? null;
+    // Codex review (PR #53, P1): the events schedule must actually DRIVE
+    // gain state, not just fire notifications alongside an unrelated
+    // computation — every tick's stem envelopes are reconstructed FROM the
+    // schedule (deriveStemEnvelopesFromEvents()) whenever one is available,
+    // rather than reading plan.stems directly. Falls back to plan.stems for
+    // a plan with no bar-clock data (legacy caller, or a hand-built test
+    // plan) so #fireDueMixZoneEvents() no-ops and this stays exactly the
+    // pre-9G behavior.
+    const stems = (events && mixZone?.bars > 0 && mixZone?.durationSec > 0)
+      ? deriveStemEnvelopesFromEvents(events, mixZone, plan.curve)
+      : plan.stems;
+    const eqSchedule = computeEqSchedule(plan);
     this.#stemCrossfade = {
       fadeSec: plan.fadeSec,
-      stems: plan.stems,
+      stems,
       baseSwap,
-      eqRampSec: computeEqRampSec(plan),
+      eqHoldSec: eqSchedule?.holdSec ?? null,
+      eqRampSec: eqSchedule?.rampSec ?? null,
+      events,
+      mixZone,
+      nextEventIndex: 0,
     };
     this.#fadeElapsedSec = 0;
     this.#incomingStemFramesRead = 0;
@@ -306,6 +363,9 @@ export class MixStream extends Readable {
     this.#inEq = baseSwap
       ? createIncomingBaseSwapProcessor(48000, plan.highpassHz ?? 120, plan.lowshelfGainDb ?? 2)
       : null;
+    // Phase 9J round-2 (Codex, PR #56 P1): see the matching #inGateEq comment
+    // in startCrossfade() — same fix, stem-mix path.
+    this.#inGateEq = baseSwap ? createOutgoingBaseSwapProcessor(48000, plan.highpassHz ?? 120) : null;
 
     for (const s of allSources) {
       s.on('data', () => this.#wakeConsumer());
@@ -435,6 +495,17 @@ export class MixStream extends Readable {
     if (!this.#pendingRead || this.#destroyed) return;
 
     const frame = this.#readFrame();
+    // Codex review (PR #53, round 2, P2): #readFrame() can run a synchronous
+    // 'mixzoneevent' listener (via #readStemCrossfadeFrame() ->
+    // #fireDueMixZoneEvents()) that itself calls endMixer() — which sets
+    // #destroyed and already calls push(null) (EOF) before this read
+    // returns. Without this check, execution unwinds back here and falls
+    // through to push(frame ?? SILENCE_FRAME) below regardless, a push
+    // after EOF that Node turns into ERR_STREAM_PUSH_AFTER_EOF and destroys
+    // the stream over — same as the P1/P2 null-deref this method's own
+    // internals already guard against, just one frame later in the call
+    // chain, where `this` is still valid so nothing throws here directly.
+    if (this.#destroyed) return;
     if (frame === null) {
       // No PCM this tick. Keep delivering 20 ms silence so a piped opus
       // encoder stays readable: @discordjs/voice AudioPlayer.checkPlayable()
@@ -679,6 +750,7 @@ export class MixStream extends Readable {
       }
       if (this.#crossfade.eqRampSec != null) {
         this.#crossfade.eqRampSec = null;
+        this.#crossfade.eqHoldSec = null;
       }
       if (outFrame) {
         this.#consumedBytes += FRAME_BYTES;
@@ -699,14 +771,22 @@ export class MixStream extends Readable {
     // mix to 1, reproducing the prior "always fully filtered" behavior
     // exactly. mixFrames() below only reads outFrame/processedOut (never
     // mutates), so skip the defensive copy when there is no filter to blend.
+    // Phase 9J (§17 9J): holds fully dry until eqHoldSec, then ramps over
+    // eqRampSec — see computeEqSchedule()'s docstring.
     const eqMix = this.#crossfade.eqRampSec != null
-      ? clamp01(this.#fadeElapsedSec / this.#crossfade.eqRampSec)
+      ? clamp01((this.#fadeElapsedSec - this.#crossfade.eqHoldSec) / this.#crossfade.eqRampSec)
       : 1;
     const processedOut = this.#outEq
       ? blendFrame(outFrame, this.#outEq(Buffer.from(outFrame)), eqMix)
       : outFrame;
+    // Phase 9J round-2 (Codex, PR #56 P1): the dry side here used to be the
+    // raw inFrame (full LOW energy) — at eqMix==0 that let incoming's bass
+    // rise on the ordinary instrumental gain envelope instead of staying at
+    // "B LOW 0%" (§12.2). #inGateEq (highpass, same as #outEq) gates it
+    // instead; blendFrame() at eqMix==1 still returns #inEq's wet frame
+    // untouched, so behavior above eqMix==0 is unchanged.
     const processedIn = this.#inEq
-      ? blendFrame(inFrame, this.#inEq(Buffer.from(inFrame)), eqMix)
+      ? blendFrame(this.#inGateEq(Buffer.from(inFrame)), this.#inEq(Buffer.from(inFrame)), eqMix)
       : inFrame;
 
     const outGain = gainForPosition({
@@ -779,8 +859,10 @@ export class MixStream extends Readable {
     const inVocal = inVocalFrame ?? SILENCE_FRAME;
     const inInst = inInstFrame ?? SILENCE_FRAME;
 
-    const { stems, fadeSec, eqRampSec } = this.#stemCrossfade;
-    const eqMix = eqRampSec != null ? clamp01(this.#fadeElapsedSec / eqRampSec) : 1;
+    const { stems, fadeSec, eqHoldSec, eqRampSec } = this.#stemCrossfade;
+    // Phase 9J (§17 9J): holds fully dry until eqHoldSec, then ramps over
+    // eqRampSec — see computeEqSchedule()'s docstring.
+    const eqMix = eqRampSec != null ? clamp01((this.#fadeElapsedSec - eqHoldSec) / eqRampSec) : 1;
     // Bass-swap EQ applies only to the instrumental pair — bass energy
     // lives there, not in the vocal stem, and post-sum filtering would
     // re-couple vocal/instrumental through a shared filter, undermining the
@@ -788,8 +870,10 @@ export class MixStream extends Readable {
     const processedOutInst = this.#outEq
       ? blendFrame(outInst, this.#outEq(Buffer.from(outInst)), eqMix)
       : outInst;
+    // Phase 9J round-2 (Codex, PR #56 P1): see the matching comment in
+    // #readCrossfadeFrame() — same #inGateEq fix, stem path.
     const processedInInst = this.#inEq
-      ? blendFrame(inInst, this.#inEq(Buffer.from(inInst)), eqMix)
+      ? blendFrame(this.#inGateEq(Buffer.from(inInst)), this.#inEq(Buffer.from(inInst)), eqMix)
       : inInst;
 
     const outVocalGain = gainForStemPosition({ positionSec: this.#fadeElapsedSec, ...stems.outVocal });
@@ -803,6 +887,7 @@ export class MixStream extends Readable {
     );
     this.#consumedBytes += FRAME_BYTES;
     this.#fadeElapsedSec += FRAME_MS / 1000;
+    this.#fireDueMixZoneEvents();
     // Counts every processed tick, including ticks held past fadeSec while
     // catching up #incoming — unlike a fadeSec-derived constant, this grows
     // by 1 on each such hold tick too, since a hold tick also advances the
@@ -901,11 +986,53 @@ export class MixStream extends Readable {
     return mixed;
   }
 
+  /**
+   * Phase 9G (docs/mix-transition-phase9.md §9.2): fires 'mixzoneevent' for
+   * every scheduled bar-event #fadeElapsedSec has now reached or passed,
+   * exactly once each and in schedule order — the concrete mechanism by
+   * which this transition "progresses through multiple bar events" instead
+   * of existing only as one continuous equal-power curve. `barSec` is
+   * derived from mixZone.durationSec/bars (the exact same relationship
+   * planBeatmixTransition() used to compute fadeSec in the first place —
+   * see beatmixTransition.js's `barSec = (60/targetBpm)*beatsPerBar`,
+   * `fadeSec = barSec*bars`) rather than recomputed from targetBpm, so this
+   * can never drift from the window the gain envelopes themselves are
+   * defined over. No-op when the current stem crossfade has no events/
+   * mixZone (the planner couldn't derive a bar clock — see
+   * buildTransitionEvents()'s own guard).
+   *
+   * Codex review (PR #53, P2): a synchronous 'mixzoneevent' listener that
+   * itself changes crossfade state (dropCurrent(), endMixer(), a future
+   * planner recovery hook) can null #stemCrossfade before this returns —
+   * writing the advanced cursor back onto `this.#stemCrossfade` after such
+   * a listener ran would then throw on `null`, killing the mixer stream
+   * over a downstream listener's own unrelated action. `crossfade` is
+   * captured once and mutated directly (never re-read from
+   * `this.#stemCrossfade`), so a listener nulling the live field can never
+   * make this throw; the loop also stops firing further (now-stale) events
+   * the moment that happens, rather than continuing to describe a
+   * crossfade that no longer exists.
+   */
+  #fireDueMixZoneEvents() {
+    const crossfade = this.#stemCrossfade;
+    const { events, mixZone } = crossfade;
+    if (!events || !(mixZone?.bars > 0) || !(mixZone?.durationSec > 0)) return;
+    const barSec = mixZone.durationSec / mixZone.bars;
+    while (crossfade.nextEventIndex < events.length
+      && this.#fadeElapsedSec >= events[crossfade.nextEventIndex].bar * barSec - 1e-6) {
+      const event = events[crossfade.nextEventIndex];
+      crossfade.nextEventIndex += 1; // advance before emit — see docstring
+      this.emit('mixzoneevent', { ...event, mixZone });
+      if (this.#stemCrossfade !== crossfade) return; // torn down by the listener
+    }
+  }
+
   #promoteStemIncoming() {
     const next = this.#incoming;
     this.#clearStemSources();
     this.#outEq = null;
     this.#inEq = null;
+    this.#inGateEq = null;
     this.#fadeElapsedSec = 0;
 
     if (this.#current) {
@@ -965,6 +1092,7 @@ export class MixStream extends Readable {
     this.#crossfade = null;
     this.#outEq = null;
     this.#inEq = null;
+    this.#inGateEq = null;
     this.#fadeElapsedSec = 0;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;
@@ -1010,6 +1138,7 @@ export class MixStream extends Readable {
     this.#crossfade = null;
     this.#outEq = null;
     this.#inEq = null;
+    this.#inGateEq = null;
     this.#fadeElapsedSec = 0;
     this.#heldOutFrame = null;
     this.#heldInFrame = null;

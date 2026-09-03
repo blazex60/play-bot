@@ -8,6 +8,7 @@ import {
 import { MixStream } from './mixStream.js';
 import { PcmSource } from './pcmSource.js';
 import { MAX_UNDERRUN_MS } from './config.js';
+import { deriveStemEnvelopesFromEvents } from './stemTransition.js';
 
 function silence(bytes) {
   return Buffer.alloc(bytes);
@@ -20,6 +21,18 @@ function collectFrames(stream, count) {
       frames.push(chunk);
       if (frames.length >= count) {
         stream.off('data', onData);
+        // Codex (PR #56 round 3, P2): removing the last 'data' listener does
+        // NOT drop a Readable back out of flowing mode — MixStream's
+        // internal push loop is otherwise entirely synchronous (no real I/O
+        // wait between ticks for these in-memory PcmSource fixtures), so
+        // without this it keeps generating frames nobody reads, in the same
+        // synchronous flow loop, all the way toward whatever fadeSec implies
+        // (an 800s fixture is 40,000 ticks) before this callback even
+        // returns. pause() flips state.flowing to false, which the flow
+        // loop's own `while (state.flowing && ...)` check (evaluated right
+        // after this handler returns) stops on — it does not interrupt an
+        // already-started #tryPushFrame() call, only the next one.
+        stream.pause();
         resolve(frames);
       }
     };
@@ -366,6 +379,115 @@ function makeStemPlan(fadeSec, overrides = {}) {
     },
   };
 }
+
+test('MixStream startStemCrossfade holds the bass-swap EQ fully dry until shortly before swapBar, same as the plain-crossfade path (Phase 9J, §17 9J)', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 900 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Isolate outInstrumental: everything else silent (0).
+    const outInstValue = 8000;
+    // 240BPM keeps barSec at 1s (vs. the doc examples' typical 120BPM) purely
+    // to shrink this fixture (Codex, PR #56 P2: the original 120BPM/700-frame
+    // version added ~23s to every server test run) — the hold/ramp formula
+    // itself is BPM-agnostic, so this exercises identical logic in less time.
+    const frames = 230; // 4.6s @20ms, well past swapBarSec below.
+    const outgoing = { vocal: stemSource(0, frames), instrumental: stemSource(outInstValue, frames) };
+    const incoming = {
+      vocal: stemSource(0, frames),
+      instrumental: stemSource(0, frames),
+      full: stemSource(0, frames),
+    };
+    const plan = {
+      ...makeStemPlan(800), // long fadeSec keeps outInstrumental's OWN gain ~flat across the sampled window
+      baseSwap: true,
+      highpassHz: 120,
+      targetBpm: 240,
+      sync: { bars: 400, beatsPerBar: 4 },
+      // barSec=1s; swapBar 4 -> swapBarSec=4s; DEFAULT_EQ_RAMP_BARS(2 bars)
+      // -> rampSec=2s, holdSec=2s (100 frames) of room to verify the hold.
+      eq: { type: 'bass-swap', swapBar: 4, highpassHz: 120 },
+    };
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const collected = await collectFrames(mix, 220);
+    const abs = (frame) => Math.max(...Array.from(pcmView(frame), Math.abs));
+
+    // First frame and a frame still inside the 2s hold (50 frames = 1s in)
+    // must be byte-identical — mixNFrames() applies its own OVERLAP_GAIN/
+    // soft-clip headroom regardless of the EQ blend, so this compares two
+    // dry (eqMix=0) frames against each other rather than against the raw
+    // input value, isolating just the "does the hold actually hold" claim.
+    assert.deepEqual(collected[50], collected[0],
+      'expected a frame still inside the 2s hold to be identical to the first (both fully dry)');
+    // Well past swapBarSec (4s = 200 frames): fully wet — a highpass driving
+    // a constant (DC) signal toward ~0 once its IIR history has settled.
+    assert.ok(abs(collected[210]) < abs(collected[0]) / 3,
+      `expected the swap to have completed well past swapBar (dry=${abs(collected[0])}, later=${abs(collected[210])})`);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade gates incoming LOW during the EQ hold instead of letting it ride the instrumental gain envelope (Codex, PR #56 P1)', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 900 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Isolate inInstrumental: everything else silent (0), including the
+    // outgoing side — this test is only about whether INCOMING's own LOW
+    // content is suppressed while eqMix==0, not about the outgoing highpass
+    // (already covered by the test above).
+    const inInstValue = 8000;
+    const frames = 230;
+    const outgoing = { vocal: stemSource(0, frames), instrumental: stemSource(0, frames) };
+    const incoming = {
+      vocal: stemSource(0, frames),
+      instrumental: stemSource(inInstValue, frames),
+      full: stemSource(0, frames),
+    };
+    const plan = {
+      // inInstrumental's OWN gain envelope saturates to full within 0.2s —
+      // far ahead of the 2s EQ hold below — so that by the 1s "still in
+      // hold" checkpoint, a full-amplitude incoming signal is actually
+      // available to be gated (or not). This is the crux of the P1 finding:
+      // bass swap and instrumental blend must run on separate timelines
+      // (§17 9J), so instrumental gain reaching full quickly must NOT also
+      // mean incoming's LOW is already audible.
+      ...makeStemPlan(800, {
+        inInstrumental: { role: 'in', fadeSec: 0.2, curve: 'equal-power', startOffsetSec: 0 },
+      }),
+      baseSwap: true,
+      highpassHz: 120,
+      targetBpm: 240,
+      sync: { bars: 400, beatsPerBar: 4 },
+      // barSec=1s; swapBar 4 -> swapBarSec=4s; rampSec=2s, holdSec=2s.
+      eq: { type: 'bass-swap', swapBar: 4, highpassHz: 120 },
+    };
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const collected = await collectFrames(mix, 220);
+    const abs = (frame) => Math.max(...Array.from(pcmView(frame), Math.abs));
+
+    // 1s in: still well inside the 2s hold, but inInstrumental's own gain
+    // has long since reached full — before the fix, this frame was the raw
+    // dry incoming frame (full LOW energy); now it must be highpass-gated
+    // (near silent), not merely attenuated by the (already-saturated) gain.
+    const midHold = abs(collected[50]);
+    // Well past swapBarSec (4s = 200 frames): fully wet — LOW handed over.
+    const afterSwap = abs(collected[210]);
+    assert.ok(midHold < afterSwap / 3,
+      `expected incoming LOW to still be gated 1s into the hold, well below its post-swap level (midHold=${midHold}, afterSwap=${afterSwap})`);
+  } finally {
+    mix.endMixer();
+  }
+});
 
 test('MixStream startStemCrossfade mixes 4 stems then promotes to the incoming full-mix source', async () => {
   const mix = new MixStream();
@@ -970,6 +1092,278 @@ test('MixStream startStemCrossfade: inVocal contributes nothing before its own s
     'expected a real mixed frame, not underrun silence');
   assert.deepEqual(withLowInVocal, withHighInVocal,
     'expected wildly different inVocal content to produce an IDENTICAL first frame, since inVocal gain is still 0 there');
+});
+
+test('MixStream startStemCrossfade fires mixzoneevent for each scheduled bar-event, once each, in schedule order (Phase 9G)', async () => {
+  // docs/mix-transition-phase9.md §9's completion criterion: not a single
+  // equal-power crossfade, but a transition that progresses through
+  // multiple bar events. This asserts the concrete mechanism: MixStream
+  // fires 'mixzoneevent' as #fadeElapsedSec crosses each of plan.events'
+  // scheduled bar positions (converted via mixZone.durationSec/bars),
+  // each exactly once, in ascending order.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 12; // fadeSec=0.2s -> 10 frames @20ms; a few spares past that.
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames + 20),
+    };
+    const plan = {
+      ...makeStemPlan(0.2),
+      // 2 bars over the 0.2s window -> barSec = 0.1s/bar (5 frames/bar).
+      mixZone: {
+        startSec: 0, durationSec: 0.2, bars: 2, beatsPerBar: 4, targetBpm: 120,
+      },
+      events: [
+        { bar: 0, action: 'incoming-instrumental-start' },
+        { bar: 1, action: 'bass-swap' },
+        { bar: 2, action: 'incoming-vocal-handoff' },
+      ],
+    };
+
+    const fired = [];
+    mix.on('mixzoneevent', (e) => fired.push(e.action));
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const promotedPromise = new Promise((resolve) => {
+      mix.on('trackend', (info) => { if (info?.promoted) resolve(); });
+    });
+    mix.on('data', () => {}); // keep the stream flowing so ticks actually happen
+    await promotedPromise;
+
+    assert.deepEqual(fired, ['incoming-instrumental-start', 'bass-swap', 'incoming-vocal-handoff']);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade fires no mixzoneevent when the plan carries no events/mixZone (legacy/non-beatmix plan)', async () => {
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 12;
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames + 20),
+    };
+    const plan = makeStemPlan(0.2); // no mixZone/events, same as every other pre-9G test in this file.
+
+    const fired = [];
+    mix.on('mixzoneevent', (e) => fired.push(e));
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const promotedPromise = new Promise((resolve) => {
+      mix.on('trackend', (info) => { if (info?.promoted) resolve(); });
+    });
+    mix.on('data', () => {});
+    await promotedPromise;
+
+    assert.deepEqual(fired, []);
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade survives a mixzoneevent listener that tears down the crossfade synchronously (Codex review, PR #53, P2)', async () => {
+  // A synchronous 'mixzoneevent' listener that itself changes crossfade
+  // state (dropCurrent(), endMixer(), a future planner recovery hook) can
+  // null #stemCrossfade before #fireDueMixZoneEvents() returns. The
+  // original implementation destructured nextEventIndex out at the start,
+  // looped with a local variable, then wrote the advanced cursor back onto
+  // `this.#stemCrossfade.nextEventIndex` at the end — a write onto `null`
+  // that throws and kills the mixer stream, over a downstream listener's
+  // own unrelated action. This proves the fix: no throw, and no further
+  // (now-stale) events fire once the listener has torn the crossfade down.
+  const mix = new MixStream();
+  let caught = null;
+  mix.on('error', (err) => { caught = err; });
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 12;
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames + 20),
+    };
+    const plan = {
+      ...makeStemPlan(0.2),
+      // 2 bars over the 0.2s window -> barSec = 0.1s/bar (5 frames/bar),
+      // same schedule as the ordering test above.
+      mixZone: { startSec: 0, durationSec: 0.2, bars: 2, beatsPerBar: 4, targetBpm: 120 },
+      events: [
+        { bar: 0, action: 'incoming-instrumental-start' },
+        { bar: 1, action: 'bass-swap' },
+        { bar: 2, action: 'incoming-vocal-handoff' },
+      ],
+    };
+
+    const fired = [];
+    mix.on('mixzoneevent', (e) => {
+      fired.push(e.action);
+      mix.dropCurrent(); // synchronously tears down #stemCrossfade mid-schedule
+    });
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+    mix.on('data', () => {}); // keep the stream flowing so ticks actually happen
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(caught, null, 'must not have thrown/emitted error from the torn-down write-back');
+    assert.deepEqual(fired, ['incoming-instrumental-start'],
+      'must fire exactly the one event live at teardown, never a stale one after');
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade does not push after EOF when a mixzoneevent listener calls endMixer() synchronously (Codex review, PR #53, round 2, P2)', async () => {
+  // endMixer() (unlike dropCurrent()) sets #destroyed and calls push(null)
+  // (EOF) itself. The previous fix stopped #fireDueMixZoneEvents() from
+  // throwing on a torn-down #stemCrossfade, but #readStemCrossfadeFrame()
+  // still runs to completion and returns a frame, which #tryPushFrame()
+  // then pushed unconditionally — a push AFTER the EOF endMixer() already
+  // sent, which Node turns into ERR_STREAM_PUSH_AFTER_EOF and destroys the
+  // stream over a downstream listener's own legitimate teardown.
+  const mix = new MixStream();
+  let caught = null;
+  mix.on('error', (err) => { caught = err; });
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 12;
+    const outgoing = { vocal: stemSource(2000, fadeFrames), instrumental: stemSource(3000, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(4000, fadeFrames),
+      instrumental: stemSource(5000, fadeFrames),
+      full: stemSource(6000, fadeFrames + 20),
+    };
+    const plan = {
+      ...makeStemPlan(0.2),
+      mixZone: { startSec: 0, durationSec: 0.2, bars: 2, beatsPerBar: 4, targetBpm: 120 },
+      events: [
+        { bar: 0, action: 'incoming-instrumental-start' },
+        { bar: 1, action: 'bass-swap' },
+        { bar: 2, action: 'incoming-vocal-handoff' },
+      ],
+    };
+
+    mix.on('mixzoneevent', () => { mix.endMixer(); }); // synchronous teardown, first event, bar 0
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+    mix.on('data', () => {}); // keep the stream flowing so ticks actually happen
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(caught, null, 'must not have pushed after EOF (ERR_STREAM_PUSH_AFTER_EOF)');
+  } finally {
+    mix.endMixer();
+  }
+});
+
+test('MixStream startStemCrossfade drives its stem gains from events/mixZone, not plan.stems, when both are present (Codex review, PR #53, P1)', async () => {
+  // If MixStream silently ignored events/mixZone and read plan.stems
+  // instead (the exact bug Codex flagged), the schedule would only ever
+  // produce 'mixzoneevent' notifications alongside a normal equal-power
+  // curve — never actually changing what gets mixed. This proves the
+  // opposite: the actual mixed PCM follows the events-derived envelope,
+  // while a plan.stems fixture engineered to disagree is never consulted.
+  const mix = new MixStream();
+  try {
+    mix.setCurrent(stemSource(1000, 50), { durationSec: 60 });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const fadeFrames = 12;
+    const outVocalValue = 1000;
+    const outInstValue = 3000;
+    const inInstValue = 5000;
+    const inVocalValue = 4000;
+    const outgoing = { vocal: stemSource(outVocalValue, fadeFrames), instrumental: stemSource(outInstValue, fadeFrames) };
+    const incoming = {
+      vocal: stemSource(inVocalValue, fadeFrames),
+      instrumental: stemSource(inInstValue, fadeFrames),
+      full: stemSource(6000, fadeFrames + 20),
+    };
+
+    // 2 bars over the 0.2s window -> barSec = 0.1s/bar, same as the
+    // mixzoneevent schedule test above.
+    const mixZone = { startSec: 0, durationSec: 0.2, bars: 2, beatsPerBar: 4, targetBpm: 120 };
+    const events = [
+      { bar: 0, action: 'incoming-instrumental-start' },
+      { bar: 1, action: 'outgoing-vocal-release' },
+      { bar: 2, action: 'outgoing-vocal-silent' },
+      { bar: 2, action: 'incoming-vocal-handoff' },
+    ];
+    const plan = {
+      ...makeStemPlan(0.2, {
+        // Deliberately disagrees with the events schedule above: if this
+        // fallback were what actually drove the mix, outVocal would already
+        // be ramping down and inVocal already ramping up by positionSec
+        // =0.04s (frame index 2) — the events schedule instead holds
+        // outVocal at full volume and inVocal fully silent until then.
+        outVocal: { role: 'out', fadeSec: 0.2, curve: 'equal-power', startOffsetSec: 0 },
+        inVocal: { role: 'in', fadeSec: 0.2, curve: 'equal-power', startOffsetSec: 0 },
+      }),
+      mixZone,
+      events,
+    };
+
+    const ok = mix.startStemCrossfade({ outgoing, incoming }, plan);
+    assert.equal(ok, true);
+
+    const frames = await collectFrames(mix, 3);
+    const gotFrame = frames[2]; // positionSec = 2 * 0.02s = 0.04s
+
+    const SILENCE_FRAME = Buffer.alloc(FRAME_BYTES);
+    const derivedStems = deriveStemEnvelopesFromEvents(events, mixZone);
+    const positionSec = 2 * (FRAME_MS / 1000);
+    const expectedFromEvents = mixNFrames(
+      [fillFrame(outVocalValue), fillFrame(outInstValue), fillFrame(inInstValue), fillFrame(inVocalValue)],
+      [
+        gainForStemPosition({ positionSec, ...derivedStems.outVocal }),
+        gainForStemPosition({ positionSec, ...derivedStems.outInstrumental }),
+        gainForStemPosition({ positionSec, ...derivedStems.inInstrumental }),
+        gainForStemPosition({ positionSec, ...derivedStems.inVocal }),
+      ],
+    );
+    const expectedFromPlanStemsOnly = mixNFrames(
+      [fillFrame(outVocalValue), fillFrame(outInstValue), fillFrame(inInstValue), fillFrame(inVocalValue)],
+      [
+        gainForStemPosition({ positionSec, ...plan.stems.outVocal }),
+        gainForStemPosition({ positionSec, ...plan.stems.outInstrumental }),
+        gainForStemPosition({ positionSec, ...plan.stems.inInstrumental }),
+        gainForStemPosition({ positionSec, ...plan.stems.inVocal }),
+      ],
+    );
+
+    assert.notDeepEqual(gotFrame, SILENCE_FRAME, 'sanity: the mix must not be silent at this tick');
+    assert.notDeepEqual(expectedFromEvents, expectedFromPlanStemsOnly,
+      'sanity: the fixture must actually make the two sources disagree');
+    assert.deepEqual(gotFrame, expectedFromEvents,
+      'expected the mixed frame to follow the events/mixZone-derived envelope');
+    assert.notDeepEqual(gotFrame, expectedFromPlanStemsOnly,
+      'must not have fallen back to plan.stems while events/mixZone were present');
+  } finally {
+    mix.endMixer();
+  }
 });
 
 test('MixStream startStemCrossfade substitutes silence for a stem that ends early instead of aborting the transition', async () => {

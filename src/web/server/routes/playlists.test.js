@@ -271,6 +271,47 @@ test('POST /api/playlists/mine/generate saves a playlist from Gemini suggestions
   assert.equal(response.json().playlist.tracks[0].videoId, 'vid-gen')
 })
 
+test('POST /api/playlists/mine/generate ignores a stale-versioned cached analysis row', async (t) => {
+  // Phase 9F Codex review (PR #52, P2): loadAnalysis() here must reject a
+  // track_analysis row below ANALYSIS_VERSION the same way internal.js's own
+  // loadAnalysis() does (see internal.test.js's "probes the tempo backend
+  // once..." test for that predicate's original, order-flip-based proof) —
+  // otherwise a pre-upgrade payload_json (e.g. built under the old 45s tail
+  // window) keeps silently influencing optimizeTrackOrder() through this
+  // route indefinitely. This test only proves the stale row doesn't crash
+  // generation or otherwise surface (the response is a normal, successful
+  // playlist save) — an ordering-level flip proof would need a full
+  // tempo-backend-controllable fixture this route doesn't expose a DI hook
+  // for (unlike /internal/optimize-order), so it isn't attempted here.
+  const { ANALYSIS_VERSION } = await import('../../../audio/trackAnalysis.js')
+  const { createGenerateRateLimiter } = await import('../services/gemini.js')
+  const gemini = {
+    available: true,
+    async generateTrackList() {
+      return { playlistName: 'Summer', tracks: [{ title: '夜に駆ける' }] }
+    },
+  }
+  const searchYoutube = async () => [{ id: 'vid-stale', title: '夜に駆ける' }]
+  const { db, app } = await setup(t, {
+    gemini,
+    searchYoutube,
+    generateLimiter: createGenerateRateLimiter({ cooldownMs: 0, maxConcurrent: 4 }),
+  })
+  db.prepare(`
+    INSERT INTO track_analysis (video_id, version, payload_json, analyzed_at)
+    VALUES (?, ?, ?, ?)
+  `).run('vid-stale', ANALYSIS_VERSION - 1, JSON.stringify({ version: ANALYSIS_VERSION - 1, bpm: 120 }), Math.floor(Date.now() / 1000))
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/playlists/mine/generate',
+    payload: { prompt: 'YOASOBI 夏', count: 3 },
+  })
+  assert.equal(response.statusCode, 200)
+  assert.equal(response.json().playlist.name, 'Summer')
+  assert.equal(response.json().playlist.tracks[0].videoId, 'vid-stale')
+})
+
 test('POST /api/playlists/mine/generate returns 429 when rate-limited', async (t) => {
   const { createGenerateRateLimiter } = await import('../services/gemini.js')
   const generateLimiter = createGenerateRateLimiter({ cooldownMs: 60_000, maxConcurrent: 1 })

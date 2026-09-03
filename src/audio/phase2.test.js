@@ -532,6 +532,139 @@ test('MixStream beatmix mode ramps the bass-swap EQ in over swapBar instead of a
   mix.endMixer();
 });
 
+test('MixStream beatmix mode holds the bass-swap EQ fully dry until shortly before swapBar, instead of ramping from t=0 (Phase 9J, §17 9J: "bass swap と instrumental blend が別々の時間軸で動作する")', async () => {
+  // Codex/docs §12.2's example: the swap itself only spans a couple of bars
+  // ENDING at swapBar (here: bars 7-8 of a much longer window), not the
+  // entire 0->swapBar range the old computeEqRampSec() used — instrumental's
+  // OWN gain envelope (unaffected here: fadeSec=800 keeps it ~flat across
+  // the sampled frames) keeps running on its own, separate timeline.
+  const mix = new MixStream();
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const silent = Buffer.alloc(FRAME_BYTES);
+  // 240BPM keeps barSec at 1s (vs. the doc examples' typical 120BPM) purely
+  // to shrink this fixture (Codex, PR #56 P2: the original 120BPM/900-frame
+  // version added ~4s to every server test run on top of the companion
+  // mixStream.test.js fixture) — the hold/ramp formula itself is
+  // BPM-agnostic, so this exercises identical logic in less time.
+  const frames = 230;
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: frames }, () => Buffer.from(loud)));
+  const incoming = PcmSource.fromBuffers(Array.from({ length: frames }, () => Buffer.from(silent)));
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: frames }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    mode: 'beatmix',
+    fadeSec: 800,
+    curve: 'equal-power',
+    baseSwap: true,
+    highpassHz: 120,
+    targetBpm: 240,
+    sync: { bars: 400, beatsPerBar: 4 },
+    // barSec=1s; swapBar 4 -> swapBarSec=4s; DEFAULT_EQ_RAMP_BARS(2 bars)
+    // -> rampSec=2s, holdSec=2s (100 frames @20ms) of room to verify hold.
+    eq: { type: 'bass-swap', swapBar: 4, highpassHz: 120 },
+  }), true);
+
+  const first = await readFramePaused(mix);
+  const expectedDry = mixFrames(
+    loud, silent,
+    gainForPosition({ positionSec: 0, fadeSec: 800, curve: 'equal-power', role: 'out' }),
+    gainForPosition({ positionSec: 0, fadeSec: 800, curve: 'equal-power', role: 'in' }),
+  );
+  assert.deepEqual(first, expectedDry,
+    'expected the very first frame to be fully dry (unfiltered) — no ramp-in from t=0');
+
+  // Still within the 2s hold (50 frames = 1s in) — still fully dry.
+  let midHoldFrame;
+  for (let i = 0; i < 50; i++) midHoldFrame = await readFramePaused(mix);
+  const expectedMidHold = mixFrames(
+    loud, silent,
+    gainForPosition({ positionSec: 1, fadeSec: 800, curve: 'equal-power', role: 'out' }),
+    gainForPosition({ positionSec: 1, fadeSec: 800, curve: 'equal-power', role: 'in' }),
+  );
+  assert.deepEqual(midHoldFrame, expectedMidHold,
+    'expected a frame still inside the 2s hold to remain fully dry');
+
+  // Well past swapBarSec (4s = 200 frames from start) — fully wet.
+  let later;
+  for (let i = 0; i < 160; i++) later = await readFramePaused(mix);
+  const laterView = new Int16Array(later.buffer, later.byteOffset, later.byteLength / 2);
+  const laterAbs = Math.max(...Array.from(laterView, Math.abs));
+  const firstView = new Int16Array(first.buffer, first.byteOffset, first.byteLength / 2);
+  const firstAbs = Math.max(...Array.from(firstView, Math.abs));
+  assert.ok(
+    firstAbs > laterAbs * 3,
+    `expected the swap to have completed well past swapBar (first=${firstAbs}, later=${laterAbs})`,
+  );
+  mix.endMixer();
+});
+
+test('MixStream beatmix mode gates incoming LOW during the EQ hold instead of letting it ride the crossfade gain envelope (Codex, PR #56 P1)', async () => {
+  // Every existing bass-swap EQ test (above, and the stem-mix equivalent in
+  // mixStream.test.js) used a SILENT incoming source — they only ever
+  // exercised the outgoing highpass. Codex (PR #56 P1) found that with real
+  // LOW content on the incoming side, eqMix==0 selected the raw dry incoming
+  // frame — full LOW energy, not the "B LOW 0%" §12.2 requires — so
+  // incoming's bass rode the ordinary crossfade gain envelope instead of
+  // staying gated through eqHoldSec. This swaps which side is loud (incoming,
+  // not outgoing) but otherwise reuses the test above's long-fadeSec setup —
+  // the crossfade gain stays ~flat across the sampled window either way, so
+  // any amplitude swing between the two checkpoints below can only come from
+  // the EQ gate, not the (separately unchanged, ~flat) gain envelope.
+  const mix = new MixStream();
+  const silent = Buffer.alloc(FRAME_BYTES);
+  const loud = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(loud.buffer).fill(8000);
+  const frames = 230;
+  const outgoing = PcmSource.fromBuffers(Array.from({ length: frames }, () => Buffer.from(silent)));
+  const incoming = PcmSource.fromBuffers(Array.from({ length: frames }, () => Buffer.from(loud)));
+
+  assert.equal(mix.setCurrent(outgoing, { durationSec: frames }), true);
+  assert.ok(await readFramePaused(mix));
+  assert.equal(mix.startCrossfade(incoming, {
+    mode: 'beatmix',
+    fadeSec: 800, // long fadeSec keeps the crossfade gain ~flat across the sampled window (same as the test above)
+    curve: 'equal-power',
+    baseSwap: true,
+    highpassHz: 120,
+    targetBpm: 240,
+    sync: { bars: 400, beatsPerBar: 4 },
+    // barSec=1s; swapBar 4 -> swapBarSec=4s; rampSec=2s, holdSec=2s.
+    eq: { type: 'bass-swap', swapBar: 4, highpassHz: 120 },
+  }), true);
+
+  // 1.98s in: right at the end of the 2s hold, so the crossfade gain (which
+  // is NOT flat near t=0 on the incoming/'in' side — sin(t) grows roughly
+  // linearly with t there, unlike the ~flat cos(t) the outgoing/'out' side
+  // gets near t=0) has already grown as much as it ever will before the EQ
+  // ramp starts, maximizing how much of it this checkpoint captures. Before
+  // the fix, this frame carried the raw dry incoming signal (full LOW,
+  // scaled by that grown gain); now it must be highpass-gated (silent, gain
+  // notwithstanding — a highpass driving a DC signal settles to exactly 0).
+  let midHold;
+  for (let i = 0; i < 99; i++) midHold = await readFramePaused(mix);
+  const midHoldAbs = Math.max(...Array.from(new Int16Array(midHold.buffer, midHold.byteOffset, midHold.byteLength / 2), Math.abs));
+
+  // Well past swapBarSec (4s = 200 frames from start) — LOW handed over.
+  // eqMix==1 here regardless of the fix (both blendFrame branches resolve to
+  // the same wet frame at mix>=1), so this checkpoint's value is unaffected
+  // by the fix — it only serves as the "LOW is clearly audible" reference.
+  let afterSwap;
+  for (let i = 0; i < 111; i++) afterSwap = await readFramePaused(mix);
+  const afterSwapAbs = Math.max(...Array.from(new Int16Array(afterSwap.buffer, afterSwap.byteOffset, afterSwap.byteLength / 2), Math.abs));
+
+  // /10 (not /3): the crossfade gain alone already grows ~4x between these
+  // two checkpoints (t=1.98s -> t=4.2s, fadeSec=800), which on its own very
+  // nearly clears a /3 threshold even with NO EQ gating at all — this was
+  // caught by revert-test-restore (a /3 threshold passed even with the
+  // #inGateEq fix reverted). /10 needs the EQ gate itself to account for
+  // most of the gap, not just the gain envelope's own growth.
+  assert.ok(midHoldAbs < afterSwapAbs / 10,
+    `expected incoming LOW to still be gated near the end of the hold, well below its post-swap level (midHold=${midHoldAbs}, afterSwap=${afterSwapAbs})`);
+  mix.endMixer();
+});
+
 test('MixStream cancels a beatmix outright if incoming PCM never buffers before the overlap starts', async () => {
   // Codex round-6 (follow-up on round-5): a beatmix's whole premise is that
   // outgoing's downbeat and incoming's (seeked) downbeat land together once

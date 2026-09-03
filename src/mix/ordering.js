@@ -10,6 +10,7 @@ import {
   DOWNBEAT_CONFIDENCE_MIN,
   MARGINAL_TEMPO_MIN_SCORE,
   MIN_OVERLAP_BARS,
+  MIX_BARS,
 } from '../audio/beatmixTransition.js';
 import { canTempoMatch, buildTempoFilter } from '../audio/tempo.js';
 import { isHalfDouble } from '../audio/trackAnalysis.js';
@@ -81,12 +82,12 @@ export function bpmDelta(a, b) {
  * @param {object | null | undefined} toAnalysis
  * @returns {number}
  */
-function minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis) {
+function minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis, bars = MIN_OVERLAP_BARS) {
   if (!(targetBpm > 0)) return MIN_OVERLAP_SEC_FOR_ORDERING;
   const beatsPerBar = fromAnalysis?.downbeatGrid?.meter ?? toAnalysis?.downbeatGrid?.meter ?? 4;
   const barSec = (60 / targetBpm) * beatsPerBar;
   if (!(barSec > 0)) return MIN_OVERLAP_SEC_FOR_ORDERING;
-  return Math.max(MIN_OVERLAP_SEC_FOR_ORDERING, barSec * MIN_OVERLAP_BARS);
+  return Math.max(MIN_OVERLAP_SEC_FOR_ORDERING, barSec * bars);
 }
 
 /** Full penalty for a positively-identified beatmix infeasibility (see below). */
@@ -282,40 +283,65 @@ function beatmixCompatibilityCost(fromAnalysis, toAnalysis, tempoBackend) {
   // that fails either filter on every exit partner naturally leaves
   // bestScore at 0, i.e. the same BEATMIX_INFEASIBLE_COST as any other
   // confirmed no-fit case.
+  //
+  // Codex review (PR #48, round 6): planBeatmixTransition()'s own search is
+  // tiers-outer/pairs-inner (9E round 2) — the WIDEST bar tier with ANY
+  // fitting pair wins outright, even over a narrower tier's higher-scoring
+  // pair. Scoring the single best pair across every tier combined (as this
+  // loop used to) could report a much better score than live playback will
+  // ever actually select for this edge — e.g. a merely-adequate pair that
+  // only fits the 8-bar (preferred) tier is what live planning picks, but
+  // this used to score the edge on an excellent pair that only fits 4 bars,
+  // distorting optimizeTrackOrder()'s choices around a quality the track
+  // will never actually get. Mirrors the live planner: try MIX_BARS
+  // .preferred first, only falling to .minimum when no pair reaches the
+  // wider tier at all. `exitCandidates` must be recomputed per tier (not
+  // reused from the narrowest-floor value above) since findExitCandidates()
+  // itself is what enforces the exit side's own room requirement — the
+  // per-pair checks below only cover the entry side.
   const incomingDurationSec = Number.isFinite(toAnalysis.durationSec) ? toAnalysis.durationSec : Infinity;
   let bestScore = 0;
-  for (const exit of exitCandidates) {
-    for (const entry of entryCandidates) {
-      const forwardSafePlayback = match.ratio != null
-        ? entryForwardSafeSec(toAnalysis, entry.sec) / match.ratio
-        : entryForwardSafeSec(toAnalysis, entry.sec);
-      if (forwardSafePlayback + 1e-6 < minOverlapSec) continue;
-      const roomInIncomingPlayback = match.ratio != null
-        ? (incomingDurationSec - entry.sec) / match.ratio
-        : (incomingDurationSec - entry.sec);
-      if (roomInIncomingPlayback + 1e-6 < minOverlapSec) continue;
-      const score = scoreTransitionPair({
-        outgoing: fromAnalysis,
-        incoming: toAnalysis,
-        exit,
-        entry,
-        targetBpm,
-        match,
-      });
-      if (score > bestScore) bestScore = score;
+  for (const tierBars of [MIX_BARS.preferred, MIX_BARS.minimum]) {
+    const tierMinOverlapSec = minOverlapSecFor(targetBpm, fromAnalysis, toAnalysis, tierBars);
+    const tierExitCandidates = findExitCandidates(fromAnalysis, { minOverlapSec: tierMinOverlapSec });
+    let bestAtTier = 0;
+    for (const exit of tierExitCandidates) {
+      for (const entry of entryCandidates) {
+        const forwardSafePlayback = match.ratio != null
+          ? entryForwardSafeSec(toAnalysis, entry.sec) / match.ratio
+          : entryForwardSafeSec(toAnalysis, entry.sec);
+        if (forwardSafePlayback + 1e-6 < tierMinOverlapSec) continue;
+        const roomInIncomingPlayback = match.ratio != null
+          ? (incomingDurationSec - entry.sec) / match.ratio
+          : (incomingDurationSec - entry.sec);
+        if (roomInIncomingPlayback + 1e-6 < tierMinOverlapSec) continue;
+        const score = scoreTransitionPair({
+          outgoing: fromAnalysis,
+          incoming: toAnalysis,
+          exit,
+          entry,
+          targetBpm,
+          match,
+        });
+        // §8.3 / Codex review (PR #48, round 7): planBeatmixTransition()
+        // only takes the 4-6% "marginal" tempo tier "when confidence/
+        // transition conditions are high" — it applies this per-pair,
+        // DURING the tier search itself (beatmixTransition.js's own
+        // `anyMarginalRejected`), so a sub-threshold pair at a wider tier
+        // doesn't block the search from reaching a qualifying pair at a
+        // narrower one. Checking it only ONCE after this loop (round 6's
+        // shape, and the original pre-9E round-4-on-#35 shape before that)
+        // let a sub-threshold pair win the wide tier's `bestAtTier`/`break`
+        // outright, reporting full infeasibility even when live planning
+        // would have found a real, qualifying pair one tier down. Filtering
+        // here instead mirrors the live planner exactly: a pair below
+        // MARGINAL_TEMPO_MIN_SCORE is skipped, letting the search continue
+        // to other pairs at this tier, then to narrower tiers.
+        if (match.tier === 'marginal' && score < MARGINAL_TEMPO_MIN_SCORE) continue;
+        if (score > bestAtTier) bestAtTier = score;
+      }
     }
-  }
-
-  // §8.3: planBeatmixTransition() only takes the 4-6% "marginal" tempo tier
-  // "when confidence/transition conditions are high" — it rejects the best
-  // pair outright (marginal-tempo-low-confidence) if its score falls below
-  // MARGINAL_TEMPO_MIN_SCORE, regardless of how good the other sub-signals
-  // are. Without this gate a marginal-tempo pair with a mediocre overall
-  // score would still get partial credit here instead of the full
-  // infeasibility penalty the live planner would apply (Codex round-4 on
-  // PR #35).
-  if (match.tier === 'marginal' && bestScore < MARGINAL_TEMPO_MIN_SCORE) {
-    return BEATMIX_INFEASIBLE_COST;
+    if (bestAtTier > 0) { bestScore = bestAtTier; break; }
   }
 
   return 1 - bestScore;
