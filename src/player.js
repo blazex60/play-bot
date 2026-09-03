@@ -914,6 +914,34 @@ export class GuildPlayer {
       this.#analysisQ().noteUnderrunCleared(this);
       this.#stemQ().noteUnderrunCleared(this);
     });
+    // MixStream extends Node's Readable. @discordjs/voice's
+    // createAudioResource() pipes it into an Opus encoder internally via
+    // stream.pipeline(); if that pipeline ever tears down abnormally (e.g.
+    // ERR_STREAM_PREMATURE_CLOSE when the encoder side closes early), Node
+    // calls destroy(err) on mixStream too, which emits the standard 'error'
+    // event. An EventEmitter emitting 'error' with no listener throws
+    // synchronously — crashing the whole bot process, not just this guild's
+    // playback (unlike sourceerror/incomingerror, which are this module's
+    // own recoverable signals). Same recovery shape as the Idle handler
+    // above: rebuild the mixer pipeline and restart the current track.
+    this.#mixStream.on('error', (err) => {
+      console.error('[GuildPlayer] mixStream error:', err);
+      if (this.#idleRecovering) return;
+      this.#idleRecovering = true;
+      this.#hadError = true;
+      this.#abortSourceAudioWait();
+      this.#stemQ().noteUnderrunCleared(this);
+      this.#recoverMixerPlayback({ play: false });
+      const restartCurrent = this.#queue.current && !this.#handlingAfter && !this.#forceSkip;
+      const done = () => { this.#idleRecovering = false; };
+      if (restartCurrent) {
+        this.playNext().catch((restartErr) => {
+          console.error('[GuildPlayer] mixStream error recovery restart failed:', restartErr.message);
+        }).finally(done);
+      } else {
+        done();
+      }
+    });
   }
 
   #analysisQ() {
