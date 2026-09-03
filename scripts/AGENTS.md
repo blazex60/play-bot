@@ -15,6 +15,11 @@
 | `build-web.mjs` | `web/vite.config.js` で Vite ビルドを `bun --bun` 経由で実行し、一時ディレクトリ経由で成果物を配置する（`bun run build:web`） |
 | `run-node-tests.mjs` | `src/`, `scripts/` 配下の `*.test.js` を再帰的に検出して `node --test` で実行する（Fastify inject が bun の HTTP と合わないためサーバスイートは Node）。`web/` ディレクトリは除外するが `src/web/` は除外**しない**よう明示的にコメントで注意書きされている（basename 一致で誤除外した過去のバグの再発防止） |
 | `run-browser-tests.mjs` | Playwright を `test/browser/playwright.config.mjs` で実行する（`bun run test:e2e`） |
+| `codex-cloud-setup.sh` | Codex Cloud 用セットアップ。共通スクリプトを Codex モードで起動する |
+| `codex-cloud-maintenance.sh` | Codex Cloud のキャッシュ再利用時に `bun.lock` と依存関係を同期する |
+| `claude-code-cloud-setup.sh` | Claude Code Cloud のキャッシュ対象VMにOSツールを導入する、環境設定欄への貼り付け用スクリプト |
+| `claude-code-session-start.sh` | Claude Code Cloud の各セッションでNode依存とPlaywright Chromiumを同期する |
+| `cloud-setup-common.sh` | 両クラウド環境の Ubuntu パッケージ、Bun、Node依存、yt-dlp、Playwrightを準備する共通処理 |
 | `qa-manifest.mjs` | QA manifest（`test/qa/manifests/*.json`）を zod スキーマで検証・パースする。`assertionSchema`（`outputIncludes`/`pathExists`）や `resourceSchema`（port/database/browserProfile/composeProject の割り当て）を定義 |
 | `qa-safety.mjs` | QA タスク実行時のサンドボックス化ヘルパー: 環境変数のホワイトリスト化（`createChildEnvironment`）、シンボリックリンク拒否、出力の秘匿情報redaction、排他的ファイル書き込み |
 | `qa-task.mjs` | manifest 駆動で QA ケース（一連のコマンド + assertion + cleanup 検証）を実行するランナー（`bun run qa:task`） |

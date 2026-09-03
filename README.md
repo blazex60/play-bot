@@ -75,6 +75,49 @@ bun run check
 
 Web UI の React dev server はテスト時に Playwright config が起動する。production では `music-web` が `web/dist` を Fastify static として配信する。
 
+## Codex Cloud / Claude Code Cloud
+
+クラウドエージェントの環境設定では、リポジトリに含まれるセットアップスクリプトを指定する。
+
+### Codex Cloud
+
+Environment の package version は **Node.js 22** に固定する。
+
+Environment の **Setup script**:
+
+```bash
+bash scripts/codex-cloud-setup.sh
+```
+
+Environment の **Maintenance script**:
+
+```bash
+bash scripts/codex-cloud-maintenance.sh
+```
+
+Maintenance script はキャッシュされた環境が別のコミットで再利用されたときに、`bun.lock` と `node_modules` を同期する。
+
+### Claude Code Cloud
+
+Cloud environment の **Setup script** には、`scripts/claude-code-cloud-setup.sh` の内容を貼り付ける。環境セットアップはリポジトリに依存せず、キャッシュ対象のVMへOSツールだけを導入する。
+
+```bash
+# scripts/claude-code-cloud-setup.sh の内容を貼り付ける
+```
+
+リポジトリ取得後は、`.claude/settings.json` の `SessionStart` hook が `scripts/claude-code-session-start.sh` を実行し、Node依存とPlaywright Chromiumを同期する。このhookは `CLAUDE_CODE_REMOTE=true` のときだけ動くため、ローカルのClaude Code起動には影響しない。
+
+Claude Code Cloud では Bun のパッケージ取得がプロキシの影響で失敗する場合がある。その場合だけ、SessionStart scriptは `npm install --no-package-lock` に切り替え、追跡対象のlockfileを変更せずに `node_modules` を作成する。
+
+両方のセットアップで以下を準備する。
+
+- `ffmpeg` / `aubio-tools` / Python / native addon向けビルドツール
+- Bun と `bun.lock` に基づく開発依存関係
+- `yt-dlp`
+- Playwright Chromium と必要なOSライブラリ
+
+セットアップスクリプトは `.env` を作成せず、Bot、Web server、Docker Composeも起動しない。APIキーやOAuth secretは各クラウド環境のSecretまたはCredential設定から渡す。
+
 ## Docker で起動
 
 ```bash
