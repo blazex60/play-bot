@@ -1,0 +1,81 @@
+name: Feature request
+description: 新機能や改善案を提案します
+title: "[Feature]: "
+labels: []
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        機能提案ありがとうございます。
+        実装方法だけでなく「どの問題を解決したいか」が分かると検討しやすくなります。
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: 対象コンポーネント
+      description: 提案が主に関係する箇所を選択してください。
+      options:
+        - Discord Bot / Slash Command
+        - Voice / Audio Playback
+        - Queue / Playlist
+        - Web UI / Dashboard
+        - Admin UI / Permissions
+        - OAuth / Authentication
+        - YouTube / yt-dlp
+        - MIX / Gemini
+        - Docker / Deployment
+        - CI / Development Experience
+        - Documentation
+        - その他
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい問題
+      description: 現状どのような不便・制約・課題がありますか？
+      placeholder: 例）プレイリストが長い場合、キュー内で目的の曲を探しにくい
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する機能
+      description: どのような機能・挙動を追加したいか説明してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 想定する利用方法 / 動作
+      description: UI、コマンド、API、操作フローなど、具体的なイメージがあれば記入してください。
+      placeholder: |
+        例）
+        1. /queue search <keyword> を実行
+        2. 一致する曲を一覧表示
+        3. 選択した曲へジャンプ
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 代替案
+      description: 現在使っている回避策や、他に考えた方法があれば記入してください。
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 補足情報
+      description: 参考URL、モックアップ、関連 Issue、技術的なアイデアなどがあれば記入してください。
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 確認事項
+      options:
+        - label: 同じ内容の Issue / Feature request が既に存在しないことを確認しました
+          required: true
