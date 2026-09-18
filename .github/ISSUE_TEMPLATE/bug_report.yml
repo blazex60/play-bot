@@ -1,0 +1,117 @@
+name: Bug report
+description: 不具合や想定外の挙動を報告します
+title: "[Bug]: "
+labels: []
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        不具合報告ありがとうございます。
+        調査しやすくするため、分かる範囲で以下を記入してください。
+        トークン、APIキー、Cookie、OAuth情報などの機密情報は貼り付けないでください。
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: 対象コンポーネント
+      description: 問題が発生している箇所を選択してください。
+      options:
+        - Discord Bot / Slash Command
+        - Voice / Audio Playback
+        - Queue / Playlist
+        - Web UI / Dashboard
+        - Admin UI / Permissions
+        - OAuth / Authentication
+        - YouTube / yt-dlp
+        - MIX / Gemini
+        - Docker / Docker Compose
+        - Cloudflare Tunnel / Pages
+        - CI / GitHub Actions
+        - Setup / Development Environment
+        - その他
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 問題の概要
+      description: 何が起きているかを簡潔に説明してください。
+      placeholder: 例）/play を実行すると再生開始前に Bot が VC から切断される
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 再現手順
+      description: 問題を再現できる手順を番号付きで記入してください。
+      placeholder: |
+        1. Bot を起動する
+        2. VC に参加する
+        3. /play <URL> を実行する
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待する動作
+      description: 本来どのように動作するべきかを記入してください。
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際の動作
+      description: 実際に発生した挙動を記入してください。
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: バージョン / Commit
+      description: 使用しているブランチ、タグ、または commit SHA を記入してください。
+      placeholder: main / v1.2.3 / abc1234
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 実行環境
+      description: 問題に関係する環境情報を記入してください。
+      placeholder: |
+        OS: Ubuntu 24.04
+        Node.js: 22.x
+        Bun: 1.2.x
+        Docker: 28.x
+        Browser: Chrome 153
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: ログ / エラーメッセージ
+      description: 関連するログやスタックトレースを貼り付けてください。機密情報は必ず削除してください。
+      render: shell
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 補足情報
+      description: スクリーンショット、動画、関連 Issue、発生頻度などがあれば記入してください。
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 確認事項
+      options:
+        - label: 同じ内容の Issue が既に存在しないことを確認しました
+          required: true
+        - label: 投稿内容にトークン、APIキー、Cookie、OAuth情報などの機密情報が含まれていないことを確認しました
+          required: true
