@@ -12,7 +12,7 @@
       "steps": [
         {
           "id": "sqlite-load",
-          "command": ["bun", "-e", "import Database from './src/db/sqlite.js'; const db = new Database(':memory:'); db.prepare('select 1 as ok').get(); db.close(); console.log('P0_SQLITE_OK')"],
+          "command": ["bun", "-e", "import Database from './src/web/db/sqlite.js'; const db = new Database(':memory:'); db.prepare('select 1 as ok').get(); db.close(); console.log('P0_SQLITE_OK')"],
           "cwd": ".",
           "timeoutMs": 10000,
           "assertions": [{ "kind": "outputIncludes", "value": "P0_SQLITE_OK" }],

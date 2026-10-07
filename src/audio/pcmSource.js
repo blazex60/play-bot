@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
-import { resolveAudioStream } from '../search.js';
+import { resolveAudioStream } from '../media/search.js';
 import { FRAME_BYTES } from './fade.js';
 
 const LOUDNORM_TARGET = 'I=-16:TP=-1.5:LRA=11';

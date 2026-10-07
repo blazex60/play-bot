@@ -1,6 +1,6 @@
-import { createTrack } from '../../../queue.js'
+import { createTrack } from '../../../playback/queue.js'
 import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
-import { resolveMetadata as defaultResolveMetadata, searchYoutube as defaultSearchYoutube } from '../../../search.js'
+import { resolveMetadata as defaultResolveMetadata, searchYoutube as defaultSearchYoutube } from '../../../media/search.js'
 import { resolveYoutubeTrack } from '../matching.js'
 import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
 import { createGenerateRateLimiter, isGeminiGenerateAvailable, withGenerateLimit } from '../services/gemini.js'

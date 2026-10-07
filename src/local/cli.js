@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline';
-import { GuildPlayer } from '../player.js';
-import { GuildQueue } from '../queue.js';
+import { GuildPlayer } from '../playback/player.js';
+import { GuildQueue } from '../playback/queue.js';
+import { PlaybackService } from '../playback/playbackService.js';
 import {
   isPlaylistUrl,
   mapEntryToTrack,
@@ -8,9 +9,9 @@ import {
   resolveMetadata,
   searchYoutube,
   PLAYLIST_LIMIT,
-} from '../search.js';
-import { getGuildSettings, setFade, setNormalize } from '../settings.js';
-import { fmtDuration, LOOP_LABELS } from '../format.js';
+} from '../media/search.js';
+import { getGuildSettings, setFade, setNormalize } from '../shared/settings.js';
+import { fmtDuration, LOOP_LABELS } from '../shared/format.js';
 import { LocalVoiceConnection } from './connection.js';
 
 export const LOCAL_GUILD_ID = 'local';
@@ -74,6 +75,9 @@ export function progressBar(positionSec, durationSec, width = 20) {
 export function createLocalPlayerCli({ sink, decode, output = process.stdout, input = process.stdin, searchFn = searchYoutube } = {}) {
   const rl = createInterface({ input, terminal: input.isTTY === true });
   let session = null;
+  // Single-session adapter: the CLI is its own sessions map, so the service
+  // resolves the one live session regardless of the guildId passed in.
+  const playback = new PlaybackService({ getSession: () => session });
   let pendingAnswer = null;
   let closed = false;
   let busy = false;
@@ -145,15 +149,14 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
       tracks = [mapEntryToTrack(results[Number(answer) - 1], { requestedBy: LOCAL_REQUESTED_BY })];
     }
     if (!tracks.length) { say('❌ 追加する曲がありません'); return; }
-    const s = ensureSession();
-    const wasEmpty = s.queue.isEmpty;
-    for (const track of tracks) s.queue.add(track);
-    if (tracks.length === 1) say(`✅ キューに追加: ${fmtTrackLine(tracks[0])}`);
-    else say(`✅ ${tracks.length} 曲をキューに追加しました`);
-    if (wasEmpty) {
-      say('⏳ 再生を開始します...');
-      await s.player.playNext();
-    }
+    ensureSession();
+    await playback.enqueue(LOCAL_GUILD_ID, tracks, {
+      onEnqueued: async ({ wasEmpty }) => {
+        if (tracks.length === 1) say(`✅ キューに追加: ${fmtTrackLine(tracks[0])}`);
+        else say(`✅ ${tracks.length} 曲をキューに追加しました`);
+        if (wasEmpty) say('⏳ 再生を開始します...');
+      },
+    });
   }
 
   function ask(question) {
@@ -187,30 +190,30 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
           break;
         case 'pause':
           if (!requireSession()) break;
-          say(session.player.pause() ? '⏸️ 一時停止しました' : '❌ 一時停止できませんでした');
+          say(playback.pause(LOCAL_GUILD_ID) ? '⏸️ 一時停止しました' : '❌ 一時停止できませんでした');
           break;
         case 'resume':
           if (!requireSession()) break;
-          say(session.player.resume() ? '▶️ 再開しました' : '❌ 再開できませんでした');
+          say(playback.resume(LOCAL_GUILD_ID) ? '▶️ 再開しました' : '❌ 再開できませんでした');
           break;
         case 'skip':
         case 's':
           if (!requireSession()) break;
-          await session.player.skip();
+          await playback.skip(LOCAL_GUILD_ID);
           say('⏭️ スキップしました');
           break;
         case 'stop':
           if (!requireSession()) break;
-          await session.player.stop();
+          await playback.stop(LOCAL_GUILD_ID);
           say('⏹️ 停止してキューをクリアしました');
           break;
         case 'queue':
         case 'q': {
           if (!requireSession()) break;
-          const { queue } = session;
-          const current = queue.current;
-          const upcoming = queue.upcoming();
-          say(`🔁 ループ: ${LOOP_LABELS[queue.loopMode]}`);
+          const state = playback.getState(LOCAL_GUILD_ID);
+          const current = state.current;
+          const upcoming = state.upcoming;
+          say(`🔁 ループ: ${LOOP_LABELS[state.loopMode]}`);
           say(current ? `再生中: ${fmtTrackLine(current)}` : '再生中の曲がありません');
           if (!upcoming.length) say('（キューは空）');
           upcoming.forEach((t, i) => say(`  ${i + 1}. ${fmtTrackLine(t)}`));
@@ -218,12 +221,12 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
         }
         case 'shuffle':
           if (!requireSession()) break;
-          session.queue.shuffle();
+          playback.shuffle(LOCAL_GUILD_ID);
           say('🔀 キューをシャッフルしました');
           break;
         case 'loop': {
           if (!requireSession()) break;
-          const mode = session.queue.cycleLoop();
+          const mode = playback.cycleLoop(LOCAL_GUILD_ID);
           say(`🔁 ループモード: ${LOOP_LABELS[mode]}`);
           break;
         }
@@ -231,9 +234,9 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
           if (!requireSession()) break;
           const parsed = parseSeekArg(arg);
           if (!parsed) { say('❌ 使い方: seek <秒|mm:ss|+N|-N>'); break; }
-          const pos = session.player.trackPositionSec;
+          const pos = playback.getState(LOCAL_GUILD_ID).positionSec;
           const target = parsed.relative ? Math.max(0, pos + parsed.sec) : parsed.sec;
-          const applied = await session.player.seekTo(target);
+          const applied = await playback.seekTo(LOCAL_GUILD_ID, target);
           if (applied !== false) {
             say(`⏩ ${fmtDuration(Math.floor(applied))} へシークしました`);
           } else {
@@ -244,12 +247,13 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
         case 'np':
         case 'nowplaying': {
           if (!requireSession()) break;
-          const current = session.queue.current;
+          const state = playback.getState(LOCAL_GUILD_ID);
+          const current = state.current;
           if (!current) { say('❌ 再生中の曲がありません'); break; }
-          const pos = Math.floor(session.player.trackPositionSec);
-          const bar = progressBar(session.player.trackPositionSec, current.duration);
+          const pos = Math.floor(state.positionSec);
+          const bar = progressBar(state.positionSec, current.duration);
           say(`🎵 ${fmtTrackLine(current)}`);
-          say(`   ${bar ? `${bar} ` : ''}${fmtDuration(pos)} / ${fmtDuration(current.duration)} | 状態: ${session.player.status}`);
+          say(`   ${bar ? `${bar} ` : ''}${fmtDuration(pos)} / ${fmtDuration(current.duration)} | 状態: ${state.status}`);
           break;
         }
         case 'fade':
@@ -262,7 +266,7 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
         }
         case 'status': {
           const settings = getGuildSettings(LOCAL_GUILD_ID);
-          say(`接続: ${session ? session.connection.state.status : 'なし'} | プレイヤー: ${session?.player.status ?? 'なし'} | sink: ${sink.name}`);
+          say(`接続: ${session ? session.connection.state.status : 'なし'} | プレイヤー: ${playback.getState(LOCAL_GUILD_ID).status} | sink: ${sink.name}`);
           say(`fade=${settings.fade ? 'on' : 'off'} normalize=${settings.normalize ? 'on' : 'off'}`);
           break;
         }

@@ -1,4 +1,4 @@
-import { generatePlaylistFromPrompt, defaultPlaylistName } from '../../../mix/playlistGenerate.js';
+import { generatePlaylistFromPrompt, defaultPlaylistName } from '../../../media/mix/playlistGenerate.js';
 import { createPlaylist, getOwnedPlaylist, getPlaylistTracks, insertTrack, serializePlaylistRow, serializeTrackRow } from '../routes/playlists-db.js';
 
 export const GENERATION_DEDUPE_TTL_MS = 120_000;

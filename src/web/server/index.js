@@ -11,7 +11,7 @@ import { registerDiscordAuthRoutes } from './auth/discord.js'
 import { registerDemoAuthRoutes } from './auth/demo.js'
 import { registerYoutubeAuthRoutes } from './auth/youtube.js'
 import { createRequireAuth } from './middleware/requireAuth.js'
-import { runMigrations } from '../../db/migrate.js'
+import { runMigrations } from '../db/migrate.js'
 import { stateRoutes } from './routes/state.js'
 import { linksRoutes } from './routes/links.js'
 import { controlRoutes } from './routes/control.js'
@@ -28,7 +28,7 @@ const projectRoot = resolve(thisDir, '../../..')
 const webDist = join(projectRoot, 'web/dist')
 
 async function loadDefaultDb() {
-  const dbModule = await import('../../db/index.js')
+  const dbModule = await import('../db/index.js')
   if (typeof dbModule.getDatabase === 'function') {
     return dbModule.getDatabase()
   }

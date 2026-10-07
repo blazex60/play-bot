@@ -1,4 +1,4 @@
-import { deleteServiceLink } from '../../../db/tokenStore.js'
+import { deleteServiceLink } from '../../db/tokenStore.js'
 import { listYoutubePlaylists } from '../services/youtube.js'
 import { bindRouteError, getSessionUser } from './route-utils.js'
 

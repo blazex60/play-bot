@@ -53,4 +53,4 @@ RUN bun install --frozen-lockfile --omit=dev
 COPY src/ ./src/
 COPY --from=web-build /app/web/dist ./web/dist
 
-CMD ["sh", "-c", "node src/deploy.js --if-changed && node src/index.js"]
+CMD ["sh", "-c", "node src/discord/deploy.js --if-changed && node src/discord/main.js"]

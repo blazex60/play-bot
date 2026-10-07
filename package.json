@@ -3,16 +3,16 @@
   "version": "1.0.0",
   "description": "Discord music bot using discord.js v14 + @discordjs/voice",
   "type": "module",
-  "main": "src/index.js",
+  "main": "src/discord/main.js",
   "license": "MIT",
   "engines": {
     "node": ">=20",
     "bun": ">=1.2.0"
   },
   "scripts": {
-    "start": "node src/deploy.js --if-changed && node src/index.js",
+    "start": "node src/discord/deploy.js --if-changed && node src/discord/main.js",
     "player": "node src/local/index.js",
-    "deploy": "node src/deploy.js",
+    "deploy": "node src/discord/deploy.js",
     "test": "bun run test:server",
     "test:server": "bun scripts/run-node-tests.mjs --suite server",
     "test:web": "bun test --preload ./web/happy-dom-register.js --preload ./web/bun-test-setup.js web/src",
@@ -21,7 +21,7 @@
     "test:container": "bun scripts/run-node-tests.mjs --suite container",
     "typecheck": "tsc --noEmit -p web/tsconfig.json && bun -e \"console.log('P0_TYPECHECK_OK')\"",
     "build:web": "bun scripts/build-web.mjs",
-    "db:inspect": "node src/db/inspect.js",
+    "db:inspect": "node src/web/db/inspect.js",
     "plan:validate": "node test/plan/validate-plan.mjs",
     "qa:task": "bun scripts/qa-task.mjs",
     "check": "bun run test:server && bun run test:web && bun run typecheck && bun run build:web && bun run test:e2e"

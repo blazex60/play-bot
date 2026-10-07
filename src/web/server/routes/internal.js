@@ -1,9 +1,9 @@
 import { bindRouteError, nowUnix, recordOperationLog } from './route-utils.js'
-import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js'
+import { optimizeTrackOrder, isValidPermutation } from '../../../media/mix/ordering.js'
 import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
 import { probeTempoBackend } from '../../../audio/tempo.js'
 import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
-import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
+import { searchYoutube as defaultSearchYoutube } from '../../../media/search.js'
 import { resolveYoutubeTrack } from '../matching.js'
 import {
   REFINE_TIMEOUT_MS,

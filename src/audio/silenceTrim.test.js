@@ -12,7 +12,7 @@ import {
   SILENCE_TRIM_FILTER,
   SILENCE_TRIM_THRESHOLD_DB,
 } from './silenceTrim.js';
-import { trimSilence } from '../normalize.js';
+import { trimSilence } from './normalize.js';
 import { probeDurationSec } from './duration.js';
 
 function spawnBuffered(cmd, args) {
