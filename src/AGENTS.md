@@ -12,7 +12,7 @@ Bot 本体のソース。レイヤー分離された構成: `discord/`（Discord
 | Directory | Purpose |
 |-----------|---------|
 | `discord/` | Discord adapter。`main.js`（bot エントリーポイント）、`deploy.js`、`commands/`、interaction ハンドラ（`queueEditorInteractions.js`/`recommendFlow.js`/`queueEditorView.js`/`views.js`）、`permissions.js`/`webPermission.js`、loopback internal API `botApi.js` |
-| `playback/` | 再生ドメイン。`playbackService.js`（adapters 用の in-process facade）、`sessions.js`（SessionManager: VC セッション共有状態）、`player.js`（GuildPlayer）、`queue.js`（GuildQueue）、`queueExhaustion.js`、`autoplay.js`（個人化/おすすめ選出）、`player/`（player 補助: `analysisCoordinator.js`・`playbackWatchdog.js`・`playbackDrive.js`・`playbackPolicy.js`・`test-helpers.js`） |
+| `playback/` | 再生ドメイン。`playbackService.js`（adapters 用の in-process facade）、`sessions.js`（SessionManager: VC セッション共有状態）、`player.js`（GuildPlayer）、`queue.js`（GuildQueue）、`queueExhaustion.js`、`autoplay.js`（個人化/おすすめ選出）、`player/`（player 補助: `analysisCoordinator.js`・`playbackWatchdog.js`・`sourcePreparer.js`・`transitionCoordinator.js`・`mixerPipeline.js`・`queueAdvancement.js`・`playbackDrive.js`・`playbackPolicy.js`・`test-helpers.js`） |
 | `media/` | メディア取得。`search.js`（yt-dlp spawn: 検索/メタデータ/ストリーム解決）、`mix/`（Camelot/ordering/playlistGenerate） |
 | `audio/` | 音声基盤。`normalize.js`（loudnorm プリフェッチ）、`mixStream.js`、`pcmSource.js`、解析（`trackAnalysis`/`beatmixTransition`/`phraseAnalysis`/`downbeatAnalysis`/`keyAnalysis`/`vocalActivity`）、ステム（`stemCache`/`stemTransition`/`stemPrefetch`）、`tempo.js`、`analysisQueue.js` |
 | `shared/` | adapter/domain 共有の純粋ユーティリティ。`format.js`（`fmtDuration`,`LOOP_LABELS`）、`settings.js`（guild 設定 JSON）、`webClient.js`（bot→web internal HTTP client） |
