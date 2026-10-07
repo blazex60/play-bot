@@ -1452,6 +1452,13 @@ export class GuildPlayer {
     this.#idleRecovering = false;
     try {
       this.#mixStream?.removeAllListeners();
+      // audioPlayer.stop() below destroys the resource, and the opus
+      // encoder's pipeline() then destroy()s this MixStream with
+      // ERR_STREAM_PREMATURE_CLOSE — possibly on a later tick, after the
+      // 'error' listeners were just removed. An 'error' event with no
+      // listener throws synchronously, so keep a swallowing handler until
+      // the stream is fully torn down (same crash class fixed in 96b0f58).
+      this.#mixStream?.on('error', () => {});
       this.#mixStream?.endMixer();
     } catch {
       // already ended
