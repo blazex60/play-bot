@@ -43,17 +43,24 @@ function fmtTrackLine(track, prefix = '') {
  * Session lifecycle mirrors the bot: a session is created lazily by `play`
  * and torn down when the queue exhausts (GuildPlayer -> onDisconnect).
  *
- * @param {{ sink: { name: string, write(buf): boolean, close(): Promise<void> }, decode: (packet: Buffer) => Buffer }} deps
+ * @param {{ sink: { name: string, write(buf): boolean, close(): Promise<void> }, decode: (packet: Buffer) => Buffer, output?: object, input?: object, searchFn?: Function }} deps
  */
-export function createLocalPlayerCli({ sink, decode, output = process.stdout } = {}) {
-  const rl = createInterface({ input: process.stdin, terminal: process.stdin.isTTY === true });
+export function createLocalPlayerCli({ sink, decode, output = process.stdout, input = process.stdin, searchFn = searchYoutube } = {}) {
+  const rl = createInterface({ input, terminal: input.isTTY === true });
   let session = null;
   let pendingAnswer = null;
   let closed = false;
+  let busy = false;
+  let commandChain = Promise.resolve();
+  const heldLines = [];
+
+  // rl.prompt() throws ERR_USE_AFTER_CLOSE once stdin EOFs (piped input),
+  // while queued commands may still be finishing — guard every prompt.
+  const prompt = () => { if (!rl.closed) rl.prompt(); };
 
   const say = (...args) => {
     output.write(`${args.join(' ')}\n`);
-    rl.prompt();
+    prompt();
   };
 
   function ensureSession() {
@@ -102,13 +109,13 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout } =
       }
     } else {
       say('⏳ 検索中...');
-      const results = await searchYoutube(query);
+      const results = await searchFn(query);
       if (!results.length) { say('❌ 検索結果が見つかりませんでした'); return; }
       results.forEach((entry, i) => {
         say(`  ${i + 1}. ${entry.title ?? 'Unknown'} [${fmtDuration(entry.duration)}] ${entry.channel ?? ''}`);
       });
-      const answer = await ask('番号を選択 (1-5, c でキャンセル): ');
-      if (!/^[1-5]$/.test(answer) || !results[Number(answer) - 1]) { say('キャンセルしました'); return; }
+      const answer = await ask(`番号を選択 (1-${results.length}, c でキャンセル): `);
+      if (!/^\d+$/.test(answer) || !results[Number(answer) - 1]) { say('キャンセルしました'); return; }
       tracks = [mapEntryToTrack(results[Number(answer) - 1], { requestedBy: LOCAL_REQUESTED_BY })];
     }
     if (!tracks.length) { say('❌ 追加する曲がありません'); return; }
@@ -125,8 +132,22 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout } =
 
   function ask(question) {
     output.write(`${question}\n`);
-    rl.prompt();
-    return new Promise((resolve) => { pendingAnswer = resolve; });
+    prompt();
+    return new Promise((resolve) => {
+      pendingAnswer = resolve;
+      // A line typed before this question posted (piped input or a fast
+      // typist) is held — the earliest one answers it.
+      if (heldLines.length) resolveAnswer(heldLines.shift());
+    });
+  }
+
+  // yt-dlp stderr noise that occasionally lands in error messages.
+  function cleanError(err) {
+    return String(err?.message ?? err)
+      .split('\n')
+      .filter((line) => !/Deprecated Feature|^\s*WARNING:/.test(line))
+      .join('\n')
+      .trim();
   }
 
   async function handleCommand(line) {
@@ -217,9 +238,9 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout } =
           say(`❓ 不明なコマンド: ${cmd}（help で一覧）`);
       }
     } catch (err) {
-      say(`❌ エラー: ${err.message}`);
+      say(`❌ エラー: ${cleanError(err)}`);
     }
-    if (!closed) rl.prompt();
+    prompt();
   }
 
   function requireSession() {
@@ -241,27 +262,59 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout } =
     rl.close();
   }
 
+  function resolveAnswer(text) {
+    const resolve = pendingAnswer;
+    pendingAnswer = null;
+    resolve(text);
+  }
+
+  function dispatch(text) {
+    busy = true;
+    commandChain = commandChain
+      .then(() => handleCommand(text))
+      .catch(() => {})
+      .finally(() => {
+        busy = false;
+        flushHeld();
+      });
+  }
+
+  // Lines typed while a command is still running are held: when the command
+  // settles, a held line either answers a pick it posted (pendingAnswer) or
+  // runs as a command — in arrival order.
+  function flushHeld() {
+    while (heldLines.length && !busy && !closed) {
+      const text = heldLines.shift();
+      if (pendingAnswer) { resolveAnswer(text); continue; }
+      dispatch(text);
+    }
+  }
+
+  function onLine(line) {
+    const text = line.trim();
+    // A pending pick/answer is resolved here (outside the serial command
+    // chain) — a command awaiting ask() must not block the input loop.
+    if (pendingAnswer) { resolveAnswer(text); return; }
+    if (closed) return;
+    if (busy) { heldLines.push(text); return; }
+    dispatch(text);
+  }
+
   async function run() {
     say('🎧 ローカルプレイヤー起動（Bot の再生経路をローカル出力に接続）');
     say(`   出力: ${sink.name} | help でコマンド一覧`);
     rl.setPrompt('player> ');
-    rl.prompt();
-    try {
-      for await (const line of rl) {
-        if (closed) break;
-        const text = line.trim();
-        if (pendingAnswer) {
-          const resolve = pendingAnswer;
-          pendingAnswer = null;
-          resolve(text);
-          continue;
-        }
-        await handleCommand(text);
-        if (closed) break;
-      }
-    } finally {
-      await shutdown();
+    prompt();
+    rl.on('line', onLine);
+    await new Promise((resolve) => rl.once('close', resolve));
+    // stdin EOF: cancel any open pick, then let in-flight and held commands
+    // (e.g. everything buffered ahead of the EOF) run to completion.
+    while (busy || heldLines.length || pendingAnswer) {
+      flushHeld();
+      if (pendingAnswer) resolveAnswer(heldLines.shift() ?? '');
+      await commandChain;
     }
+    await shutdown();
   }
 
   return { run, shutdown, handleCommand };
