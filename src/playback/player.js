@@ -3,7 +3,6 @@ import {
   createAudioResource,
   AudioPlayerStatus,
   NoSubscriberBehavior,
-  StreamType,
   VoiceConnectionStatus,
 } from '@discordjs/voice';
 import { resolveAudioStream } from '../media/search.js';
@@ -17,7 +16,7 @@ import { AnalysisCoordinator } from './player/analysisCoordinator.js';
 import { PlaybackWatchdog } from './player/playbackWatchdog.js';
 import { SourcePreparer } from './player/sourcePreparer.js';
 import { TransitionCoordinator } from './player/transitionCoordinator.js';
-import { MixStream } from '../audio/mixStream.js';
+import { MixerPipeline, PCM_WAIT_TIMEOUT_MS } from './player/mixerPipeline.js';
 import { createFileSource } from '../audio/pcmSource.js';
 import { analyzeTrackFile } from '../audio/trackAnalysis.js';
 import { resetSessionTempo, probeTempoBackend, compensateDurationSec } from '../audio/tempo.js';
@@ -42,8 +41,9 @@ const PENDING_GAPLESS_MAX_AGE_MS = 30_000;
  * longer than that; 50 × 20 ms = 1 s.
  */
 export const MIXER_MAX_MISSED_FRAMES = 50;
-/** How long GuildPlayer waits for ffmpeg/yt-dlp to produce the first PCM. */
-export const PCM_WAIT_TIMEOUT_MS = 15_000;
+// Moved to player/mixerPipeline.js with the pipeline code; re-exported so
+// existing importers (tests) keep working.
+export { PCM_WAIT_TIMEOUT_MS, MIXER_AUDIO_RESOURCE_OPTIONS } from './player/mixerPipeline.js';
 
 export const MIXER_AUDIO_PLAYER_OPTIONS = {
   behaviors: {
@@ -53,18 +53,6 @@ export const MIXER_AUDIO_PLAYER_OPTIONS = {
     noSubscriber: NoSubscriberBehavior.Pause,
     maxMissedFrames: MIXER_MAX_MISSED_FRAMES,
   },
-};
-
-/**
- * silencePaddingFrames default 5: when the opus encoder is not readable,
- * AudioResource.read() returns Discord SILENCE_FRAME and never reads MixStream
- * again, then ends the resource (~100 ms). MixStream is session-lived, so
- * padding-to-end is never correct.
- */
-export const MIXER_AUDIO_RESOURCE_OPTIONS = {
-  inputType: StreamType.Raw,
-  inlineVolume: false,
-  silencePaddingFrames: 0,
 };
 
 function sleep(ms) {
@@ -80,9 +68,6 @@ export class GuildPlayer {
   #queueExhaustedTimeoutMs;
   #recordPlayFn;
   #onTrackStart;
-  #cancelSourceAudioWait = null;
-  #pcmWaitGeneration = 0;
-  #pcmWaitTimeoutMs = PCM_WAIT_TIMEOUT_MS;
   #pauseRequested = false;
   #audioPlayer;
   #forceSkip = false;
@@ -97,16 +82,11 @@ export class GuildPlayer {
   // so #ensureOutgoingStemPrep() can loudnorm the outgoing stems with the
   // same measured LUFS value the currently-playing full-mix source used.
   #currentMeasured = null;
-  #createAudioResource;
   #handlingAfter = false;
   #handlingAfterPlayback = 0;
   #pendingAfter = false;
   #playbackCount = 0;
-  #mixStream = null;
-  #mixerResource = null;
-  #mixerStarted = false;
-  /** Prevents Idle recovery from stacking playNext() while a restart is in flight. */
-  #idleRecovering = false;
+  #pipeline;
   #analysis;
   #sourcePreparer;
   #transitions;
@@ -190,15 +170,56 @@ export class GuildPlayer {
     this.#recordPlayFn = recordPlayFn;
     this.#onTrackStart = onTrackStart;
     this.#audioPlayer = audioPlayer;
-    this.#createAudioResource = createAudioResourceFn;
     this.#analysisQueue = analysisQueue;
     this.#stemQueue = stemQueue;
     this.#createFileSourceFn = createFileSourceFn;
     this.#logTransitionPlanFn = logTransitionPlanFn;
     this.#logGaplessTransitionFn = logGaplessTransitionFn;
-    this.#pcmWaitTimeoutMs = Number.isFinite(pcmWaitTimeoutMs)
-      ? pcmWaitTimeoutMs
-      : PCM_WAIT_TIMEOUT_MS;
+
+    // Mixer + first-PCM wait lifecycle — the session-lived MixStream, the
+    // opus resource attach/rebuild, and the dead-mixer recovery paths —
+    // lives in the MixerPipeline (same DI pattern as the coordinators
+    // below). Built first because #transitions reaches it through the
+    // getMixStream thunk; the advancement-loop entry points
+    // (#advanceAfterPlayback/#onCrossfadePromoted/#onSnapHandoff/playNext)
+    // stay here and are injected as bound callbacks, so `this` still
+    // resolves to the GuildPlayer inside them.
+    this.#pipeline = new MixerPipeline({
+      audioPlayer,
+      connection,
+      createAudioResourceFn,
+      pcmWaitTimeoutMs,
+      pauseSource: this,
+      getQueueCurrent: () => this.#queue.current,
+      isHandlingAfter: () => this.#handlingAfter,
+      isForceSkip: () => this.#forceSkip,
+      markHadError: () => {
+        this.#hadError = true;
+      },
+      advanceAfterPlayback: () => this.#advanceAfterPlayback(),
+      onCrossfadePromoted: () => this.#onCrossfadePromoted(),
+      onSnapHandoff: (adopt) => this.#onSnapHandoff(adopt),
+      onIncomingError: (err) => {
+        // Mid-fade incoming failure: MixStream already cleared overlap and
+        // kept outgoing. Reset arm state so #maybeStartCrossfade can retry,
+        // and drop any normalize temp created for the failed incoming leg.
+        console.warn('[GuildPlayer] mix incoming error:', err.message);
+        this.#transitions.crossfadeStarted = false;
+        this.#transitions.crossfadeTargetTrack = null;
+        // §2.3/§8.4: this attempt never reached promotion — a stashed
+        // beatmix tempo here belongs to the failed incoming, not whatever
+        // eventually does get promoted. Left set, it would wrongly apply to
+        // a later, unrelated (possibly non-beatmix) promotion.
+        this.#transitions.pendingSessionTempo = null;
+        this.#transitions.pendingIncomingEntrySec = 0;
+        this.#sourcePreparer.cleanupIncomingTempFile().catch((cleanupErr) => {
+          console.warn('[GuildPlayer] incoming temp cleanup failed:', cleanupErr.message);
+        });
+      },
+      playNext: () => this.playNext(),
+      getAnalysisQueue: () => this.#analysisQ(),
+      getStemQueue: () => this.#stemQ(),
+    });
 
     // Analysis/stem-separation scheduling + caches live in the coordinator;
     // the player only applies settled results (duration/tempo) via the
@@ -250,7 +271,7 @@ export class GuildPlayer {
       analysis: this.#analysis,
       sourcePreparer: this.#sourcePreparer,
       audioPlayer,
-      getMixStream: () => this.#mixStream,
+      getMixStream: () => this.#pipeline.mixStream,
       isForceSkip: () => this.#forceSkip,
       isHandlingAfter: () => this.#handlingAfter,
       maybeRefillQueue: () => this.#maybeRefillQueue(),
@@ -269,24 +290,24 @@ export class GuildPlayer {
       onStall: () => {
         console.warn('[GuildPlayer] watchdog: stall detected');
         this.#hadError = true;
-        this.#mixStream?.dropCurrent();
+        this.mixStream?.dropCurrent();
         // Codex review (PR #45, P1): same silent underrun-state reset as the
         // other dropCurrent() call sites.
         this.#stemQ().noteUnderrunCleared(this);
       },
     });
 
-    this.#initMixerPipeline();
+    this.#pipeline.initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
-      if (!this.#mixerStarted || this.#idleRecovering) return;
+      if (!this.#pipeline.mixerStarted || this.#pipeline.idleRecovering) return;
       console.warn('[GuildPlayer] unexpected Idle, recovering mixer playback');
-      this.#idleRecovering = true;
+      this.#pipeline.idleRecovering = true;
       // Never play the rebuilt mixer empty: MixStream's 8s underrun guard
       // would sourceerror while playNext is still downloading/analyzing.
       // handleAfter already calls playNext; mid-track Idle must restart here.
-      this.#recoverMixerPlayback({ play: false });
+      this.#pipeline.recoverMixerPlayback({ play: false });
       const restartCurrent = this.#queue.current && !this.#handlingAfter && !this.#forceSkip;
-      const done = () => { this.#idleRecovering = false; };
+      const done = () => { this.#pipeline.idleRecovering = false; };
       if (restartCurrent) {
         this.playNext().catch((err) => {
           console.error('[GuildPlayer] mixer Idle restart failed:', err.message);
@@ -305,14 +326,14 @@ export class GuildPlayer {
     this.#audioPlayer.on('error', err => {
       console.error('[GuildPlayer] audioPlayer error:', err);
       this.#hadError = true;
-      this.#abortSourceAudioWait();
-      this.#mixStream?.dropCurrent();
+      this.#pipeline.abortSourceAudioWait();
+      this.mixStream?.dropCurrent();
       // Codex review (PR #45, P1): dropCurrent() resets MixStream's own
       // underrun state WITHOUT emitting 'underrunClear' — if this player
       // had a stem-queue pause source registered (mid-underrun when this
       // error hit), nothing would ever clear it otherwise, indefinitely
       // SIGSTOPping the shared process-wide stem queue's current job for
-      // every guild. See #initMixerPipeline()'s 'underrun' wiring.
+      // every guild. See MixerPipeline.initMixerPipeline()s 'underrun' wiring.
       this.#stemQ().noteUnderrunCleared(this);
     });
 
@@ -325,7 +346,7 @@ export class GuildPlayer {
     this.#connection.subscribe(this.#audioPlayer);
     this.#connection.on?.('stateChange', (_oldState, newState) => {
       if (newState?.status === VoiceConnectionStatus.Destroyed) {
-        this.#abortSourceAudioWait();
+        this.#pipeline.abortSourceAudioWait();
       }
     });
   }
@@ -397,14 +418,14 @@ export class GuildPlayer {
     // starts as soon as a current source is attached; a slow decoder would
     // sourceerror/skip the track while this 15s wait was still pending.
     // Between tracks MixStream stays in keep-alive silence until then.
-    const waitGeneration = this.#pcmWaitGeneration;
-    const waited = await this.#waitForSourceAudio(source);
-    if (this.#isSourceAudioWaitSuperseded(track, waited, waitGeneration)) {
-      this.#discardUnusedSource(source);
+    const waitGeneration = this.#pipeline.pcmWaitGeneration;
+    const waited = await this.#pipeline.waitForSourceAudio(source);
+    if (this.#pipeline.isSourceAudioWaitSuperseded(track, waited, waitGeneration)) {
+      this.#pipeline.discardUnusedSource(source);
       return;
     }
     if (waited !== 'ready') {
-      this.#discardUnusedSource(source);
+      this.#pipeline.discardUnusedSource(source);
       this.#hadError = true;
       if (this.#handlingAfter) {
         this.#pendingAfter = true;
@@ -422,11 +443,11 @@ export class GuildPlayer {
     // Rebuild first if Idle/stop ended the mixer, attach PCM, then play.
     // Playing before setCurrent leaves MixStream with no current source and
     // starts the underrun guard against silence.
-    if (this.#isMixerDead()) {
-      this.#recoverMixerPlayback({ play: false });
+    if (this.#pipeline.isMixerDead()) {
+      this.#pipeline.recoverMixerPlayback({ play: false });
     }
     const durationSec = this.#resolvePlaybackDurationSec(track);
-    if (!this.#mixStream.setCurrent(source, { durationSec })) {
+    if (!this.mixStream.setCurrent(source, { durationSec })) {
       return;
     }
     // Codex review (PR #43, round 3): only now that setCurrent() has
@@ -450,7 +471,7 @@ export class GuildPlayer {
     // first packet is music, not keep-alive silence. A /pause during the
     // wait leaves AudioPlayer Idle; honor it and do not start until resume.
     if (!this.#pauseRequested) {
-      this.#ensureMixerPlaying();
+      this.#pipeline.ensureMixerPlaying();
     }
     this.#sourcePreparer.clearPreparedIncoming();
     this.#transitions.crossfadeStarted = false;
@@ -481,103 +502,6 @@ export class GuildPlayer {
     return track.duration ?? null;
   }
 
-  #initMixerPipeline() {
-    this.#mixStream = new MixStream();
-    this.#mixerResource = null;
-    this.#mixerStarted = false;
-    this.#mixStream.on('trackend', (info) => {
-      if (info?.promoted) {
-        this.#onCrossfadePromoted();
-        return;
-      }
-      this.#advanceAfterPlayback();
-    });
-    this.#mixStream.on('sourceerror', (err) => {
-      console.error('[GuildPlayer] mix source error:', err.message);
-      this.#hadError = true;
-      this.#abortSourceAudioWait();
-      this.#mixStream.dropCurrent();
-      // Codex review (PR #45, P1): see the audioPlayer 'error' handler's
-      // identical comment above — dropCurrent() here has the same silent
-      // underrun-state reset.
-      this.#stemQ().noteUnderrunCleared(this);
-    });
-    this.#mixStream.on('incomingerror', (err) => {
-      // Mid-fade incoming failure: MixStream already cleared overlap and kept
-      // outgoing. Reset arm state so #maybeStartCrossfade can retry, and drop
-      // any normalize temp created for the failed incoming leg.
-      console.warn('[GuildPlayer] mix incoming error:', err.message);
-      this.#transitions.crossfadeStarted = false;
-      this.#transitions.crossfadeTargetTrack = null;
-      // §2.3/§8.4: this attempt never reached promotion — a stashed beatmix
-      // tempo here belongs to the failed incoming, not whatever eventually
-      // does get promoted. Left set, it would wrongly apply to a later,
-      // unrelated (possibly non-beatmix) promotion.
-      this.#transitions.pendingSessionTempo = null;
-      this.#transitions.pendingIncomingEntrySec = 0;
-      this.#sourcePreparer.cleanupIncomingTempFile().catch((cleanupErr) => {
-        console.warn('[GuildPlayer] incoming temp cleanup failed:', cleanupErr.message);
-      });
-    });
-    this.#mixStream.on('snaphandoff', ({ adopt }) => {
-      this.#onSnapHandoff(adopt).catch((err) => {
-        console.warn('[GuildPlayer] snap handoff failed:', err.message);
-      });
-    });
-    this.#mixStream.on('underrun', () => {
-      this.#analysisQ().noteUnderrun(this);
-      // Phase 9C §5.4 "Playback Safety": a Demucs job actively running
-      // during a live mixer underrun is exactly the CPU pressure the
-      // stem-preparation queue's pause() exists to relieve — forward the
-      // same underrun signal to it. This is the only automatic trigger for
-      // StemQueue.pause(); no separate CPU-monitoring signal exists yet.
-      //
-      // Codex review (PR #45): routed through noteUnderrun() (debounced —
-      // only actually pauses once the underrun has persisted past
-      // pauseAfterUnderrunMs), matching the realtime queue's own line
-      // above, NOT the immediate pause() command. A raw underrun event can
-      // be jittery (several isolated one-frame stalls in quick succession);
-      // charging each one straight against pause()'s pauseCount could hit
-      // MAX_PAUSES and kill a long-running Demucs job over transient noise
-      // the realtime queue itself is built to ignore. pause()/resume()
-      // remain available as an explicit, non-debounced command for a
-      // future direct/CPU-monitoring trigger — just not this one.
-      this.#stemQ().noteUnderrun(this);
-    });
-    this.#mixStream.on('underrunClear', () => {
-      this.#analysisQ().noteUnderrunCleared(this);
-      this.#stemQ().noteUnderrunCleared(this);
-    });
-    // MixStream extends Node's Readable. @discordjs/voice's
-    // createAudioResource() pipes it into an Opus encoder internally via
-    // stream.pipeline(); if that pipeline ever tears down abnormally (e.g.
-    // ERR_STREAM_PREMATURE_CLOSE when the encoder side closes early), Node
-    // calls destroy(err) on mixStream too, which emits the standard 'error'
-    // event. An EventEmitter emitting 'error' with no listener throws
-    // synchronously — crashing the whole bot process, not just this guild's
-    // playback (unlike sourceerror/incomingerror, which are this module's
-    // own recoverable signals). Same recovery shape as the Idle handler
-    // above: rebuild the mixer pipeline and restart the current track.
-    this.#mixStream.on('error', (err) => {
-      console.error('[GuildPlayer] mixStream error:', err);
-      if (this.#idleRecovering) return;
-      this.#idleRecovering = true;
-      this.#hadError = true;
-      this.#abortSourceAudioWait();
-      this.#stemQ().noteUnderrunCleared(this);
-      this.#recoverMixerPlayback({ play: false });
-      const restartCurrent = this.#queue.current && !this.#handlingAfter && !this.#forceSkip;
-      const done = () => { this.#idleRecovering = false; };
-      if (restartCurrent) {
-        this.playNext().catch((restartErr) => {
-          console.error('[GuildPlayer] mixStream error recovery restart failed:', restartErr.message);
-        }).finally(done);
-      } else {
-        done();
-      }
-    });
-  }
-
   #analysisQ() {
     return this.#analysisQueue ?? getAnalysisQueue();
   }
@@ -594,7 +518,7 @@ export class GuildPlayer {
       this.#hadError
       || this.#handlingAfter
       || this.#transitions.crossfadeStarted
-      || this.#mixStream?.isCrossfading
+      || this.mixStream?.isCrossfading
     ) return;
     const current = this.#queue.current;
     if (!current) return;
@@ -706,140 +630,6 @@ export class GuildPlayer {
     }
   }
 
-  #isMixerStreamDead() {
-    return !this.#mixStream
-      || this.#mixStream.isDestroyed()
-      || this.#mixStream.destroyed;
-  }
-
-  #isMixerDead() {
-    return this.#isMixerStreamDead() || this.#mixerResource?.ended === true;
-  }
-
-  #attachMixerResource() {
-    this.#mixerResource = this.#createAudioResource(
-      this.#mixStream,
-      MIXER_AUDIO_RESOURCE_OPTIONS,
-    );
-  }
-
-  #inspectSourceAudio(source) {
-    if (!source) return 'empty';
-    if (source.error) return 'error';
-    if ((source.available ?? 0) > 0) return 'ready';
-    if (source.ended) return 'empty';
-    return null;
-  }
-
-  #isSourceAudioWaitSuperseded(track, waited, waitGeneration) {
-    return waited === 'aborted'
-      || waitGeneration !== this.#pcmWaitGeneration
-      || this.#queue.current !== track
-      || this.#forceSkip;
-  }
-
-  #discardUnusedSource(source) {
-    if (!source) return;
-    if (this.#mixStream?.currentSource === source) return;
-    source.destroy?.();
-  }
-
-  #abortSourceAudioWait() {
-    this.#pcmWaitGeneration += 1;
-    const cancel = this.#cancelSourceAudioWait;
-    this.#cancelSourceAudioWait = null;
-    cancel?.();
-  }
-
-  #waitForSourceAudio(source) {
-    this.#cancelSourceAudioWait?.();
-    const immediate = this.#inspectSourceAudio(source);
-    if (immediate) return Promise.resolve(immediate);
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (reason) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        source.off?.('data', onData);
-        source.off?.('end', onEnd);
-        source.off?.('error', onError);
-        if (this.#cancelSourceAudioWait === cancel) {
-          this.#cancelSourceAudioWait = null;
-        }
-        resolve(reason);
-      };
-      const onData = () => {
-        // PcmSource emits `data` on ffmpeg EOF even when available === 0.
-        // That wake-up is not buffered audio; keep waiting until end/error
-        // or a later chunk actually fills the buffer.
-        const result = this.#inspectSourceAudio(source);
-        if (result) finish(result);
-      };
-      const onEnd = () => finish(this.#inspectSourceAudio(source) ?? 'empty');
-      const onError = () => finish('error');
-      const cancel = () => finish('aborted');
-      this.#cancelSourceAudioWait = cancel;
-      const timer = setTimeout(() => finish('timeout'), this.#pcmWaitTimeoutMs);
-      source.on('data', onData);
-      source.on('end', onEnd);
-      source.on('error', onError);
-    });
-  }
-
-  /**
-   * @discordjs/voice destroys playStream when leaving Playing. If MixStream was
-   * destroyed mid-session, rebuild it so later setCurrent/play can succeed.
-   * Never pipeline an empty MixStream into AudioPlayer — that leaves the opus
-   * encoder unreadable, and default missed-frames/silence-padding destroy it
-   * again before playNext can attach PCM.
-   */
-  #recoverMixerPlayback({ play = false } = {}) {
-    if (this.#isMixerDead()) {
-      console.warn('[GuildPlayer] mixer resource ended; rebuilding pipeline');
-      try {
-        this.#mixStream?.removeAllListeners();
-        if (this.#mixStream && !this.#mixStream.destroyed) {
-          this.#mixStream.destroy();
-        }
-      } catch {
-        // already destroyed
-      }
-      this.#initMixerPipeline();
-    }
-    this.#mixerStarted = false;
-    if (play) this.#ensureMixerPlaying();
-  }
-
-  #ensureMixerPlaying() {
-    if (this.#isMixerStreamDead()) {
-      this.#recoverMixerPlayback({ play: false });
-    }
-    if (this.#isMixerStreamDead()) return;
-    const hasSource = Boolean(this.#mixStream.currentSource) || this.#mixStream.isCrossfading;
-    if (!this.#mixerResource || this.#mixerResource.ended) {
-      if (!hasSource) return;
-      this.#attachMixerResource();
-    }
-    try {
-      this.#connection?.subscribe?.(this.#audioPlayer);
-      this.#audioPlayer.play(this.#mixerResource);
-      this.#mixerStarted = true;
-    } catch (err) {
-      console.error('[GuildPlayer] mixer play failed, rebuilding:', err.message);
-      this.#recoverMixerPlayback({ play: false });
-      if (this.#isMixerStreamDead() || !this.#mixStream.currentSource) return;
-      this.#attachMixerResource();
-      try {
-        this.#connection?.subscribe?.(this.#audioPlayer);
-        this.#audioPlayer.play(this.#mixerResource);
-        this.#mixerStarted = true;
-      } catch (err2) {
-        console.error('[GuildPlayer] mixer recovery rebuild play failed:', err2.message);
-      }
-    }
-  }
-
   async #onCrossfadePromoted() {
     this.#forceSkip = false;
     this.#hadError = false;
@@ -911,7 +701,7 @@ export class GuildPlayer {
     // playback advances it. See #currentEntryOverlapConsumedSec's own
     // comment for why this must be captured once here rather than derived
     // live from positionSec on every later arm-loop tick.
-    this.#transitions.currentEntryOverlapConsumedSec = (this.#mixStream?.positionSec ?? 0) * this.#transitions.sessionTempo.tempoRatio;
+    this.#transitions.currentEntryOverlapConsumedSec = (this.mixStream?.positionSec ?? 0) * this.#transitions.sessionTempo.tempoRatio;
     // The incoming source was seeked forward by promotedEntrySec (native
     // seconds) at spawn — its remaining native content is only
     // (duration - promotedEntrySec), not the full native duration. Convert
@@ -920,10 +710,10 @@ export class GuildPlayer {
     const remainingNativeDurationSec = nativeDurationSec != null
       ? Math.max(0, nativeDurationSec - promotedEntrySec)
       : null;
-    this.#mixStream?.setDurationSec(
+    this.mixStream?.setDurationSec(
       compensateDurationSec(remainingNativeDurationSec, this.#transitions.sessionTempo.tempoRatio),
     );
-    this.#ensureMixerPlaying();
+    this.#pipeline.ensureMixerPlaying();
     this.#transitions.startCrossfadeArm();
     this.#sourcePreparer.prefetchUpcoming();
     this.#sourcePreparer.ensureIncomingPrepForUpcoming();
@@ -936,11 +726,11 @@ export class GuildPlayer {
   }
 
   get mixStream() {
-    return this.#mixStream;
+    return this.#pipeline.mixStream;
   }
 
   get positionSec() {
-    return this.#mixStream?.positionSec ?? 0;
+    return this.mixStream?.positionSec ?? 0;
   }
 
   /**
@@ -954,7 +744,7 @@ export class GuildPlayer {
     // native seconds with the session tempo ratio before adding the entry
     // offset — same formula as #currentEntryOverlapConsumedSec.
     const ratio = this.#transitions.sessionTempo?.tempoRatio ?? 1;
-    return (this.#transitions.currentEntrySec ?? 0) + (this.#mixStream?.positionSec ?? 0) * ratio;
+    return (this.#transitions.currentEntrySec ?? 0) + (this.mixStream?.positionSec ?? 0) * ratio;
   }
 
   get sessionTempo() {
@@ -993,7 +783,7 @@ export class GuildPlayer {
       return true;
     }
     // AudioPlayer.pause() is a no-op while Idle (PCM still buffering).
-    if (this.#cancelSourceAudioWait != null || Boolean(this.#mixStream?.currentSource)) {
+    if (this.#pipeline.cancelSourceAudioWait != null || Boolean(this.mixStream?.currentSource)) {
       this.#pauseRequested = true;
       return true;
     }
@@ -1007,9 +797,9 @@ export class GuildPlayer {
   resume() {
     if (this.#pauseRequested) {
       this.#pauseRequested = false;
-      if (this.#cancelSourceAudioWait) return true;
-      if (this.#mixStream?.currentSource) {
-        if (!this.#mixerStarted) this.#ensureMixerPlaying();
+      if (this.#pipeline.cancelSourceAudioWait) return true;
+      if (this.mixStream?.currentSource) {
+        if (!this.#pipeline.mixerStarted) this.#pipeline.ensureMixerPlaying();
         else this.#audioPlayer.unpause();
         return true;
       }
@@ -1029,8 +819,8 @@ export class GuildPlayer {
    */
   async seekTo(targetSec) {
     const track = this.#queue.current;
-    if (!track || !this.#mixStream?.currentSource || this.#mixStream.isDestroyed()) return false;
-    if (this.#mixStream.isCrossfading || this.#handlingAfter) return false;
+    if (!track || !this.mixStream?.currentSource || this.mixStream.isDestroyed()) return false;
+    if (this.mixStream.isCrossfading || this.#handlingAfter) return false;
     const durationSec = this.#resolvePlaybackDurationSec(track);
     let target = Math.max(0, targetSec);
     if (durationSec != null) target = Math.min(target, Math.max(0, durationSec - 0.5));
@@ -1053,14 +843,14 @@ export class GuildPlayer {
     // Same rule as playNext: wait for real PCM before adopting — the
     // MixStream underrun guard starts as soon as a current source is
     // attached, so a still-buffering decoder would sourceerror the track.
-    const waitGeneration = this.#pcmWaitGeneration;
-    const waited = await this.#waitForSourceAudio(source);
-    if (this.#isSourceAudioWaitSuperseded(track, waited, waitGeneration) || waited !== 'ready') {
+    const waitGeneration = this.#pipeline.pcmWaitGeneration;
+    const waited = await this.#pipeline.waitForSourceAudio(source);
+    if (this.#pipeline.isSourceAudioWaitSuperseded(track, waited, waitGeneration) || waited !== 'ready') {
       source.destroy?.();
       return false;
     }
     const remainingSec = durationSec != null ? Math.max(0, durationSec - target) : null;
-    if (!this.#mixStream.adoptCurrent(source, { durationSec: remainingSec })) {
+    if (!this.mixStream.adoptCurrent(source, { durationSec: remainingSec })) {
       source.destroy();
       return false;
     }
@@ -1085,8 +875,8 @@ export class GuildPlayer {
 
   async skip() {
     this.#forceSkip = true;
-    this.#abortSourceAudioWait();
-    this.#mixStream?.dropCurrent();
+    this.#pipeline.abortSourceAudioWait();
+    this.mixStream?.dropCurrent();
     // Codex review (PR #45, P1): same silent underrun-state reset as the
     // other dropCurrent() call sites — a /skip landing mid-underrun must
     // not leave this player's stem-queue pause source stuck forever.
@@ -1118,7 +908,7 @@ export class GuildPlayer {
   async stop() {
     this.#pauseRequested = false;
     this.#queue.clear();
-    this.#abortSourceAudioWait();
+    this.#pipeline.abortSourceAudioWait();
     this.#clearWatchdog();
     this.#transitions.clearCrossfadeArm();
     this.#sourcePreparer.clearPreparedIncoming();
@@ -1130,7 +920,7 @@ export class GuildPlayer {
     this.#transitions.pendingGaplessFrom = null;
     this.#transitions.lastEvaluatedTransitionReport = null;
     this.#analysisQ().noteUnderrunCleared(this);
-    // Symmetric with the underrunClear wiring above (#initMixerPipeline) —
+    // Symmetric with the underrunClear wiring above (MixerPipeline.initMixerPipeline) —
     // release this player's pause source on the stem queue too, so a
     // stopped guild never leaves it stuck paused for other guilds.
     this.#stemQ().resume(this);
@@ -1138,25 +928,25 @@ export class GuildPlayer {
     await this.#sourcePreparer.cleanupIncomingTempFile();
     this.#sourcePreparer.discardPrefetch();
     // Ignore Idle from stop()/endMixer so recovery does not fight teardown.
-    this.#mixerStarted = false;
-    this.#idleRecovering = false;
+    this.#pipeline.mixerStarted = false;
+    this.#pipeline.idleRecovering = false;
     try {
-      this.#mixStream?.removeAllListeners();
+      this.mixStream?.removeAllListeners();
       // audioPlayer.stop() below destroys the resource, and the opus
       // encoder's pipeline() then destroy()s this MixStream with
       // ERR_STREAM_PREMATURE_CLOSE — possibly on a later tick, after the
       // 'error' listeners were just removed. An 'error' event with no
       // listener throws synchronously, so keep a swallowing handler until
       // the stream is fully torn down (same crash class fixed in 96b0f58).
-      this.#mixStream?.on('error', () => {});
-      this.#mixStream?.endMixer();
+      this.mixStream?.on('error', () => {});
+      this.mixStream?.endMixer();
     } catch {
       // already ended
     }
     this.#audioPlayer.stop();
     // endMixer() permanently closes MixStream. Rebuild so a later playNext()
     // (same session, no /leave) can setCurrent on a live mixer.
-    this.#initMixerPipeline();
+    this.#pipeline.initMixerPipeline();
   }
 
   #advanceAfterPlayback() {
@@ -1288,13 +1078,13 @@ export class GuildPlayer {
 
   #maybeApplyAnalysisDuration(track, analysis) {
     if (this.#queue.current !== track) return;
-    if (analysis?.durationSec && this.#mixStream?.remainingSec == null) {
+    if (analysis?.durationSec && this.mixStream?.remainingSec == null) {
       // §8.4: if this track was itself promoted via a beatmix, #sessionTempo
       // already carries its stretched tempoRatio (see #onCrossfadePromoted) —
       // native analysis duration must convert to playback-domain before
       // feeding setDurationSec, the same conversion promotion itself applies.
       // A no-op (ratio 1) for the common non-stretched case.
-      this.#mixStream.setDurationSec(compensateDurationSec(analysis.durationSec, this.#transitions.sessionTempo.tempoRatio));
+      this.mixStream.setDurationSec(compensateDurationSec(analysis.durationSec, this.#transitions.sessionTempo.tempoRatio));
     }
     // Phase 7 §8.4: the fast-path #analysisCache read in #resetSessionTempoFor
     // usually misses (analysis isn't scheduled/fetched until after a track
