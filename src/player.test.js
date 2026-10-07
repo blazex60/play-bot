@@ -427,3 +427,102 @@ test('GuildPlayer: a flowing mixer pipeline still plays PCM after createAudioRes
     await player.stop()
   }
 })
+
+test('GuildPlayer: seekTo rebuilds the source at the offset and adopts it in place', async () => {
+  const calls = []
+  const { player } = makePlayer({
+    trackDuration: 60,
+    createPcmSourceFn: async (track, opts) => {
+      calls.push(opts)
+      const source = makePendingPcmSource()
+      deliverPcm(source)
+      return source
+    },
+  })
+
+  assert.equal(await player.seekTo(10), false, 'seek with nothing playing must fail')
+
+  await player.playNext()
+  const firstSource = player.mixStream.currentSource
+
+  assert.equal(await player.seekTo(30), 30)
+  assert.equal(calls.at(-1).startSec, 30)
+  assert.notEqual(player.mixStream.currentSource, firstSource, 'seek must swap the current source')
+  assert.ok(player.trackPositionSec >= 30 && player.trackPositionSec < 31,
+    `trackPositionSec should be ~30, got ${player.trackPositionSec}`)
+
+  // Absolute seeks clamp inside the resolved duration (60s track) and
+  // report the applied position so callers can display what happened.
+  assert.equal(await player.seekTo(90), 59.5)
+  assert.equal(calls.at(-1).startSec, 59.5)
+
+  await player.stop()
+})
+
+test('GuildPlayer: seekTo keeps the same queue slot — no trackend, no advance', async () => {
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    createPcmSourceFn: async () => {
+      const source = makePendingPcmSource()
+      deliverPcm(source)
+      return source
+    },
+  })
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60 }))
+
+  await player.playNext()
+  assert.equal(queue.current?.title, 'Track A')
+  assert.equal(await player.seekTo(20), 20)
+  assert.equal(queue.current?.title, 'Track A', 'seek must not advance the queue')
+  assert.equal(queue.upcoming().length, 1)
+
+  await player.stop()
+})
+
+test('GuildPlayer: seekTo reuses the current normalized file instead of re-fetching', async () => {
+  const { mkdtempSync } = await import('node:fs')
+  const { execFileSync } = await import('node:child_process')
+  const { GuildPlayer } = await import('./player.js')
+  const { GuildQueue } = await import('./queue.js')
+  const dir = mkdtempSync('/tmp/seek-reuse-')
+  const wav = `${dir}/src.wav`
+  execFileSync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=60',
+    '-ar', '48000', '-ac', '2', wav], { stdio: 'pipe' })
+
+  // Build without createPcmSourceFn: the real #createPcmSource path must run
+  // so the prefetched file is tracked as #currentTempFile.
+  const queue = new GuildQueue()
+  queue.add(createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60 }))
+  let fetches = 0
+  const player = new GuildPlayer({
+    guildId: 'guild-1',
+    queue,
+    audioPlayer: makeAudioPlayer(),
+    connection: { subscribe() {} },
+    onDisconnect: async () => {},
+    prefetchTrackFn: async () => {
+      fetches += 1
+      return {
+        filePath: wav,
+        measured: { measured_I: -30, measured_TP: 0, measured_LRA: 0, measured_thresh: -40, offset: 0 },
+      }
+    },
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async () => null,
+    resolveAudioStreamFn: (url) => ({ url }),
+    createAudioResourceFn: (stream) => ({ stream, playStream: { destroy() {} } }),
+  })
+
+  await player.playNext()
+  const firstSource = player.mixStream.currentSource
+  assert.ok(firstSource, 'expected a live source')
+  assert.equal(fetches, 1, 'sanity: initial fetch happened once')
+
+  assert.equal(await player.seekTo(30), 30)
+  assert.equal(fetches, 1, 'seek must not re-download the track')
+  assert.notEqual(player.mixStream.currentSource, firstSource, 'seek must swap the source')
+  assert.ok(player.trackPositionSec >= 30 && player.trackPositionSec < 31,
+    `trackPositionSec should be ~30, got ${player.trackPositionSec}`)
+
+  await player.stop()
+})

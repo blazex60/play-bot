@@ -11,6 +11,7 @@
   },
   "scripts": {
     "start": "node src/deploy.js --if-changed && node src/index.js",
+    "player": "node src/local/index.js",
     "deploy": "node src/deploy.js",
     "test": "bun run test:server",
     "test:server": "bun scripts/run-node-tests.mjs --suite server",

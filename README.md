@@ -75,6 +75,17 @@ bun run check
 
 Web UI の React dev server はテスト時に Playwright config が起動する。production では `music-web` が `web/dist` を Fastify static として配信する。
 
+### ローカルプレイヤー
+
+Discord には接続せず、Bot と同じ再生経路（yt-dlp -> FFmpeg -> `MixStream` -> `AudioPlayer`）をローカルのオーディオ出力に流して試せる REPL。
+
+```bash
+bun run player                      # ffplay -> aplay の順に自動検出して再生
+bun run player --sink wav --out out.wav  # 音声デバイスがない環境では WAV ファイルに書き出し
+```
+
+`play <URL or キーワード>` で曲を追加し、`pause` / `resume` / `skip` / `stop` / `queue` / `shuffle` / `loop` / `np` / `seek` / `fade` / `normalize` / `status` を対話的に実行できる（詳しくは `help`）。`quit` で終了。yt-dlp と ffplay or aplay が必要。
+
 ## Codex Cloud / Claude Code Cloud
 
 クラウドエージェントの環境設定では、リポジトリに含まれるセットアップスクリプトを指定する。
