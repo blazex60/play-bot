@@ -67,3 +67,43 @@ test('commands run serially in input order', async () => {
   const text = out();
   assert.ok(text.indexOf('不明なコマンド: bogus') < text.indexOf('接続:'), 'order flipped');
 });
+
+test('parseSeekArg: absolute seconds, mm:ss, hh:mm:ss, relative ±N', async () => {
+  const { parseSeekArg } = await import('./cli.js');
+  assert.deepEqual(parseSeekArg('90'), { sec: 90, relative: false });
+  assert.deepEqual(parseSeekArg('1:30'), { sec: 90, relative: false });
+  assert.deepEqual(parseSeekArg('1:02:30'), { sec: 3750, relative: false });
+  assert.deepEqual(parseSeekArg('+10'), { sec: 10, relative: true });
+  assert.deepEqual(parseSeekArg('-10'), { sec: -10, relative: true });
+  assert.deepEqual(parseSeekArg('+1:30'), { sec: 90, relative: true });
+  assert.equal(parseSeekArg('abc'), null);
+  assert.equal(parseSeekArg(''), null);
+  assert.equal(parseSeekArg('1:2:3:4'), null);
+});
+
+test('progressBar renders proportional fill, empty without duration', async () => {
+  const { progressBar } = await import('./cli.js');
+  assert.equal(progressBar(0, 60, 10), '[░░░░░░░░░░]');
+  assert.equal(progressBar(30, 60, 10), '[█████░░░░░]');
+  assert.equal(progressBar(60, 60, 10), '[██████████]');
+  assert.equal(progressBar(120, 60, 10), '[██████████]', 'clamped at 100%');
+  assert.equal(progressBar(10, null, 10), '');
+});
+
+test('seek command requires a session', async () => {
+  const { cli, input, out } = makeCli();
+  const done = cli.run();
+  input.write('seek 30\n');
+  input.end();
+  assert.equal(await resolvesWithin(done, 5000), true, 'REPL did not settle');
+  assert.match(out(), /再生中の曲がありません/);
+});
+
+test('seek rejects malformed arguments', async () => {
+  const { cli, input, out } = makeCli();
+  const done = cli.run();
+  input.write('seek\n');
+  input.end();
+  assert.equal(await resolvesWithin(done, 5000), true, 'REPL did not settle');
+  assert.match(out(), /再生中の曲がありません|使い方: seek/);
+});

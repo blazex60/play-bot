@@ -427,3 +427,53 @@ test('GuildPlayer: a flowing mixer pipeline still plays PCM after createAudioRes
     await player.stop()
   }
 })
+
+test('GuildPlayer: seekTo rebuilds the source at the offset and adopts it in place', async () => {
+  const calls = []
+  const { player } = makePlayer({
+    trackDuration: 60,
+    createPcmSourceFn: async (track, opts) => {
+      calls.push(opts)
+      const source = makePendingPcmSource()
+      deliverPcm(source)
+      return source
+    },
+  })
+
+  assert.equal(await player.seekTo(10), false, 'seek with nothing playing must fail')
+
+  await player.playNext()
+  const firstSource = player.mixStream.currentSource
+
+  assert.equal(await player.seekTo(30), true)
+  assert.equal(calls.at(-1).startSec, 30)
+  assert.notEqual(player.mixStream.currentSource, firstSource, 'seek must swap the current source')
+  assert.ok(player.trackPositionSec >= 30 && player.trackPositionSec < 31,
+    `trackPositionSec should be ~30, got ${player.trackPositionSec}`)
+
+  // Absolute seeks clamp inside the resolved duration (60s track).
+  await player.seekTo(90)
+  assert.equal(calls.at(-1).startSec, 59.5)
+
+  await player.stop()
+})
+
+test('GuildPlayer: seekTo keeps the same queue slot — no trackend, no advance', async () => {
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    createPcmSourceFn: async () => {
+      const source = makePendingPcmSource()
+      deliverPcm(source)
+      return source
+    },
+  })
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60 }))
+
+  await player.playNext()
+  assert.equal(queue.current?.title, 'Track A')
+  assert.equal(await player.seekTo(20), true)
+  assert.equal(queue.current?.title, 'Track A', 'seek must not advance the queue')
+  assert.equal(queue.upcoming().length, 1)
+
+  await player.stop()
+})

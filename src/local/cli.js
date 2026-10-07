@@ -26,6 +26,7 @@ const HELP_TEXT = `コマンド一覧:
   shuffle               キューをシャッフル
   loop                  ループ切り替え（オフ→1曲→キュー）
   np                    再生中の曲（now playing）
+  seek <±秒|mm:ss>      シーク（例: seek 90, seek +10, seek -10, seek 1:30）
   fade <on|off>         クロスフェード切り替え（既定 on）
   normalize <on|off>    音量ノーマライズ切り替え
   status                接続/再生状態
@@ -36,6 +37,31 @@ function fmtTrackLine(track, prefix = '') {
   const dur = fmtDuration(track.duration);
   const by = track.requestedBy ? ` (req: ${track.requestedBy})` : '';
   return `${prefix}${track.title} [${dur}]${by}`;
+}
+
+/**
+ * Parse a seek argument into seconds.
+ * Accepts `90`, `1:30`, `1:02:30`, and `+10` / `-10` relative offsets.
+ * @returns {{ sec: number, relative: boolean } | null}
+ */
+export function parseSeekArg(arg) {
+  const text = String(arg ?? '').trim();
+  const m = text.match(/^([+-])?\s*(?:(\d+):(\d{1,2}):(\d{1,2})|(\d+):(\d{1,2})|(\d+(?:\.\d+)?))$/);
+  if (!m) return null;
+  const sign = m[1] === '-' ? -1 : 1;
+  let sec;
+  if (m[2] != null) sec = Number(m[2]) * 3600 + Number(m[3]) * 60 + Number(m[4]);
+  else if (m[5] != null) sec = Number(m[5]) * 60 + Number(m[6]);
+  else sec = Number(m[7]);
+  if (!Number.isFinite(sec)) return null;
+  return { sec: sign * sec, relative: m[1] != null };
+}
+
+export function progressBar(positionSec, durationSec, width = 20) {
+  if (durationSec == null || durationSec <= 0) return '';
+  const frac = Math.min(1, Math.max(0, positionSec / durationSec));
+  const filled = Math.round(frac * width);
+  return `[${'█'.repeat(filled)}${'░'.repeat(width - filled)}]`;
 }
 
 /**
@@ -201,13 +227,28 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
           say(`🔁 ループモード: ${LOOP_LABELS[mode]}`);
           break;
         }
+        case 'seek': {
+          if (!requireSession()) break;
+          const parsed = parseSeekArg(arg);
+          if (!parsed) { say('❌ 使い方: seek <秒|mm:ss|+N|-N>'); break; }
+          const pos = session.player.trackPositionSec;
+          const target = parsed.relative ? Math.max(0, pos + parsed.sec) : parsed.sec;
+          if (await session.player.seekTo(target)) {
+            say(`⏩ ${fmtDuration(Math.floor(target))} へシークしました`);
+          } else {
+            say('❌ シークできませんでした（再生中でないか、トランジション中です）');
+          }
+          break;
+        }
         case 'np':
         case 'nowplaying': {
           if (!requireSession()) break;
           const current = session.queue.current;
           if (!current) { say('❌ 再生中の曲がありません'); break; }
+          const pos = Math.floor(session.player.trackPositionSec);
+          const bar = progressBar(session.player.trackPositionSec, current.duration);
           say(`🎵 ${fmtTrackLine(current)}`);
-          say(`   ${fmtDuration(Math.floor(session.player.positionSec))} / ${fmtDuration(current.duration)} | 状態: ${session.player.status}`);
+          say(`   ${bar ? `${bar} ` : ''}${fmtDuration(pos)} / ${fmtDuration(current.duration)} | 状態: ${session.player.status}`);
           break;
         }
         case 'fade':

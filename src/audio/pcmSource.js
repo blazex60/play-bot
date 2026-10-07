@@ -126,9 +126,9 @@ export class PcmSource extends EventEmitter {
     this.emit('data');
   }
 
-  static createStreamSource(track, { resolveAudioStreamFn = resolveAudioStream } = {}) {
+  static createStreamSource(track, { resolveAudioStreamFn = resolveAudioStream, startSec = 0 } = {}) {
     const source = new PcmSource();
-    const input = resolveAudioStreamFn(track.webpageUrl);
+    const input = resolveAudioStreamFn(track.webpageUrl, { startSec });
     source.#input = input;
 
     const proc = spawn('ffmpeg', [

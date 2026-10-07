@@ -170,11 +170,13 @@ export async function resolveRelated(videoId, { limit = 10 } = {}) {
   return entries.slice(0, limit).map(entry => mapEntryToTrack(entry, { requestedBy: '🔀 自動再生', requestedById: null }));
 }
 
-export function resolveAudioStream(url) {
+export function resolveAudioStream(url, { startSec } = {}) {
   const proc = spawn('yt-dlp', buildYtdlpArgs(
     '-f', YTDLP_AUDIO_FORMAT,
     '--hls-use-mpegts',
     '--no-playlist',
+    // Byte-range seek on the media URL — skips download of the head.
+    ...(startSec > 0.001 ? ['--download-sections', `*${startSec}-inf`] : []),
     '-o', '-',
     url,
   ));

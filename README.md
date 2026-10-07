@@ -84,7 +84,7 @@ bun run player                      # ffplay -> aplay の順に自動検出し�
 bun run player --sink wav --out out.wav  # 音声デバイスがない環境では WAV ファイルに書き出し
 ```
 
-`play <URL or キーワード>` で曲を追加し、`pause` / `resume` / `skip` / `stop` / `queue` / `shuffle` / `loop` / `np` / `fade` / `normalize` / `status` を対話的に実行できる（詳しくは `help`）。`quit` で終了。yt-dlp と ffplay or aplay が必要。
+`play <URL or キーワード>` で曲を追加し、`pause` / `resume` / `skip` / `stop` / `queue` / `shuffle` / `loop` / `np` / `seek` / `fade` / `normalize` / `status` を対話的に実行できる（詳しくは `help`）。`quit` で終了。yt-dlp と ffplay or aplay が必要。
 
 ## Codex Cloud / Claude Code Cloud
 

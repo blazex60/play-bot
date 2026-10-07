@@ -1315,6 +1315,16 @@ export class GuildPlayer {
     return this.#mixStream?.positionSec ?? 0;
   }
 
+  /**
+   * Position on the track's own timeline: MixStream.positionSec plus the
+   * native offset the current source's decoder started at (seeked sources,
+   * beatmix/stem promotions). Use this for display — plain positionSec is
+   * relative to decoder start.
+   */
+  get trackPositionSec() {
+    return (this.#currentEntrySec ?? 0) + (this.#mixStream?.positionSec ?? 0);
+  }
+
   get sessionTempo() {
     return this.#sessionTempo;
   }
@@ -1391,6 +1401,61 @@ export class GuildPlayer {
       return true;
     }
     return this.#audioPlayer.unpause();
+  }
+
+  /**
+   * Seek within the current track by rebuilding the PCM source at an
+   * offset and adopting it in place — no trackend, no queue advance.
+   * Normalized (file) sources seek via ffmpeg -ss; stream sources
+   * re-resolve with yt-dlp --download-sections. Returns false when there
+   * is nothing playing or a crossfade is running.
+   * @param {number} targetSec absolute position on the native timeline
+   */
+  async seekTo(targetSec) {
+    const track = this.#queue.current;
+    if (!track || !this.#mixStream?.currentSource || this.#mixStream.isDestroyed()) return false;
+    if (this.#mixStream.isCrossfading || this.#handlingAfter) return false;
+    const durationSec = this.#resolvePlaybackDurationSec(track);
+    let target = Math.max(0, targetSec);
+    if (durationSec != null) target = Math.min(target, Math.max(0, durationSec - 0.5));
+    let source;
+    try {
+      source = await this.#createPcmSource(track, { startSec: target });
+    } catch (err) {
+      console.error('[GuildPlayer] seek source failed:', err);
+      return false;
+    }
+    // Same rule as playNext: wait for real PCM before adopting — the
+    // MixStream underrun guard starts as soon as a current source is
+    // attached, so a still-buffering decoder would sourceerror the track.
+    const waitGeneration = this.#pcmWaitGeneration;
+    const waited = await this.#waitForSourceAudio(source);
+    if (this.#isSourceAudioWaitSuperseded(track, waited, waitGeneration) || waited !== 'ready') {
+      source.destroy?.();
+      return false;
+    }
+    const remainingSec = durationSec != null ? Math.max(0, durationSec - target) : null;
+    if (!this.#mixStream.adoptCurrent(source, { durationSec: remainingSec })) {
+      source.destroy();
+      return false;
+    }
+    // The decoder now starts at `target` on the native timeline — mirror
+    // the bookkeeping a fresh track start performs, plus cancel anything
+    // prepped/armed against the pre-seek position.
+    this.#clearCrossfadeArm();
+    this.#clearPreparedIncoming();
+    this.#crossfadeStarted = false;
+    this.#crossfadeTargetTrack = null;
+    this.#pendingSessionTempo = null;
+    this.#pendingIncomingEntrySec = 0;
+    this.#lastEvaluatedTransitionReport = null;
+    this.#currentEntrySec = target;
+    this.#currentEntryOverlapConsumedSec = 0;
+    this.#resetSessionTempoFor(track);
+    this.#playbackStart = Date.now();
+    this.#lastActiveAt = Date.now();
+    this.#startCrossfadeArm();
+    return true;
   }
 
   async skip() {
@@ -1611,11 +1676,11 @@ export class GuildPlayer {
       if (!forIncoming) this.#discardPrefetch();
       // Live/untrimmed stream — do not keep a prior trimmed duration.
       if (track.videoId) this.#probedDurationCache.delete(track.videoId);
-      // §9.3: createStreamSource has no startSec/tempoFilter support at all —
-      // mark the source so a caller that requested either doesn't stash
-      // beatmix bookkeeping (session tempo, entry offset) for audio that is
-      // actually playing from native position 0 at native tempo.
-      const source = createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
+      // §9.3: createStreamSource has no tempoFilter support at all — mark
+      // the source so a caller that requested one doesn't stash beatmix
+      // bookkeeping (session tempo) for audio actually playing at native
+      // tempo. startSec is honored via yt-dlp --download-sections.
+      const source = createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream, startSec });
       source.tempoHonored = false;
       return source;
     }
@@ -1656,7 +1721,7 @@ export class GuildPlayer {
       if (err?.code === 'INCOMING_PREP_CANCELLED') throw err;
       console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err.message);
       if (track.videoId) this.#probedDurationCache.delete(track.videoId);
-      const source = createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream });
+      const source = createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStream, startSec });
       source.tempoHonored = false;
       return source;
     }
