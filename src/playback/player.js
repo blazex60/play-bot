@@ -11,8 +11,8 @@ import {
   prefetchTrack,
   stageTempFileCopy,
 } from '../audio/normalize.js';
-import { shouldReconnectRetry } from './player/playbackPolicy.js';
 import { AnalysisCoordinator } from './player/analysisCoordinator.js';
+import { QueueAdvancement } from './player/queueAdvancement.js';
 import { PlaybackWatchdog } from './player/playbackWatchdog.js';
 import { SourcePreparer } from './player/sourcePreparer.js';
 import { TransitionCoordinator } from './player/transitionCoordinator.js';
@@ -55,10 +55,6 @@ export const MIXER_AUDIO_PLAYER_OPTIONS = {
   },
 };
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 export class GuildPlayer {
   #guildId;
   #connection;
@@ -82,14 +78,11 @@ export class GuildPlayer {
   // so #ensureOutgoingStemPrep() can loudnorm the outgoing stems with the
   // same measured LUFS value the currently-playing full-mix source used.
   #currentMeasured = null;
-  #handlingAfter = false;
-  #handlingAfterPlayback = 0;
-  #pendingAfter = false;
-  #playbackCount = 0;
   #pipeline;
   #analysis;
   #sourcePreparer;
   #transitions;
+  #advancement;
   #analysisQueue;
   /**
    * Phase 9C (docs/mix-transition-phase9.md §5): dedicated pausable serial
@@ -102,8 +95,6 @@ export class GuildPlayer {
    * getStemPreparationQueue() singleton via #stemQ().
    */
   #stemQueue;
-  /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
-  #queueRefill = null;
   /** Phase 9A (docs/mix-transition-phase9.md §3): test-only override — see logTransitionPlan()'s own docstring for the always-on-metrics/MIX_DEBUG-gated-log split. */
   #logTransitionPlanFn;
   /** Phase 9A (Codex review, PR #43): test-only override — see logGaplessTransition()'s own docstring for why the snap-handoff path needs a separate, report-less logging entry point. */
@@ -180,10 +171,10 @@ export class GuildPlayer {
     // opus resource attach/rebuild, and the dead-mixer recovery paths —
     // lives in the MixerPipeline (same DI pattern as the coordinators
     // below). Built first because #transitions reaches it through the
-    // getMixStream thunk; the advancement-loop entry points
-    // (#advanceAfterPlayback/#onCrossfadePromoted/#onSnapHandoff/playNext)
-    // stay here and are injected as bound callbacks, so `this` still
-    // resolves to the GuildPlayer inside them.
+    // getMixStream thunk; the advancement/handoff entry points
+    // (#advancement.advanceAfterPlayback/#onCrossfadePromoted/
+    // #onSnapHandoff/playNext) are injected as bound callbacks into it, so
+    // `this` still resolves to the right owner inside them.
     this.#pipeline = new MixerPipeline({
       audioPlayer,
       connection,
@@ -191,12 +182,12 @@ export class GuildPlayer {
       pcmWaitTimeoutMs,
       pauseSource: this,
       getQueueCurrent: () => this.#queue.current,
-      isHandlingAfter: () => this.#handlingAfter,
+      isHandlingAfter: () => this.#advancement.handlingAfter,
       isForceSkip: () => this.#forceSkip,
       markHadError: () => {
         this.#hadError = true;
       },
-      advanceAfterPlayback: () => this.#advanceAfterPlayback(),
+      advanceAfterPlayback: () => this.#advancement.advanceAfterPlayback(),
       onCrossfadePromoted: () => this.#onCrossfadePromoted(),
       onSnapHandoff: (adopt) => this.#onSnapHandoff(adopt),
       onIncomingError: (err) => {
@@ -263,8 +254,9 @@ export class GuildPlayer {
     // evaluation + plan selection, and the session-tempo / promotion
     // bookkeeping those decisions carry — lives in the TransitionCoordinator
     // (same DI pattern as #analysis/#sourcePreparer). The advancement loop
-    // (#handleAfter/#playNextMixer/#onCrossfadePromoted/#onSnapHandoff) stays
-    // here and reads/writes the coordinator's public state fields.
+    // itself now lives in QueueAdvancement below; the remaining handoff
+    // paths (#playNextMixer/#onCrossfadePromoted/#onSnapHandoff) stay here
+    // and read/write the coordinator's public state fields.
     this.#transitions = new TransitionCoordinator({
       guildId,
       queue,
@@ -273,8 +265,8 @@ export class GuildPlayer {
       audioPlayer,
       getMixStream: () => this.#pipeline.mixStream,
       isForceSkip: () => this.#forceSkip,
-      isHandlingAfter: () => this.#handlingAfter,
-      maybeRefillQueue: () => this.#maybeRefillQueue(),
+      isHandlingAfter: () => this.#advancement.handlingAfter,
+      maybeRefillQueue: () => this.#advancement.maybeRefillQueue(),
       resolvePlaybackDurationSec: (track) => this.#resolvePlaybackDurationSec(track),
       probeTempoBackendFn,
       getCachedStemsFn,
@@ -297,6 +289,33 @@ export class GuildPlayer {
       },
     });
 
+    // After-playback advancement — the serialized handleAfter drain, the
+    // force-skip/error ordering, and the queue-exhaustion/refill machinery
+    // — lives in QueueAdvancement (same DI pattern as the coordinators
+    // above). Built after #transitions/#sourcePreparer because it drives
+    // them directly; the pipeline/transitions thunks above only reach it
+    // lazily, so this ordering is safe.
+    this.#advancement = new QueueAdvancement({
+      queue,
+      handleQueueExhausted,
+      queueExhaustedTimeoutMs,
+      transitions: this.#transitions,
+      sourcePreparer: this.#sourcePreparer,
+      playNext: (gaplessFrom) => this.playNext(gaplessFrom),
+      disconnect: () => this.#disconnect(),
+      cleanupCurrentTempFile: () => this.#cleanupCurrentTempFile(),
+      clearWatchdog: () => this.#clearWatchdog(),
+      isForceSkip: () => this.#forceSkip,
+      clearForceSkip: () => {
+        this.#forceSkip = false;
+      },
+      isHadError: () => this.#hadError,
+      clearHadError: () => {
+        this.#hadError = false;
+      },
+      getPlaybackStart: () => this.#playbackStart,
+    });
+
     this.#pipeline.initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
       if (!this.#pipeline.mixerStarted || this.#pipeline.idleRecovering) return;
@@ -306,7 +325,7 @@ export class GuildPlayer {
       // would sourceerror while playNext is still downloading/analyzing.
       // handleAfter already calls playNext; mid-track Idle must restart here.
       this.#pipeline.recoverMixerPlayback({ play: false });
-      const restartCurrent = this.#queue.current && !this.#handlingAfter && !this.#forceSkip;
+      const restartCurrent = this.#queue.current && !this.#advancement.handlingAfter && !this.#forceSkip;
       const done = () => { this.#pipeline.idleRecovering = false; };
       if (restartCurrent) {
         this.playNext().catch((err) => {
@@ -378,8 +397,8 @@ export class GuildPlayer {
   }
 
   async #playNextMixer(track, { gaplessFrom = null } = {}) {
-    if (this.#queueRefill && this.#queueRefill.key !== this.#queueRefillKey(track)) {
-      this.#queueRefill = null;
+    if (this.#advancement.queueRefill && this.#advancement.queueRefill.key !== this.#advancement.queueRefillKey(track)) {
+      this.#advancement.queueRefill = null;
     }
     let source;
     try {
@@ -387,10 +406,10 @@ export class GuildPlayer {
     } catch (err) {
       console.warn(`[GuildPlayer] pcm source failed for ${track.title}:`, err.message);
       this.#hadError = true;
-      if (this.#handlingAfter) {
-        this.#pendingAfter = true;
+      if (this.#advancement.handlingAfter) {
+        this.#advancement.pendingAfter = true;
       } else {
-        this.#advanceAfterPlayback();
+        this.#advancement.advanceAfterPlayback();
       }
       return;
     }
@@ -427,10 +446,10 @@ export class GuildPlayer {
     if (waited !== 'ready') {
       this.#pipeline.discardUnusedSource(source);
       this.#hadError = true;
-      if (this.#handlingAfter) {
-        this.#pendingAfter = true;
+      if (this.#advancement.handlingAfter) {
+        this.#advancement.pendingAfter = true;
       } else {
-        this.#advanceAfterPlayback();
+        this.#advancement.advanceAfterPlayback();
       }
       return;
     }
@@ -438,7 +457,7 @@ export class GuildPlayer {
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
     this.#resetWatchdog();
-    this.#playbackCount += 1;
+    this.#advancement.playbackCount += 1;
 
     // Rebuild first if Idle/stop ended the mixer, attach PCM, then play.
     // Playing before setCurrent leaves MixStream with no current source and
@@ -516,7 +535,7 @@ export class GuildPlayer {
     // advance the queue twice and skip/replace the snapped-in track.
     if (
       this.#hadError
-      || this.#handlingAfter
+      || this.#advancement.handlingAfter
       || this.#transitions.crossfadeStarted
       || this.mixStream?.isCrossfading
     ) return;
@@ -613,7 +632,7 @@ export class GuildPlayer {
     this.#transitions.clearCrossfadeArm();
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
-    this.#playbackCount += 1;
+    this.#advancement.playbackCount += 1;
     if (promotedTempo) {
       this.#transitions.sessionTempo = promotedTempo;
     } else {
@@ -673,7 +692,7 @@ export class GuildPlayer {
 
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
-    this.#playbackCount += 1;
+    this.#advancement.playbackCount += 1;
     this.#transitions.crossfadeStarted = false;
     // §8.4: a beatmix transition stashed the incoming track's stretched
     // tempo state in #pendingSessionTempo when the crossfade started — carry
@@ -820,7 +839,7 @@ export class GuildPlayer {
   async seekTo(targetSec) {
     const track = this.#queue.current;
     if (!track || !this.mixStream?.currentSource || this.mixStream.isDestroyed()) return false;
-    if (this.mixStream.isCrossfading || this.#handlingAfter) return false;
+    if (this.mixStream.isCrossfading || this.#advancement.handlingAfter) return false;
     const durationSec = this.#resolvePlaybackDurationSec(track);
     let target = Math.max(0, targetSec);
     if (durationSec != null) target = Math.min(target, Math.max(0, durationSec - 0.5));
@@ -912,7 +931,7 @@ export class GuildPlayer {
     this.#clearWatchdog();
     this.#transitions.clearCrossfadeArm();
     this.#sourcePreparer.clearPreparedIncoming();
-    this.#queueRefill = null;
+    this.#advancement.queueRefill = null;
     // Codex review (PR #43, round 4/5): an explicit stop must not leave a
     // stashed gapless continuation OR evaluated-plan snapshot around for a
     // later, unrelated playNext() (e.g. a fresh /play in the same session,
@@ -949,134 +968,7 @@ export class GuildPlayer {
     this.#pipeline.initMixerPipeline();
   }
 
-  #advanceAfterPlayback() {
-    if (this.#handlingAfter) {
-      // A newly started track can fail while an exhausted-queue continuation
-      // is still planning. Preserve that transition so it is handled after
-      // the active handoff, but ignore duplicate events from the playback it
-      // is already handling. Comparing playback instances (rather than tracks)
-      // also preserves an error from a TRACK-loop replay of the same track.
-      if (this.#playbackCount !== this.#handlingAfterPlayback) {
-        this.#pendingAfter = true;
-      }
-      return;
-    }
-    this.#handlingAfter = true;
-    this.#drainAfterPlayback()
-      .catch(err => {
-        console.error('[GuildPlayer] handleAfter error:', err);
-      })
-      .finally(() => {
-        this.#handlingAfter = false;
-        this.#handlingAfterPlayback = 0;
-      });
-  }
-
-  async #drainAfterPlayback() {
-    do {
-      this.#pendingAfter = false;
-      this.#handlingAfterPlayback = this.#playbackCount;
-      await this.#handleAfter();
-    } while (this.#pendingAfter);
-  }
-
-  async #handleAfter() {
-    this.#transitions.clearCrossfadeArm();
-    // Same reasoning as #onCrossfadePromoted()'s reset (Codex): a natural,
-    // non-crossfade track end (no fallback was even eligible for the
-    // failed pair) must also release the marker once that pair's attempt
-    // has concluded, not just the crossfade-promotion path.
-    this.#transitions.stemMixUnavailableKey = null;
-    await this.#cleanupCurrentTempFile();
-
-    const upcomingBeforeAdvance = this.#queue.loopMode === LoopMode.TRACK
-      ? this.#queue.current
-      : this.#queue.upcoming()[0];
-    const preserveIncoming = upcomingBeforeAdvance
-      && this.#sourcePreparer.preparedIncoming?.track === upcomingBeforeAdvance;
-    if (!preserveIncoming) {
-      this.#sourcePreparer.clearPreparedIncoming();
-      await this.#sourcePreparer.cleanupIncomingTempFile();
-    }
-
-    if (this.#forceSkip) {
-      this.#forceSkip = false;
-      this.#queue.next({ forceAdvance: true });
-      await this.playNext();
-      return;
-    }
-
-    const elapsed = Date.now() - this.#playbackStart;
-    const track = this.#queue.current;
-
-    if (shouldReconnectRetry({ elapsedMs: elapsed, track, hadError: this.#hadError })) {
-      await sleep(2000);
-      await this.playNext();
-      return;
-    }
-
-    const finishedTrack = track;
-    const shouldForceAdvance = this.#hadError;
-    this.#hadError = false;
-    const nextTrack = this.#queue.next({ forceAdvance: shouldForceAdvance });
-    if (nextTrack === null) {
-      // Stop the stall watchdog before handing off: nothing is playing right
-      // now either way, and a handler that starts a new track (auto mode) or
-      // waits on a user pick (recommend mode) needs a clean slate rather than
-      // an interval left ticking against an idle player forever.
-      this.#clearWatchdog();
-      // Codex review (PR #43, round 3): can't log here — there is no next
-      // track yet, and the eventual continuation (if handleQueueExhausted
-      // adds one) calls the public playNext() itself, outside this method's
-      // call stack. Stash the finished track so that call picks it up (see
-      // #pendingGaplessFrom's docstring) and logs only once its source
-      // actually starts, same "natural, non-error" guard as the branch below.
-      if (!shouldForceAdvance) {
-        this.#transitions.pendingGaplessFrom = { track: finishedTrack, setAt: Date.now() };
-      }
-      const handled = await this.#startQueueRefill(finishedTrack);
-      // null = another round already owns the autoplay lock; do not disconnect.
-      if (handled !== false) return;
-      this.#transitions.pendingGaplessFrom = null;
-      await this.#disconnect();
-    } else {
-      // Codex review (PR #43): a "hard handoff" — no crossfade was armed AND
-      // #onSnapHandoff() either never ran or its prepared source was missing/
-      // rejected — still advances the queue to a real next track here, and
-      // never touches any of the other two transition-logging call sites.
-      // Only the natural case is worth logging: forceSkip/reconnect-retry
-      // already returned above, so !shouldForceAdvance means this wasn't an
-      // error-forced skip either. Pass it through to playNext() rather than
-      // logging here directly (Codex round-3 P2) — the incoming track can
-      // still fail to start inside #playNextMixer, and only that method
-      // knows once setCurrent() has actually accepted the source.
-      await this.playNext(shouldForceAdvance ? null : finishedTrack);
-    }
-  }
-
-  async #tryHandleQueueExhausted(finishedTrack) {
-    if (!this.#handleQueueExhausted) return false;
-    // planAutoTrack/planRecommendations await yt-dlp and fetch calls with no
-    // timeout of their own; without a bound here, a hang there would leave
-    // the player idle forever since the watchdog was already cleared.
-    let timeoutHandle;
-    const timeout = new Promise((_, reject) => {
-      timeoutHandle = setTimeout(
-        () => reject(new Error('handleQueueExhausted timed out')),
-        this.#queueExhaustedTimeoutMs
-      );
-    });
-    try {
-      return await Promise.race([this.#handleQueueExhausted(finishedTrack), timeout]);
-    } catch (err) {
-      console.error('[GuildPlayer] handleQueueExhausted error:', err);
-      return false;
-    } finally {
-      clearTimeout(timeoutHandle);
-    }
-  }
-
-  #maybeApplyAnalysisDuration(track, analysis) {
+  async #maybeApplyAnalysisDuration(track, analysis) {
     if (this.#queue.current !== track) return;
     if (analysis?.durationSec && this.mixStream?.remainingSec == null) {
       // §8.4: if this track was itself promoted via a beatmix, #sessionTempo
@@ -1096,34 +988,6 @@ export class GuildPlayer {
       // Same headBpm preference as #resetSessionTempoFor, for the same reason.
       this.#transitions.sessionTempo = resetSessionTempo(analysis.headBpm ?? analysis.bpm);
     }
-  }
-
-  #queueRefillKey(track) {
-    return track?.videoId || track?.webpageUrl || track || null;
-  }
-
-  #startQueueRefill(track) {
-    const key = this.#queueRefillKey(track);
-    if (this.#queueRefill?.key === key) return this.#queueRefill.promise;
-    const promise = this.#tryHandleQueueExhausted(track);
-    this.#queueRefill = { key, promise };
-    return promise;
-  }
-
-  #maybeRefillQueue() {
-    if (this.#queue.loopMode === LoopMode.TRACK) return;
-    if (this.#queue.upcoming().length > 0) return;
-    if (!this.#handleQueueExhausted) return;
-    const current = this.#queue.current;
-    if (!current) return;
-    if (this.#queueRefill?.key === this.#queueRefillKey(current)) return;
-    this.#startQueueRefill(current)
-      .then((handled) => {
-        if (handled) this.#sourcePreparer.prefetchUpcoming();
-      })
-      .catch((err) => {
-        console.warn('[GuildPlayer] early queue refill failed:', err.message);
-      });
   }
 
   async #cleanupCurrentTempFile() {
