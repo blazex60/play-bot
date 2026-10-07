@@ -35,3 +35,13 @@ test('createSink validates arguments', async () => {
   await assert.rejects(() => createSink({ sink: 'wav' }), /--out/);
   await assert.rejects(() => createSink({ sink: 'bogus' }), /不明な sink/);
 });
+
+test('sink write() does not crash after the child process exits early', async () => {
+  // ffplay/aplay exiting (e.g. no audio device) makes stdin writes fail with
+  // EPIPE/ERR_STREAM_DESTROYED — handled, not thrown.
+  const sink = await createSink({ sink: 'ffplay' });
+  await sink.close();
+  assert.doesNotThrow(() => { sink.write(Buffer.alloc(FRAME_BYTES)); });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(sink.write(Buffer.alloc(FRAME_BYTES)), false);
+});

@@ -354,7 +354,10 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
     while (busy || heldLines.length || pendingAnswer) {
       flushHeld();
       if (pendingAnswer) resolveAnswer(heldLines.shift() ?? '');
-      await commandChain;
+      // Race, not a plain await: an in-flight command may post a pick
+      // (pendingAnswer) that only this loop can still answer post-EOF —
+      // awaiting the chain unconditionally would deadlock on it.
+      await Promise.race([commandChain, new Promise((resolve) => setImmediate(resolve))]);
     }
     await shutdown();
   }

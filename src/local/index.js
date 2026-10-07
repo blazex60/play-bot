@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { createOpusDecoder } from './connection.js';
 import { createLocalPlayerCli } from './cli.js';
 import { createSink, SINK_CHOICES } from './sinks.js';

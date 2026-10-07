@@ -17,6 +17,9 @@ function spawnSink(name, cmd, args) {
   let warnedBackpressure = false;
   let spawnError = null;
   proc.on('error', (err) => { spawnError = err; });
+  // ffplay/aplay exiting early (e.g. audio device unavailable) makes stdin
+  // writes fail with EPIPE — an unhandled stream error would crash the CLI.
+  proc.stdin.on('error', (err) => { spawnError = err; });
   return {
     name,
     get error() { return spawnError; },

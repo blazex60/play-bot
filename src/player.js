@@ -1322,7 +1322,11 @@ export class GuildPlayer {
    * relative to decoder start.
    */
   get trackPositionSec() {
-    return (this.#currentEntrySec ?? 0) + (this.#mixStream?.positionSec ?? 0);
+    // positionSec is in the playback (output-frame) domain; convert it to
+    // native seconds with the session tempo ratio before adding the entry
+    // offset — same formula as #currentEntryOverlapConsumedSec.
+    const ratio = this.#sessionTempo?.tempoRatio ?? 1;
+    return (this.#currentEntrySec ?? 0) + (this.#mixStream?.positionSec ?? 0) * ratio;
   }
 
   get sessionTempo() {
@@ -1421,7 +1425,16 @@ export class GuildPlayer {
     if (durationSec != null) target = Math.min(target, Math.max(0, durationSec - 0.5));
     let source;
     try {
-      source = await this.#createPcmSource(track, { startSec: target });
+      if (this.#currentTempFile) {
+        // Reuse the already-normalized file: -ss inside it instead of a
+        // full re-download + re-loudnorm (and #currentTempFile stays the
+        // tracked owner, so the old file isn't orphaned).
+        const fileSource = this.#createFileSourceFn ?? createFileSource;
+        source = fileSource(this.#currentTempFile, { measured: this.#currentMeasured, startSec: target });
+        source.tempoHonored = true;
+      } else {
+        source = await this.#createPcmSource(track, { startSec: target });
+      }
     } catch (err) {
       console.error('[GuildPlayer] seek source failed:', err);
       return false;

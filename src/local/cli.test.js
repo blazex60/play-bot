@@ -107,3 +107,20 @@ test('seek rejects malformed arguments', async () => {
   assert.equal(await resolvesWithin(done, 5000), true, 'REPL did not settle');
   assert.match(out(), /再生中の曲がありません|使い方: seek/);
 });
+
+test('stdin EOF while a keyword search is still running cancels the pick it posts', async () => {
+  let resolveSearch;
+  const searchFn = () => new Promise((resolve) => { resolveSearch = resolve; });
+  const { cli, input, out } = makeCli({ searchFn });
+  const done = cli.run();
+  input.write('play some song\n');
+  input.end();
+  // EOF lands before the search resolves — the pick is posted mid-drain and
+  // only the drain loop can still answer it (Codex: unconditional commandChain
+  // await deadlocked here).
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  resolveSearch(SEARCH_RESULTS);
+  assert.equal(await resolvesWithin(done, 5000), true, 'REPL did not settle');
+  assert.match(out(), /番号を選択/);
+  assert.match(out(), /キャンセルしました/);
+});
