@@ -1407,9 +1407,10 @@ export class GuildPlayer {
    * Seek within the current track by rebuilding the PCM source at an
    * offset and adopting it in place — no trackend, no queue advance.
    * Normalized (file) sources seek via ffmpeg -ss; stream sources
-   * re-resolve with yt-dlp --download-sections. Returns false when there
-   * is nothing playing or a crossfade is running.
+   * re-resolve with yt-dlp --download-sections.
    * @param {number} targetSec absolute position on the native timeline
+   * @returns {Promise<number|false>} the applied (clamped) position, or
+   *          false when nothing is playing / a crossfade is in flight
    */
   async seekTo(targetSec) {
     const track = this.#queue.current;
@@ -1455,7 +1456,7 @@ export class GuildPlayer {
     this.#playbackStart = Date.now();
     this.#lastActiveAt = Date.now();
     this.#startCrossfadeArm();
-    return true;
+    return target;
   }
 
   async skip() {

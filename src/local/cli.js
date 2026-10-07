@@ -233,8 +233,9 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
           if (!parsed) { say('❌ 使い方: seek <秒|mm:ss|+N|-N>'); break; }
           const pos = session.player.trackPositionSec;
           const target = parsed.relative ? Math.max(0, pos + parsed.sec) : parsed.sec;
-          if (await session.player.seekTo(target)) {
-            say(`⏩ ${fmtDuration(Math.floor(target))} へシークしました`);
+          const applied = await session.player.seekTo(target);
+          if (applied !== false) {
+            say(`⏩ ${fmtDuration(Math.floor(applied))} へシークしました`);
           } else {
             say('❌ シークできませんでした（再生中でないか、トランジション中です）');
           }
