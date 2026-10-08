@@ -28,6 +28,7 @@ function sleep(ms) {
  *   disconnect: () => Promise<void>,
  *   cleanupCurrentTempFile: () => Promise<void>,
  *   clearWatchdog: () => void,
+ *   isStopping: () => boolean,
  *   isForceSkip: () => boolean,
  *   clearForceSkip: () => void,
  *   isHadError: () => boolean,
@@ -63,6 +64,7 @@ export class QueueAdvancement {
   #disconnect;
   #cleanupCurrentTempFile;
   #clearWatchdog;
+  #isStopping;
   #isForceSkip;
   #clearForceSkip;
   #isHadError;
@@ -79,6 +81,7 @@ export class QueueAdvancement {
     disconnect,
     cleanupCurrentTempFile,
     clearWatchdog,
+    isStopping,
     isForceSkip,
     clearForceSkip,
     isHadError,
@@ -94,6 +97,7 @@ export class QueueAdvancement {
     this.#disconnect = disconnect;
     this.#cleanupCurrentTempFile = cleanupCurrentTempFile;
     this.#clearWatchdog = clearWatchdog;
+    this.#isStopping = isStopping;
     this.#isForceSkip = isForceSkip;
     this.#clearForceSkip = clearForceSkip;
     this.#isHadError = isHadError;
@@ -133,6 +137,11 @@ export class QueueAdvancement {
   }
 
   async #handleAfter() {
+    // A stop() in flight owns teardown (queue clear, mixer rebuild): a
+    // drain that lands inside its window must not advance, refill, or
+    // disconnect — a refill started now could resolve into an enqueue
+    // that revives the playback the user just stopped.
+    if (this.#isStopping()) return;
     this.#transitions.clearCrossfadeArm();
     // Same reasoning as #onCrossfadePromoted()'s reset (Codex): a natural,
     // non-crossfade track end (no fallback was even eligible for the
@@ -241,6 +250,9 @@ export class QueueAdvancement {
   }
 
   maybeRefillQueue() {
+    // Same stop guard as #handleAfter: a refill triggered during stop()'s
+    // teardown window would plan against a queue the stop already owns.
+    if (this.#isStopping()) return;
     if (this.#queue.loopMode === LoopMode.TRACK) return;
     if (this.#queue.upcoming().length > 0) return;
     if (!this.#handleQueueExhausted) return;

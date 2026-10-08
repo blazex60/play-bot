@@ -17,20 +17,24 @@ export const sessions = new Map()
 // Builds the in-process playback facade bound to a given sessions Map.
 // Commands/handlers receive a sessions Map as an argument (tests inject
 // fakes), so they bind their service to that map rather than the global
-// singleton below. onStop is what makes playback.stop() the application-level
-// "stop": after the player halts, in-flight autoplay planning is invalidated
-// and pending recommendation prompts are cancelled so nothing can resurrect
-// playback on top of the stop.
+// singleton below. onStopStart/onStop are what make playback.stop() the
+// application-level "stop": in-flight autoplay planning is invalidated
+// and pending recommendation prompts are cancelled so nothing can
+// resurrect playback on top of the stop.
 export function playbackFor(sessionsMap) {
+  // Session-bound invalidation (deliberately NOT the map-bound
+  // bumpPlanToken/cancelPendingRecommendations helpers): the point is
+  // killing THIS session's in-flight plans and prompts, so the effect
+  // must land on the session object captured by PlaybackService.stop —
+  // immune to a leave+rejoin swapping the map entry mid-stop.
+  const invalidateSession = (guildId, session) => {
+    session.planToken += 1
+    session.recommendHooks?.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
+  }
   return new PlaybackService({
     getSession: (guildId) => sessionsMap.get(guildId),
-    onStop: (guildId) => {
-      // Both helpers take the bound map explicitly: a PlaybackService bound
-      // to an injected/test sessions Map must bump that map's planToken and
-      // read that map's recommendHooks, never the global `sessions`.
-      bumpPlanToken(sessionsMap, guildId)
-      cancelPendingRecommendations(sessionsMap, guildId)
-    },
+    onStopStart: invalidateSession,
+    onStop: invalidateSession,
   })
 }
 

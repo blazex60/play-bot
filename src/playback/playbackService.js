@@ -18,19 +18,29 @@
 export class PlaybackService {
   #getSession;
   #onStop;
+  #onStopStart;
 
   /**
    * @param {{ getSession: (guildId: string) => object|undefined,
-   *            onStop?: (guildId: string) => void }} deps
-   *   onStop runs after every stop(): sessions.js wires it to plan-token
-   *   invalidation + pending-recommendation cancellation, which is what
-   *   "stop playback" means at the application level (a stale autoplay
-   *   continuation or pickable prompt must not resurrect playback).
+   *            onStopStart?: (guildId: string, session: object) => void,
+   *            onStop?: (guildId: string, session: object) => void }} deps
+   *   onStopStart runs BEFORE the player's async teardown, against the
+   *   session captured at entry: sessions.js wires it to plan-token
+   *   invalidation + pending-recommendation cancellation, so an in-flight
+   *   recommend plan is dead from the first tick of stop() and cannot
+   *   enqueue during the teardown window. Being session-bound, it lands
+   *   on the session being stopped even if the map entry is later
+   *   replaced (leave + rejoin mid-stop).
+   *   onStop runs after stop() resolves, but only while the stopped
+   *   session is still the live one — a leave + rejoin during the stop
+   *   await must not let the old stop bump the NEW session's planToken
+   *   or cancel ITS recommendations.
    */
-  constructor({ getSession, onStop = null }) {
+  constructor({ getSession, onStop = null, onStopStart = null }) {
     if (typeof getSession !== 'function') throw new Error('PlaybackService requires getSession');
     this.#getSession = getSession;
     this.#onStop = onStop;
+    this.#onStopStart = onStopStart;
   }
 
   hasSession(guildId) {
@@ -89,6 +99,14 @@ export class PlaybackService {
    *   (autoplay planning that captured a session before /leave + rejoin)
    *   pass the session they planned against so they cannot add tracks to a
    *   replacement session.
+   *
+   *   Stop-lifecycle contract: playback is started only when no stop()
+   *   was in flight at enqueue entry AND the player's stopGeneration is
+   *   unchanged since entry. A mid-stop enqueue (or one a fresh stop
+   *   overtakes mid-await) still lands its tracks on the live session's
+   *   queue but reports started:false and never calls playNext — nothing
+   *   here revives playback on top of, or right after, a stop. A stop
+   *   that completed before entry does not block a fresh start.
    * @returns {Promise<{ wasEmpty: boolean, started: boolean } | null>}
    *   null when the guild has no session. On an expectedSession mismatch at
    *   entry returns { wasEmpty: false, started: false } without touching the
@@ -104,6 +122,10 @@ export class PlaybackService {
       return { wasEmpty: false, started: false };
     }
     const wasEmpty = session.queue.isEmpty;
+    // Stop-lifecycle snapshot (see the contract above): a stop already in
+    // flight, or one that begins during the awaits below, always wins.
+    const stopInFlightAtEntry = session.player.isStopping === true;
+    const stopGeneration = session.player.stopGeneration ?? 0;
     for (const track of tracks) session.queue.add(track);
     if (onEnqueued) await onEnqueued({ wasEmpty });
     // The await above is an open async window: /leave may have destroyed or
@@ -120,7 +142,11 @@ export class PlaybackService {
       // whose track still sits at the head may start playback — otherwise
       // both the cleared enqueue and the rival would call playNext and
       // double-start the rival's track.
-      if (tracks.includes(session.queue.current)) {
+      if (
+        !stopInFlightAtEntry &&
+        (session.player.stopGeneration ?? 0) === stopGeneration &&
+        tracks.includes(session.queue.current)
+      ) {
         started = true;
         if (awaitStart) {
           await session.player.playNext();
@@ -156,8 +182,20 @@ export class PlaybackService {
   async stop(guildId) {
     const session = this.#getSession(guildId);
     if (!session) return false;
+    // Stop-start invalidation fires BEFORE the async teardown: a
+    // recommend plan or autoplay continuation resolving during stop()'s
+    // cleanup window must already see a bumped planToken / cancelled
+    // prompts, not only after teardown completes. It runs against the
+    // session captured here, so a later session replacement can't
+    // redirect it.
+    this.#onStopStart?.(guildId, session);
     await session.player.stop();
-    this.#onStop?.(guildId);
+    // The session may have been destroyed and replaced (leave + rejoin)
+    // while stop's async cleanup was in flight — the completion hook must
+    // not bump the NEW session's planToken or cancel ITS recommendations.
+    if (this.#getSession(guildId) === session) {
+      this.#onStop?.(guildId, session);
+    }
     return true;
   }
 

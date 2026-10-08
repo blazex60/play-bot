@@ -327,6 +327,101 @@ test('GuildPlayer: playNext calls onTrackStart with the track videoId', async ()
   await player.stop()
 })
 
+test('GuildPlayer: a playNext issued during stop() teardown abandons instead of reviving', async () => {
+  const started = []
+  const { player, resources } = makePlayer({
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => makePendingPcmSource(),
+  })
+
+  const stopping = player.stop()
+  assert.equal(player.isStopping, true)
+  // Issued inside the teardown window: it must not survive stop()'s tail
+  // (which endMixer()s the very stream a fresh setCurrent would land on).
+  await player.playNext()
+  await stopping
+
+  assert.equal(player.isStopping, false)
+  assert.equal(resources.length, 0)
+  assert.deepEqual(started, [])
+})
+
+test('GuildPlayer: a playNext overtaken by stop() mid-prep abandons without disconnecting', async () => {
+  const started = []
+  let disconnected = false
+  let releaseSource
+  const sourceReady = new Promise((resolve) => { releaseSource = resolve })
+  const { player, resources } = makePlayer({
+    onDisconnect: async () => { disconnected = true },
+    onTrackStart: (videoId) => started.push(videoId),
+    createPcmSourceFn: async () => {
+      await sourceReady
+      return makePendingPcmSource()
+    },
+  })
+
+  const playing = player.playNext()
+  await nextTurn()
+  await player.stop()   // clears the queue + bumps the stop generation
+  releaseSource()       // the in-flight prep only resolves after the stop
+  await playing
+
+  // Pre-fix this fell into the no-current disconnect path, turning a plain
+  // /stop into a session-destroying disconnect. stop() owns teardown now.
+  assert.equal(disconnected, false)
+  assert.equal(resources.length, 0)
+  assert.deepEqual(started, [])
+})
+
+test('GuildPlayer: a prep failure overtaken by stop() does not kick the advancement drain', async () => {
+  let disconnected = false
+  let exhaustionCalls = 0
+  let rejectPrep
+  const prepFailed = new Promise((_, reject) => { rejectPrep = reject })
+  const { player } = makePlayer({
+    onDisconnect: async () => { disconnected = true },
+    handleQueueExhausted: async () => { exhaustionCalls += 1; return false },
+    createPcmSourceFn: () => prepFailed,
+  })
+
+  const playing = player.playNext()
+  await nextTurn()
+  await player.stop()
+  rejectPrep(new Error('prep failed'))
+  await playing
+  await nextTurn()
+
+  // Without the overtake guard the catch path would kick
+  // advanceAfterPlayback → empty queue → exhaustion refill → disconnect.
+  assert.equal(exhaustionCalls, 0)
+  assert.equal(disconnected, false)
+})
+
+test('GuildPlayer: a new playNext after stop() completes is not torn down by the finished stop', async () => {
+  const started = []
+  const { player, audioPlayer, queue } = makePlayer({
+    onTrackStart: (videoId) => started.push(videoId),
+  })
+
+  await player.stop()
+  assert.equal(player.isStopping, false)
+  assert.equal(queue.isEmpty, true)
+
+  queue.add(createTrack({
+    title: 'Track B',
+    webpageUrl: 'https://example.com/b',
+    duration: 60,
+    videoId: 'vid-b',
+  }))
+  await player.playNext()
+
+  assert.equal(audioPlayer.state.status, AudioPlayerStatus.Playing)
+  assert.equal(queue.current.title, 'Track B')
+  assert.deepEqual(started, ['vid-b'])
+
+  await player.stop()
+})
+
 test('GuildPlayer: stop() then a newly queued track can play', async () => {
   const started = []
   const first = createTrack({

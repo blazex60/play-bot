@@ -43,6 +43,9 @@ function fakeSession(initialTracks = []) {
     player: {
       status: 'playing',
       trackPositionSec: 12.5,
+      // Stop-lifecycle surface the enqueue start decision fences on.
+      stopGeneration: 0,
+      isStopping: false,
       playNext: async () => {
         calls.push('playNext')
       },
@@ -294,6 +297,62 @@ test('enqueue: expectedSession proceeds normally while it is still the live sess
   assert.deepEqual(session.calls, ['playNext'])
 })
 
+// --- enqueue × stop() lifecycle ---
+// The documented contract: an enqueue issued while a stop() is in flight
+// (or one a fresh stop overtakes mid-await) still lands its tracks on the
+// live session's queue but reports started:false and never calls playNext —
+// nothing revives playback on top of, or right after, a stop.
+
+test('enqueue: a stop in flight at entry reports started:false and never calls playNext', async () => {
+  const session = fakeSession()
+  session.player.isStopping = true
+  session.player.stopGeneration = 1
+  const { wasEmpty, started } = await serviceFor(session).enqueue('g', ['track-a'])
+  assert.equal(wasEmpty, true)
+  assert.equal(started, false)
+  assert.deepEqual(session.tracks, ['track-a']) // tracks still land on the live session
+  assert.deepEqual(session.calls, [])
+})
+
+test('enqueue: a stop that begins mid-await wins even if its track still heads the queue', async () => {
+  const session = fakeSession()
+  const { wasEmpty, started } = await serviceFor(session).enqueue('g', ['track-a'], {
+    onEnqueued: async () => {
+      // A stop() began inside the window: its generation bump is the
+      // invalidation signal — even though our track still sits at the
+      // head (added after the stop's own queue.clear ran), the stop wins.
+      session.player.stopGeneration += 1
+    },
+  })
+  assert.equal(wasEmpty, true)
+  assert.equal(started, false)
+  assert.deepEqual(session.tracks, ['track-a'])
+  assert.deepEqual(session.calls, []) // no post-stop playNext
+})
+
+test('enqueue: an expectedSession continuation during a stop cannot revive playback', async () => {
+  const session = fakeSession()
+  session.player.isStopping = true
+  session.player.stopGeneration = 1
+  const map = new Map([['g', session]])
+  const result = await mapBackedService(map).enqueue('g', ['track-a'], {
+    expectedSession: session,
+    awaitStart: false,
+  })
+  assert.deepEqual(result, { wasEmpty: true, started: false })
+  assert.deepEqual(session.tracks, ['track-a'])
+  assert.deepEqual(session.calls, [])
+})
+
+test('enqueue: a stop that completed before entry does not block a fresh start', async () => {
+  const session = fakeSession()
+  session.player.stopGeneration = 3 // a past stop leaves the generation bumped but stable
+  const { wasEmpty, started } = await serviceFor(session).enqueue('g', ['track-a'])
+  assert.equal(wasEmpty, true)
+  assert.equal(started, true)
+  assert.deepEqual(session.calls, ['playNext'])
+})
+
 // --- transport controls ---
 
 test('pause/resume delegate to the player and null out without a session', () => {
@@ -328,6 +387,72 @@ test('stop: invokes the onStop hook after player.stop()', async () => {
   })
   await playback.stop('g')
   assert.deepEqual(order, ['onStop:g:stop'])
+})
+
+// --- stop() hook lifecycle ---
+// onStopStart fires BEFORE the async teardown against the session captured
+// at entry (stop-start invalidation); onStop fires after teardown only while
+// that same session is still the live one — a leave+rejoin mid-stop must not
+// let the old stop touch the replacement session.
+
+test('stop: onStopStart runs before teardown, onStop after — both with the captured session', async () => {
+  const session = fakeSession(['t'])
+  const order = []
+  const playback = serviceFor(session, {
+    onStopStart: (guildId, s) => order.push(`onStopStart:${guildId}:${s === session}`),
+    onStop: (guildId, s) => order.push(`onStop:${guildId}:${s === session}`),
+  })
+  session.player.stop = async () => {
+    order.push('playerStop')
+  }
+  await playback.stop('g')
+  assert.deepEqual(order, ['onStopStart:g:true', 'playerStop', 'onStop:g:true'])
+})
+
+test('stop: stop-start invalidation lands while teardown is still in flight', async () => {
+  const session = fakeSession(['t'])
+  let planToken = 0
+  const playback = serviceFor(session, {
+    onStopStart: (guildId, s) => {
+      assert.equal(s, session)
+      planToken += 1
+    },
+  })
+  let release
+  session.player.stop = async () => {
+    await new Promise((resolve) => { release = resolve })
+  }
+  const stopping = playback.stop('g')
+  // The teardown is still gated on `release`, but invalidation already ran:
+  // an in-flight recommend plan resolving in this window sees a dead token.
+  assert.equal(planToken, 1)
+  release()
+  assert.equal(await stopping, true)
+})
+
+test('stop: a session replaced mid-stop never receives the old stop\'s completion hook', async () => {
+  const stale = fakeSession(['t'])
+  const replacement = fakeSession(['t'])
+  const map = new Map([['g', stale]])
+  const calls = []
+  const playback = new PlaybackService({
+    getSession: (g) => map.get(g),
+    onStopStart: (g, s) => calls.push(`start:${s === stale}`),
+    onStop: (g, s) => calls.push(`stop:${s === stale}`),
+  })
+  let release
+  stale.player.stop = async () => {
+    stale.calls.push('stop')
+    await new Promise((resolve) => { release = resolve })
+  }
+  const stopping = playback.stop('g')
+  // leave + rejoin while the old session's teardown is in flight.
+  map.set('g', replacement)
+  release()
+  assert.equal(await stopping, true)
+  // The start hook still hit the session actually being stopped; the
+  // completion hook is identity-gated and skips the replacement.
+  assert.deepEqual(calls, ['start:true'])
 })
 
 test('seekTo delegates and distinguishes no-session from seek-failure', async () => {

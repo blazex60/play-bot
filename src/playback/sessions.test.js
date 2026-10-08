@@ -5,6 +5,7 @@ import {
   hasAutoplayContinuationBeenUsed,
   releaseAutoplayContinuation,
   recordPlayedVideoId,
+  playbackFor,
   MAX_SESSION_HISTORY,
 } from './sessions.js'
 
@@ -77,4 +78,41 @@ test('recordPlayedVideoId: mutates the session\'s existing array in place, so a 
 
   assert.equal(session.recentPlayedVideoIds, sameArrayRef)
   assert.deepEqual(session.recentPlayedVideoIds, ['vid-old', 'vid-new'])
+})
+
+// playbackFor wiring: playback.stop()'s hooks invalidate the session being
+// stopped — at stop START (planToken + pending recommendations), before the
+// async teardown finishes — and must never land on a replacement session
+// created by a leave+rejoin inside the stop window.
+test('playbackFor: stop invalidates the stopped session at stop start — never the replacement', async () => {
+  const map = new Map()
+  const playback = playbackFor(map)
+  const cancelled = []
+  let release
+  const sessionA = {
+    planToken: 0,
+    recommendHooks: { cancelRecommendations: (guildId) => cancelled.push(`A:${guildId}`) },
+    player: { stop: async () => { await new Promise((resolve) => { release = resolve }) } },
+    queue: { isEmpty: false },
+  }
+  map.set('g', sessionA)
+
+  const stopping = playback.stop('g')
+  // Invalidation lands the moment stop begins, while its teardown is still
+  // gated on `release` — an in-flight recommend plan resolving in this
+  // window already sees a dead planToken.
+  assert.equal(sessionA.planToken, 1)
+  assert.deepEqual(cancelled, ['A:g'])
+
+  // leave + rejoin mid-stop: the map now holds a different session.
+  const sessionB = {
+    planToken: 0,
+    recommendHooks: { cancelRecommendations: (guildId) => cancelled.push(`B:${guildId}`) },
+  }
+  map.set('g', sessionB)
+  release()
+  await stopping
+
+  assert.equal(sessionB.planToken, 0)
+  assert.deepEqual(cancelled, ['A:g'])
 })

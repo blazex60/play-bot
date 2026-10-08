@@ -112,6 +112,20 @@ export class GuildPlayer {
    * long enough for Demucs — see #ensureStemPrefetch()/#runLowPriorityStemPrefetch().
    */
   #stemPrefetchTracker = new StemPrefetchTracker();
+  /**
+   * Stop lifecycle guard. #stopGeneration bumps synchronously at every
+   * stop() invocation — before any of its async teardown runs — so every
+   * path that can race stop's cleanup window (playNext's source prep, a
+   * PlaybackService.enqueue start decision) snapshots it and abandons the
+   * moment a stop begins instead of reviving playback on the rebuilt
+   * mixer. #stopTail serializes the teardown itself (overlapping stop()s
+   * run one at a time) and is the single "no stop in flight" await point;
+   * it never rejects so awaiters can't be poisoned by a teardown error
+   * (the stop() caller itself still sees the rejection via `tail`).
+   */
+  #stopGeneration = 0;
+  #stopping = false;
+  #stopTail = Promise.resolve();
 
   constructor({
     guildId,
@@ -305,6 +319,7 @@ export class GuildPlayer {
       disconnect: () => this.#disconnect(),
       cleanupCurrentTempFile: () => this.#cleanupCurrentTempFile(),
       clearWatchdog: () => this.#clearWatchdog(),
+      isStopping: () => this.#stopping,
       isForceSkip: () => this.#forceSkip,
       clearForceSkip: () => {
         this.#forceSkip = false;
@@ -384,6 +399,18 @@ export class GuildPlayer {
    * transition.
    */
   async playNext(gaplessFrom = null) {
+    // A stop() in flight always wins: a playNext issued inside stop()'s
+    // teardown window abandons here instead of starting on a mixer the
+    // tail is about to endMixer() and rebuild. Callers that decide start
+    // eligibility themselves (PlaybackService.enqueue) gate on
+    // isStopping/stopGeneration up front, so what reaches here mid-stop
+    // is a stale internal path (advancement drain, Idle recovery) whose
+    // start must not survive the stop.
+    const generation = this.#stopGeneration;
+    if (this.#stopping) {
+      await this.#stopTail;
+      return;
+    }
     const track = this.#queue.current;
     if (!track) {
       await this.#disconnect();
@@ -393,10 +420,10 @@ export class GuildPlayer {
     this.#transitions.pendingGaplessFrom = null;
     const pendingStillFresh = pending && Date.now() - pending.setAt < PENDING_GAPLESS_MAX_AGE_MS;
     const resolvedGaplessFrom = gaplessFrom ?? (pendingStillFresh ? pending.track : null);
-    await this.#playNextMixer(track, { gaplessFrom: resolvedGaplessFrom });
+    await this.#playNextMixer(track, { gaplessFrom: resolvedGaplessFrom, generation });
   }
 
-  async #playNextMixer(track, { gaplessFrom = null } = {}) {
+  async #playNextMixer(track, { gaplessFrom = null, generation = this.#stopGeneration } = {}) {
     if (this.#advancement.queueRefill && this.#advancement.queueRefill.key !== this.#advancement.queueRefillKey(track)) {
       this.#advancement.queueRefill = null;
     }
@@ -406,6 +433,10 @@ export class GuildPlayer {
     } catch (err) {
       console.warn(`[GuildPlayer] pcm source failed for ${track.title}:`, err.message);
       this.#hadError = true;
+      // A stop() that began during the prep await owns teardown — kicking
+      // the advancement drain here could end in a disconnect the stop
+      // never asked for.
+      if (this.#stopGeneration !== generation) return;
       if (this.#advancement.handlingAfter) {
         this.#advancement.pendingAfter = true;
       } else {
@@ -414,6 +445,14 @@ export class GuildPlayer {
       return;
     }
 
+    if (this.#stopGeneration !== generation) {
+      // A stop() began while this source was being prepared: it already
+      // cleared the queue and owns teardown — abandoning here must not
+      // fall into the no-current disconnect below (/stop is not /leave).
+      source.destroy();
+      await this.#cleanupCurrentTempFile();
+      return;
+    }
     if (this.#queue.current !== track) {
       source.destroy();
       await this.#cleanupCurrentTempFile();
@@ -451,6 +490,12 @@ export class GuildPlayer {
       } else {
         this.#advancement.advanceAfterPlayback();
       }
+      return;
+    }
+    if (this.#stopGeneration !== generation) {
+      // Same overtake guard as after the prep await: a stop that began
+      // during the PCM wait owns teardown — discard, never setCurrent.
+      this.#pipeline.discardUnusedSource(source);
       return;
     }
 
@@ -813,6 +858,29 @@ export class GuildPlayer {
     return this.#audioPlayer.state.status;
   }
 
+  /**
+   * Stop lifecycle counter: incremented synchronously at every stop()
+   * entry. PlaybackService.enqueue snapshots it so a stop that began
+   * after the enqueue entered is detected even once the stop finished.
+   */
+  get stopGeneration() {
+    return this.#stopGeneration;
+  }
+
+  /** True while a stop()'s serialized teardown tail is in flight. */
+  get isStopping() {
+    return this.#stopping;
+  }
+
+  /**
+   * Settles once the in-flight stop() teardown finishes (immediately when
+   * none is running) — never rejects. Awaited by anything that must not
+   * run inside stop()'s async cleanup window.
+   */
+  get stopTail() {
+    return this.#stopTail;
+  }
+
   resume() {
     if (this.#pauseRequested) {
       this.#pauseRequested = false;
@@ -925,6 +993,28 @@ export class GuildPlayer {
   }
 
   async stop() {
+    // Synchronous invalidation: the generation bumps before any async
+    // teardown runs, so every path that snapshots it (playNext's source
+    // prep, PlaybackService.enqueue's start decision) sees the stop the
+    // moment it begins — not when cleanup happens to finish.
+    this.#stopGeneration += 1;
+    this.#stopping = true;
+    // Serialized tail: overlapping stop()s run their teardown strictly
+    // one at a time, and #stopTail stays a never-rejecting await point
+    // for "no stop in flight".
+    const tail = this.#stopTail.then(() => this.#stopTeardown());
+    const settled = tail.catch(() => {});
+    this.#stopTail = settled;
+    try {
+      await tail;
+    } finally {
+      // Only the most recent stop() clears the flag — an overlapping one
+      // keeps #stopping true until its own tail finishes.
+      if (this.#stopTail === settled) this.#stopping = false;
+    }
+  }
+
+  async #stopTeardown() {
     this.#pauseRequested = false;
     this.#queue.clear();
     this.#pipeline.abortSourceAudioWait();
