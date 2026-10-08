@@ -43,8 +43,12 @@ export class PlaybackService {
    * objects are plain data (createTrack) frozen at creation — every track in
    * the queue is immutable — so callers can't corrupt queue internals by
    * mutating what this returns.
-   * @returns {{ active: true, current, upcoming, isEmpty, loopMode, status, positionSec }
+   * @returns {{ active: true, current, upcoming, isEmpty, loopMode, status, positionSec, revision }
    *         | { active: false, isEmpty: true }}
+   *   revision is the queue's optimistic-concurrency token — index-based
+   *   mutators (the queue editor's move/remove buttons) embed it and pass
+   *   it back via the *IfRevision methods so an operation submitted against
+   *   an older render is rejected instead of hitting the wrong track.
    */
   getState(guildId) {
     const session = this.#getSession(guildId);
@@ -55,6 +59,7 @@ export class PlaybackService {
       upcoming: session.queue.upcoming(),
       isEmpty: session.queue.isEmpty,
       loopMode: session.queue.loopMode,
+      revision: session.queue.revision ?? 0,
       status: session.player?.status ?? 'unknown',
       // Position on the track's own (native) timeline — the value the
       // now-playing views and the local CLI display.
@@ -187,6 +192,30 @@ export class PlaybackService {
   moveUpcoming(guildId, fromIndex, toIndex) {
     const session = this.#getSession(guildId);
     return session ? session.queue.moveUpcoming(fromIndex, toIndex) : false;
+  }
+
+  /**
+   * Revision-checked variants for index-based UI operations: the caller
+   * passes the revision embedded in the rendered message and the op applies
+   * only if the queue hasn't changed since. Without this, a track removed
+   * ahead of the index between render and click shifts every later index
+   * and the operation silently hits the wrong track.
+   * @returns {'stale'|true|false} 'stale' on a revision mismatch (nothing
+   *   changed), true/false the underlying op's result, false when there is
+   *   no session.
+   */
+  removeUpcomingIfRevision(guildId, upcomingIndex, expectedRevision) {
+    const session = this.#getSession(guildId);
+    if (!session) return false;
+    if (session.queue.revision !== expectedRevision) return 'stale';
+    return session.queue.removeUpcoming(upcomingIndex);
+  }
+
+  moveUpcomingIfRevision(guildId, fromIndex, toIndex, expectedRevision) {
+    const session = this.#getSession(guildId);
+    if (!session) return false;
+    if (session.queue.revision !== expectedRevision) return 'stale';
+    return session.queue.moveUpcoming(fromIndex, toIndex);
   }
 
   reorderUpcomingIfUnchanged(guildId, order, snapshotIds) {

@@ -15,6 +15,12 @@ const PAGE_SIZE = 10
 export function buildQueueEditorPayload(queueState, { page = 0, selectedIndex = null } = {}) {
   const current = queueState.current
   const upcoming = queueState.upcoming
+  // Optimistic-concurrency token embedded into every custom_id and select
+  // value: the mutating buttons are index-based, so any queue change after
+  // this render makes them stale and the handler rejects the op instead of
+  // hitting the wrong track. Well under Discord's 100-char custom_id limit.
+  const revision = Number.isInteger(queueState.revision) ? queueState.revision : 0
+  const revSuffix = `_r${revision}`
   const totalPages = Math.max(1, Math.ceil(upcoming.length / PAGE_SIZE))
   const clampedPage = Math.min(Math.max(page, 0), totalPages - 1)
   const pageStart = clampedPage * PAGE_SIZE
@@ -49,7 +55,7 @@ export function buildQueueEditorPayload(queueState, { page = 0, selectedIndex = 
 
   if (pageItems.length) {
     const select = new StringSelectMenuBuilder()
-      .setCustomId(`qedit_select_p${clampedPage}`)
+      .setCustomId(`qedit_select_p${clampedPage}${revSuffix}`)
       .setPlaceholder('曲を選択...')
       .addOptions(
         pageItems.map((t, i) => {
@@ -57,7 +63,7 @@ export function buildQueueEditorPayload(queueState, { page = 0, selectedIndex = 
           return {
             label: `${absIndex + 1}. ${t.title}`.slice(0, 80),
             description: fmtDuration(t.duration).slice(0, 80),
-            value: String(absIndex),
+            value: `${absIndex}:r${revision}`,
             default: absIndex === effectiveSelectedIndex,
           }
         })
@@ -66,23 +72,23 @@ export function buildQueueEditorPayload(queueState, { page = 0, selectedIndex = 
   }
 
   const prevButton = new ButtonBuilder()
-    .setCustomId(`qedit_page_p${clampedPage - 1}`)
+    .setCustomId(`qedit_page_p${clampedPage - 1}${revSuffix}`)
     .setLabel('◀ 前へ')
     .setStyle(ButtonStyle.Secondary)
     .setDisabled(clampedPage <= 0)
   const nextButton = new ButtonBuilder()
-    .setCustomId(`qedit_page_p${clampedPage + 1}`)
+    .setCustomId(`qedit_page_p${clampedPage + 1}${revSuffix}`)
     .setLabel('次へ ▶')
     .setStyle(ButtonStyle.Secondary)
     .setDisabled(clampedPage >= totalPages - 1)
   const closeButton = new ButtonBuilder()
-    .setCustomId(`qedit_close_p${clampedPage}`)
+    .setCustomId(`qedit_close_p${clampedPage}${revSuffix}`)
     .setLabel('✖ 閉じる')
     .setStyle(ButtonStyle.Secondary)
   components.push(new ActionRowBuilder().addComponents(prevButton, nextButton, closeButton))
 
   if (effectiveSelectedIndex != null) {
-    const suffix = `_p${clampedPage}_i${effectiveSelectedIndex}`
+    const suffix = `_p${clampedPage}_i${effectiveSelectedIndex}${revSuffix}`
     const upButton = new ButtonBuilder()
       .setCustomId(`qedit_moveup${suffix}`)
       .setLabel('↑')

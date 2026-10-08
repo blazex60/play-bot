@@ -174,6 +174,81 @@ test('reorderUpcomingIfUnchanged: applies when snapshot still matches', () => {
   assert.deepEqual(queue.upcoming().map((t) => t.title), ['C', 'A', 'B'])
 })
 
+// --- revision (optimistic concurrency for index-based mutators) -------------
+
+test('revision: starts at 0 and increments on every mutation of tracks/currentIndex', () => {
+  const queue = new GuildQueue()
+  assert.equal(queue.revision, 0)
+  queue.add(createTrack({ title: 'current', webpageUrl: 'https://example.com/current', duration: 60 }))
+  queue.add(createTrack({ title: 'A', webpageUrl: 'https://example.com/a', duration: 60 }))
+  queue.add(createTrack({ title: 'B', webpageUrl: 'https://example.com/b', duration: 60 }))
+  queue.add(createTrack({ title: 'C', webpageUrl: 'https://example.com/c', duration: 60 }))
+  assert.equal(queue.revision, 4)
+  assert.equal(queue.removeUpcoming(0), true)
+  assert.equal(queue.revision, 5)
+  assert.equal(queue.moveUpcoming(0, 1), true)
+  assert.equal(queue.revision, 6)
+  queue.shuffle()
+  assert.equal(queue.revision, 7)
+  queue.next()
+  assert.equal(queue.revision, 8)
+  queue.clear()
+  assert.equal(queue.revision, 9)
+})
+
+test('revision: read operations, loopMode changes, and rejected mutations do not bump it', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B'])
+  const before = queue.revision
+  void queue.current
+  void queue.isEmpty
+  queue.upcoming()
+  queue.wrappedUpcoming(2)
+  queue.cycleLoop()
+  queue.loopMode = LoopMode.QUEUE
+  assert.equal(queue.removeUpcoming(99), false)
+  assert.equal(queue.moveUpcoming(0, 0), false)
+  assert.equal(queue.moveUpcoming(2, 0), false)
+  assert.equal(queue.reorderUpcoming([9]), false)
+  assert.equal(queue.reorderUpcomingIfUnchanged([0], ['bogus-snapshot']), false)
+  assert.equal(queue.revision, before)
+})
+
+test('revision: next() bumps only when it actually advances', () => {
+  const queue = makeQueueWithUpcoming(['A', 'B'])
+  const before = queue.revision
+  queue.loopMode = LoopMode.TRACK
+  // TRACK loop without forceAdvance re-returns the current track: no
+  // mutation, no bump.
+  assert.equal(queue.next().title, 'A')
+  assert.equal(queue.revision, before)
+  queue.next({ forceAdvance: true })
+  assert.equal(queue.revision, before + 1)
+})
+
+test('revision: reorderUpcomingIfUnchanged bumps only when the apply actually happens', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
+  const snapshot = queue.upcoming().map(trackIdentity)
+  const before = queue.revision
+  // Snapshot invalidated by an intervening mutation → rejected, no bump.
+  queue.moveUpcoming(0, 2)
+  assert.equal(queue.revision, before + 1)
+  assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot), false)
+  assert.equal(queue.revision, before + 1)
+  // Matching snapshot → applies → bumps once. Upcoming is now ['B','C','A'],
+  // so order [2,0,1] rewrites it to ['A','B','C'].
+  const snapshot2 = queue.upcoming().map(trackIdentity)
+  assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot2), true)
+  assert.equal(queue.revision, before + 2)
+  assert.deepEqual(queue.upcoming().map((t) => t.title), ['A', 'B', 'C'])
+})
+
+test('revision: shuffle on a queue with no upcoming tracks does not bump', () => {
+  const queue = makeQueueWithUpcoming(['current'])
+  const before = queue.revision
+  queue.shuffle() // nothing to shuffle — early return, no mutation
+  assert.equal(queue.revision, before)
+})
+
 // --- wrappedUpcoming (Codex review, PR #44) ---------------------------------
 
 test('wrappedUpcoming: same as upcoming() when there is no loop or the window is already satisfied', () => {

@@ -30,7 +30,16 @@ export function sameTrackSnapshot(tracks, snapshotIds) {
 export class GuildQueue {
   #tracks = [];
   #currentIndex = 0;
+  // Optimistic-concurrency token for index-based mutators (the Discord
+  // queue editor): bumped on every change to #tracks or #currentIndex, so
+  // an operation submitted from a UI rendered against an older queue state
+  // can be rejected instead of silently hitting the wrong track.
+  #revision = 0;
   loopMode = LoopMode.OFF;
+
+  get revision() {
+    return this.#revision;
+  }
 
   get current() {
     if (!this.#tracks.length || this.#currentIndex >= this.#tracks.length) return null;
@@ -46,11 +55,13 @@ export class GuildQueue {
     // enqueued through the bot's /import endpoint) is still immutable once
     // it's inside the queue. Fields are primitives/null — shallow is enough.
     this.#tracks.push(Object.freeze(track));
+    this.#revision += 1;
   }
 
   clear() {
     this.#tracks = [];
     this.#currentIndex = 0;
+    this.#revision += 1;
   }
 
   shuffle() {
@@ -60,6 +71,7 @@ export class GuildQueue {
       const j = start + Math.floor(Math.random() * (i - start + 1));
       [this.#tracks[i], this.#tracks[j]] = [this.#tracks[j], this.#tracks[i]];
     }
+    this.#revision += 1;
   }
 
   cycleLoop() {
@@ -75,6 +87,7 @@ export class GuildQueue {
       return this.#tracks[this.#currentIndex];
     }
     this.#currentIndex += 1;
+    this.#revision += 1;
     if (this.#currentIndex >= this.#tracks.length) {
       if (this.loopMode === LoopMode.QUEUE) {
         this.#currentIndex = 0;
@@ -126,6 +139,7 @@ export class GuildQueue {
     const abs = this.#upcomingToAbsolute(upcomingIndex);
     if (abs === null) return false;
     this.#tracks.splice(abs, 1);
+    this.#revision += 1;
     return true;
   }
 
@@ -136,6 +150,7 @@ export class GuildQueue {
     const absTo = this.#upcomingToAbsolute(toIndex);
     const [track] = this.#tracks.splice(absFrom, 1);
     this.#tracks.splice(absTo, 0, track);
+    this.#revision += 1;
     return true;
   }
 
@@ -159,6 +174,7 @@ export class GuildQueue {
     for (let i = 0; i < len; i += 1) {
       this.#tracks[this.#currentIndex + 1 + i] = reordered[i];
     }
+    this.#revision += 1;
     return true;
   }
 

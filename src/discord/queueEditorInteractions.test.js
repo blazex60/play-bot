@@ -104,7 +104,7 @@ test('handleQueueEditorInteraction: an allowed user can still remove a track via
   await withTempSettings(async () => {
     const session = makeSession()
     const sessions = new Map([['guild-1', session]])
-    const interaction = fakeInteraction({ customId: 'qedit_remove_p0_i0' })
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${session.queue.revision}` })
 
     await handleQueueEditorInteraction(interaction, sessions)
 
@@ -136,7 +136,7 @@ test('handleQueueEditorInteraction: removing a track via the editor records an o
     await withLoggedOperations(async (calls) => {
       const session = makeSession()
       const sessions = new Map([['guild-1', session]])
-      const interaction = fakeInteraction({ customId: 'qedit_remove_p0_i0' })
+      const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${session.queue.revision}` })
 
       await handleQueueEditorInteraction(interaction, sessions)
 
@@ -158,7 +158,7 @@ test('handleQueueEditorInteraction: moving a track via the editor records a succ
       // qedit_movedown (index 0 -> 1) is a real, successful move.
       session.queue.add(createTrack({ title: 'third', webpageUrl: 'https://example.com/third', duration: 60, requestedBy: 'tester' }))
       const sessions = new Map([['guild-1', session]])
-      const interaction = fakeInteraction({ customId: 'qedit_movedown_p0_i0' })
+      const interaction = fakeInteraction({ customId: `qedit_movedown_p0_i0_r${session.queue.revision}` })
 
       await handleQueueEditorInteraction(interaction, sessions)
 
@@ -176,7 +176,7 @@ test('handleQueueEditorInteraction: a no-op move via the editor records a failed
       const sessions = new Map([['guild-1', session]])
       // makeSession() has exactly one upcoming track, so moving it to the
       // front (already position 0) is a no-op moveUpcoming reports as failed.
-      const interaction = fakeInteraction({ customId: 'qedit_tofront_p0_i0' })
+      const interaction = fakeInteraction({ customId: `qedit_tofront_p0_i0_r${session.queue.revision}` })
 
       await handleQueueEditorInteraction(interaction, sessions)
 
@@ -215,5 +215,117 @@ test('handleQueueEditorInteraction: an allowed user can close the editor', async
     await handleQueueEditorInteraction(interaction, sessions)
 
     assert.equal(deleted, true)
+  })
+})
+
+// --- revision guard (optimistic concurrency) --------------------------------
+// The editor operates by upcoming index; a queue change between render and
+// click shifts every later index. Without the embedded _r revision the op
+// would silently hit the wrong track.
+
+test('handleQueueEditorInteraction: a remove submitted against a stale revision warns and removes nothing', async () => {
+  await withTempSettings(async () => {
+    const session = makeSession()
+    const staleRevision = session.queue.revision
+    // Another user's op lands after our message rendered (e.g. /play).
+    session.queue.add(createTrack({ title: 'late', webpageUrl: 'https://example.com/late', duration: 60, requestedBy: 'tester' }))
+    const sessions = new Map([['guild-1', session]])
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}` })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.update.length, 1, 're-renders the panel with fresh state')
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
+    assert.deepEqual(session.queue.upcoming().map((t) => t.title), ['next', 'late'], 'stale remove must not delete the track now at that index')
+  })
+})
+
+test('handleQueueEditorInteraction: a move submitted against a stale revision warns and reorders nothing', async () => {
+  await withTempSettings(async () => {
+    const session = makeSession()
+    session.queue.add(createTrack({ title: 'third', webpageUrl: 'https://example.com/third', duration: 60, requestedBy: 'tester' }))
+    const staleRevision = session.queue.revision
+    session.queue.removeUpcoming(1) // 'third' removed since our render
+    const sessions = new Map([['guild-1', session]])
+    const interaction = fakeInteraction({ customId: `qedit_movedown_p0_i0_r${staleRevision}` })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
+    assert.deepEqual(session.queue.upcoming().map((t) => t.title), ['next'], 'stale move must leave the queue untouched')
+  })
+})
+
+test('handleQueueEditorInteraction: a stale jumpmodal submit warns and does not move', async () => {
+  await withTempSettings(async () => {
+    const session = makeSession()
+    session.queue.add(createTrack({ title: 'third', webpageUrl: 'https://example.com/third', duration: 60, requestedBy: 'tester' }))
+    const staleRevision = session.queue.revision
+    session.queue.shuffle()
+    const sessions = new Map([['guild-1', session]])
+    const interaction = fakeInteraction({ customId: `qedit_jumpmodal_p0_i0_r${staleRevision}`, kind: 'modal' })
+    interaction.fields = { getTextInputValue: () => '2' }
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
+  })
+})
+
+test('handleQueueEditorInteraction: duplicate videoIds — a stale remove cannot hit the wrong twin', async () => {
+  await withTempSettings(async () => {
+    const queue = new GuildQueue()
+    queue.add(createTrack({ title: 'current', webpageUrl: 'https://example.com/current', duration: 60, requestedBy: 'tester' }))
+    // Same videoId twice — an identity-based check can't tell them apart;
+    // the revision can, because it rejects on ANY queue change since render.
+    queue.add(createTrack({ title: 'dupe A', webpageUrl: 'https://example.com/d', duration: 60, requestedBy: 'tester', videoId: 'dup' }))
+    queue.add(createTrack({ title: 'dupe B', webpageUrl: 'https://example.com/d', duration: 60, requestedBy: 'tester', videoId: 'dup' }))
+    const session = { connection: { joinConfig: { channelId: 'voice-1' } }, queue }
+    const staleRevision = queue.revision
+    queue.removeUpcoming(0) // 'dupe A' removed since our render — index 0 is now 'dupe B'
+    const sessions = new Map([['guild-1', session]])
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}` })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.equal(queue.upcoming().length, 1, 'must not remove the track that shifted into the stale index')
+    assert.equal(queue.upcoming()[0].title, 'dupe B')
+  })
+})
+
+test('handleQueueEditorInteraction: a pre-deploy custom_id without _r parses as stale and warns instead of mutating', async () => {
+  await withTempSettings(async () => {
+    const session = makeSession()
+    const sessions = new Map([['guild-1', session]])
+    const interaction = fakeInteraction({ customId: 'qedit_remove_p0_i0' }) // old format, no revision
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
+    assert.equal(session.queue.upcoming().length, 1, 'must not remove without a matching revision')
+  })
+})
+
+test('handleQueueEditorInteraction: a stale-revision rejection records a stale_revision operation log entry', async () => {
+  await withTempSettings(async () => {
+    await withLoggedOperations(async (calls) => {
+      const session = makeSession()
+      const staleRevision = session.queue.revision
+      session.queue.add(createTrack({ title: 'late', webpageUrl: 'https://example.com/late', duration: 60, requestedBy: 'tester' }))
+      const sessions = new Map([['guild-1', session]])
+      const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}` })
+
+      await handleQueueEditorInteraction(interaction, sessions)
+
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].action, 'queue')
+      assert.equal(calls[0].success, false)
+      assert.equal(calls[0].detail, 'stale_revision')
+    })
   })
 })

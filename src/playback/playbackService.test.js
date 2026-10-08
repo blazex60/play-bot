@@ -10,6 +10,7 @@ function fakeSession(initialTracks = []) {
     tracks,
     calls,
     queue: {
+      revision: 0,
       get isEmpty() {
         return tracks.length === 0
       },
@@ -363,6 +364,49 @@ test('queue operations delegate and null out without a session', () => {
   assert.equal(empty.reorderUpcomingIfUnchanged('g', [], []), false)
 })
 
+// --- revision-checked queue ops (optimistic concurrency for index-based UI) ---
+
+test('removeUpcomingIfRevision/moveUpcomingIfRevision: delegate only when the revision matches', () => {
+  const session = fakeSession(['a', 'b', 'c'])
+  session.queue.revision = 7
+  const playback = serviceFor(session)
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, 7), true)
+  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, 7), true)
+  assert.deepEqual(session.calls, ['removeUpcoming:0', 'moveUpcoming:0->1'])
+})
+
+test('removeUpcomingIfRevision/moveUpcomingIfRevision: stale revision returns stale and never touches the queue', () => {
+  // Real GuildQueue so "untouched" is verified against production code.
+  const session = realQueueSession(['current-t', 'next-t', 'third-t'])
+  const playback = serviceFor(session)
+  const before = session.queue.revision
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, before - 1), 'stale')
+  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, before - 1), 'stale')
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, 'not-a-number'), 'stale')
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, null), 'stale')
+  assert.deepEqual(session.queue.upcoming().map((t) => t.title), ['next-t', 'third-t'])
+  assert.equal(session.queue.revision, before)
+})
+
+test('removeUpcomingIfRevision/moveUpcomingIfRevision: false when there is no session', () => {
+  const empty = serviceFor(null)
+  assert.equal(empty.removeUpcomingIfRevision('g', 0, 0), false)
+  assert.equal(empty.moveUpcomingIfRevision('g', 0, 1, 0), false)
+})
+
+test('removeUpcomingIfRevision/moveUpcomingIfRevision: propagate the underlying op result on a match', () => {
+  const session = realQueueSession(['current-t', 'next-t'])
+  const playback = serviceFor(session)
+  const rev = session.queue.revision
+  // Index out of range → the queue itself reports false (not stale).
+  assert.equal(playback.removeUpcomingIfRevision('g', 99, rev), false)
+  // Real remove applies and bumps the revision, so the same expectedRevision
+  // is immediately stale afterwards — this is what makes a second click on
+  // the same rendered button safe.
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev), true)
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev), 'stale')
+})
+
 // --- state snapshot ---
 
 test('getState returns a plain snapshot without live internals', () => {
@@ -380,6 +424,17 @@ test('getState returns a plain snapshot without live internals', () => {
   assert.equal(state.queue, undefined)
   assert.equal(state.session, undefined)
   assert.equal(state.connection, undefined)
+})
+
+test('getState: exposes the queue revision and tracks its mutations', () => {
+  const session = realQueueSession(['current-t', 'next-t'])
+  const playback = serviceFor(session)
+  const before = playback.getState('g').revision
+  assert.equal(before, session.queue.revision)
+  session.queue.add(createTrack({ title: 't', webpageUrl: 'u', duration: 1, requestedBy: 'u' }))
+  assert.equal(playback.getState('g').revision, before + 1)
+  // Integer survives JSON serialization (the web API serializes getState).
+  assert.equal(JSON.parse(JSON.stringify(playback.getState('g'))).revision, before + 1)
 })
 
 test('getState reports inactive for a missing session', () => {
