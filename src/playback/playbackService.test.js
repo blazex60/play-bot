@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { PlaybackService } from './playbackService.js'
+import { GuildQueue, createTrack } from './queue.js'
 
 function fakeSession(initialTracks = []) {
   const tracks = [...initialTracks]
@@ -394,4 +395,65 @@ test('queueIsEmpty / hasSession reflect session presence and queue state', () =>
   const empty = serviceFor(null)
   assert.equal(empty.hasSession('g'), false)
   assert.equal(empty.queueIsEmpty('g'), true)
+})
+
+// --- getState immutability ---
+// Tracks are frozen (createTrack / queue.add), so the object references the
+// snapshot shares with queue internals can't be corrupted through them.
+// Uses a real GuildQueue (not the fakeSession mock) so the freeze behavior
+// under test is production code.
+
+function realQueueSession(titles = []) {
+  const queue = new GuildQueue()
+  for (const title of titles) {
+    queue.add(createTrack({
+      title,
+      webpageUrl: `https://example.com/${title}`,
+      duration: 60,
+      requestedBy: 'user',
+      thumbnail: null,
+      videoId: `vid-${title}`,
+    }))
+  }
+  return {
+    queue,
+    player: { status: 'playing', trackPositionSec: 12.5 },
+  }
+}
+
+test('getState: mutating state.current leaves queue internals untouched', () => {
+  const session = realQueueSession(['current-t', 'next-t'])
+  const state = serviceFor(session).getState('g')
+  assert.throws(() => { state.current.title = 'tampered' }, TypeError)
+  assert.equal(session.queue.current.title, 'current-t')
+})
+
+test('getState: mutating an upcoming track leaves queue internals untouched', () => {
+  const session = realQueueSession(['current-t', 'next-t'])
+  const state = serviceFor(session).getState('g')
+  assert.throws(() => { state.upcoming[0].duration = 999 }, TypeError)
+  assert.equal(session.queue.upcoming()[0].duration, 60)
+})
+
+test('getState: pushing to state.upcoming does not grow the queue', () => {
+  const session = realQueueSession(['current-t', 'next-t'])
+  const state = serviceFor(session).getState('g')
+  state.upcoming.push({ title: 'intruder' })
+  assert.equal(state.upcoming.length, 2)
+  assert.deepEqual(session.queue.upcoming().map((t) => t.title), ['next-t'])
+})
+
+test('getState: returns the full field set and JSON round-trips frozen tracks', () => {
+  const session = realQueueSession(['current-t', 'next-t', 'third-t'])
+  session.queue.loopMode = 'track'
+  const state = serviceFor(session).getState('g')
+  assert.equal(state.active, true)
+  assert.equal(state.current.title, 'current-t')
+  assert.deepEqual(state.upcoming.map((t) => t.title), ['next-t', 'third-t'])
+  assert.equal(state.isEmpty, false)
+  assert.equal(state.loopMode, 'track')
+  assert.equal(state.status, 'playing')
+  assert.equal(state.positionSec, 12.5)
+  // Frozen objects serialize normally — web API responses unchanged.
+  assert.deepEqual(JSON.parse(JSON.stringify(state)), state)
 })

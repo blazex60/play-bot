@@ -1,7 +1,9 @@
 export const LoopMode = Object.freeze({ OFF: 'off', TRACK: 'track', QUEUE: 'queue' });
 
 export function createTrack({ title, webpageUrl, duration, requestedBy, requestedById = null, thumbnail, videoId = null, channel = null }) {
-  return { title, webpageUrl, duration, requestedBy, requestedById, thumbnail, videoId, channel };
+  // Tracks are value objects: immutable from creation so snapshots handed
+  // out via getState can share them without exposing queue internals.
+  return Object.freeze({ title, webpageUrl, duration, requestedBy, requestedById, thumbnail, videoId, channel });
 }
 
 /** Stable identity for snapshot checks during async optimize. */
@@ -40,7 +42,10 @@ export class GuildQueue {
   }
 
   add(track) {
-    this.#tracks.push(track);
+    // Freeze on entry so a track that bypassed createTrack (e.g. raw JSON
+    // enqueued through the bot's /import endpoint) is still immutable once
+    // it's inside the queue. Fields are primitives/null — shallow is enough.
+    this.#tracks.push(Object.freeze(track));
   }
 
   clear() {

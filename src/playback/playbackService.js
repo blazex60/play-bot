@@ -40,7 +40,9 @@ export class PlaybackService {
   /**
    * Read-only snapshot of a guild's playback state for display/serialization.
    * Never exposes the GuildPlayer/GuildQueue objects themselves. Track
-   * objects are plain data (createTrack) and safe to share.
+   * objects are plain data (createTrack) frozen at creation — every track in
+   * the queue is immutable — so callers can't corrupt queue internals by
+   * mutating what this returns.
    * @returns {{ active: true, current, upcoming, isEmpty, loopMode, status, positionSec }
    *         | { active: false, isEmpty: true }}
    */

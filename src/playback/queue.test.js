@@ -24,6 +24,19 @@ test('createTrack: videoId/channel/requestedById are carried through when provid
   assert.equal(track.requestedById, 'discord-123')
 })
 
+test('createTrack: returns an immutable (frozen) track', () => {
+  const track = createTrack({ title: 'A', webpageUrl: 'https://example.com/a', duration: 60, requestedBy: 'user' })
+  assert.ok(Object.isFrozen(track))
+  assert.throws(() => { track.title = 'tampered' }, TypeError)
+})
+
+test('queue.add: freezes tracks that bypassed createTrack', () => {
+  const queue = new GuildQueue()
+  queue.add({ title: 'raw', webpageUrl: 'https://example.com/raw', duration: 10 })
+  assert.ok(Object.isFrozen(queue.current))
+  assert.throws(() => { queue.current.title = 'tampered' }, TypeError)
+})
+
 function makeQueueWithUpcoming(titles) {
   const queue = new GuildQueue()
   for (const title of titles) {
