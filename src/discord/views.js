@@ -36,23 +36,3 @@ export function createSearchResultComponents(results) {
 export function parseSearchCustomId(customId) {
   return parseChoiceCustomId(customId, 'search');
 }
-
-export class PendingChoiceStore {
-  #map = new Map();
-
-  set(messageId, entry) {
-    this.#map.set(messageId, entry);
-  }
-
-  get(messageId) {
-    return this.#map.get(messageId) ?? null;
-  }
-
-  delete(messageId) {
-    this.#map.delete(messageId);
-  }
-
-  entries() {
-    return this.#map.entries();
-  }
-}

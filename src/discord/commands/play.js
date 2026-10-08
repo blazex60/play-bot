@@ -2,6 +2,7 @@ import { SlashCommandBuilder, MessageFlags } from 'discord.js'
 import { createTrack } from '../../playback/queue.js'
 import { searchYoutube, resolveMetadata, isPlaylistUrl, resolveFlatPlaylist, PLAYLIST_LIMIT } from '../../media/search.js'
 import { createSearchResultComponents } from '../views.js'
+import { recommendHooks } from '../recommendHooks.js'
 import { getOrCreateSession, pendingStore, playbackFor, webClient } from '../../playback/sessions.js'
 import { checkSameVoiceChannel, checkCommandAllowed, replyFlags, sendVisibleFollowUp } from '../permissions.js'
 import { fmtDuration } from '../../shared/format.js'
@@ -58,7 +59,7 @@ export default {
         }
 
         try {
-          await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
+          await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId, recommendHooks })
         } catch (err) {
           await interaction.deleteReply().catch(() => {})
           await sendVisibleFollowUp(interaction, `❌ VCへの接続に失敗しました: ${err.message}`, { flags: MessageFlags.Ephemeral })
@@ -87,7 +88,7 @@ export default {
       }
 
       try {
-        await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId })
+        await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel, textChannelId: interaction.channelId, recommendHooks })
       } catch (err) {
         await interaction.deleteReply().catch(() => {})
         await sendVisibleFollowUp(interaction, `❌ VCへの接続に失敗しました: ${err.message}`, { flags: MessageFlags.Ephemeral })
@@ -177,7 +178,7 @@ export default {
         return
       }
       try {
-        await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel: liveChannel, textChannelId: interaction.channelId })
+        await getOrCreateSession({ guildId: interaction.guildId, guild: interaction.guild, channel: liveChannel, textChannelId: interaction.channelId, recommendHooks })
       } catch (err) {
         await interaction.followUp({ content: `❌ VCへの接続に失敗しました: ${err.message}`, flags: MessageFlags.Ephemeral })
         logSelect(false, err.message)

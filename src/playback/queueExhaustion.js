@@ -1,6 +1,5 @@
 import { getGuildSettings } from '../shared/settings.js'
 import { planAutoTrack, planRecommendations, formatAutoAddNotification } from './autoplay.js'
-import { cancelRecommendations, hasPendingForGuild, postRecommendationPrompt } from '../discord/recommendFlow.js'
 
 // This is a re-entrancy lock for a single in-flight queue-exhaustion round,
 // not a "used up" marker: it's claimed at the start of handleQueueExhausted
@@ -30,7 +29,10 @@ export function releaseAutoplayContinuation(session) {
 // so this module never depends on sessions.js, keeping the import graph
 // one-directional. See sessions.js's getOrCreateSession for how guildId,
 // guild, connection, queue, onDisconnect, webClient, recommendPendingStore,
-// and recommendRounds are wired in.
+// recommendRounds, and recommendHooks are wired in. recommendHooks carries
+// the Discord-side prompt functions (cancelRecommendations /
+// hasPendingForGuild / postRecommendationPrompt), injected by the adapter
+// that created the session — see discord/recommendHooks.js.
 export function createQueueExhaustionHandler({
   guildId,
   guild,
@@ -42,7 +44,16 @@ export function createQueueExhaustionHandler({
   webClient,
   recommendPendingStore,
   recommendRounds,
+  recommendHooks,
 }) {
+  // Callers that don't inject hooks (tests, adapters without recommend
+  // support) get no-ops: planning still runs, prompts just never post.
+  const {
+    cancelRecommendations = () => {},
+    hasPendingForGuild = () => false,
+    postRecommendationPrompt = async () => 0,
+  } = recommendHooks ?? {}
+
   const handleQueueExhausted = async (lastTrack) => {
     const session = getSession()
     if (!session) return false

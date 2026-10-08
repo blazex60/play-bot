@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { MessageFlags } from 'discord.js'
 import { GuildQueue, createTrack } from '../playback/queue.js'
-import { PendingChoiceStore } from './views.js'
+import { PendingChoiceStore } from '../shared/pendingChoiceStore.js'
 import {
   cancelRecommendations,
   handleRecommendChoice,

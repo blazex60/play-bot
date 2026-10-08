@@ -1,9 +1,8 @@
 import { joinVoiceChannel, VoiceConnectionStatus, entersState } from '@discordjs/voice'
 import { GuildQueue } from './queue.js'
 import { GuildPlayer } from './player.js'
-import { PendingChoiceStore } from '../discord/views.js'
+import { PendingChoiceStore } from '../shared/pendingChoiceStore.js'
 import { createWebClient } from '../shared/webClient.js'
-import { cancelRecommendations } from '../discord/recommendFlow.js'
 import {
   createQueueExhaustionHandler,
   claimAutoplayContinuation,
@@ -12,7 +11,7 @@ import {
 } from './queueExhaustion.js'
 import { PlaybackService } from './playbackService.js'
 
-// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed, recentPlayedVideoIds }>
+// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed, recentPlayedVideoIds, recommendHooks }>
 export const sessions = new Map()
 
 // Builds the in-process playback facade bound to a given sessions Map.
@@ -43,7 +42,10 @@ export async function destroySession(sessionsMap, guildId) {
   const session = sessionsMap.get(guildId)
   if (!session) return
   sessionsMap.delete(guildId)
-  cancelPendingRecommendations(guildId)
+  // Uses the session's own injected hooks rather than
+  // cancelPendingRecommendations(guildId): the map entry is already gone by
+  // this point, and the injected map may not be the global `sessions`.
+  session.recommendHooks?.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
   await session.player.stop().catch(() => {})
   session.connection.destroy()
 }
@@ -72,13 +74,25 @@ export const recommendRounds = new Map()
 
 export const webClient = createWebClient()
 
+// Recommendation prompts are a Discord-adapter concern (recommendFlow.js),
+// which playback can't import without creating a playback→discord edge, so
+// the functions the teardown/exhaustion paths need are injected per session
+// through getOrCreateSession's config (see discord/recommendHooks.js).
+// Sessions created without them (tests, adapters with no recommend support)
+// get no-ops: the exhaustion handler still plans, prompts just never post.
+const NOOP_RECOMMEND_HOOKS = {
+  cancelRecommendations: () => {},
+  hasPendingForGuild: () => false,
+  postRecommendationPrompt: async () => 0,
+}
+
 // /stop clears playback without destroying the session/connection, and
 // /leave deletes the session directly — neither goes through onDisconnect,
 // so both must explicitly drop any still-open recommendation prompts for
 // the guild (otherwise a stale button click can still enqueue and start a
 // track after the user thought they stopped/left).
 export function cancelPendingRecommendations(guildId) {
-  cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
+  sessions.get(guildId)?.recommendHooks?.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
 }
 
 // Invalidates any queue-exhaustion planning currently in flight for a guild.
@@ -108,7 +122,7 @@ export {
   isSessionStale,
 } from './sessionAccessors.js'
 
-export async function getOrCreateSession({ guildId, guild, channel, textChannelId = null }) {
+export async function getOrCreateSession({ guildId, guild, channel, textChannelId = null, recommendHooks }) {
   const existing = sessions.get(guildId)
   if (existing && existing.connection.state.status !== VoiceConnectionStatus.Destroyed) {
     if (textChannelId) existing.textChannelId = textChannelId
@@ -131,6 +145,12 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
 
   const queue = new GuildQueue()
 
+  // Adapter-supplied recommendation functions (see NOOP_RECOMMEND_HOOKS).
+  // Stored on the session so onDisconnect/destroySession/playbackFor's
+  // onStop can reach them through the sessions Map, and passed into the
+  // queue-exhaustion handler config below.
+  const hooks = { ...NOOP_RECOMMEND_HOOKS, ...recommendHooks }
+
   // Assigned once at the bottom of this function; onDisconnect closes over
   // this binding (not a snapshot) so it can tell whether it's still the
   // current session for the guild by the time it actually runs.
@@ -144,7 +164,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     // closure would delete and destroy that brand new, unrelated session.
     if (s && s === session) {
       sessions.delete(guildId)
-      cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
+      hooks.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
       if (s.connection.state.status !== VoiceConnectionStatus.Destroyed) {
         s.connection.destroy()
       }
@@ -162,6 +182,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     webClient,
     recommendPendingStore,
     recommendRounds,
+    recommendHooks: hooks,
   })
 
   // Like onDisconnect above, this closes over the `session` binding (not a
@@ -186,7 +207,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   // that starts playback with no /play command in the picture) still gets
   // somewhere to post recommend-mode choices instead of recommend mode
   // silently falling through to a disconnect at the next queue exhaustion.
-  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0, autoplayContinuationUsed: false, recentPlayedVideoIds: [] }
+  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0, autoplayContinuationUsed: false, recentPlayedVideoIds: [], recommendHooks: hooks }
   sessions.set(guildId, session)
   return session
 }

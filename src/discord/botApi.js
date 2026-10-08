@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 
 import { getOrCreateSession, cancelPendingRecommendations, bumpPlanToken, playbackFor, webClient } from '../playback/sessions.js';
+import { recommendHooks } from './recommendHooks.js';
 import { resolveWebPermission } from './webPermission.js';
 import {
   getGuildSettings,
@@ -368,7 +369,7 @@ export function buildBotApi({
       return;
     }
 
-    await getOrCreateSessionFn({ guildId, guild, channel });
+    await getOrCreateSessionFn({ guildId, guild, channel, recommendHooks });
     return enqueueTracks(playback, guildId, tracks);
   });
 
