@@ -104,7 +104,7 @@ test('handleQueueEditorInteraction: an allowed user can still remove a track via
   await withTempSettings(async () => {
     const session = makeSession()
     const sessions = new Map([['guild-1', session]])
-    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${session.queue.revision}` })
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${session.queue.revision}_q${session.queue.id}` })
 
     await handleQueueEditorInteraction(interaction, sessions)
 
@@ -136,7 +136,7 @@ test('handleQueueEditorInteraction: removing a track via the editor records an o
     await withLoggedOperations(async (calls) => {
       const session = makeSession()
       const sessions = new Map([['guild-1', session]])
-      const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${session.queue.revision}` })
+      const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${session.queue.revision}_q${session.queue.id}` })
 
       await handleQueueEditorInteraction(interaction, sessions)
 
@@ -158,7 +158,7 @@ test('handleQueueEditorInteraction: moving a track via the editor records a succ
       // qedit_movedown (index 0 -> 1) is a real, successful move.
       session.queue.add(createTrack({ title: 'third', webpageUrl: 'https://example.com/third', duration: 60, requestedBy: 'tester' }))
       const sessions = new Map([['guild-1', session]])
-      const interaction = fakeInteraction({ customId: `qedit_movedown_p0_i0_r${session.queue.revision}` })
+      const interaction = fakeInteraction({ customId: `qedit_movedown_p0_i0_r${session.queue.revision}_q${session.queue.id}` })
 
       await handleQueueEditorInteraction(interaction, sessions)
 
@@ -176,7 +176,7 @@ test('handleQueueEditorInteraction: a no-op move via the editor records a failed
       const sessions = new Map([['guild-1', session]])
       // makeSession() has exactly one upcoming track, so moving it to the
       // front (already position 0) is a no-op moveUpcoming reports as failed.
-      const interaction = fakeInteraction({ customId: `qedit_tofront_p0_i0_r${session.queue.revision}` })
+      const interaction = fakeInteraction({ customId: `qedit_tofront_p0_i0_r${session.queue.revision}_q${session.queue.id}` })
 
       await handleQueueEditorInteraction(interaction, sessions)
 
@@ -230,7 +230,7 @@ test('handleQueueEditorInteraction: a remove submitted against a stale revision 
     // Another user's op lands after our message rendered (e.g. /play).
     session.queue.add(createTrack({ title: 'late', webpageUrl: 'https://example.com/late', duration: 60, requestedBy: 'tester' }))
     const sessions = new Map([['guild-1', session]])
-    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}` })
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}_q${session.queue.id}` })
 
     await handleQueueEditorInteraction(interaction, sessions)
 
@@ -248,7 +248,7 @@ test('handleQueueEditorInteraction: a move submitted against a stale revision wa
     const staleRevision = session.queue.revision
     session.queue.removeUpcoming(1) // 'third' removed since our render
     const sessions = new Map([['guild-1', session]])
-    const interaction = fakeInteraction({ customId: `qedit_movedown_p0_i0_r${staleRevision}` })
+    const interaction = fakeInteraction({ customId: `qedit_movedown_p0_i0_r${staleRevision}_q${session.queue.id}` })
 
     await handleQueueEditorInteraction(interaction, sessions)
 
@@ -265,7 +265,7 @@ test('handleQueueEditorInteraction: a stale jumpmodal submit warns and does not 
     const staleRevision = session.queue.revision
     session.queue.shuffle()
     const sessions = new Map([['guild-1', session]])
-    const interaction = fakeInteraction({ customId: `qedit_jumpmodal_p0_i0_r${staleRevision}`, kind: 'modal' })
+    const interaction = fakeInteraction({ customId: `qedit_jumpmodal_p0_i0_r${staleRevision}_q${session.queue.id}`, kind: 'modal' })
     interaction.fields = { getTextInputValue: () => '2' }
 
     await handleQueueEditorInteraction(interaction, sessions)
@@ -287,7 +287,7 @@ test('handleQueueEditorInteraction: duplicate videoIds — a stale remove cannot
     const staleRevision = queue.revision
     queue.removeUpcoming(0) // 'dupe A' removed since our render — index 0 is now 'dupe B'
     const sessions = new Map([['guild-1', session]])
-    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}` })
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}_q${queue.id}` })
 
     await handleQueueEditorInteraction(interaction, sessions)
 
@@ -318,7 +318,7 @@ test('handleQueueEditorInteraction: a stale-revision rejection records a stale_r
       const staleRevision = session.queue.revision
       session.queue.add(createTrack({ title: 'late', webpageUrl: 'https://example.com/late', duration: 60, requestedBy: 'tester' }))
       const sessions = new Map([['guild-1', session]])
-      const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}` })
+      const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${staleRevision}_q${session.queue.id}` })
 
       await handleQueueEditorInteraction(interaction, sessions)
 
@@ -327,5 +327,70 @@ test('handleQueueEditorInteraction: a stale-revision rejection records a stale_r
       assert.equal(calls[0].success, false)
       assert.equal(calls[0].detail, 'stale_revision')
     })
+  })
+})
+
+// --- queue identity (cross-session collision guard) --------------------------
+// #revision restarts at 0 on every new GuildQueue, so revision alone cannot
+// distinguish a token minted under a destroyed session from the replacement
+// session's queue that climbed back to the same count. The embedded _q<id>
+// is process-unique per queue, so the dead session's token can never match.
+
+test('handleQueueEditorInteraction: a button from a destroyed session cannot mutate its replacement at the same revision', async () => {
+  await withTempSettings(async () => {
+    // Session A forms a queue; an editor renders at revision 2.
+    const sessionA = makeSession()
+    const renderedRevision = sessionA.queue.revision
+    assert.equal(renderedRevision, 2)
+    const staleQueueId = sessionA.queue.id
+    // /leave destroys A; a rejoin creates session B whose fresh queue also
+    // reaches revision 2 — identical revision, different queue identity.
+    const sessionB = makeSession()
+    assert.equal(sessionB.queue.revision, renderedRevision)
+    assert.notEqual(sessionB.queue.id, staleQueueId)
+    const sessions = new Map([['guild-1', sessionB]])
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${renderedRevision}_q${staleQueueId}` })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
+    assert.deepEqual(sessionB.queue.upcoming().map((t) => t.title), ['next'], 'session B queue must be unchanged')
+  })
+})
+
+test('handleQueueEditorInteraction: a stale queue id on a move warns and reorders nothing', async () => {
+  await withTempSettings(async () => {
+    const sessionA = makeSession()
+    sessionA.queue.add(createTrack({ title: 'third', webpageUrl: 'https://example.com/third', duration: 60, requestedBy: 'tester' }))
+    const renderedRevision = sessionA.queue.revision
+    const staleQueueId = sessionA.queue.id
+    const sessionB = makeSession()
+    sessionB.queue.add(createTrack({ title: 'third', webpageUrl: 'https://example.com/third', duration: 60, requestedBy: 'tester' }))
+    assert.equal(sessionB.queue.revision, renderedRevision)
+    const sessions = new Map([['guild-1', sessionB]])
+    const interaction = fakeInteraction({ customId: `qedit_movedown_p0_i0_r${renderedRevision}_q${staleQueueId}` })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
+    assert.deepEqual(sessionB.queue.upcoming().map((t) => t.title), ['next', 'third'])
+  })
+})
+
+test('handleQueueEditorInteraction: a custom_id with _r but no _q is stale on a mutating action even at the live revision', async () => {
+  await withTempSettings(async () => {
+    const session = makeSession()
+    const sessions = new Map([['guild-1', session]])
+    // Deployed between the revision fix and the queue-id fix: parses, but
+    // the missing token can never equal the live queue id → stale, no op.
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${session.queue.revision}` })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
+    assert.equal(session.queue.upcoming().length, 1, 'must not remove without a matching queue id')
   })
 })

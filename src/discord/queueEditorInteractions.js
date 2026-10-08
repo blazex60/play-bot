@@ -21,21 +21,26 @@ function logQueueOp(interaction, success, detail) {
 }
 
 // _r<rev> is the queue revision the message was rendered against (see
-// GuildQueue#revision). It's optional so a pre-deploy message without it
-// still parses — a missing revision can never match the live counter, so
-// old mutating buttons resolve to the same 'stale' warning instead of a
-// silent no-op.
-const CUSTOM_ID_RE = /^(qedit_[a-z]+)_p(\d+)(?:_i(\d+))?(?:_r(\d+))?$/
+// GuildQueue#revision) and _q<id> the queue's process-unique id (see
+// GuildQueue#id). Both are optional so a pre-deploy message without them
+// still parses — a missing token can never match the live queue, so old
+// mutating buttons resolve to the same 'stale' warning instead of a
+// silent no-op. The id matters because the revision restarts at 0 per
+// queue: a button rendered under a destroyed session would otherwise be
+// able to mutate its replacement once the new queue reaches the same
+// revision count.
+const CUSTOM_ID_RE = /^(qedit_[a-z]+)_p(\d+)(?:_i(\d+))?(?:_r(\d+))?(?:_q(\d+))?$/
 
 function parseCustomId(customId) {
   const match = customId.match(CUSTOM_ID_RE)
   if (!match) return null
-  const [, action, pageStr, indexStr, revisionStr] = match
+  const [, action, pageStr, indexStr, revisionStr, queueIdStr] = match
   return {
     action,
     page: parseInt(pageStr, 10),
     selectedIndex: indexStr !== undefined ? parseInt(indexStr, 10) : null,
     revision: revisionStr !== undefined ? parseInt(revisionStr, 10) : null,
+    queueId: queueIdStr !== undefined ? parseInt(queueIdStr, 10) : null,
   }
 }
 
@@ -51,7 +56,7 @@ async function rejectStaleSelection(interaction, playback, page, detail) {
 export async function handleQueueEditorInteraction(interaction, sessions) {
   const parsed = parseCustomId(interaction.customId)
   if (!parsed) return
-  const { action, page, revision } = parsed
+  const { action, page, revision, queueId } = parsed
   let { selectedIndex } = parsed
 
   const session = sessions.get(interaction.guildId)
@@ -79,8 +84,9 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
   if (!checkSameVoiceChannel(interaction, session)) return
 
   if (interaction.isStringSelectMenu() && action === 'qedit_select') {
-    // Values are `${index}:r${revision}` — read-only re-render, so only the
-    // index matters (parseInt stops at ':'; pre-deploy plain indexes too).
+    // Values are `${index}:r${revision}:q${queueId}` — read-only re-render,
+    // so only the index matters (parseInt stops at ':'; pre-deploy plain
+    // indexes too).
     selectedIndex = parseInt(interaction.values[0], 10)
     return interaction.update(buildQueueEditorPayload(playback.getState(interaction.guildId), { page, selectedIndex }))
   }
@@ -97,7 +103,7 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
     const toIndex = action === 'qedit_moveup' ? selectedIndex - 1
       : action === 'qedit_movedown' ? selectedIndex + 1
       : 0
-    const moved = playback.moveUpcomingIfRevision(interaction.guildId, selectedIndex, toIndex, revision)
+    const moved = playback.moveUpcomingIfRevision(interaction.guildId, selectedIndex, toIndex, revision, queueId)
     if (moved === 'stale') {
       return rejectStaleSelection(interaction, playback, page, 'stale_revision')
     }
@@ -110,7 +116,7 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
     if (selectedIndex === null || selectedIndex < 0 || selectedIndex >= len) {
       return rejectStaleSelection(interaction, playback, page, 'stale_index')
     }
-    const removed = playback.removeUpcomingIfRevision(interaction.guildId, selectedIndex, revision)
+    const removed = playback.removeUpcomingIfRevision(interaction.guildId, selectedIndex, revision, queueId)
     if (removed === 'stale') {
       return rejectStaleSelection(interaction, playback, page, 'stale_revision')
     }
@@ -121,10 +127,11 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
   }
 
   if (interaction.isButton() && action === 'qedit_jump') {
-    // The submit is a separate interaction — carry the revision through
-    // the modal's own custom_id so the move is still guarded on submit.
+    // The submit is a separate interaction — carry the revision and queue
+    // id through the modal's own custom_id so the move is still guarded on
+    // submit.
     const modal = new ModalBuilder()
-      .setCustomId(`qedit_jumpmodal_p${page}_i${selectedIndex}${revision != null ? `_r${revision}` : ''}`)
+      .setCustomId(`qedit_jumpmodal_p${page}_i${selectedIndex}${revision != null ? `_r${revision}` : ''}${queueId != null ? `_q${queueId}` : ''}`)
       .setTitle('移動先の位置')
     const input = new TextInputBuilder()
       .setCustomId('qedit_jump_input')
@@ -145,7 +152,7 @@ export async function handleQueueEditorInteraction(interaction, sessions) {
       return interaction.reply({ content: '❌ 無効な位置です', flags: MessageFlags.Ephemeral })
     }
     const toIndex = n - 1
-    const moved = playback.moveUpcomingIfRevision(interaction.guildId, selectedIndex, toIndex, revision)
+    const moved = playback.moveUpcomingIfRevision(interaction.guildId, selectedIndex, toIndex, revision, queueId)
     if (moved === 'stale') {
       return rejectStaleSelection(interaction, playback, page, 'stale_revision')
     }

@@ -288,3 +288,27 @@ test('wrappedUpcoming: a single-track QUEUE-loop queue returns [] just like upco
   queue.loopMode = LoopMode.QUEUE
   assert.deepEqual(queue.wrappedUpcoming(3), [])
 })
+
+// --- id (process-unique queue identity for cross-session staleness) -----------
+// #revision restarts at 0 per instance, so a queue-editor token minted under
+// a destroyed session could collide with the replacement queue's revision.
+// The id is a module-level monotonic counter: two queues never share one.
+
+test('id: every GuildQueue gets a unique, increasing identity', () => {
+  const a = new GuildQueue()
+  const b = new GuildQueue()
+  const c = new GuildQueue()
+  assert.ok(Number.isInteger(a.id) && a.id > 0)
+  assert.ok(b.id > a.id)
+  assert.ok(c.id > b.id)
+})
+
+test('id: stable across mutations — unlike revision it never changes', () => {
+  const queue = makeQueueWithUpcoming(['current', 'A', 'B'])
+  const id = queue.id
+  queue.removeUpcoming(0)
+  queue.shuffle()
+  queue.next()
+  queue.clear()
+  assert.equal(queue.id, id)
+})

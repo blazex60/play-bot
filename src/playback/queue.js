@@ -27,7 +27,16 @@ export function sameTrackSnapshot(tracks, snapshotIds) {
   return true;
 }
 
+// Process-unique identity counter for GuildQueue instances. A queue's
+// #revision restarts at 0 per instance, so a UI token (queue-editor
+// custom_id) carrying only a revision can collide with a REPLACEMENT
+// session's queue that happens to reach the same count. Stamping each
+// queue with a never-reused id makes a token minted against a destroyed
+// session's queue unmatchable forever after.
+let nextQueueId = 0;
+
 export class GuildQueue {
+  #id = ++nextQueueId;
   #tracks = [];
   #currentIndex = 0;
   // Optimistic-concurrency token for index-based mutators (the Discord
@@ -36,6 +45,10 @@ export class GuildQueue {
   // can be rejected instead of silently hitting the wrong track.
   #revision = 0;
   loopMode = LoopMode.OFF;
+
+  get id() {
+    return this.#id;
+  }
 
   get revision() {
     return this.#revision;

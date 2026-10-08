@@ -18,9 +18,14 @@ export function buildQueueEditorPayload(queueState, { page = 0, selectedIndex = 
   // Optimistic-concurrency token embedded into every custom_id and select
   // value: the mutating buttons are index-based, so any queue change after
   // this render makes them stale and the handler rejects the op instead of
-  // hitting the wrong track. Well under Discord's 100-char custom_id limit.
+  // hitting the wrong track. The queue's own id travels with it (_q) — the
+  // revision restarts at 0 for each new session's queue, so without the id
+  // a button rendered under a destroyed session could collide with its
+  // replacement's revision. Well under Discord's 100-char custom_id limit.
   const revision = Number.isInteger(queueState.revision) ? queueState.revision : 0
-  const revSuffix = `_r${revision}`
+  const queueId = Number.isInteger(queueState.queueId) ? queueState.queueId : null
+  const revSuffix = `_r${revision}${queueId != null ? `_q${queueId}` : ''}`
+  const valueSuffix = `:r${revision}${queueId != null ? `:q${queueId}` : ''}`
   const totalPages = Math.max(1, Math.ceil(upcoming.length / PAGE_SIZE))
   const clampedPage = Math.min(Math.max(page, 0), totalPages - 1)
   const pageStart = clampedPage * PAGE_SIZE
@@ -63,7 +68,7 @@ export function buildQueueEditorPayload(queueState, { page = 0, selectedIndex = 
           return {
             label: `${absIndex + 1}. ${t.title}`.slice(0, 80),
             description: fmtDuration(t.duration).slice(0, 80),
-            value: `${absIndex}:r${revision}`,
+            value: `${absIndex}${valueSuffix}`,
             default: absIndex === effectiveSelectedIndex,
           }
         })

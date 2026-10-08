@@ -10,6 +10,7 @@ function fakeSession(initialTracks = []) {
     tracks,
     calls,
     queue: {
+      id: 1,
       revision: 0,
       get isEmpty() {
         return tracks.length === 0
@@ -491,12 +492,12 @@ test('queue operations delegate and null out without a session', () => {
 
 // --- revision-checked queue ops (optimistic concurrency for index-based UI) ---
 
-test('removeUpcomingIfRevision/moveUpcomingIfRevision: delegate only when the revision matches', () => {
+test('removeUpcomingIfRevision/moveUpcomingIfRevision: delegate only when the revision and queue id match', () => {
   const session = fakeSession(['a', 'b', 'c'])
   session.queue.revision = 7
   const playback = serviceFor(session)
-  assert.equal(playback.removeUpcomingIfRevision('g', 0, 7), true)
-  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, 7), true)
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, 7, 1), true)
+  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, 7, 1), true)
   assert.deepEqual(session.calls, ['removeUpcoming:0', 'moveUpcoming:0->1'])
 })
 
@@ -505,31 +506,50 @@ test('removeUpcomingIfRevision/moveUpcomingIfRevision: stale revision returns st
   const session = realQueueSession(['current-t', 'next-t', 'third-t'])
   const playback = serviceFor(session)
   const before = session.queue.revision
-  assert.equal(playback.removeUpcomingIfRevision('g', 0, before - 1), 'stale')
-  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, before - 1), 'stale')
-  assert.equal(playback.removeUpcomingIfRevision('g', 0, 'not-a-number'), 'stale')
-  assert.equal(playback.removeUpcomingIfRevision('g', 0, null), 'stale')
+  const qid = session.queue.id
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, before - 1, qid), 'stale')
+  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, before - 1, qid), 'stale')
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, 'not-a-number', qid), 'stale')
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, null, qid), 'stale')
   assert.deepEqual(session.queue.upcoming().map((t) => t.title), ['next-t', 'third-t'])
   assert.equal(session.queue.revision, before)
 })
 
+test('removeUpcomingIfRevision/moveUpcomingIfRevision: a queue id from a dead session is stale even at a matching revision', () => {
+  // Repro of the cross-session collision: session A's editor was rendered
+  // at revision N, session A is destroyed, and the replacement session's
+  // fresh queue climbs back to the same revision N. The queue id embedded
+  // in A's message can never equal the live queue's id, so the op rejects.
+  const sessionB = realQueueSession(['current-t', 'next-t', 'third-t'])
+  const playback = serviceFor(sessionB)
+  const deadQueueId = sessionB.queue.id - 1 // every prior GuildQueue's id
+  const rev = sessionB.queue.revision
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev, deadQueueId), 'stale')
+  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, rev, deadQueueId), 'stale')
+  // A pre-_q message (or a forged one with no token) can never match either.
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev, null), 'stale')
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev, undefined), 'stale')
+  assert.deepEqual(sessionB.queue.upcoming().map((t) => t.title), ['next-t', 'third-t'])
+})
+
 test('removeUpcomingIfRevision/moveUpcomingIfRevision: false when there is no session', () => {
   const empty = serviceFor(null)
-  assert.equal(empty.removeUpcomingIfRevision('g', 0, 0), false)
-  assert.equal(empty.moveUpcomingIfRevision('g', 0, 1, 0), false)
+  assert.equal(empty.removeUpcomingIfRevision('g', 0, 0, 1), false)
+  assert.equal(empty.moveUpcomingIfRevision('g', 0, 1, 0, 1), false)
 })
 
 test('removeUpcomingIfRevision/moveUpcomingIfRevision: propagate the underlying op result on a match', () => {
   const session = realQueueSession(['current-t', 'next-t'])
   const playback = serviceFor(session)
   const rev = session.queue.revision
+  const qid = session.queue.id
   // Index out of range → the queue itself reports false (not stale).
-  assert.equal(playback.removeUpcomingIfRevision('g', 99, rev), false)
+  assert.equal(playback.removeUpcomingIfRevision('g', 99, rev, qid), false)
   // Real remove applies and bumps the revision, so the same expectedRevision
   // is immediately stale afterwards — this is what makes a second click on
   // the same rendered button safe.
-  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev), true)
-  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev), 'stale')
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev, qid), true)
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, rev, qid), 'stale')
 })
 
 // --- state snapshot ---
@@ -551,11 +571,15 @@ test('getState returns a plain snapshot without live internals', () => {
   assert.equal(state.connection, undefined)
 })
 
-test('getState: exposes the queue revision and tracks its mutations', () => {
+test('getState: exposes the queue revision and queue id, and tracks revision mutations', () => {
   const session = realQueueSession(['current-t', 'next-t'])
   const playback = serviceFor(session)
   const before = playback.getState('g').revision
   assert.equal(before, session.queue.revision)
+  // Identity token for the *IfRevision guard: the revision alone restarts
+  // at 0 on every new session's queue, so the editor embeds both.
+  assert.equal(playback.getState('g').queueId, session.queue.id)
+  assert.equal(JSON.parse(JSON.stringify(playback.getState('g'))).queueId, session.queue.id)
   session.queue.add(createTrack({ title: 't', webpageUrl: 'u', duration: 1, requestedBy: 'u' }))
   assert.equal(playback.getState('g').revision, before + 1)
   // Integer survives JSON serialization (the web API serializes getState).
