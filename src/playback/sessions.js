@@ -25,8 +25,11 @@ export function playbackFor(sessionsMap) {
   return new PlaybackService({
     getSession: (guildId) => sessionsMap.get(guildId),
     onStop: (guildId) => {
-      bumpPlanToken(guildId)
-      cancelPendingRecommendations(guildId)
+      // Both helpers take the bound map explicitly: a PlaybackService bound
+      // to an injected/test sessions Map must bump that map's planToken and
+      // read that map's recommendHooks, never the global `sessions`.
+      bumpPlanToken(sessionsMap, guildId)
+      cancelPendingRecommendations(sessionsMap, guildId)
     },
   })
 }
@@ -43,8 +46,8 @@ export async function destroySession(sessionsMap, guildId) {
   if (!session) return
   sessionsMap.delete(guildId)
   // Uses the session's own injected hooks rather than
-  // cancelPendingRecommendations(guildId): the map entry is already gone by
-  // this point, and the injected map may not be the global `sessions`.
+  // cancelPendingRecommendations(sessionsMap, guildId): the map entry is
+  // already gone by this point, so a map lookup could not find it anyway.
   session.recommendHooks?.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
   await session.player.stop().catch(() => {})
   session.connection.destroy()
@@ -91,16 +94,16 @@ const NOOP_RECOMMEND_HOOKS = {
 // so both must explicitly drop any still-open recommendation prompts for
 // the guild (otherwise a stale button click can still enqueue and start a
 // track after the user thought they stopped/left).
-export function cancelPendingRecommendations(guildId) {
-  sessions.get(guildId)?.recommendHooks?.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
+export function cancelPendingRecommendations(sessionsMap, guildId) {
+  sessionsMap.get(guildId)?.recommendHooks?.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
 }
 
 // Invalidates any queue-exhaustion planning currently in flight for a guild.
 // Call this whenever something changes state that in-flight planning already
 // read before its first await — stopping playback, or flipping autoplayMode/
 // personalize — so a stale continuation can't act on outdated assumptions.
-export function bumpPlanToken(guildId) {
-  const session = sessions.get(guildId)
+export function bumpPlanToken(sessionsMap, guildId) {
+  const session = sessionsMap.get(guildId)
   if (session) session.planToken += 1
 }
 

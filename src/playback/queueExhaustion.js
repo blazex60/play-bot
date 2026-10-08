@@ -86,7 +86,11 @@ export function createQueueExhaustionHandler({
         // 30s timeout, and mixer startup (download + loudnorm) can exceed
         // that. Returning handled as soon as the track is queued lets
         // playback continue outside the planning timeout.
-        await playback.enqueue(guildId, [autoTrack], { awaitStart: false })
+        // expectedSession pins the enqueue to the session this round planned
+        // against: a /leave + rejoin between the isStale() check above and
+        // this call swaps the map entry, and without the pin a stale
+        // continuation would add its track to the replacement session.
+        await playback.enqueue(guildId, [autoTrack], { awaitStart: false, expectedSession: session })
         if (getGuildSettings(guildId).autoNotify === true) {
           const textChannelId = session.textChannelId
           const textChannel = textChannelId ? guild.channels.cache.get(textChannelId) : null

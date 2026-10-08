@@ -144,6 +144,154 @@ test('enqueue: returns null when the guild has no session', async () => {
   assert.equal(result, null)
 })
 
+// --- enqueue async-window guards ---
+// onEnqueued is an arbitrary async window (callers post Discord replies in
+// it): /stop can clear the queue, /leave can destroy or replace the session,
+// and a rival enqueue can re-fill the queue in the meantime. These tests
+// simulate each of those by mutating the fake session/map mid-await.
+
+function mapBackedService(map) {
+  return new PlaybackService({ getSession: (guildId) => map.get(guildId) })
+}
+
+test('enqueue: a stop-clear during the onEnqueued await does not start playback', async () => {
+  const session = fakeSession()
+  const { wasEmpty, started } = await serviceFor(session).enqueue('g', ['track-a'], {
+    onEnqueued: async () => {
+      // /stop: player.stop() calls queue.clear() — the session stays live
+      // but our just-added track is gone.
+      session.tracks.length = 0
+      session.calls.push('stop-clear')
+    },
+  })
+  assert.equal(wasEmpty, true)
+  assert.equal(started, false)
+  assert.deepEqual(session.tracks, [])
+  assert.deepEqual(session.calls, ['stop-clear']) // playNext never called
+})
+
+test('enqueue: an in-flight enqueue cannot revive playback after playback.stop()', async () => {
+  const session = fakeSession()
+  // Real GuildPlayer.stop() clears the queue — mirror that here.
+  session.player.stop = async () => {
+    session.calls.push('stop')
+    session.tracks.length = 0
+  }
+  const playback = serviceFor(session)
+  let release
+  const pending = playback.enqueue('g', ['track-a'], {
+    onEnqueued: () => new Promise((resolve) => { release = resolve }),
+  })
+  await playback.stop('g')
+  release()
+  const { wasEmpty, started } = await pending
+  assert.equal(wasEmpty, true)
+  assert.equal(started, false)
+  assert.deepEqual(session.calls, ['stop']) // no playNext after stop
+})
+
+test('enqueue: a session swap during the onEnqueued await leaves the stale and new sessions alone', async () => {
+  const staleSession = fakeSession()
+  const newSession = fakeSession()
+  const map = new Map([['g', staleSession]])
+  const playback = mapBackedService(map)
+  const result = await playback.enqueue('g', ['track-a'], {
+    onEnqueued: async () => {
+      // /leave + immediate rejoin: the map now holds a different session.
+      map.delete('g')
+      map.set('g', newSession)
+    },
+  })
+  assert.deepEqual(result, { wasEmpty: true, started: false })
+  // The stale session got the track (added before the swap) but its player
+  // is never started again — playback must not revive post-leave.
+  assert.deepEqual(staleSession.tracks, ['track-a'])
+  assert.deepEqual(staleSession.calls, [])
+  // The replacement session is untouched by the stale enqueue.
+  assert.deepEqual(newSession.tracks, [])
+  assert.deepEqual(newSession.calls, [])
+})
+
+test('enqueue: session destruction during the onEnqueued await does not start playback', async () => {
+  const session = fakeSession()
+  const map = new Map([['g', session]])
+  const playback = mapBackedService(map)
+  const result = await playback.enqueue('g', ['track-a'], {
+    onEnqueued: async () => {
+      map.delete('g')
+    },
+  })
+  assert.deepEqual(result, { wasEmpty: true, started: false })
+  assert.deepEqual(session.tracks, ['track-a'])
+  assert.deepEqual(session.calls, []) // playNext never called on the dead session
+})
+
+test('enqueue: a stop-clear between two enqueues yields exactly one playNext', async () => {
+  const session = fakeSession()
+  const map = new Map([['g', session]])
+  const playback = mapBackedService(map)
+
+  let releaseA
+  const aDone = playback.enqueue('g', ['track-a'], {
+    onEnqueued: () => new Promise((resolve) => { releaseA = resolve }),
+  })
+  // A's adds run synchronously before its onEnqueued await suspends.
+  await Promise.resolve()
+  // /stop clears A's track while A is still awaiting its reply.
+  session.tracks.length = 0
+  // Rival enqueue B sees the now-empty queue and gets to start playback.
+  const bResult = await playback.enqueue('g', ['track-b'])
+  releaseA()
+  const aResult = await aDone
+
+  assert.equal(bResult.started, true)
+  assert.equal(aResult.started, false)
+  // Exactly one start total — A must not double-start B's track.
+  assert.deepEqual(session.calls, ['playNext'])
+  assert.deepEqual(session.tracks, ['track-b'])
+})
+
+test('enqueue: expectedSession blocks a stale continuation from touching the replacement session', async () => {
+  const staleSession = fakeSession()
+  const newSession = fakeSession()
+  const map = new Map([['g', newSession]]) // rejoin already swapped the entry
+  const playback = mapBackedService(map)
+  const result = await playback.enqueue('g', ['track-a'], { expectedSession: staleSession })
+  assert.deepEqual(result, { wasEmpty: false, started: false })
+  assert.deepEqual(newSession.tracks, [])
+  assert.deepEqual(newSession.calls, [])
+  assert.deepEqual(staleSession.tracks, [])
+})
+
+test('enqueue: expectedSession aborts after the onEnqueued await when the session was swapped', async () => {
+  const staleSession = fakeSession()
+  const newSession = fakeSession()
+  const map = new Map([['g', staleSession]])
+  const playback = mapBackedService(map)
+  const { wasEmpty, started } = await playback.enqueue('g', ['track-a'], {
+    expectedSession: staleSession,
+    onEnqueued: async () => {
+      map.set('g', newSession)
+    },
+  })
+  assert.equal(wasEmpty, true)
+  assert.equal(started, false)
+  assert.deepEqual(newSession.tracks, [])
+  assert.deepEqual(newSession.calls, [])
+  assert.deepEqual(staleSession.calls, [])
+})
+
+test('enqueue: expectedSession proceeds normally while it is still the live session', async () => {
+  const session = fakeSession()
+  const map = new Map([['g', session]])
+  const { wasEmpty, started } = await mapBackedService(map).enqueue('g', ['track-a'], {
+    expectedSession: session,
+  })
+  assert.equal(wasEmpty, true)
+  assert.equal(started, true)
+  assert.deepEqual(session.calls, ['playNext'])
+})
+
 // --- transport controls ---
 
 test('pause/resume delegate to the player and null out without a session', () => {

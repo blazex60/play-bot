@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 
-import { getOrCreateSession, cancelPendingRecommendations, bumpPlanToken, playbackFor, webClient } from '../playback/sessions.js';
+import { getOrCreateSession, bumpPlanToken, playbackFor, webClient } from '../playback/sessions.js';
 import { recommendHooks } from './recommendHooks.js';
 import { resolveWebPermission } from './webPermission.js';
 import {
@@ -253,7 +253,7 @@ export function buildBotApi({
       // Queue-exhaustion planning already in flight read the old settings
       // before its first await; invalidate it so it can't act on values the
       // user just changed from the dashboard.
-      bumpPlanToken(guildId);
+      bumpPlanToken(sessions, guildId);
       return { ok: true, state: serializeSession(playback, guildId) };
     }
 

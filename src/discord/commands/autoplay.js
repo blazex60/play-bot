@@ -42,7 +42,7 @@ export default {
         )
     ),
 
-  async execute(interaction) {
+  async execute(interaction, sessions) {
     const subcommand = interaction.options.getSubcommand()
 
     if (subcommand === 'mode') {
@@ -51,7 +51,7 @@ export default {
       // Queue-exhaustion planning already in flight read the old mode before
       // its first await; invalidate it so it can't act on a setting the user
       // just changed (e.g. finishing an "auto" pick after switching to off).
-      bumpPlanToken(interaction.guildId)
+      bumpPlanToken(sessions, interaction.guildId)
       await interaction.reply({
         content: `✅ 自動再生モードを **${MODE_LABELS[mode]}** にしました`,
         ...replyFlags(interaction.guildId, 'autoplay'),
@@ -62,7 +62,7 @@ export default {
     if (subcommand === 'personalize') {
       const enabled = interaction.options.getBoolean('value', true)
       await setPersonalize(interaction.guildId, enabled)
-      bumpPlanToken(interaction.guildId)
+      bumpPlanToken(sessions, interaction.guildId)
       await interaction.reply({
         content: `✅ パーソナライズを **${enabled ? '有効' : '無効'}** にしました`,
         ...replyFlags(interaction.guildId, 'autoplay'),

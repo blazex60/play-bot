@@ -68,33 +68,62 @@ export class PlaybackService {
    * Adds tracks to the guild's queue and starts playback if it was empty.
    * @param {object[]} tracks
    * @param {{ onEnqueued?: (info: { wasEmpty: boolean }) => Promise<void>|void,
-   *           awaitStart?: boolean }} [options]
+   *           awaitStart?: boolean,
+   *           expectedSession?: object }} [options]
    *   onEnqueued runs after the adds but before playNext is started/awaited —
    *   callers use it for their "added to queue" confirmation so the reply
    *   ordering matches the old inline pattern.
    *   awaitStart: false starts playback without awaiting it (for the
    *   time-bounded queue-exhaustion continuation, where playNext must not
    *   block the handler).
+   *   expectedSession pins this enqueue to one session object: it must still
+   *   be the live session for the guild both at entry and after the
+   *   onEnqueued await, or the call is abandoned. Stale continuations
+   *   (autoplay planning that captured a session before /leave + rejoin)
+   *   pass the session they planned against so they cannot add tracks to a
+   *   replacement session.
    * @returns {Promise<{ wasEmpty: boolean, started: boolean } | null>}
-   *   null when the guild has no session.
+   *   null when the guild has no session. On an expectedSession mismatch at
+   *   entry returns { wasEmpty: false, started: false } without touching the
+   *   queue or player. When the session is destroyed or swapped during the
+   *   onEnqueued await, returns { wasEmpty, started: false } — the tracks
+   *   were added to the (now-stale) session's queue but playback is not
+   *   started and the live session is left alone.
    */
-  async enqueue(guildId, tracks, { onEnqueued = null, awaitStart = true } = {}) {
+  async enqueue(guildId, tracks, { onEnqueued = null, awaitStart = true, expectedSession = null } = {}) {
     const session = this.#getSession(guildId);
     if (!session || !Array.isArray(tracks)) return null;
+    if (expectedSession && session !== expectedSession) {
+      return { wasEmpty: false, started: false };
+    }
     const wasEmpty = session.queue.isEmpty;
     for (const track of tracks) session.queue.add(track);
     if (onEnqueued) await onEnqueued({ wasEmpty });
+    // The await above is an open async window: /leave may have destroyed or
+    // replaced the session and /stop may have cleared the queue. Never touch
+    // a session that is no longer the live one — a stale enqueue must not
+    // revive playback post-leave or act on a replacement session.
+    if (this.#getSession(guildId) !== session) {
+      return { wasEmpty, started: false };
+    }
     let started = false;
     if (wasEmpty && tracks.length > 0) {
-      started = true;
-      if (awaitStart) {
-        await session.player.playNext();
-      } else {
-        // Fire-and-forget: callers in a bounded continuation can't afford to
-        // await mixer startup (download + loudnorm can take tens of seconds).
-        session.player.playNext().catch((err) => {
-          console.error('[playback] playNext failed:', err?.message ?? err);
-        });
+      // A stop() during the await cleared our tracks out (queue.clear), and
+      // a rival enqueue may since have re-filled the queue. Only the enqueue
+      // whose track still sits at the head may start playback — otherwise
+      // both the cleared enqueue and the rival would call playNext and
+      // double-start the rival's track.
+      if (tracks.includes(session.queue.current)) {
+        started = true;
+        if (awaitStart) {
+          await session.player.playNext();
+        } else {
+          // Fire-and-forget: callers in a bounded continuation can't afford to
+          // await mixer startup (download + loudnorm can take tens of seconds).
+          session.player.playNext().catch((err) => {
+            console.error('[playback] playNext failed:', err?.message ?? err);
+          });
+        }
       }
     }
     return { wasEmpty, started };
