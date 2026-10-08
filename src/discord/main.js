@@ -4,7 +4,7 @@ import { Client, Collection, Events, GatewayIntentBits, MessageFlags } from 'dis
 import { readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { sessions, pendingStore, recommendPendingStore, recommendRounds, destroySession, webClient } from '../playback/sessions.js'
+import { sessions, pendingStore, recommendPendingStore, recommendRounds, destroySession, webClient, sessionVoiceChannelId } from '../playback/sessions.js'
 import { parseSearchCustomId } from './views.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
 import { handleRecommendChoice, handleShowRecommendations, RECOMMEND_CUSTOM_ID_PREFIX, RECOMMEND_SHOW_CUSTOM_ID } from './recommendFlow.js'
@@ -123,7 +123,7 @@ client.on(Events.VoiceStateUpdate, async (oldState) => {
   const session = sessions.get(oldState.guild.id)
   if (!session) return
 
-  const botChannel = session.connection.joinConfig.channelId
+  const botChannel = sessionVoiceChannelId(session)
   if (oldState.channelId !== botChannel) return
 
   const channel = oldState.guild.channels.cache.get(botChannel)

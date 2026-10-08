@@ -3,6 +3,7 @@ import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
 import { checkCommandAllowed, checkInVoiceChannel } from './permissions.js'
 import { createTrack } from '../playback/queue.js'
 import { PlaybackService } from '../playback/playbackService.js'
+import { sessionPlanToken, isSessionStale } from '../playback/sessionAccessors.js'
 import { fmtDuration } from '../shared/format.js'
 import { resolveAdminRoleId } from '../shared/settings.js'
 
@@ -353,8 +354,8 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore,
   }
   // Snapshot enough to detect /stop or a disconnect (VC empty, /leave,
   // watchdog) landing during the awaits below.
-  const planTokenAtClaim = session.planToken
-  const isSessionStale = () => sessions.get(entry.guildId) !== session || session.planToken !== planTokenAtClaim
+  const planTokenAtClaim = sessionPlanToken(session)
+  const isStale = () => isSessionStale(sessions, entry.guildId, session, planTokenAtClaim)
 
   // Claim this user's own prompt synchronously, before ANY await — a double
   // click on the same message would otherwise both read this same entry and
@@ -375,7 +376,7 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore,
     // which dispatch here instead of through index.js's chat-input-command
     // guard.
     if (!checkCommandAllowed(interaction, resolveAdminRoleId(entry.guildId), 'play', entry.guildId, interaction.member)) {
-      if (!isSessionStale() && !entry.expired) {
+      if (!isStale() && !entry.expired) {
         pendingStore.set(interaction.message.id, entry)
       }
       return
@@ -385,7 +386,7 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore,
     // actually enqueueing/starting playback must reflect who's in the room
     // right now, same as every other playback-affecting command.
     if (!(await checkInVoiceChannel(interaction, session))) {
-      if (!isSessionStale() && !entry.expired) {
+      if (!isStale() && !entry.expired) {
         pendingStore.set(interaction.message.id, entry)
       }
       return
@@ -398,7 +399,7 @@ export async function handleRecommendChoice(interaction, sessions, pendingStore,
     await interaction.deferUpdate()
     await interaction.deleteReply().catch(() => {})
 
-    if (isSessionStale()) {
+    if (isStale()) {
       // /stop or a disconnect landed while deferUpdate()/deleteReply() were
       // in flight; the session this pick read is gone or was reset, so
       // don't resurrect playback on top of it.

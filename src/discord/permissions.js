@@ -1,5 +1,6 @@
 import { MessageFlags } from 'discord.js'
 import { resolveCommandPermission, getCommandVisibilitySettings } from '../shared/settings.js'
+import { sessionVoiceChannelId, sessionVoiceGuildId } from '../playback/sessionAccessors.js'
 
 // Historical hardcoded reply visibility, kept as the fallback for any guild
 // that hasn't customized a given command via the admin dashboard yet.
@@ -123,7 +124,7 @@ export async function requireSessionInSameVoice(interaction, sessions, { emptyMe
 
 export function checkSameVoiceChannel(interaction, session) {
   const targetChannelId = session
-    ? session.connection.joinConfig.channelId
+    ? sessionVoiceChannelId(session)
     : interaction.member.voice?.channelId
   if (!targetChannelId) return true
   const inVoice = interaction.member.voice.channelId === targetChannelId
@@ -149,13 +150,13 @@ export function checkSameVoiceChannel(interaction, session) {
 // checkCommandAllowed call too), in which case that fetch is skipped.
 export async function checkInVoiceChannel(interaction, session, resolvedMember = interaction.member) {
   const targetChannelId = session
-    ? session.connection.joinConfig.channelId
+    ? sessionVoiceChannelId(session)
     : resolvedMember?.voice?.channelId
   if (!targetChannelId) return true
 
   let member = resolvedMember
   if (!member) {
-    const guild = interaction.client.guilds.cache.get(session.connection.joinConfig.guildId)
+    const guild = interaction.client.guilds.cache.get(sessionVoiceGuildId(session))
     member = guild ? await guild.members.fetch(interaction.user.id).catch(() => null) : null
   }
 

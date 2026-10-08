@@ -12,7 +12,7 @@ Bot 本体のソース。レイヤー分離された構成: `discord/`（Discord
 | Directory | Purpose |
 |-----------|---------|
 | `discord/` | Discord adapter。`main.js`（bot エントリーポイント）、`deploy.js`、`commands/`、interaction ハンドラ（`queueEditorInteractions.js`/`recommendFlow.js`/`queueEditorView.js`/`views.js`）、`permissions.js`/`webPermission.js`、loopback internal API `botApi.js` |
-| `playback/` | 再生ドメイン。`playbackService.js`（adapters 用の in-process facade）、`sessions.js`（SessionManager: VC セッション共有状態）、`player.js`（GuildPlayer）、`queue.js`（GuildQueue）、`queueExhaustion.js`、`autoplay.js`（個人化/おすすめ選出）、`player/`（player 補助: `analysisCoordinator.js`・`playbackWatchdog.js`・`sourcePreparer.js`・`transitionCoordinator.js`・`mixerPipeline.js`・`queueAdvancement.js`・`playbackDrive.js`・`playbackPolicy.js`・`test-helpers.js`） |
+| `playback/` | 再生ドメイン。`playbackService.js`（adapters 用の in-process facade）、`sessions.js`（SessionManager: VC セッション共有状態）、`sessionAccessors.js`（session フィールドの read-only ヘルパー）、`player.js`（GuildPlayer）、`queue.js`（GuildQueue）、`queueExhaustion.js`、`autoplay.js`（個人化/おすすめ選出）、`player/`（player 補助: `analysisCoordinator.js`・`playbackWatchdog.js`・`sourcePreparer.js`・`transitionCoordinator.js`・`mixerPipeline.js`・`queueAdvancement.js`・`playbackDrive.js`・`playbackPolicy.js`・`test-helpers.js`） |
 | `media/` | メディア取得。`search.js`（yt-dlp spawn: 検索/メタデータ/ストリーム解決）、`mix/`（Camelot/ordering/playlistGenerate） |
 | `audio/` | 音声基盤。`normalize.js`（loudnorm プリフェッチ）、`mixStream.js`、`pcmSource.js`、解析（`trackAnalysis`/`beatmixTransition`/`phraseAnalysis`/`downbeatAnalysis`/`keyAnalysis`/`vocalActivity`）、ステム（`stemCache`/`stemTransition`/`stemPrefetch`）、`tempo.js`、`analysisQueue.js` |
 | `shared/` | adapter/domain 共有の純粋ユーティリティ。`format.js`（`fmtDuration`,`LOOP_LABELS`）、`settings.js`（guild 設定 JSON）、`webClient.js`（bot→web internal HTTP client） |
@@ -25,6 +25,7 @@ Bot 本体のソース。レイヤー分離された構成: `discord/`（Discord
 - **依存方向**: adapters（`discord/`・`local/`）→ `playback/playbackService.js` → playback 内部（`sessions`/`GuildPlayer`/`GuildQueue`）→ `audio/`/`media/` インフラ。逆向きの import（例: `audio/` → `discord/`、`queue.js` → Discord 系、`media/` → player 状態）は禁止
 - **循環インポート防止**: `playback/sessions.js` が VC セッションの共有状態を保持するハブ。`playback/queueExhaustion.js` のように `sessions.js` から呼ばれる側のモジュールは `sessions.js` を import せず、必要な値は関数引数（`getSession` サンク等）で受け取ること
 - adapters は `session.player` / `session.queue` を直接操作しない。`sessions.js` の `playbackFor(sessions)` で取得する `PlaybackService`（`enqueue`/`pause`/`resume`/`skip`/`stop`/`seekTo`/`shuffle`/`cycleLoop`/`removeUpcoming`/`moveUpcoming`/`reorderUpcomingIfUnchanged`/`getState`）経由で操作する。セッション破棄は `destroySession(sessions, guildId)`
+- adapters は `session.player`/`session.queue` 以外の session フィールド（`connection`/`planToken` 等）の読み取りにも `playback/sessionAccessors.js` の read-only ヘルパー（`sessionVoiceChannelId`/`sessionVoiceGuildId`/`sessionConnectionStatus`/`sessionPlanToken`/`isSessionStale`）を使う。`sessions.js` を import できない adapter（recommendFlow・permissions は循環になる）のため実体は leaf モジュールにあり、`sessions.js` から re-export される
 - Bot process は `better-sqlite3` を絶対に import しない。DB（`src/web/db/`）が必要な操作は `src/web/server/` 経由の internal API を使う
 - `playback/player.js` のウォッチドッグ（`playback/player/playbackWatchdog.js`）は `state.playbackDuration` の増加を見て判定する。`stateChange` イベント自体はループ再生開始時にしか発火しないため使わない。ストール時は `MixStream.dropCurrent()` する
 - `#hadError` フラグは `queue.next({ forceAdvance: true })` を呼ぶ**前**に退避してからリセットする（順序が逆だと無限リトライになる）

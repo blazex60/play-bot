@@ -95,6 +95,19 @@ export function bumpPlanToken(guildId) {
 // in queueExhaustion.js, next to the handler it guards.
 export { claimAutoplayContinuation, releaseAutoplayContinuation, hasAutoplayContinuationBeenUsed }
 
+// Read-only session field accessors for adapter layers. The implementations
+// live in sessionAccessors.js (a leaf module) because adapters like
+// recommendFlow/permissions can't import sessions.js without a circular
+// import — sessions.js already imports them. Re-exported here so they remain
+// part of this module's public surface.
+export {
+  sessionVoiceChannelId,
+  sessionVoiceGuildId,
+  sessionConnectionStatus,
+  sessionPlanToken,
+  isSessionStale,
+} from './sessionAccessors.js'
+
 export async function getOrCreateSession({ guildId, guild, channel, textChannelId = null }) {
   const existing = sessions.get(guildId)
   if (existing && existing.connection.state.status !== VoiceConnectionStatus.Destroyed) {

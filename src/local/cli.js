@@ -2,6 +2,7 @@ import { createInterface } from 'node:readline';
 import { GuildPlayer } from '../playback/player.js';
 import { GuildQueue } from '../playback/queue.js';
 import { PlaybackService } from '../playback/playbackService.js';
+import { sessionConnectionStatus } from '../playback/sessionAccessors.js';
 import {
   isPlaylistUrl,
   mapEntryToTrack,
@@ -266,7 +267,7 @@ export function createLocalPlayerCli({ sink, decode, output = process.stdout, in
         }
         case 'status': {
           const settings = getGuildSettings(LOCAL_GUILD_ID);
-          say(`接続: ${session ? session.connection.state.status : 'なし'} | プレイヤー: ${playback.getState(LOCAL_GUILD_ID).status} | sink: ${sink.name}`);
+          say(`接続: ${session ? sessionConnectionStatus(session) : 'なし'} | プレイヤー: ${playback.getState(LOCAL_GUILD_ID).status} | sink: ${sink.name}`);
           say(`fade=${settings.fade ? 'on' : 'off'} normalize=${settings.normalize ? 'on' : 'off'}`);
           break;
         }
