@@ -320,6 +320,7 @@ export class GuildPlayer {
       cleanupCurrentTempFile: () => this.#cleanupCurrentTempFile(),
       clearWatchdog: () => this.#clearWatchdog(),
       isStopping: () => this.#stopping,
+      stopGeneration: () => this.#stopGeneration,
       isForceSkip: () => this.#forceSkip,
       clearForceSkip: () => {
         this.#forceSkip = false;
@@ -908,6 +909,11 @@ export class GuildPlayer {
     const track = this.#queue.current;
     if (!track || !this.mixStream?.currentSource || this.mixStream.isDestroyed()) return false;
     if (this.mixStream.isCrossfading || this.#advancement.handlingAfter) return false;
+    // Same overtake rule as playNext: a stop() in flight owns teardown and
+    // the mixer rebuild — a seek must not adopt a source onto it. The
+    // generation snapshot catches a stop that begins in either await below.
+    if (this.#stopping) return false;
+    const generation = this.#stopGeneration;
     const durationSec = this.#resolvePlaybackDurationSec(track);
     let target = Math.max(0, targetSec);
     if (durationSec != null) target = Math.min(target, Math.max(0, durationSec - 0.5));
@@ -927,12 +933,21 @@ export class GuildPlayer {
       console.error('[GuildPlayer] seek source failed:', err);
       return false;
     }
+    if (this.#stopGeneration !== generation) {
+      // A stop() began while the source was being prepared: its teardown
+      // cleared the queue and owns the mixer rebuild — adoptCurrent below
+      // would land this source on the rebuilt mixer and revive playback.
+      source.destroy?.();
+      return false;
+    }
     // Same rule as playNext: wait for real PCM before adopting — the
     // MixStream underrun guard starts as soon as a current source is
     // attached, so a still-buffering decoder would sourceerror the track.
     const waitGeneration = this.#pipeline.pcmWaitGeneration;
     const waited = await this.#pipeline.waitForSourceAudio(source);
-    if (this.#pipeline.isSourceAudioWaitSuperseded(track, waited, waitGeneration) || waited !== 'ready') {
+    if (this.#stopGeneration !== generation
+      || this.#pipeline.isSourceAudioWaitSuperseded(track, waited, waitGeneration)
+      || waited !== 'ready') {
       source.destroy?.();
       return false;
     }

@@ -29,6 +29,7 @@ function sleep(ms) {
  *   cleanupCurrentTempFile: () => Promise<void>,
  *   clearWatchdog: () => void,
  *   isStopping: () => boolean,
+ *   stopGeneration: () => number,
  *   isForceSkip: () => boolean,
  *   clearForceSkip: () => void,
  *   isHadError: () => boolean,
@@ -65,6 +66,7 @@ export class QueueAdvancement {
   #cleanupCurrentTempFile;
   #clearWatchdog;
   #isStopping;
+  #stopGeneration;
   #isForceSkip;
   #clearForceSkip;
   #isHadError;
@@ -82,6 +84,7 @@ export class QueueAdvancement {
     cleanupCurrentTempFile,
     clearWatchdog,
     isStopping,
+    stopGeneration,
     isForceSkip,
     clearForceSkip,
     isHadError,
@@ -98,6 +101,7 @@ export class QueueAdvancement {
     this.#cleanupCurrentTempFile = cleanupCurrentTempFile;
     this.#clearWatchdog = clearWatchdog;
     this.#isStopping = isStopping;
+    this.#stopGeneration = stopGeneration;
     this.#isForceSkip = isForceSkip;
     this.#clearForceSkip = clearForceSkip;
     this.#isHadError = isHadError;
@@ -129,19 +133,29 @@ export class QueueAdvancement {
   }
 
   async #drainAfterPlayback() {
+    // One stop generation for the whole drain: a stop that begins during
+    // any await below must abort every later step — including a stop that
+    // already COMPLETED (isStopping false again, generation advanced).
+    // Re-snapshotting per iteration would re-baseline onto the post-stop
+    // world and let a stale pendingAfter run queue.next()/playNext()/
+    // refill/disconnect on top of the finished teardown.
+    const generation = this.#stopGeneration();
     do {
       this.pendingAfter = false;
       this.handlingAfterPlayback = this.playbackCount;
-      await this.#handleAfter();
-    } while (this.pendingAfter);
+      await this.#handleAfter(generation);
+    } while (this.pendingAfter && this.#stopGeneration() === generation);
   }
 
-  async #handleAfter() {
+  async #handleAfter(generation) {
     // A stop() in flight owns teardown (queue clear, mixer rebuild): a
     // drain that lands inside its window must not advance, refill, or
     // disconnect — a refill started now could resolve into an enqueue
-    // that revives the playback the user just stopped.
-    if (this.#isStopping()) return;
+    // that revives the playback the user just stopped. The generation
+    // comparison (not isStopping) is what catches a stop that already
+    // COMPLETED inside one of the awaits below — #stopping is false again
+    // by then, but this drain is still running against pre-stop state.
+    if (this.#isStopping() || this.#stopGeneration() !== generation) return;
     this.#transitions.clearCrossfadeArm();
     // Same reasoning as #onCrossfadePromoted()'s reset (Codex): a natural,
     // non-crossfade track end (no fallback was even eligible for the
@@ -149,6 +163,7 @@ export class QueueAdvancement {
     // has concluded, not just the crossfade-promotion path.
     this.#transitions.stemMixUnavailableKey = null;
     await this.#cleanupCurrentTempFile();
+    if (this.#stopGeneration() !== generation) return;
 
     const upcomingBeforeAdvance = this.#queue.loopMode === LoopMode.TRACK
       ? this.#queue.current
@@ -158,6 +173,7 @@ export class QueueAdvancement {
     if (!preserveIncoming) {
       this.#sourcePreparer.clearPreparedIncoming();
       await this.#sourcePreparer.cleanupIncomingTempFile();
+      if (this.#stopGeneration() !== generation) return;
     }
 
     if (this.#isForceSkip()) {
@@ -172,6 +188,9 @@ export class QueueAdvancement {
 
     if (shouldReconnectRetry({ elapsedMs: elapsed, track, hadError: this.#isHadError() })) {
       await sleep(2000);
+      // A stop during the reconnect grace owns teardown now — retrying
+      // playNext here would revive the playback it just stopped.
+      if (this.#stopGeneration() !== generation) return;
       await this.#playNext();
       return;
     }
@@ -196,6 +215,14 @@ export class QueueAdvancement {
         this.#transitions.pendingGaplessFrom = { track: finishedTrack, setAt: Date.now() };
       }
       const handled = await this.#startQueueRefill(finishedTrack);
+      // A stop that began (or finished) while the refill was in flight owns
+      // the queue and the disconnect decision — a stale handled=false must
+      // not disconnect, and the gapless stash this drain set belongs to a
+      // handoff that will never happen.
+      if (this.#stopGeneration() !== generation) {
+        this.#transitions.pendingGaplessFrom = null;
+        return;
+      }
       // null = another round already owns the autoplay lock; do not disconnect.
       if (handled !== false) return;
       this.#transitions.pendingGaplessFrom = null;
@@ -259,8 +286,13 @@ export class QueueAdvancement {
     const current = this.#queue.current;
     if (!current) return;
     if (this.queueRefill?.key === this.queueRefillKey(current)) return;
+    const generation = this.#stopGeneration();
     this.#startQueueRefill(current)
       .then((handled) => {
+        // Same stale-work guard as #handleAfter: a stop that began while
+        // the refill planned owns the queue now — prefetching on top of it
+        // would race its rebuild.
+        if (this.#stopGeneration() !== generation) return;
         if (handled) this.#sourcePreparer.prefetchUpcoming();
       })
       .catch((err) => {

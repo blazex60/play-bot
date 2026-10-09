@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { AudioPlayerStatus, NoSubscriberBehavior, StreamType } from '@discordjs/voice'
-import { createTrack } from './queue.js'
+import { createTrack, GuildQueue } from './queue.js'
+import { QueueAdvancement } from './player/queueAdvancement.js'
 import { triggerTrackEnd } from './player/playbackDrive.js'
 import { makePlayer, makeAudioPlayer, nextTurn, makePendingPcmSource, deliverPcm } from './player/test-helpers.js'
 import {
@@ -620,4 +621,219 @@ test('GuildPlayer: seekTo reuses the current normalized file instead of re-fetch
     `trackPositionSec should be ~30, got ${player.trackPositionSec}`)
 
   await player.stop()
+})
+
+// --- QueueAdvancement stopGeneration guards --------------------------------
+// The drain is exercised directly so each await boundary can be held open
+// with a deferred promise — no sleeps. stopState stands in for the player's
+// #stopping/#stopGeneration pair: a stop bumps generation synchronously at
+// entry, so a stop that BEGINS and even COMPLETES inside a drain await is
+// still visible to the drain as a generation delta.
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+function makeAdvancementDeps({ queue, stopState = {}, handleQueueExhausted = null } = {}) {
+  const calls = { playNext: [], disconnect: 0, prefetchUpcoming: 0 }
+  const flags = { forceSkip: false, hadError: false }
+  const deps = {
+    queue,
+    handleQueueExhausted,
+    queueExhaustedTimeoutMs: 5_000,
+    transitions: {
+      clearCrossfadeArm() {},
+      stemMixUnavailableKey: null,
+      pendingGaplessFrom: null,
+    },
+    sourcePreparer: {
+      preparedIncoming: null,
+      clearPreparedIncoming() {},
+      async cleanupIncomingTempFile() {},
+      prefetchUpcoming() { calls.prefetchUpcoming += 1 },
+    },
+    playNext: async (gaplessFrom = null) => { calls.playNext.push(gaplessFrom) },
+    disconnect: async () => { calls.disconnect += 1 },
+    cleanupCurrentTempFile: async () => {},
+    clearWatchdog: () => {},
+    isStopping: () => stopState.stopping === true,
+    stopGeneration: () => stopState.generation ?? 0,
+    isForceSkip: () => flags.forceSkip,
+    clearForceSkip: () => { flags.forceSkip = false },
+    isHadError: () => flags.hadError,
+    clearHadError: () => { flags.hadError = false },
+    // Past the reconnect grace so the natural-end path runs by default.
+    getPlaybackStart: () => Date.now() - 60_000,
+  }
+  return { deps, calls, flags, stopState }
+}
+
+function countQueueNexts(queue) {
+  const origNext = queue.next.bind(queue)
+  let nextCalls = 0
+  queue.next = (opts) => { nextCalls += 1; return origNext(opts) }
+  return () => nextCalls
+}
+
+test('QueueAdvancement: a drain held in cleanup when stop() begins does not queue.next', async () => {
+  const trackA = createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a' })
+  const trackB = createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b' })
+  const queue = new GuildQueue()
+  queue.add(trackA)
+  queue.add(trackB)
+  const nextCalls = countQueueNexts(queue)
+  const cleanup = deferred()
+  const { deps, calls, stopState } = makeAdvancementDeps({ queue })
+  deps.cleanupCurrentTempFile = () => cleanup.promise
+  const adv = new QueueAdvancement(deps)
+
+  adv.advanceAfterPlayback()
+  assert.equal(adv.handlingAfter, true)
+  // stop() begins while the drain is parked on the cleanup await.
+  stopState.generation = 1
+  stopState.stopping = true
+  cleanup.resolve()
+  await nextTurn()
+
+  assert.equal(nextCalls(), 0, 'stale drain must not advance the queue')
+  assert.equal(queue.current, trackA)
+  assert.deepEqual(calls.playNext, [])
+  assert.equal(calls.disconnect, 0)
+  assert.equal(adv.handlingAfter, false, 'aborted drain must release the drain lock')
+})
+
+test('QueueAdvancement: a drain held in cleanup when stop() begins does not disconnect', async () => {
+  // Single track: an unguarded drain would reach queue.next() → null →
+  // refill → disconnect once the cleanup await resolves.
+  const queue = new GuildQueue()
+  queue.add(createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a' }))
+  const cleanup = deferred()
+  let exhaustionCalls = 0
+  const { deps, calls, stopState } = makeAdvancementDeps({
+    queue,
+    handleQueueExhausted: async () => { exhaustionCalls += 1; return false },
+  })
+  deps.cleanupCurrentTempFile = () => cleanup.promise
+  const adv = new QueueAdvancement(deps)
+
+  adv.advanceAfterPlayback()
+  stopState.generation = 1
+  stopState.stopping = true
+  cleanup.resolve()
+  await nextTurn()
+
+  assert.equal(exhaustionCalls, 0)
+  assert.equal(calls.disconnect, 0)
+  assert.equal(adv.handlingAfter, false)
+})
+
+test('QueueAdvancement: a stop that began AND completed during an await still aborts the drain', async () => {
+  const trackA = createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a' })
+  const trackB = createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b' })
+  const queue = new GuildQueue()
+  queue.add(trackA)
+  queue.add(trackB)
+  const nextCalls = countQueueNexts(queue)
+  const cleanup = deferred()
+  const { deps, calls, stopState } = makeAdvancementDeps({ queue })
+  deps.cleanupCurrentTempFile = () => cleanup.promise
+  const adv = new QueueAdvancement(deps)
+
+  adv.advanceAfterPlayback()
+  // The whole stop lifecycle fits inside the cleanup await: isStopping is
+  // false again by the time it resolves — only the generation delta marks
+  // this drain as stale.
+  stopState.generation = 1
+  stopState.stopping = false
+  cleanup.resolve()
+  await nextTurn()
+
+  assert.equal(nextCalls(), 0, 'a completed stop must not resume the stale drain')
+  assert.equal(queue.current, trackA)
+  assert.deepEqual(calls.playNext, [])
+  assert.equal(calls.disconnect, 0)
+  assert.equal(adv.handlingAfter, false)
+})
+
+test('QueueAdvancement: a refill resolving after stop() began does not disconnect', async () => {
+  const queue = new GuildQueue()
+  queue.add(createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a' }))
+  const refill = deferred()
+  const { deps, calls, stopState } = makeAdvancementDeps({
+    queue,
+    handleQueueExhausted: () => refill.promise,
+  })
+  const adv = new QueueAdvancement(deps)
+
+  adv.advanceAfterPlayback()
+  await nextTurn()
+  assert.equal(queue.current, null, 'sanity: the natural end advanced past the last track')
+
+  // stop() begins while the drain is parked on the refill; a stale
+  // handled=false must not run disconnect on top of the stop's teardown.
+  stopState.generation = 1
+  stopState.stopping = true
+  refill.resolve(false)
+  await nextTurn()
+
+  assert.equal(calls.disconnect, 0)
+  assert.equal(adv.handlingAfter, false)
+})
+
+test('QueueAdvancement: normal track end still advances to the next track', async () => {
+  const trackA = createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a' })
+  const trackB = createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b' })
+  const queue = new GuildQueue()
+  queue.add(trackA)
+  queue.add(trackB)
+  const { deps, calls } = makeAdvancementDeps({ queue })
+  const adv = new QueueAdvancement(deps)
+
+  adv.advanceAfterPlayback()
+  await nextTurn()
+
+  assert.equal(queue.current, trackB)
+  assert.deepEqual(calls.playNext, [trackA], 'natural end hands the finished track to playNext as gaplessFrom')
+  assert.equal(adv.handlingAfter, false)
+})
+
+test('QueueAdvancement: force skip still advances to the next track', async () => {
+  const trackA = createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a' })
+  const trackB = createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b' })
+  const queue = new GuildQueue()
+  queue.add(trackA)
+  queue.add(trackB)
+  const { deps, calls, flags } = makeAdvancementDeps({ queue })
+  flags.forceSkip = true
+  const adv = new QueueAdvancement(deps)
+
+  adv.advanceAfterPlayback()
+  await nextTurn()
+
+  assert.equal(queue.current, trackB)
+  assert.equal(flags.forceSkip, false, 'drain consumes the force-skip flag')
+  assert.equal(calls.playNext.length, 1)
+  assert.equal(adv.handlingAfter, false)
+})
+
+test('GuildPlayer: a trackend drain overtaken by stop() does not refill or disconnect', async () => {
+  let exhaustionCalls = 0
+  let disconnected = false
+  const { player } = makePlayer({
+    handleQueueExhausted: async () => { exhaustionCalls += 1; return false },
+    onDisconnect: async () => { disconnected = true },
+  })
+
+  await player.playNext()
+  triggerTrackEnd({ mixStream: player.mixStream })
+  // The drain's first await is already pending; a synchronous stop() lands
+  // inside it (generation bumps before teardown microtasks run).
+  await player.stop()
+  await nextTurn()
+
+  assert.equal(exhaustionCalls, 0, 'stale drain must not kick the refill path')
+  assert.equal(disconnected, false, 'stale drain must not disconnect')
 })
