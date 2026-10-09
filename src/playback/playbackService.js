@@ -59,10 +59,11 @@ export class PlaybackService {
    *   mutators (the queue editor's move/remove buttons) embed it and pass
    *   it back via the *IfRevision methods so an operation submitted against
    *   an older render is rejected instead of hitting the wrong track.
-   *   queueId is the queue's process-unique identity (GuildQueue#id): the
-   *   revision restarts at 0 for every new session's queue, so the *IfRevision
-   *   methods also require the queueId to match — a token minted against a
-   *   destroyed session's queue can never mutate its replacement.
+   *   queueId is the queue's restart-safe identity (GuildQueue#id — a
+   *   random UUID string): the revision restarts at 0 for every new
+   *   session's queue, so the *IfRevision methods also require the queueId
+   *   to match — a token minted against a destroyed session's queue (or a
+   *   previous process's queue) can never mutate its replacement.
    */
   getState(guildId) {
     const session = this.#getSession(guildId);
@@ -239,13 +240,17 @@ export class PlaybackService {
 
   /**
    * Revision- and identity-checked variants for index-based UI operations:
-   * the caller passes the revision AND queue id embedded in the rendered
-   * message, and the op applies only if both still match the live queue.
-   * Without the revision check, a track removed ahead of the index between
-   * render and click shifts every later index and the operation silently
-   * hits the wrong track. Without the queueId check, a message rendered
-   * under a destroyed session could collide with the replacement queue's
-   * revision (which restarts at 0) and mutate a session it never saw.
+   * the caller passes the revision AND queue id (a UUID string) embedded in
+   * the rendered message, and the op applies only if both still match the
+   * live queue. A missing, legacy-numeric, or foreign expectedQueueId can
+   * never equal the live UUID, so it resolves 'stale'. Without the revision
+   * check, a track removed ahead of the index between render and click
+   * shifts every later index and the operation silently hits the wrong
+   * track. Without the queueId check, a message rendered under a destroyed
+   * session or a previous process could collide with the replacement
+   * queue's revision (which restarts at 0) and mutate a session it never
+   * saw.
+   * @param {string|null} expectedQueueId
    * @returns {'stale'|true|false} 'stale' on a queueId or revision mismatch
    *   (nothing changed), true/false the underlying op's result, false when
    *   there is no session.

@@ -21,15 +21,16 @@ function logQueueOp(interaction, success, detail) {
 }
 
 // _r<rev> is the queue revision the message was rendered against (see
-// GuildQueue#revision) and _q<id> the queue's process-unique id (see
+// GuildQueue#revision) and _q<id> the queue's restart-safe UUID (see
 // GuildQueue#id). Both are optional so a pre-deploy message without them
-// still parses — a missing token can never match the live queue, so old
-// mutating buttons resolve to the same 'stale' warning instead of a
-// silent no-op. The id matters because the revision restarts at 0 per
-// queue: a button rendered under a destroyed session would otherwise be
-// able to mutate its replacement once the new queue reaches the same
-// revision count.
-const CUSTOM_ID_RE = /^(qedit_[a-z]+)_p(\d+)(?:_i(\d+))?(?:_r(\d+))?(?:_q(\d+))?$/
+// still parses — and legacy numeric _q tokens (from the pre-UUID process
+// counter) still parse too: a missing or numeric token can never equal a
+// live UUID, so old mutating buttons resolve to the same 'stale' warning
+// instead of a silent no-op. The id matters because the revision restarts
+// at 0 per queue (and per process): a button rendered under a destroyed
+// session or a previous process would otherwise be able to mutate the
+// replacement once the new queue reaches the same revision count.
+const CUSTOM_ID_RE = /^(qedit_[a-z]+)_p(\d+)(?:_i(\d+))?(?:_r(\d+))?(?:_q([0-9a-fA-F-]+))?$/
 
 function parseCustomId(customId) {
   const match = customId.match(CUSTOM_ID_RE)
@@ -40,7 +41,7 @@ function parseCustomId(customId) {
     page: parseInt(pageStr, 10),
     selectedIndex: indexStr !== undefined ? parseInt(indexStr, 10) : null,
     revision: revisionStr !== undefined ? parseInt(revisionStr, 10) : null,
-    queueId: queueIdStr !== undefined ? parseInt(queueIdStr, 10) : null,
+    queueId: queueIdStr !== undefined ? queueIdStr : null,
   }
 }
 

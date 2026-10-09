@@ -289,18 +289,22 @@ test('wrappedUpcoming: a single-track QUEUE-loop queue returns [] just like upco
   assert.deepEqual(queue.wrappedUpcoming(3), [])
 })
 
-// --- id (process-unique queue identity for cross-session staleness) -----------
-// #revision restarts at 0 per instance, so a queue-editor token minted under
-// a destroyed session could collide with the replacement queue's revision.
-// The id is a module-level monotonic counter: two queues never share one.
+// --- id (restart-safe queue identity for cross-session staleness) -------------
+// #revision restarts at 0 per instance — and an integer counter would collide
+// again after a process restart — so a queue-editor token minted under a
+// destroyed or previous-process queue could hit its replacement. The id is a
+// random UUID: two independently constructed queues can't share one even
+// across restarts, and no persistence is needed.
 
-test('id: every GuildQueue gets a unique, increasing identity', () => {
+test('id: every GuildQueue gets a distinct, UUID-format identity', () => {
   const a = new GuildQueue()
   const b = new GuildQueue()
   const c = new GuildQueue()
-  assert.ok(Number.isInteger(a.id) && a.id > 0)
-  assert.ok(b.id > a.id)
-  assert.ok(c.id > b.id)
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+  for (const queue of [a, b, c]) assert.match(queue.id, uuidRe)
+  assert.notEqual(a.id, b.id)
+  assert.notEqual(b.id, c.id)
+  assert.notEqual(a.id, c.id)
 })
 
 test('id: stable across mutations — unlike revision it never changes', () => {

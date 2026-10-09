@@ -10,7 +10,7 @@ function fakeSession(initialTracks = []) {
     tracks,
     calls,
     queue: {
-      id: 1,
+      id: 'queue-id-fake',
       revision: 0,
       get isEmpty() {
         return tracks.length === 0
@@ -496,8 +496,8 @@ test('removeUpcomingIfRevision/moveUpcomingIfRevision: delegate only when the re
   const session = fakeSession(['a', 'b', 'c'])
   session.queue.revision = 7
   const playback = serviceFor(session)
-  assert.equal(playback.removeUpcomingIfRevision('g', 0, 7, 1), true)
-  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, 7, 1), true)
+  assert.equal(playback.removeUpcomingIfRevision('g', 0, 7, session.queue.id), true)
+  assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, 7, session.queue.id), true)
   assert.deepEqual(session.calls, ['removeUpcoming:0', 'moveUpcoming:0->1'])
 })
 
@@ -522,7 +522,7 @@ test('removeUpcomingIfRevision/moveUpcomingIfRevision: a queue id from a dead se
   // in A's message can never equal the live queue's id, so the op rejects.
   const sessionB = realQueueSession(['current-t', 'next-t', 'third-t'])
   const playback = serviceFor(sessionB)
-  const deadQueueId = sessionB.queue.id - 1 // every prior GuildQueue's id
+  const deadQueueId = new GuildQueue().id // a real queue id that isn't the live one
   const rev = sessionB.queue.revision
   assert.equal(playback.removeUpcomingIfRevision('g', 0, rev, deadQueueId), 'stale')
   assert.equal(playback.moveUpcomingIfRevision('g', 0, 1, rev, deadQueueId), 'stale')
@@ -534,8 +534,8 @@ test('removeUpcomingIfRevision/moveUpcomingIfRevision: a queue id from a dead se
 
 test('removeUpcomingIfRevision/moveUpcomingIfRevision: false when there is no session', () => {
   const empty = serviceFor(null)
-  assert.equal(empty.removeUpcomingIfRevision('g', 0, 0, 1), false)
-  assert.equal(empty.moveUpcomingIfRevision('g', 0, 1, 0, 1), false)
+  assert.equal(empty.removeUpcomingIfRevision('g', 0, 0, 'any-id'), false)
+  assert.equal(empty.moveUpcomingIfRevision('g', 0, 1, 0, 'any-id'), false)
 })
 
 test('removeUpcomingIfRevision/moveUpcomingIfRevision: propagate the underlying op result on a match', () => {
@@ -577,8 +577,12 @@ test('getState: exposes the queue revision and queue id, and tracks revision mut
   const before = playback.getState('g').revision
   assert.equal(before, session.queue.revision)
   // Identity token for the *IfRevision guard: the revision alone restarts
-  // at 0 on every new session's queue, so the editor embeds both.
-  assert.equal(playback.getState('g').queueId, session.queue.id)
+  // at 0 on every new session's queue, so the editor embeds both. The id
+  // is a random UUID string — restart-safe, unlike a process counter.
+  const queueId = playback.getState('g').queueId
+  assert.equal(queueId, session.queue.id)
+  assert.equal(typeof queueId, 'string')
+  // String survives JSON serialization (the web API serializes getState).
   assert.equal(JSON.parse(JSON.stringify(playback.getState('g'))).queueId, session.queue.id)
   session.queue.add(createTrack({ title: 't', webpageUrl: 'u', duration: 1, requestedBy: 'u' }))
   assert.equal(playback.getState('g').revision, before + 1)

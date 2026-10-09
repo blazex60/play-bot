@@ -21,9 +21,10 @@ export function buildQueueEditorPayload(queueState, { page = 0, selectedIndex = 
   // hitting the wrong track. The queue's own id travels with it (_q) — the
   // revision restarts at 0 for each new session's queue, so without the id
   // a button rendered under a destroyed session could collide with its
-  // replacement's revision. Well under Discord's 100-char custom_id limit.
+  // replacement's revision. The id is a 36-char UUID (see GuildQueue#id);
+  // even the longest custom_id stays well under Discord's 100-char limit.
   const revision = Number.isInteger(queueState.revision) ? queueState.revision : 0
-  const queueId = Number.isInteger(queueState.queueId) ? queueState.queueId : null
+  const queueId = queueState.queueId != null ? String(queueState.queueId) : null
   const revSuffix = `_r${revision}${queueId != null ? `_q${queueId}` : ''}`
   const valueSuffix = `:r${revision}${queueId != null ? `:q${queueId}` : ''}`
   const totalPages = Math.max(1, Math.ceil(upcoming.length / PAGE_SIZE))

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { configureSettingsPathForTest, setDefaultCommandPermission } from '../shared/settings.js'
 import { GuildQueue, createTrack } from '../playback/queue.js'
 import { handleQueueEditorInteraction } from './queueEditorInteractions.js'
+import { buildQueueEditorPayload } from './queueEditorView.js'
 import { webClient } from '../playback/sessions.js'
 
 // webClient is a real singleton (it fails soft internally, so letting it
@@ -393,4 +394,71 @@ test('handleQueueEditorInteraction: a custom_id with _r but no _q is stale on a 
     assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
     assert.equal(session.queue.upcoming().length, 1, 'must not remove without a matching queue id')
   })
+})
+
+test('handleQueueEditorInteraction: a legacy numeric _q custom_id is stale on a mutating action even at the live revision', async () => {
+  await withTempSettings(async () => {
+    const session = makeSession()
+    const sessions = new Map([['guild-1', session]])
+    // Pre-UUID format: _q carried a process-local counter that could
+    // collide with a post-restart queue's id. It still parses (mutating
+    // buttons degrade to the stale warning, not silence), but a numeric
+    // token can never equal the live UUID → stale, no mutation.
+    const interaction = fakeInteraction({ customId: `qedit_remove_p0_i0_r${session.queue.revision}_q3` })
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(interaction.calls.followUp.length, 1)
+    assert.match(interaction.calls.followUp[0].content, /キューが変更されました/)
+    assert.equal(session.queue.upcoming().length, 1, 'must not remove with a numeric queue id')
+  })
+})
+
+// --- custom_id length budget -------------------------------------------------
+// Discord caps custom_ids (and select values) at 100 chars. The full 36-char
+// UUID travels in every one, so the longest variant — qedit_jumpmodal, which
+// stacks _p + _i + _r + _q — must still fit with multi-digit fields.
+
+test('handleQueueEditorInteraction: the qedit_jumpmodal custom_id stays under the 100-char limit with a full UUID', async () => {
+  await withTempSettings(async () => {
+    const session = makeSession()
+    const sessions = new Map([['guild-1', session]])
+    const interaction = fakeInteraction({
+      customId: `qedit_jump_p12345_i99999_r99999999_q${session.queue.id}`,
+    })
+    let modalCustomId = null
+    interaction.showModal = async (modal) => { modalCustomId = modal.toJSON().custom_id }
+
+    await handleQueueEditorInteraction(interaction, sessions)
+
+    assert.equal(
+      modalCustomId,
+      `qedit_jumpmodal_p12345_i99999_r99999999_q${session.queue.id}`,
+      'the modal must carry page + index + revision + queue id through to submit'
+    )
+    assert.ok(modalCustomId.length <= 100, `${modalCustomId} is ${modalCustomId.length} chars — over Discord's limit`)
+  })
+})
+
+test('buildQueueEditorPayload: every rendered custom_id and select value fits the 100-char limit with a full UUID', () => {
+  const track = createTrack({ title: 't', webpageUrl: 'https://example.com/t', duration: 60, requestedBy: 'u' })
+  const state = {
+    current: track,
+    // Enough tracks for multi-digit page and index fields.
+    upcoming: Array(100_000).fill(track),
+    loopMode: 'off',
+    revision: 999_999_999,
+    queueId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+  }
+  const { components } = buildQueueEditorPayload(state, { page: 999_999, selectedIndex: 99_999 })
+  assert.ok(components.length >= 3, 'select row + nav row + action row expected')
+  for (const row of components) {
+    for (const component of row.components) {
+      const json = component.toJSON()
+      assert.ok(json.custom_id.length <= 100, `${json.custom_id} (${json.custom_id.length} chars)`)
+      for (const option of json.options ?? []) {
+        assert.ok(option.value.length <= 100, `${option.value} (${option.value.length} chars)`)
+      }
+    }
+  }
 })

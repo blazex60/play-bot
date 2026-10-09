@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 export const LoopMode = Object.freeze({ OFF: 'off', TRACK: 'track', QUEUE: 'queue' });
 
 export function createTrack({ title, webpageUrl, duration, requestedBy, requestedById = null, thumbnail, videoId = null, channel = null }) {
@@ -27,16 +29,15 @@ export function sameTrackSnapshot(tracks, snapshotIds) {
   return true;
 }
 
-// Process-unique identity counter for GuildQueue instances. A queue's
-// #revision restarts at 0 per instance, so a UI token (queue-editor
-// custom_id) carrying only a revision can collide with a REPLACEMENT
-// session's queue that happens to reach the same count. Stamping each
-// queue with a never-reused id makes a token minted against a destroyed
-// session's queue unmatchable forever after.
-let nextQueueId = 0;
-
 export class GuildQueue {
-  #id = ++nextQueueId;
+  // Restart-safe identity: a queue's #revision restarts at 0 per instance,
+  // so a UI token (queue-editor custom_id) carrying only a revision can
+  // collide with a REPLACEMENT session's queue that happens to reach the
+  // same count — and a process restart would reset a counter-based id to
+  // collide all over again. A random UUID makes a token minted against a
+  // destroyed session's (or a previous process's) queue unmatchable
+  // forever after, with no persistence needed.
+  #id = randomUUID();
   #tracks = [];
   #currentIndex = 0;
   // Optimistic-concurrency token for index-based mutators (the Discord
