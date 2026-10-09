@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto'
-
 export class WebApiError extends Error {
   constructor(message, { status, body }) {
     super(message)
@@ -11,16 +9,6 @@ export class WebApiError extends Error {
 
 const DEFAULT_WEB_PORT = '3000'
 const DEFAULT_REQUEST_TIMEOUT_MS = 5000
-// Gemini (up to 2 × 15s) plus sequential yt-dlp searches; keep under Discord's deferred-token window.
-export const GENERATE_REQUEST_TIMEOUT_MS = 120_000
-
-function isAmbiguousGenerateFailure(err) {
-  if (err?.name === 'AbortError') return true
-  const status = err?.status
-  if (status == null) return true
-  if (status === 503 && err?.body?.error === 'gemini_unavailable') return false
-  return status >= 500
-}
 
 // Bot -> Web internal channel, mirroring src/web/server/botClient.js's
 // Web -> Bot direction. Every exported method fails soft (never throws) so a
@@ -32,7 +20,6 @@ export function createWebClient({
   token = process.env.BOT_API_TOKEN,
   fetchImpl = globalThis.fetch,
   requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
-  generateTimeoutMs = GENERATE_REQUEST_TIMEOUT_MS,
 } = {}) {
   async function request(path, { method = 'GET', body, timeoutMs = requestTimeoutMs } = {}) {
     const controller = new AbortController()
@@ -118,48 +105,6 @@ export function createWebClient({
       } catch (err) {
         console.error('[webClient] putTrackAnalysis failed:', err.message)
         return false
-      }
-    },
-    async optimizeOrder({ guildId = null, anchorVideoId = null, tracks } = {}) {
-      try {
-        if (!Array.isArray(tracks) || tracks.length === 0) return null
-        const payload = await request('/internal/optimize-order', {
-          method: 'POST',
-          body: { guildId, anchorVideoId, tracks },
-        })
-        if (!payload?.order || !Array.isArray(payload.order)) return null
-        return payload
-      } catch (err) {
-        console.error('[webClient] optimizeOrder failed:', err.message)
-        return null
-      }
-    },
-    async generatePlaylist({
-      discordUserId,
-      username,
-      prompt,
-      targetCount = 10,
-      name = null,
-    } = {}) {
-      try {
-        if (!discordUserId || !username || !prompt) return null
-        const payload = await request('/internal/generate-playlist', {
-          method: 'POST',
-          timeoutMs: generateTimeoutMs,
-          body: {
-            discordUserId,
-            username,
-            prompt,
-            targetCount,
-            name,
-            idempotencyKey: randomUUID(),
-          },
-        })
-        return payload?.playlist ?? null
-      } catch (err) {
-        console.error('[webClient] generatePlaylist failed:', err.message)
-        if (isAmbiguousGenerateFailure(err)) return { ambiguous: true }
-        return null
       }
     },
   }

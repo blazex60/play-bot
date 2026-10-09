@@ -36,10 +36,6 @@ function fakeSession(initialTracks = []) {
         calls.push(`moveUpcoming:${from}->${to}`)
         return true
       },
-      reorderUpcomingIfUnchanged: (order, snapshotIds) => {
-        calls.push(`reorder:${order.join(',')}`)
-        return true
-      },
     },
     player: {
       status: 'playing',
@@ -474,20 +470,17 @@ test('queue operations delegate and null out without a session', () => {
   assert.equal(playback.cycleLoop('g'), 'track')
   assert.equal(playback.removeUpcoming('g', 1), true)
   assert.equal(playback.moveUpcoming('g', 0, 2), true)
-  assert.equal(playback.reorderUpcomingIfUnchanged('g', [1, 0], ['a', 'b']), true)
   assert.deepEqual(session.calls, [
     'shuffle',
     'cycleLoop',
     'removeUpcoming:1',
     'moveUpcoming:0->2',
-    'reorder:1,0',
   ])
   const empty = serviceFor(null)
   assert.equal(empty.shuffle('g'), false)
   assert.equal(empty.cycleLoop('g'), null)
   assert.equal(empty.removeUpcoming('g', 0), false)
   assert.equal(empty.moveUpcoming('g', 0, 1), false)
-  assert.equal(empty.reorderUpcomingIfUnchanged('g', [], []), false)
 })
 
 // --- revision-checked queue ops (optimistic concurrency for index-based UI) ---

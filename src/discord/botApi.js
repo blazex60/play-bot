@@ -1,6 +1,6 @@
 import Fastify from 'fastify';
 
-import { getOrCreateSession, bumpPlanToken, playbackFor, webClient } from '../playback/sessions.js';
+import { getOrCreateSession, bumpPlanToken, playbackFor } from '../playback/sessions.js';
 import { recommendHooks } from './recommendHooks.js';
 import { resolveWebPermission } from './webPermission.js';
 import {
@@ -15,7 +15,7 @@ import {
   resolveAdminRoleId,
 } from '../shared/settings.js';
 import { getEffectiveCommandVisibility, isMatrixManagedCommand } from './permissions.js';
-import { trackIdentity } from '../playback/queue.js';
+
 
 const AUTOPLAY_MODES = new Set(['off', 'auto', 'recommend']);
 
@@ -288,8 +288,7 @@ export function buildBotApi({
     const session = requireSession(sessions, guildId, reply);
     if (!session) return;
     const action = request.params.action;
-    const command = action === 'optimize' ? 'mix' : 'queue';
-    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command });
+    const permission = await requireAllowed({ client, sessions, guildId, userId, adminRoleId, reply, command: 'queue' });
     if (!permission) return;
 
     if (action === 'remove') {
@@ -302,35 +301,6 @@ export function buildBotApi({
       const toIndex = Number.parseInt(String(request.body?.toIndex), 10);
       const ok = playback.moveUpcoming(guildId, fromIndex, toIndex);
       return { ok, state: serializeSession(playback, guildId) };
-    }
-    if (action === 'optimize') {
-      const queueState = playback.getState(guildId);
-      const upcoming = queueState.upcoming;
-      if (upcoming.length < 2) {
-        return { ok: false, reason: 'too_few_tracks', state: serializeSession(playback, guildId) };
-      }
-      const snapshotIds = upcoming.map(trackIdentity);
-      const current = queueState.current;
-      const result = await webClient.optimizeOrder({
-        guildId,
-        anchorVideoId: current?.videoId ?? null,
-        tracks: upcoming.map((track) => ({
-          videoId: track.videoId,
-          title: track.title,
-          channel: track.channel,
-          duration: track.duration,
-        })),
-      });
-      if (!result?.order) {
-        return { ok: false, reason: 'optimize_failed', state: serializeSession(playback, guildId) };
-      }
-      const ok = playback.reorderUpcomingIfUnchanged(guildId, result.order, snapshotIds);
-      return {
-        ok,
-        reason: ok ? undefined : 'queue_changed',
-        source: result.source ?? 'algorithm',
-        state: serializeSession(playback, guildId),
-      };
     }
     reply.code(404).send({ error: 'unknown_action' });
   });

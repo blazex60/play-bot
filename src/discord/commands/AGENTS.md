@@ -5,7 +5,7 @@
 
 ## Purpose
 
-17 個のスラッシュコマンド実装。各ファイルは `export default { data: SlashCommandBuilder, execute(interaction, sessions) }` の形で 1 コマンドを定義する。`src/discord/main.js` がこのディレクトリを `readdirSync` で走査してロードし、`src/discord/deploy.js` が `data` を Discord API に登録する。両方とも `*.test.js` を除外して `.js` ファイルのみ走査するため、`play.test.js` のようなテストファイルを追加しても起動/デプロイには影響しない。
+16 個のスラッシュコマンド実装。各ファイルは `export default { data: SlashCommandBuilder, execute(interaction, sessions) }` の形で 1 コマンドを定義する。`src/discord/main.js` がこのディレクトリを `readdirSync` で走査してロードし、`src/discord/deploy.js` が `data` を Discord API に登録する。両方とも `*.test.js` を除外して `.js` ファイルのみ走査するため、`play.test.js` のようなテストファイルを追加しても起動/デプロイには影響しない。
 
 ## Key Files
 

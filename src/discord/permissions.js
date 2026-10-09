@@ -20,7 +20,6 @@ const DEFAULT_VISIBILITY = {
   normalize: 'personal',
   fade: 'personal',
   autoplay: 'personal',
-  mix: 'personal',
 }
 
 // Commands that manage the admin-role gate itself must not appear in the

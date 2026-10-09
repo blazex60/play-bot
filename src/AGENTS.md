@@ -5,7 +5,7 @@
 
 ## Purpose
 
-Bot 本体のソース。レイヤー分離された構成: `discord/`（Discord adapter: コマンド・interaction・エントリーポイント・loopback internal API）、`playback/`（再生ドメイン: PlaybackService・SessionManager・GuildPlayer・GuildQueue・autoplay ポリシー）、`media/`（yt-dlp 連携・MIX 曲順ロジック）、`audio/`（PCM/解析/トランジション/ステム等の音声基盤）、`shared/`（format/settings/webClient）、`local/`（ローカル CLI adapter）、`web/`（Fastify Web server と Web 専用 DB 層 `web/db/`）。Bot process と Web process は同じ `src/` ツリーから起動されるが、実行時プロセスとしては完全に分離している（`docker-compose.yml` 参照）。
+Bot 本体のソース。レイヤー分離された構成: `discord/`（Discord adapter: コマンド・interaction・エントリーポイント・loopback internal API）、`playback/`（再生ドメイン: PlaybackService・SessionManager・GuildPlayer・GuildQueue・autoplay ポリシー）、`media/`（yt-dlp 連携）、`audio/`（PCM/解析/トランジション/ステム等の音声基盤）、`shared/`（format/settings/webClient）、`local/`（ローカル CLI adapter）、`web/`（Fastify Web server と Web 専用 DB 層 `web/db/`）。Bot process と Web process は同じ `src/` ツリーから起動されるが、実行時プロセスとしては完全に分離している（`docker-compose.yml` 参照）。
 
 ## Subdirectories
 
@@ -13,7 +13,7 @@ Bot 本体のソース。レイヤー分離された構成: `discord/`（Discord
 |-----------|---------|
 | `discord/` | Discord adapter。`main.js`（bot エントリーポイント）、`deploy.js`、`commands/`、interaction ハンドラ（`queueEditorInteractions.js`/`recommendFlow.js`/`queueEditorView.js`/`views.js`）、`recommendHooks.js`（playback へ注入する recommend 関数束）、`permissions.js`/`webPermission.js`、loopback internal API `botApi.js` |
 | `playback/` | 再生ドメイン。`playbackService.js`（adapters 用の in-process facade）、`sessions.js`（SessionManager: VC セッション共有状態）、`sessionAccessors.js`（session フィールドの read-only ヘルパー）、`player.js`（GuildPlayer）、`queue.js`（GuildQueue）、`queueExhaustion.js`、`autoplay.js`（個人化/おすすめ選出）、`player/`（player 補助: `analysisCoordinator.js`・`playbackWatchdog.js`・`sourcePreparer.js`・`transitionCoordinator.js`・`mixerPipeline.js`・`queueAdvancement.js`・`playbackDrive.js`・`playbackPolicy.js`・`test-helpers.js`） |
-| `media/` | メディア取得。`search.js`（yt-dlp spawn: 検索/メタデータ/ストリーム解決）、`mix/`（Camelot/ordering/playlistGenerate） |
+| `media/` | メディア取得。`search.js`（yt-dlp spawn: 検索/メタデータ/ストリーム解決） |
 | `audio/` | 音声基盤。`normalize.js`（loudnorm プリフェッチ）、`mixStream.js`、`pcmSource.js`、解析（`trackAnalysis`/`beatmixTransition`/`phraseAnalysis`/`downbeatAnalysis`/`keyAnalysis`/`vocalActivity`）、ステム（`stemCache`/`stemTransition`/`stemPrefetch`）、`tempo.js`、`analysisQueue.js` |
 | `shared/` | adapter/domain 共有の純粋ユーティリティ。`format.js`（`fmtDuration`,`LOOP_LABELS`）、`settings.js`（guild 設定 JSON）、`webClient.js`（bot→web internal HTTP client）、`pendingChoiceStore.js`（選択プロンプト保留ストア） |
 | `local/` | ローカル CLI adapter（`bun run player`、LocalVoiceConnection + sinks） |

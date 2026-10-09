@@ -269,8 +269,4 @@ export class PlaybackService {
     return session.queue.moveUpcoming(fromIndex, toIndex);
   }
 
-  reorderUpcomingIfUnchanged(guildId, order, snapshotIds) {
-    const session = this.#getSession(guildId);
-    return session ? session.queue.reorderUpcomingIfUnchanged(order, snapshotIds) : false;
-  }
 }

@@ -133,9 +133,6 @@ export function Dashboard() {
     return runAction(() => api.queue(guildId, 'remove', { index }), 'キューから削除しました')
   }
 
-  function optimizeQueue() {
-    return runAction(() => api.queue(guildId, 'optimize', {}), 'MIX 向けにキューを並べ替えました')
-  }
 
   /** @param {string} service */
   async function loadPlaylists(service) {
@@ -260,7 +257,7 @@ export function Dashboard() {
           onSetMode={setAutoplayModeAction}
           onSetPersonalize={setPersonalizeAction}
         />
-        <QueueList queue={queue} busy={busy || !guildId} onMove={moveQueue} onRemove={removeQueue} onOptimize={optimizeQueue} />
+        <QueueList queue={queue} busy={busy || !guildId} onMove={moveQueue} onRemove={removeQueue} />
         <PlaylistPanel
           links={links}
           playlists={playlists}

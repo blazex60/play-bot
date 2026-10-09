@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { GuildQueue, createTrack, trackIdentity, LoopMode } from './queue.js'
+import { GuildQueue, createTrack, LoopMode } from './queue.js'
 
 test('createTrack: videoId/channel/requestedById default to null when omitted', () => {
   const track = createTrack({ title: 'A', webpageUrl: 'https://example.com/a', duration: 60, requestedBy: 'user' })
@@ -147,33 +147,6 @@ test('moveUpcoming: 先頭への移動(toIndex=0)後next()で正しい曲が再�
   assert.equal(queue.current.title, 'C')
 })
 
-test('reorderUpcoming: applies a full permutation to upcoming tracks', () => {
-  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
-  assert.equal(queue.reorderUpcoming([2, 0, 1]), true)
-  assert.deepEqual(queue.upcoming().map((t) => t.title), ['C', 'A', 'B'])
-})
-
-test('reorderUpcoming: rejects invalid permutations', () => {
-  const queue = makeQueueWithUpcoming(['current', 'A', 'B'])
-  assert.equal(queue.reorderUpcoming([0, 0]), false)
-  assert.equal(queue.reorderUpcoming([0]), false)
-})
-
-test('reorderUpcomingIfUnchanged: rejects when snapshot no longer matches', () => {
-  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
-  const snapshot = queue.upcoming().map(trackIdentity)
-  queue.moveUpcoming(0, 2)
-  assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot), false)
-  assert.deepEqual(queue.upcoming().map((t) => t.title), ['B', 'C', 'A'])
-})
-
-test('reorderUpcomingIfUnchanged: applies when snapshot still matches', () => {
-  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
-  const snapshot = queue.upcoming().map(trackIdentity)
-  assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot), true)
-  assert.deepEqual(queue.upcoming().map((t) => t.title), ['C', 'A', 'B'])
-})
-
 // --- revision (optimistic concurrency for index-based mutators) -------------
 
 test('revision: starts at 0 and increments on every mutation of tracks/currentIndex', () => {
@@ -208,8 +181,6 @@ test('revision: read operations, loopMode changes, and rejected mutations do not
   assert.equal(queue.removeUpcoming(99), false)
   assert.equal(queue.moveUpcoming(0, 0), false)
   assert.equal(queue.moveUpcoming(2, 0), false)
-  assert.equal(queue.reorderUpcoming([9]), false)
-  assert.equal(queue.reorderUpcomingIfUnchanged([0], ['bogus-snapshot']), false)
   assert.equal(queue.revision, before)
 })
 
@@ -223,23 +194,6 @@ test('revision: next() bumps only when it actually advances', () => {
   assert.equal(queue.revision, before)
   queue.next({ forceAdvance: true })
   assert.equal(queue.revision, before + 1)
-})
-
-test('revision: reorderUpcomingIfUnchanged bumps only when the apply actually happens', () => {
-  const queue = makeQueueWithUpcoming(['current', 'A', 'B', 'C'])
-  const snapshot = queue.upcoming().map(trackIdentity)
-  const before = queue.revision
-  // Snapshot invalidated by an intervening mutation → rejected, no bump.
-  queue.moveUpcoming(0, 2)
-  assert.equal(queue.revision, before + 1)
-  assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot), false)
-  assert.equal(queue.revision, before + 1)
-  // Matching snapshot → applies → bumps once. Upcoming is now ['B','C','A'],
-  // so order [2,0,1] rewrites it to ['A','B','C'].
-  const snapshot2 = queue.upcoming().map(trackIdentity)
-  assert.equal(queue.reorderUpcomingIfUnchanged([2, 0, 1], snapshot2), true)
-  assert.equal(queue.revision, before + 2)
-  assert.deepEqual(queue.upcoming().map((t) => t.title), ['A', 'B', 'C'])
 })
 
 test('revision: shuffle on a queue with no upcoming tracks does not bump', () => {
