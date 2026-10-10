@@ -3,7 +3,7 @@
 ## 概要
 
 Discord VC で YouTube 音楽をストリーミング再生する Bot。
-discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で構成。MIX 機能向けに Gemini API（Web process）を利用する。
+discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で構成。
 
 ---
 
@@ -24,8 +24,8 @@ discord.js v14 + @discordjs/voice + yt-dlp + FFmpeg で構成。MIX 機能向け
 
 ```bash
 bun install
-node src/deploy.js      # スラッシュコマンドを Discord に登録
-node src/index.js       # Bot 起動
+node src/discord/deploy.js      # スラッシュコマンドを Discord に登録
+node src/discord/main.js       # Bot 起動
 docker compose up --build
 ```
 
@@ -35,15 +35,15 @@ docker compose up --build
 
 | ファイル | 役割 |
 |---|---|
-| `src/index.js` | Bot エントリーポイント（コマンドロード・イベント処理） |
-| `src/sessions.js` | VC セッション共有状態（joinVoiceChannel・GuildQueue・GuildPlayer） |
-| `src/player.js` | GuildPlayer（PCM ミキサー・クロスフェード・ウォッチドッグ） |
-| `src/queue.js` | GuildQueue（LoopMode: OFF/TRACK/QUEUE） |
-| `src/search.js` | yt-dlp 連携（検索・メタデータ取得・ストリーム URL 解決） |
-| `src/views.js` | 検索結果ボタン UI（ActionRowBuilder） |
-| `src/commands/` | 17 個のスラッシュコマンド |
-| `src/deploy.js` | スラッシュコマンド登録スクリプト |
-| `src/botApi.js` | Web process から呼ぶ loopback-only internal API |
+| `src/discord/main.js` | Bot エントリーポイント（コマンドロード・イベント処理） |
+| `src/playback/sessions.js` | VC セッション共有状態（joinVoiceChannel・GuildQueue・GuildPlayer） |
+| `src/playback/player.js` | GuildPlayer（PCM ミキサー・クロスフェード・ウォッチドッグ） |
+| `src/playback/queue.js` | GuildQueue（LoopMode: OFF/TRACK/QUEUE） |
+| `src/media/search.js` | yt-dlp 連携（検索・メタデータ取得・ストリーム URL 解決） |
+| `src/discord/views.js` | 検索結果ボタン UI（ActionRowBuilder） |
+| `src/discord/commands/` | 16 個のスラッシュコマンド |
+| `src/discord/deploy.js` | スラッシュコマンド登録スクリプト |
+| `src/discord/botApi.js` | Web process から呼ぶ loopback-only internal API |
 | `src/web/server/` | Fastify Web server、OAuth、SQLite-backed session/token/import routes |
 | `web/src/` | React dashboard UI |
 | `web/dist/` | Docker build stage が生成し、`music-web` が配信する静的 assets |
@@ -54,7 +54,7 @@ docker compose up --build
 
 `docker-compose.yml` は同じ image から `music-bot` と `music-web` を別 process として起動する。
 
-- `music-bot`: Discord client、VC connection、`sessions` Map、`GuildPlayer`、`GuildQueue` を保持する。`src/botApi.js` は `127.0.0.1:${BOT_API_PORT}` に bind し、`BOT_API_TOKEN` bearer なしの呼び出しを拒否する
+- `music-bot`: Discord client、VC connection、`sessions` Map、`GuildPlayer`、`GuildQueue` を保持する。`src/discord/botApi.js` は `127.0.0.1:${BOT_API_PORT}` に bind し、`BOT_API_TOKEN` bearer なしの呼び出しを拒否する
 - `music-web`: `node src/web/server/index.js` で起動する。React dashboard を `web/dist` から配信し、Discord/YouTube OAuth、cookie session、encrypted token store、import history を SQLite に書く
 - `cloudflared`: `WEB_PORT` だけを tunnel する。Bot API port は絶対に tunnel しない
 
@@ -86,7 +86,7 @@ Bot process は `better-sqlite3` を開かない。SQLite は Web process 専用
 
 音声関連はすべて `@discordjs/voice` で処理する。`ytdl-core` や他の音声ライブラリは使わない。
 
-### VC 接続 (`src/sessions.js`)
+### VC 接続 (`src/playback/sessions.js`)
 
 ```text
 joinVoiceChannel({ selfDeaf: true }) → entersState(Ready, 30s)
@@ -95,7 +95,7 @@ joinVoiceChannel({ selfDeaf: true }) → entersState(Ready, 30s)
 - **`network_mode: host` 必須** — Docker の bridge NAT が UDP をブロックし `entersState(Ready)` がタイムアウトする。`docker-compose.yml` に `network_mode: "host"` を設定すること（Linux 専用、Mac/Windows 不可）
 - **`@discordjs/voice` は `^0.19.2` 以上を使うこと** — Discord が 2024年11月に旧暗号化方式（`xsalsa20_poly1305` 系）を廃止し、`aead_xchacha20_poly1305_rtpsize` / `aead_aes256_gcm_rtpsize` が必須になった。0.17.x 以前は接続しても UDP ハンドシェイクが失敗する
 
-### 音声ストリーム (`src/search.js` → `src/audio/` → `src/player.js`)
+### 音声ストリーム (`src/media/search.js` → `src/audio/` → `src/playback/player.js`)
 
 ```text
 resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
@@ -109,7 +109,7 @@ resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
 - **`StreamType.Raw`** — セッション中ずっと生きる単一の `MixStream` を 1 度だけ resource 化する。曲送りは `AudioPlayerStatus.Idle` ではなく `MixStream` の `trackend` / クロスフェード完了で駆動する
 - **normalize は再生経路で強制** — クロスフェード品質のため、尺が分かる長さ制限内の曲は loudnorm + 無音トリムを適用する。尺不明（ライブ等）と 30 分超はストリームソースへ。失敗時も未正規化のストリームソースへフォールバックする
 
-### ウォッチドッグ (`src/player.js`)
+### ウォッチドッグ (`src/playback/player.js`)
 
 - **`playbackDuration` の進捗で判定する** — `stateChange` イベントは再生開始時に一度しか発火しないため、それを基準にすると正常再生中でも常に 30 秒で誤発火する。`state.playbackDuration` が 10 秒間隔で増加しているかを確認し、増加が止まった場合のみストールと判定して `MixStream.dropCurrent()` する
 - **`#hadError` フラグ** — 音声エラー発生時に TRACK ループモードで同一トラックへ無限リトライしないよう、エラー時は `queue.next({ forceAdvance: true })` で強制スキップする。フラグ値は `next()` を呼ぶ前に退避してからリセットすること（順序が逆だとフラグが無効になる）
@@ -122,14 +122,9 @@ resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
 - **AudioPlayerStatus.Idle イベント** — ミキサー経路では曲終了の合図ではない。想定外の Idle は mixer resource の再 `play()` による復旧トリガ
 - **循環インポート防止** — `sessions.js` が共有状態を管理。`index.js` と `play.js` の双方向依存を排除
 
-## Gemini / MIX
-
-MIX プレイリスト機能（曲順最適化の補助・リクエスト文からの自動プレイリスト生成）では Google Gemini API を使う。クライアントは **Web process 専用**（`src/web/server/services/gemini.js`）。Bot process から直接呼ばない。送信するのは曲タイトル・チャンネル名・duration・ユーザーのリクエスト文に限定し、音声ファイルや OAuth トークンは送らない。Gemini 失敗時も再生は止めず、当該機能のみ縮退する。API キーは `.env` の `GEMINI_API_KEY`（モデルは `GEMINI_MODEL`）。運用前提は **課金設定済み（Paid）の Google Cloud プロジェクト**（無料枠では Google がプロンプト/応答を製品改善に利用し得るため。詳細は `legal/privacy.html`）。ミキサー実装の詳細は `docs/mix-plan.md` を参照。
-
 ## シークレット管理
 
 - `DISCORD_TOKEN` / `CLIENT_ID` は必ず `.env` に書く
 - Web UI では `DISCORD_CLIENT_SECRET`, `GOOGLE_CLIENT_SECRET`, `WEB_SESSION_SECRET`, `BOT_API_TOKEN`, `MUSICBOT_TOKEN_ENC_KEY` も `.env` のみ
-- MIX / Gemini 向けに `GEMINI_API_KEY`（および任意の `GEMINI_MODEL`）も `.env` のみ
 - OAuth redirect URI は `PUBLIC_BASE_URL` から導出する。Discord だけ `DISCORD_OAUTH_REDIRECT` で明示 override 可能
 - ソースコードにシークレットを書かない

@@ -1,4 +1,4 @@
-import { createTrack } from '../../queue.js'
+import { createTrack } from '../../playback/queue.js'
 
 function pickThumbnail(entry) {
   if (entry?.thumbnail) return entry.thumbnail

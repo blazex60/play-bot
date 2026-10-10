@@ -1,5 +1,5 @@
 import { resolveYoutubeTrack, toImportTrackRow } from '../matching.js'
-import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
+import { searchYoutube as defaultSearchYoutube } from '../../../media/search.js'
 import { bindRouteError, enqueueImportTracks, getSessionUser, requireBotPermission, requireCommandPermission, recordOperationLog } from './route-utils.js'
 
 function getImportTrack(db, trackId) {

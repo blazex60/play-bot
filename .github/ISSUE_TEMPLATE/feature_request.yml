@@ -24,7 +24,6 @@ body:
         - Admin UI / Permissions
         - OAuth / Authentication
         - YouTube / yt-dlp
-        - MIX / Gemini
         - Docker / Deployment
         - CI / Development Experience
         - Documentation

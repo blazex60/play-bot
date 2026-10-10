@@ -13,7 +13,7 @@
 |------|--------------|
 | `index.js` | エントリーポイント（`node src/web/server/index.js`）。Fastify 初期化、cookie/static plugin 登録、`runMigrations`、各 route 群と OAuth route の登録、cleanup job の起動 |
 | `config.js` | 全環境変数を1箇所に集約する `createWebConfig(env)`。`PUBLIC_BASE_URL` から OAuth redirect URI を導出（Discord のみ `DISCORD_OAUTH_REDIRECT` で override 可） |
-| `botClient.js` | Bot process の internal API（`src/botApi.js`）を呼ぶ HTTP クライアント。`BotApiError` を投げる |
+| `botClient.js` | Bot process の internal API（`src/discord/botApi.js`）を呼ぶ HTTP クライアント。`BotApiError` を投げる |
 | `matching.js` | YouTube のプレイリストトラックを YouTube 検索結果とマッチングするロジック（`resolveImportTracks` 等） |
 | `cleanup.js` | 期限切れ `oauth_states` / `web_sessions` を定期削除するジョブ（`startCleanupJob`, 既定 10 分間隔） |
 | `testSupport.js` | テスト用インメモリ SQLite（`createMemoryDb`）とスキーマ定義 |
@@ -46,9 +46,9 @@
 ## Dependencies
 
 ### Internal
-- `../../db/`（`tokenStore.js`, `migrate.js`）
-- `../../search.js`（YouTube マッチングに使用）
-- `../../queue.js`（`createTrack`）
+- `../db/`（`tokenStore.js`, `migrate.js`）
+- `../../media/search.js`（YouTube マッチングに使用）
+- `../../playback/queue.js`（`createTrack`）
 
 ### External
 - Fastify, @fastify/cookie, @fastify/static, better-sqlite3

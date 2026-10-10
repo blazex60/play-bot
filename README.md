@@ -51,7 +51,7 @@ cp .env.example .env
 bun install
 ```
 
-`.env` には Discord Bot token と application client ID に加え、Web UI 用の OAuth / session / internal API secret を設定する。再生は PCM ミキサー経路（`MixStream` + `StreamType.Raw`）が常時有効で、曲送りは `AudioPlayerStatus.Idle` ではなくミキサーの `trackend` / クロスフェード完了で駆動する（詳細は `docs/mix-plan.md`）。通常の再生に Gemini は不要で、`GEMINI_API_KEY`（任意で `GEMINI_MODEL`）が必要なのは `/mix order` や `/mix create` など Gemini を使う機能だけである。
+`.env` には Discord Bot token と application client ID に加え、Web UI 用の OAuth / session / internal API secret を設定する。再生は PCM ミキサー経路（`MixStream` + `StreamType.Raw`）が常時有効で、曲送りは `AudioPlayerStatus.Idle` ではなくミキサーの `trackend` / クロスフェード完了で駆動する（詳細は `docs/mix-plan.md`）。
 
 Provider console に登録する redirect URI:
 
@@ -153,10 +153,8 @@ docker compose up --build
 ## セキュリティ境界
 
 - `DISCORD_TOKEN`, OAuth client secrets, `WEB_SESSION_SECRET`, `BOT_API_TOKEN`, `MUSICBOT_TOKEN_ENC_KEY` は `.env` のみ
-- MIX / Gemini 向け: `GEMINI_API_KEY`（必須時）、任意の `GEMINI_MODEL` も `.env` のみ（詳細は `docs/mix-plan.md`）
 - Bot API は loopback + bearer token 前提で、Cloudflare Tunnel には出さない
 - Web permissions は Bot API が Discord live voice state と実効管理者ロール（ギルド別 `/adminrole` 設定、未設定時は `ADMIN_ROLE_ID`）で判定する
-- Gemini API は Web process から MIX の曲順補助・リクエスト文からのプレイリスト生成にのみ使う。送信は曲メタデータとリクエスト文に限定し、失敗しても再生は継続する
 
 ## Cloudflare Pages 法務ページ
 

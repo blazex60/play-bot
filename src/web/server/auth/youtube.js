@@ -7,7 +7,7 @@ import {
 } from './oauth.js'
 
 async function defaultStoreTokens(tokens) {
-  const tokenStore = await import('../../../db/tokenStore.js')
+  const tokenStore = await import('../../db/tokenStore.js')
   return tokenStore.upsertServiceLink(tokens)
 }
 

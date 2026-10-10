@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { createOpusDecoder } from './connection.js';
 import { createLocalPlayerCli } from './cli.js';
 import { createSink, SINK_CHOICES } from './sinks.js';
-import { spawnAsync } from '../search.js';
+import { spawnAsync } from '../media/search.js';
 
 const USAGE = `使い方: bun run player [--sink <${SINK_CHOICES.join('|')}>] [--out <path>]
   --sink   出力先。既定は auto（ffplay → aplay の順に検出）。wav は --out と併用。

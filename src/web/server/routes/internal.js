@@ -1,23 +1,5 @@
 import { bindRouteError, nowUnix, recordOperationLog } from './route-utils.js'
-import { optimizeTrackOrder, isValidPermutation } from '../../../mix/ordering.js'
 import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
-import { probeTempoBackend } from '../../../audio/tempo.js'
-import { createGeneratedUserPlaylist } from '../services/playlistGenerateService.js'
-import { searchYoutube as defaultSearchYoutube } from '../../../search.js'
-import { resolveYoutubeTrack } from '../matching.js'
-import {
-  REFINE_TIMEOUT_MS,
-  createRefineRateLimiter,
-  createGenerateRateLimiter,
-  isGeminiGenerateAvailable,
-  withGenerateLimit,
-} from '../services/gemini.js'
-
-function delay(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms)
-  })
-}
 
 // Mirrors the operation_logs CHECK(source IN (...)) constraint. recordOperationLog
 // only console.errors on an insert failure (never rethrows), so without this
@@ -34,7 +16,7 @@ function getBearerToken(request) {
 
 // Phase 7A: phrases.{head,tail} are arrays of scored boundary candidates with
 // no single aggregate value; store the strongest candidate as a scalar so
-// ordering.js can filter without parsing payload_json.
+// phrase_confidence stays queryable without parsing payload_json.
 function maxPhraseScore(phrases) {
   const candidates = [...(phrases?.head ?? []), ...(phrases?.tail ?? [])]
   const scores = candidates.map((c) => c?.score).filter((n) => Number.isFinite(n))
@@ -57,11 +39,6 @@ function upsertDiscordUser(db, { discordId, username }) {
 export async function internalRoutes(app, {
   db,
   token,
-  gemini = null,
-  refineLimiter = createRefineRateLimiter(),
-  generateLimiter = createGenerateRateLimiter(),
-  searchYoutube = defaultSearchYoutube,
-  probeTempoBackendFn = probeTempoBackend,
 } = {}) {
   app.addHook('onRequest', async (request, reply) => {
     if (!token || getBearerToken(request) !== token) {
@@ -209,116 +186,4 @@ export async function internalRoutes(app, {
     }
   })
 
-  function loadAnalysis(videoId) {
-    if (!videoId || !db) return null
-    const row = db.prepare(`
-      SELECT payload_json AS payloadJson FROM track_analysis WHERE video_id = ?
-    `).get(videoId)
-    if (!row) return null
-    try {
-      const parsed = JSON.parse(row.payloadJson)
-      if ((parsed.version ?? 1) < ANALYSIS_VERSION) return null
-      return parsed
-    } catch {
-      return null
-    }
-  }
-
-  app.post('/internal/optimize-order', async (request, reply) => {
-    try {
-      if (!db) throw new Error('db is required for internal routes')
-      const { guildId = null, anchorVideoId = null, tracks } = request.body ?? {}
-      if (!Array.isArray(tracks) || tracks.length === 0) {
-        return reply.code(400).send({ error: 'missing_fields' })
-      }
-
-      const analyses = tracks.map((track) => {
-        if (track?.analysis && typeof track.analysis === 'object') return track.analysis
-        return loadAnalysis(track?.videoId)
-      });
-      const anchorAnalysis = anchorVideoId ? loadAnalysis(anchorVideoId) : null
-      // Probed once per request (memoized process-wide after the first real
-      // probe, per tempo.js), so ordering's beatmix term can gate on whether a
-      // marginal-tier or non-identity stretch is actually buildable in THIS
-      // environment rather than assuming rubberband is always available
-      // (Codex round-6 on PR #35).
-      const tempoBackend = await probeTempoBackendFn()
-
-      let order = optimizeTrackOrder({ anchorAnalysis, tracks, analyses, tempoBackend })
-      let source = 'algorithm'
-
-      // Gemini refine is optional and must stay under the bot's ~5s webClient abort.
-      // Rate-limit paid calls; on limit/timeout/failure keep the algorithm order.
-      if (gemini && tracks.length >= 2) {
-        const limitKey = guildId || 'global'
-        if (refineLimiter.tryBegin(limitKey)) {
-          try {
-            const refined = await Promise.race([
-              gemini.refineOrder({
-                tracks,
-                algorithmOrder: order,
-                timeoutMs: REFINE_TIMEOUT_MS,
-              }),
-              delay(REFINE_TIMEOUT_MS).then(() => null),
-            ])
-            if (refined && isValidPermutation(refined, tracks.length)) {
-              order = refined
-              source = 'gemini'
-            }
-          } finally {
-            refineLimiter.end(limitKey)
-          }
-        }
-      }
-
-      return reply.send({ order, source })
-    } catch (error) {
-      return bindRouteError(reply, error)
-    }
-  })
-
-  app.post('/internal/generate-playlist', async (request, reply) => {
-    try {
-      if (!db) throw new Error('db is required for internal routes')
-      if (!isGeminiGenerateAvailable(gemini)) {
-        const error = new Error('gemini_unavailable')
-        error.statusCode = 503
-        error.code = 'gemini_unavailable'
-        throw error
-      }
-
-      const {
-        discordUserId,
-        username,
-        prompt,
-        targetCount,
-        name = null,
-        idempotencyKey = null,
-      } = request.body ?? {}
-
-      if (!discordUserId || !username || !prompt) {
-        return reply.code(400).send({ error: 'missing_fields' })
-      }
-
-      upsertDiscordUser(db, { discordId: discordUserId, username })
-
-      const playlist = await withGenerateLimit(generateLimiter, discordUserId, () => createGeneratedUserPlaylist({
-        db,
-        gemini,
-        userId: discordUserId,
-        username,
-        prompt,
-        targetCount,
-        name,
-        idempotencyKey,
-        searchYoutubeFn: searchYoutube,
-        resolveYoutubeTrackFn: resolveYoutubeTrack,
-        loadAnalysisFn: async (videoId) => loadAnalysis(videoId),
-      }))
-
-      return reply.send({ playlist })
-    } catch (error) {
-      return bindRouteError(reply, error)
-    }
-  })
 }

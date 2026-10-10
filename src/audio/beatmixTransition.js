@@ -1,5 +1,5 @@
 import { canTempoMatch, buildTempoFilter, tempoRatio, HARD_LIMIT_RATIO } from './tempo.js';
-import { camelotDistance } from '../mix/camelot.js';
+import { camelotDistance } from './camelot.js';
 import { planTransition } from './transition.js';
 import { isHalfDouble } from './trackAnalysis.js';
 import { HEAD_WINDOW_SEC } from './vocalActivity.js';

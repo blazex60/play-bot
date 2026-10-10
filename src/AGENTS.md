@@ -1,46 +1,34 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-07-15 | Updated: 2026-07-15 -->
+<!-- Generated: 2026-07-15 | Updated: 2026-10-07 -->
 
 # src
 
 ## Purpose
 
-Bot 本体のソース。Discord client のエントリーポイント、VC セッション管理、キュー/プレイヤー、yt-dlp 連携、スラッシュコマンド、そして Web process 専用の DB 層（`src/db/`）と Fastify Web server（`src/web/`）を含む。Bot process と Web process は同じ `src/` ツリーから起動されるが、実行時プロセスとしては完全に分離している（`docker-compose.yml` 参照）。
-
-## Key Files
-
-| File | Description |
-|------|--------------|
-| `index.js` | Discord Bot エントリーポイント。client 起動、コマンドロード、interaction イベント処理、`botApi.js` の起動 |
-| `sessions.js` | Guild ごとの VC セッション共有状態（`Map<guildId, { connection, player, queue }>`）。`joinVoiceChannel` + `entersState(Ready)`。queue-exhaustion 時の autoplay/recommend ポリシーは `queueExhaustion.js` に分離されている |
-| `queueExhaustion.js` | キュー枯渇時の自動再生/おすすめモード継続ロジック（`createQueueExhaustionHandler`）。`sessions.js` を import しない一方向依存を保つため `getSession` サンクを受け取る |
-| `player.js` | `GuildPlayer`。PCM ミキサー（`MixStream`）駆動、クロスフェード、ストール検出ウォッチドッグ、`#hadError` フラグによるトラックスキップ制御 |
-| `queue.js` | `GuildQueue`。トラック配列と `LoopMode`（OFF/TRACK/QUEUE）を管理 |
-| `search.js` | yt-dlp を `child_process.spawn` で呼び出し、検索・メタデータ取得を行う。`resolveAudioStream()` は yt-dlp の stdout をそのまま返す（URL を解決して FFmpeg に渡す方式ではない。詳細はルート `CLAUDE.md`） |
-| `format.js` | 表示用の共有ヘルパー（`fmtDuration`, `LOOP_LABELS`）。`commands/` と `queueEditorView.js`/`recommendFlow.js` が共有する |
-| `normalize.js` | FFmpeg loudnorm によるトラック単位の音量ノーマライズ（`/normalize` コマンド用） |
-| `views.js` | 検索結果ボタン UI（`ActionRowBuilder`）と `SearchPendingStore` |
-| `queueEditorView.js` / `queueEditorInteractions.js` | キュー編集用の Embed/コンポーネント生成と、そのボタン・モーダル interaction ハンドラ |
-| `permissions.js` | スラッシュコマンド用の VC 同席チェック（`checkSameVoiceChannel`, `requireSessionInSameVoice`）とコマンド許可マトリクス（`checkCommandAllowed`）。`/adminrole` は `MATRIX_EXCLUDED_COMMANDS` でマトリクス対象外 |
-| `webPermission.js` | Web ダッシュボードからの操作権限判定（`resolveWebPermission`）。VC 同席 or 実効管理者ロール（`/adminrole` でのギルド別設定 or `ADMIN_ROLE_ID` 環境変数のフォールバック） |
-| `settings.js` | Guild 単位の設定（normalize / fade on/off、autoplay mode 等）を JSON ファイル（`data/guild-settings.json`）に永続化 |
-| `botApi.js` | Web process から呼ばれる loopback-only 内部 Fastify API。`BOT_API_TOKEN` bearer 必須 |
-| `deploy.js` | スラッシュコマンド定義を Discord API に登録するスクリプト（`node src/deploy.js`） |
+Bot 本体のソース。レイヤー分離された構成: `discord/`（Discord adapter: コマンド・interaction・エントリーポイント・loopback internal API）、`playback/`（再生ドメイン: PlaybackService・SessionManager・GuildPlayer・GuildQueue・autoplay ポリシー）、`media/`（yt-dlp 連携）、`audio/`（PCM/解析/トランジション/ステム等の音声基盤）、`shared/`（format/settings/webClient）、`local/`（ローカル CLI adapter）、`web/`（Fastify Web server と Web 専用 DB 層 `web/db/`）。Bot process と Web process は同じ `src/` ツリーから起動されるが、実行時プロセスとしては完全に分離している（`docker-compose.yml` 参照）。
 
 ## Subdirectories
 
 | Directory | Purpose |
 |-----------|---------|
-| `commands/` | 17 個のスラッシュコマンド実装（`export default { data, execute }`）（see `commands/AGENTS.md`） |
-| `db/` | better-sqlite3 layer。Web process 専用（Bot process からは import されない）（see `db/AGENTS.md`） |
-| `web/` | Fastify Web server と（ビルド成果物経由で配信される）React dashboard の server 側（see `web/AGENTS.md`） |
+| `discord/` | Discord adapter。`main.js`（bot エントリーポイント）、`deploy.js`、`commands/`、interaction ハンドラ（`queueEditorInteractions.js`/`recommendFlow.js`/`queueEditorView.js`/`views.js`）、`recommendHooks.js`（playback へ注入する recommend 関数束）、`permissions.js`/`webPermission.js`、loopback internal API `botApi.js` |
+| `playback/` | 再生ドメイン。`playbackService.js`（adapters 用の in-process facade）、`sessions.js`（SessionManager: VC セッション共有状態）、`sessionAccessors.js`（session フィールドの read-only ヘルパー）、`player.js`（GuildPlayer）、`queue.js`（GuildQueue）、`queueExhaustion.js`、`autoplay.js`（個人化/おすすめ選出）、`player/`（player 補助: `analysisCoordinator.js`・`playbackWatchdog.js`・`sourcePreparer.js`・`transitionCoordinator.js`・`mixerPipeline.js`・`queueAdvancement.js`・`playbackDrive.js`・`playbackPolicy.js`・`test-helpers.js`） |
+| `media/` | メディア取得。`search.js`（yt-dlp spawn: 検索/メタデータ/ストリーム解決） |
+| `audio/` | 音声基盤。`normalize.js`（loudnorm プリフェッチ）、`mixStream.js`、`pcmSource.js`、解析（`trackAnalysis`/`beatmixTransition`/`phraseAnalysis`/`downbeatAnalysis`/`keyAnalysis`/`vocalActivity`）、ステム（`stemCache`/`stemTransition`/`stemPrefetch`）、`tempo.js`、`analysisQueue.js` |
+| `shared/` | adapter/domain 共有の純粋ユーティリティ。`format.js`（`fmtDuration`,`LOOP_LABELS`）、`settings.js`（guild 設定 JSON）、`webClient.js`（bot→web internal HTTP client）、`pendingChoiceStore.js`（選択プロンプト保留ストア） |
+| `local/` | ローカル CLI adapter（`bun run player`、LocalVoiceConnection + sinks） |
+| `web/` | `server/`（music-web process）と `db/`（better-sqlite3、Web process 専用） |
 
 ## For AI Agents
 
 ### Working In This Directory
-- **循環インポート防止**: `sessions.js` が VC セッションの共有状態を保持するハブ。`index.js` と `commands/*.js` の双方向依存を作らないこと。`queueExhaustion.js` のように `sessions.js` から呼ばれる側のモジュールは `sessions.js` を import せず、必要な値は関数引数（`getSession` サンク等）で受け取ること
-- Bot process は `better-sqlite3` を絶対に import しない。DB が必要な操作は `src/web/server/` 経由の internal API を使う
-- `player.js` のウォッチドッグは `state.playbackDuration` の増加を見て判定する。`stateChange` イベント自体はループ再生開始時にしか発火しないため使わない。ストール時は `MixStream.dropCurrent()` する
+- **依存方向**: adapters（`discord/`・`local/`）→ `playback/playbackService.js` → playback 内部（`sessions`/`GuildPlayer`/`GuildQueue`）→ `audio/`/`media/` インフラ。逆向きの import（例: `audio/` → `discord/`、`queue.js` → Discord 系、`media/` → player 状態）は禁止
+- **循環インポート防止**: `playback/sessions.js` が VC セッションの共有状態を保持するハブ。`playback/queueExhaustion.js` のように `sessions.js` から呼ばれる側のモジュールは `sessions.js` を import せず、必要な値は関数引数（`getSession` サンク等）で受け取ること
+- adapters は `session.player` / `session.queue` を直接操作しない。`sessions.js` の `playbackFor(sessions)` で取得する `PlaybackService`（`enqueue`/`pause`/`resume`/`skip`/`stop`/`seekTo`/`shuffle`/`cycleLoop`/`removeUpcoming`/`moveUpcoming`/`reorderUpcomingIfUnchanged`/`getState`）経由で操作する。セッション破棄は `destroySession(sessions, guildId)`
+- adapters は `session.player`/`session.queue` 以外の session フィールド（`connection`/`planToken` 等）の読み取りにも `playback/sessionAccessors.js` の read-only ヘルパー（`sessionVoiceChannelId`/`sessionVoiceGuildId`/`sessionConnectionStatus`/`sessionPlanToken`/`isSessionStale`）を使う。`sessions.js` を import できない adapter（recommendFlow・permissions は循環になる）のため実体は leaf モジュールにあり、`sessions.js` から re-export される
+- playback 側が recommend プロンプト関数（`cancelRecommendations`/`hasPendingForGuild`/`postRecommendationPrompt`）を必要とする場合は import せず、`getOrCreateSession` の `recommendHooks` config で注入する。Discord adapter 側の束は `discord/recommendHooks.js` で合成し、`play.js`/`botApi.js` など全 `getOrCreateSession` 呼び出しが渡す
+- Bot process は `better-sqlite3` を絶対に import しない。DB（`src/web/db/`）が必要な操作は `src/web/server/` 経由の internal API を使う
+- `playback/player.js` のウォッチドッグ（`playback/player/playbackWatchdog.js`）は `state.playbackDuration` の増加を見て判定する。`stateChange` イベント自体はループ再生開始時にしか発火しないため使わない。ストール時は `MixStream.dropCurrent()` する
 - `#hadError` フラグは `queue.next({ forceAdvance: true })` を呼ぶ**前**に退避してからリセットする（順序が逆だと無限リトライになる）
 - 音声は yt-dlp stdout を `PcmSource` 経由で s16le 化し、セッション寿命の `MixStream` に載せる。`StreamType.Arbitrary` で曲ごとに `createAudioResource` する旧経路は使わない（詳細はルート `CLAUDE.md`）
 
@@ -51,13 +39,14 @@ Bot 本体のソース。Discord client のエントリーポイント、VC セ�
 ### Common Patterns
 - スラッシュコマンドは `execute(interaction, sessions)` シグネチャで統一
 - ユーザー向け返信は絵文字プレフィックス付きの日本語メッセージ（`❌`, `✅`, `⏸️` 等）
-- VC 操作系コマンドは必ず `checkSameVoiceChannel(interaction, session)` を先頭でガードする
+- VC 操作系コマンドは必ず `requireSessionInSameVoice(interaction, sessions, {...})` でセッション取得+VC 同席チェックをまとめて行う
 
 ## Dependencies
 
 ### Internal
-- `commands/` は `queue.js` / `permissions.js` / `sessions.js` / `queueEditorView.js` に依存
-- `web/server/` は `db/` と `search.js` / `queue.js`（YouTube マッチング用）に依存
+- `discord/commands/` は `playback/`（`playbackFor` 経由の操作）、`discord/permissions.js`、`discord/queueEditorView.js`、`media/search.js` に依存
+- `web/server/` は `web/db/` と `media/search.js` / `playback/queue.js`（YouTube マッチング用）に依存
+- `playback/` は `audio/`（MixStream/PcmSource/解析/ステム）と `media/search.js` に依存
 
 ### External
 - discord.js v14, @discordjs/voice ^0.19.2 以上

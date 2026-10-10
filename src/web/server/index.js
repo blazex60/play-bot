@@ -11,7 +11,7 @@ import { registerDiscordAuthRoutes } from './auth/discord.js'
 import { registerDemoAuthRoutes } from './auth/demo.js'
 import { registerYoutubeAuthRoutes } from './auth/youtube.js'
 import { createRequireAuth } from './middleware/requireAuth.js'
-import { runMigrations } from '../../db/migrate.js'
+import { runMigrations } from '../db/migrate.js'
 import { stateRoutes } from './routes/state.js'
 import { linksRoutes } from './routes/links.js'
 import { controlRoutes } from './routes/control.js'
@@ -20,7 +20,6 @@ import { importRoutes } from './routes/import.js'
 import { importEditRoutes } from './routes/import-edit.js'
 import { playlistsRoutes } from './routes/playlists.js'
 import { internalRoutes } from './routes/internal.js'
-import { createGeminiClient, createGenerateRateLimiter } from './services/gemini.js'
 import { adminRoutes } from './routes/admin.js'
 
 const thisDir = dirname(fileURLToPath(import.meta.url))
@@ -28,7 +27,7 @@ const projectRoot = resolve(thisDir, '../../..')
 const webDist = join(projectRoot, 'web/dist')
 
 async function loadDefaultDb() {
-  const dbModule = await import('../../db/index.js')
+  const dbModule = await import('../db/index.js')
   if (typeof dbModule.getDatabase === 'function') {
     return dbModule.getDatabase()
   }
@@ -50,7 +49,6 @@ export async function buildWebServer({
   fetchImpl = globalThis.fetch,
   logger = true,
   startCleanup = true,
-  gemini = undefined,
 } = {}) {
   const app = Fastify({
     logger,
@@ -91,21 +89,9 @@ export async function buildWebServer({
 
   // Bot -> Web internal channel (play history), token-guarded, independent
   // of the browser cookie-session requireAuth hook used below.
-  const geminiClient = gemini === undefined
-    ? createGeminiClient({
-      apiKey: config.gemini?.apiKey,
-      model: config.gemini?.model,
-      fetchImpl,
-    })
-    : gemini
-
-  const generateLimiter = createGenerateRateLimiter()
-
   await app.register(internalRoutes, {
     db: database,
     token: config.botApi.token,
-    gemini: geminiClient,
-    generateLimiter,
   })
 
   registerDiscordAuthRoutes(app, { db: database, config, fetchImpl })
@@ -123,7 +109,7 @@ export async function buildWebServer({
     await authenticated.register(queueRoutes, { botClient, db: database })
     await authenticated.register(importRoutes, { db: database, botClient })
     await authenticated.register(importEditRoutes, { db: database, botClient })
-    await authenticated.register(playlistsRoutes, { db: database, botClient, gemini: geminiClient, generateLimiter })
+    await authenticated.register(playlistsRoutes, { db: database, botClient })
     await authenticated.register(adminRoutes, { db: database, botClient })
   })
 
