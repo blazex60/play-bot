@@ -1,3 +1,4 @@
+import { log } from '../logging/context.js'
 import { joinVoiceChannel, VoiceConnectionStatus, entersState } from '@discordjs/voice'
 import { GuildQueue } from './queue.js'
 import { GuildPlayer } from './player.js'
@@ -55,6 +56,7 @@ export async function destroySession(sessionsMap, guildId) {
   session.recommendHooks?.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
   await session.player.stop().catch(() => {})
   session.connection.destroy()
+  log.info({ event: 'voice.disconnected', guildId })
 }
 
 // How many recently-played videoIds a live VC session remembers, so autoplay
@@ -145,11 +147,13 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
 
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000)
-  } catch {
+  } catch (err) {
+    log.error({ event: 'voice.connection.failed', guildId, err })
     connection.destroy()
     throw new Error('VC への接続がタイムアウトしました')
   }
 
+  log.info({ event: 'voice.connected', guildId })
   const queue = new GuildQueue()
 
   // Adapter-supplied recommendation functions (see NOOP_RECOMMEND_HOOKS).

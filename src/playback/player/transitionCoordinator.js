@@ -1,3 +1,4 @@
+import { log } from '../../logging/context.js'
 import { AudioPlayerStatus } from '@discordjs/voice';
 import { getGuildSettings } from '../../shared/settings.js';
 import { rankTransitionCandidates } from '../../audio/transitionCandidates.js';
@@ -480,7 +481,7 @@ export class TransitionCoordinator {
     this.clearCrossfadeArm();
     this.#crossfadeArmTimer = setInterval(() => {
       this.#maybeStartCrossfade().catch((err) => {
-        console.error('[GuildPlayer] crossfade arm error:', err.message);
+        log.error({ event: 'guildplayer.crossfade.arm.error', err: err });
       });
     }, CROSSFADE_ARM_INTERVAL_MS);
   }
@@ -851,11 +852,11 @@ export class TransitionCoordinator {
             this.#sourcePreparer.ensureOutgoingStemPrep(outCachedStems, current.videoId, {
               startSec: norm.exitStartSec ?? 0,
               tempoFilter: outgoingStemTempoFilter,
-            }).catch((err) => console.warn('[GuildPlayer] outgoing stem prep failed:', err.message));
+            }).catch((err) => log.warn({ event: 'playback.stem.outgoing.failed', err }));
             this.#sourcePreparer.ensureIncomingStemPrep(inCachedStems, next.videoId, {
               startSec: norm.entrySec,
               tempoFilter: norm.tempoFilter,
-            }).catch((err) => console.warn('[GuildPlayer] incoming stem prep failed:', err.message));
+            }).catch((err) => log.warn({ event: 'playback.stem.incoming.failed', err }));
           }
         }
       }
@@ -869,7 +870,7 @@ export class TransitionCoordinator {
       try {
         source = await this.#sourcePreparer.takePreparedIncoming(next, { startSec: norm.entrySec, tempoFilter: norm.tempoFilter });
       } catch (err) {
-        console.warn('[GuildPlayer] incoming pcm source failed:', err.message);
+        log.warn({ event: 'guildplayer.incoming.pcm.source.failed', err: err });
         await this.#sourcePreparer.cleanupIncomingTempFile();
         return;
       }

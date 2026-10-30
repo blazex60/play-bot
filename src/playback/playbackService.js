@@ -1,3 +1,4 @@
+import { log } from '../logging/context.js';
 /**
  * In-process application service: the single entry point callers use to
  * operate playback. Adapters (Discord commands, the loopback bot API, the
@@ -133,6 +134,7 @@ export class PlaybackService {
     const stopInFlightAtEntry = session.player.isStopping === true;
     const stopGeneration = session.player.stopGeneration ?? 0;
     for (const track of tracks) session.queue.add(track);
+    log.info({ event: 'playback.queue.added', guildId, count: tracks.length });
     if (onEnqueued) await onEnqueued({ wasEmpty });
     // The await above is an open async window: /leave may have destroyed or
     // replaced the session and /stop may have cleared the queue. Never touch
@@ -160,7 +162,7 @@ export class PlaybackService {
           // Fire-and-forget: callers in a bounded continuation can't afford to
           // await mixer startup (download + loudnorm can take tens of seconds).
           session.player.playNext().catch((err) => {
-            console.error('[playback] playNext failed:', err?.message ?? err);
+            log.error({ event: 'playback.start.failed', guildId, err });
           });
         }
       }
@@ -182,6 +184,7 @@ export class PlaybackService {
     const session = this.#getSession(guildId);
     if (!session) return false;
     await session.player.skip();
+    log.info({ event: 'playback.track.skipped', guildId });
     return true;
   }
 
@@ -230,7 +233,9 @@ export class PlaybackService {
 
   removeUpcoming(guildId, upcomingIndex) {
     const session = this.#getSession(guildId);
-    return session ? session.queue.removeUpcoming(upcomingIndex) : false;
+    const result = session ? session.queue.removeUpcoming(upcomingIndex) : false;
+    if (result) log.info({ event: 'playback.queue.removed', guildId });
+    return result;
   }
 
   moveUpcoming(guildId, fromIndex, toIndex) {

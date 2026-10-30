@@ -1,3 +1,5 @@
+import { log } from '../../logging/context.js'
+
 export class BotApiError extends Error {
   constructor(message, { status, body }) {
     super(message)
@@ -16,23 +18,28 @@ export function createBotClient({ baseUrl, token, fetchImpl = globalThis.fetch }
   }
 
   async function request(path, { method = 'GET', body } = {}) {
-    const response = await fetchImpl(new URL(path, `${baseUrl}/`), {
-      method,
-      headers: {
-        authorization: `Bearer ${token}`,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    })
-    const text = await response.text()
-    const payload = text ? JSON.parse(text) : null
-    if (!response.ok) {
-      throw new BotApiError(`Bot API request failed: ${method} ${path}`, {
-        status: response.status,
-        body: payload,
+    try {
+      const response = await fetchImpl(new URL(path, `${baseUrl}/`), {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
       })
+      const text = await response.text()
+      const payload = text ? JSON.parse(text) : null
+      if (!response.ok) {
+        throw new BotApiError(`Bot API request failed: ${method} ${path}`, {
+          status: response.status,
+          body: payload,
+        })
+      }
+      return payload
+    } catch (err) {
+      log.error({ event: 'web.bot_api.failed', method, statusCode: err.status, err })
+      throw err
     }
-    return payload
   }
 
   return {

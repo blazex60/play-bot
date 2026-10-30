@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import { installRequestLogging } from '../logging/index.js';
 
 import { getOrCreateSession, bumpPlanToken, playbackFor } from '../playback/sessions.js';
 import { recommendHooks } from './recommendHooks.js';
@@ -180,6 +181,7 @@ export function buildBotApi({
   adminRoleId = process.env.ADMIN_ROLE_ID,
   getOrCreateSessionFn = getOrCreateSession,
   commandNames = [],
+  logger = false,
 } = {}) {
   if (!client) throw new Error('buildBotApi requires client');
   if (!sessions) throw new Error('buildBotApi requires sessions');
@@ -192,7 +194,9 @@ export function buildBotApi({
   // facade — routes never touch session.player / session.queue directly.
   const playback = playbackFor(sessions);
 
-  const app = Fastify({ logger: false });
+  const app = Fastify({ ...(logger ? { loggerInstance: logger } : { logger: false }), disableRequestLogging: true });
+  installRequestLogging(app, 'bot.api');
+  app.addHook('onError', async (request, reply, err) => { request.log.error({ event: 'bot.api.request.failed', requestId: request.id, err }); });
 
   app.addHook('onRequest', async (request, reply) => {
     if (request.url === '/healthz') return;
@@ -427,6 +431,6 @@ export async function startBotApi(options) {
   const app = buildBotApi(options);
   const port = parsePort(process.env.BOT_API_PORT);
   await app.listen({ host: LOOPBACK_HOST, port });
-  console.log(`[bot-api] listening on http://${LOOPBACK_HOST}:${port}`);
+  app.log.info({ event: 'bot.api.started', port });
   return app;
 }

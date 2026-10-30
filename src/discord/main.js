@@ -1,5 +1,7 @@
 import 'dotenv/config'
 import { Client, Collection, Events, GatewayIntentBits, MessageFlags } from 'discord.js'
+import { createLogger, installFatalLogging } from '../logging/index.js'
+import { setProcessLogger } from '../logging/context.js'
 
 import { readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -14,6 +16,12 @@ import { pruneStemCache, cleanupStaleStemStaging } from '../audio/stemCache.js'
 import { startBotApi } from './botApi.js'
 import { checkCommandAllowed } from './permissions.js'
 
+const logs = createLogger({ service: 'music-bot' })
+const logger = logs.logger
+setProcessLogger(logger)
+installFatalLogging(logs)
+logger.info({ event: 'bot.starting' })
+let botApi
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 await loadSettings()
@@ -41,9 +49,9 @@ for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js') && !f
 }
 
 client.once(Events.ClientReady, c => {
-  console.log(`Bot ready: ${c.user.tag} (id=${c.user.id})`)
-  startBotApi({ client, sessions, commandNames: [...commands.keys()] }).catch(err => {
-    console.error('[bot-api] failed to start:', err)
+  logger.info({ event: 'bot.connected' })
+  startBotApi({ client, sessions, commandNames: [...commands.keys()], logger }).then(app => { botApi = app }).catch(err => {
+    logger.error({ event: 'bot.api.start.failed', err })
     process.exitCode = 1
   })
 })
@@ -53,6 +61,9 @@ client.on(Events.InteractionCreate, async interaction => {
     const command = commands.get(interaction.commandName)
     if (!command) return
 
+    const started = performance.now()
+    const context = { command: interaction.commandName, guildId: interaction.guildId, correlationId: interaction.id }
+    logger.info({ event: 'bot.command.started', ...context })
     const logOperation = (success, detail) => webClient.logOperation({
       guildId: interaction.guildId,
       discordUserId: interaction.user.id,
@@ -64,6 +75,7 @@ client.on(Events.InteractionCreate, async interaction => {
     })
 
     if (!checkCommandAllowed(interaction, resolveAdminRoleId(interaction.guildId))) {
+      logger.info({ event: 'bot.command.denied', ...context, durationMs: performance.now() - started })
       logOperation(false, 'blocked')
       return
     }
@@ -77,11 +89,12 @@ client.on(Events.InteractionCreate, async interaction => {
       // just shows a panel; the real result is logged later from onSelect)
       // and is skipped entirely rather than logged as a success.
       const result = await command.execute(interaction, sessions)
+      logger.info({ event: 'bot.command.completed', ...context, success: result === null ? null : result !== false, durationMs: performance.now() - started })
       if (result !== null) {
         logOperation(result !== false)
       }
     } catch (err) {
-      console.error(`[${interaction.commandName}] error:`, err)
+      logger.error({ event: 'bot.command.failed', ...context, durationMs: performance.now() - started, err })
       logOperation(false, err.message)
       const reply = { content: '❌ コマンドの実行中にエラーが発生しました', flags: MessageFlags.Ephemeral }
       if (interaction.replied || interaction.deferred) {
@@ -130,9 +143,20 @@ client.on(Events.VoiceStateUpdate, async (oldState) => {
   if (!channel) return
   const humans = channel.members.filter(m => !m.user.bot)
   if (humans.size === 0) {
-    console.log(`[VoiceState] All humans left ${channel.name}, auto-disconnecting`)
-    destroySession(sessions, oldState.guild.id).catch((err) => console.error('[VoiceState] disconnect failed:', err))
+    logger.info({ event: 'voice.empty.disconnecting', guildId: oldState.guild.id })
+    destroySession(sessions, oldState.guild.id).catch((err) => logger.error({ event: 'voice.disconnect.failed', guildId: oldState.guild.id, err }))
   }
 })
 
-client.login(process.env.DISCORD_TOKEN)
+for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {
+  logger.info({ event: 'bot.stopping', signal })
+  await botApi?.close()
+  client.destroy()
+  await logs.flush()
+  process.exit(0)
+})
+client.login(process.env.DISCORD_TOKEN).catch(async err => {
+  logger.fatal({ event: 'bot.login.failed', err })
+  await logs.flush()
+  process.exitCode = 1
+})

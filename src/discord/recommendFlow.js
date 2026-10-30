@@ -1,3 +1,4 @@
+import { log } from '../logging/context.js'
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, MessageFlags } from 'discord.js'
 import { buildChoiceComponents, parseChoiceCustomId } from './views.js'
 import { checkCommandAllowed, checkInVoiceChannel } from './permissions.js'
@@ -103,7 +104,7 @@ async function reconsiderTeardown(guildId, pendingStore, recommendRounds) {
   try {
     await onTimeout()
   } catch (err) {
-    console.error('[recommendFlow] onTimeout failed:', err.message)
+    log.error({ event: 'recommendflow.ontimeout.failed', err: err });
   }
 }
 
@@ -170,7 +171,7 @@ function scheduleExpiry(entry, pendingStore, guildId, recommendRounds, onTimeout
       try {
         await onTimeout()
       } catch (err) {
-        console.error('[recommendFlow] onTimeout failed:', err.message)
+        log.error({ event: 'recommendflow.ontimeout.failed', err: err });
       }
     }
   }, RECOMMEND_TIMEOUT_MS)
@@ -197,7 +198,7 @@ function scheduleRoundExpiry(entry, recommendRounds, pendingStore, guildId, onTi
       try {
         await onTimeout()
       } catch (err) {
-        console.error('[recommendFlow] onTimeout failed:', err.message)
+        log.error({ event: 'recommendflow.ontimeout.failed', err: err });
       }
     }
   }, RECOMMEND_TIMEOUT_MS)
@@ -232,7 +233,7 @@ export async function postRecommendationPrompt({ channel, guildId, guildName, pl
   try {
     message = await channel.send({ embeds: [embed], components })
   } catch (err) {
-    console.error('[recommendFlow] failed to post recommendation prompt:', err.message)
+    log.error({ event: 'recommendflow.failed.to.post.recommendation.prompt', err: err });
     return 0
   }
 

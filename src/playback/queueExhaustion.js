@@ -1,3 +1,4 @@
+import { log } from '../logging/context.js'
 import { getGuildSettings } from '../shared/settings.js'
 import { planAutoTrack, planRecommendations, formatAutoAddNotification } from './autoplay.js'
 
@@ -98,7 +99,7 @@ export function createQueueExhaustionHandler({
             // Notification delivery is optional and must not keep the bounded
             // queue-exhaustion continuation open after playback has started.
             void textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
-              console.error('[sessions] failed to post autoplay notification:', err.message)
+              log.error({ event: 'sessions.failed.to.post.autoplay.notification', err: err });
             })
           }
         }

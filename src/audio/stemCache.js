@@ -1,3 +1,4 @@
+import { log } from '../logging/context.js'
 import { mkdtemp, mkdir, readdir, rename, rm, stat, readFile, writeFile, access, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -166,11 +167,11 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal }) 
     // Enforce the size cap after every write, not just at Bot startup —
     // a long-running process would otherwise grow the cache unbounded.
     pruneStemCache().catch((err) => {
-      console.warn(`[stemCache] prune after separation failed: ${err.message}`);
+      log.warn({ event: 'audio.stem.prune.failed', err });
     });
     return { vocalPath, instrumentalPath };
   } catch (err) {
-    console.warn(`[stemCache] separation failed for ${videoId}: ${err.message}`);
+    log.warn({ event: 'audio.stem.separation.failed', err });
     return null;
   } finally {
     await rm(jobTmpRoot, { recursive: true, force: true }).catch(() => {});

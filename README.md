@@ -217,3 +217,16 @@ bunx wrangler pages dev legal --port 8788
 
 - `http://localhost:8788/terms`
 - `http://localhost:8788/privacy`
+
+### 診断ログ
+
+Bot と Web は UTC の JSON Lines を標準出力と `./logs/music-bot/`、`./logs/music-web/` に記録します。`LOG_LEVEL` は `trace`、`debug`、`info`（既定）、`warn`、`error`、`fatal` を指定できます。Compose では `./logs` を `/app/logs` にマウントします。起動前にディレクトリを作成し、コンテナの実行ユーザーが書き込めることを確認してください。ログは Web の公開ディレクトリ外にあります。
+
+UTC 日付ごとに最大 10 MiB のファイルを 5 個まで作成し、当日を含む 7 日より古い日付を起動後と定期的に削除します。1 日の上限に達した場合はその日のファイル出力を打ち切り、標準エラーに警告します。標準出力と Docker ログは引き続き利用でき、Docker 側もサイズでローテーションされます。ログの一時的な書き込み失敗時は標準エラーを確認し、保存先の権限・空き容量を復旧してください。復旧後の新しいログから保存を再開します。保存できなかったログは復元されません。
+
+```sh
+docker compose logs --tail=100 music-bot music-web
+ls -lh logs/music-bot logs/music-web
+```
+
+診断ログは Web 管理画面の操作監査ログ `operation_logs` とは別で、上記の保持期限は監査ログには適用されません。Compose の設定変更はサービスの再作成を伴い、再生中の VC セッションが中断されます。

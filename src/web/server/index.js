@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url'
 import cookie from '@fastify/cookie'
 import fastifyStatic from '@fastify/static'
 import Fastify from 'fastify'
+import { createLogger, installRequestLogging, installFatalLogging } from '../../logging/index.js'
+import { setProcessLogger } from '../../logging/context.js'
 import { createBotClient } from './botClient.js'
 import { startCleanupJob } from './cleanup.js'
 import { createWebConfig, defaultConfig } from './config.js'
@@ -51,11 +53,14 @@ export async function buildWebServer({
   startCleanup = true,
 } = {}) {
   const app = Fastify({
-    logger,
+    ...(typeof logger === 'object' ? { loggerInstance: logger } : { logger }),
+    disableRequestLogging: true,
     trustProxy: config.trustProxy,
   })
+  installRequestLogging(app, 'web.http')
+  app.addHook('onError', async (request, reply, err) => { request.log.error({ event: 'web.request.failed', requestId: request.id, err }) })
   const database = db ?? await loadDefaultDb()
-  runMigrations(database)
+  try { runMigrations(database) } catch (err) { app.log.error({ event: 'web.migration.failed', err }); throw err }
 
   await app.register(cookie, {
     secret: config.session.secret,
@@ -140,12 +145,29 @@ export async function startWebServer({
   config = createWebConfig(),
   db,
   fetchImpl = globalThis.fetch,
+  logger = true,
 } = {}) {
-  const app = await buildWebServer({ config, db, fetchImpl })
+  const app = await buildWebServer({ config, db, fetchImpl, logger })
   await app.listen({ host: config.host, port: config.port })
   return app
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  await startWebServer()
+  const logs = createLogger({ service: 'music-web' })
+  installFatalLogging(logs)
+  setProcessLogger(logs.logger)
+  try {
+    const app = await startWebServer({ logger: logs.logger })
+    logs.logger.info({ event: 'web.started' })
+    for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {
+      logs.logger.info({ event: 'web.stopping', signal })
+      await app.close()
+      await logs.flush()
+      process.exit(0)
+    })
+  } catch (err) {
+    logs.logger.fatal({ event: 'web.start.failed', err })
+    await logs.flush()
+    process.exitCode = 1
+  }
 }

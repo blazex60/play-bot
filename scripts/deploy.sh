@@ -22,8 +22,17 @@ echo "[deploy] $OLD_SHA -> $NEW_SHA"
 echo "[deploy] changed files:"
 echo "$CHANGED" | sed 's/^/[deploy]   /'
 
+prepare_logs() {
+  mkdir -p logs/music-bot logs/music-web
+  if [ ! -w logs/music-bot ] || [ ! -w logs/music-web ]; then
+    echo "[deploy] log directories are not writable; check ownership and permissions" >&2
+    exit 1
+  fi
+}
+
 if echo "$CHANGED" | grep -Eq '^(Dockerfile|docker-compose\.yml|package\.json|bun\.lock)$'; then
   echo "[deploy] Dockerfile/compose/package manifest changed -> full rebuild (music-bot, music-web, cloudflared)"
+  prepare_logs
   docker compose up --build -d
   exit 0
 fi
@@ -35,18 +44,21 @@ if echo "$CHANGED" | grep -E '^src/' | grep -Ev '^src/web/' | grep -q .; then
   BOT_CHANGED=true
 fi
 
-if echo "$CHANGED" | grep -Eq '^(web/|src/web/)'; then
+if echo "$CHANGED" | grep -Eq '^(web/|src/web/|src/logging/)'; then
   WEB_CHANGED=true
 fi
 
 if [ "$BOT_CHANGED" = true ] && [ "$WEB_CHANGED" = true ]; then
   echo "[deploy] both src/ (bot) and web/src/web/ changed -> rebuilding music-bot + music-web"
+  prepare_logs
   docker compose up -d --build music-bot music-web
 elif [ "$BOT_CHANGED" = true ]; then
   echo "[deploy] src/ (excluding src/web/) changed -> rebuilding music-bot only"
+  prepare_logs
   docker compose up -d --build music-bot
 elif [ "$WEB_CHANGED" = true ]; then
   echo "[deploy] web/ or src/web/ changed -> rebuilding music-web only (--no-deps)"
+  prepare_logs
   docker compose up -d --build --no-deps music-web
 else
   echo "[deploy] no changes under src/ or web/ (docs/legal/other only) -> skipping docker compose, no restart"

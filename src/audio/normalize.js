@@ -1,3 +1,4 @@
+import { log } from '../logging/context.js'
 import { spawn } from 'node:child_process'
 import { rm, mkdir, rename, access, copyFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -213,7 +214,7 @@ export async function trimSilence(filePath, {
     } catch {
       await cleanupTempFile(backupPath)
     }
-    console.warn(`[normalize] silence trim skipped: ${err.message}`)
+    log.warn({ event: 'audio.silence_trim.skipped', err })
     return false
   }
 }

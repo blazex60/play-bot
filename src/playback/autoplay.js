@@ -1,3 +1,4 @@
+import { log } from '../logging/context.js'
 import { getGuildSettings } from '../shared/settings.js'
 import { resolveRelated } from '../media/search.js'
 import { createTrack } from './queue.js'
@@ -44,7 +45,7 @@ async function tryResolveRelated(resolveRelatedFn, videoId, limit) {
     const candidates = await resolveRelatedFn(videoId, { limit })
     return candidates.length > 0 ? candidates : null
   } catch (err) {
-    console.error('[autoplay] resolveRelated failed:', err.message)
+    log.error({ event: 'autoplay.resolverelated.failed', err: err });
     return null
   }
 }

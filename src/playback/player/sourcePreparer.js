@@ -1,3 +1,4 @@
+import { log } from '../../logging/context.js'
 import {
   cleanupTempFile,
   isNormalizeDurationAllowed,
@@ -204,14 +205,11 @@ export class SourcePreparer {
         this.#analysis.probedDurationCache.set(track.videoId, probedDuration);
         this.#applyAnalysisDuration(track, { durationSec: probedDuration });
       }
-      console.info(
-        `[normalize] applying: ${track.title} ` +
-        `(${prefetched.measured.measured_I} LUFS -> -16 LUFS)`
-      );
+      log.debug({ event: 'audio.normalize.applying' });
       if (forIncoming) {
         if (prepId != null && prepId !== this.#incomingPrepId) {
           cleanupTempFile(prefetched.filePath).catch((err) => {
-            console.error('[GuildPlayer] abandoned incoming temp cleanup error:', err);
+            log.error({ event: 'guildplayer.abandoned.incoming.temp.cleanup.error', err: err });
           });
           // Do not schedule analysis or open a FileSource on a temp we are
           // deleting — callers treat rejection as a cancelled/failed prep.
@@ -230,7 +228,7 @@ export class SourcePreparer {
       return source;
     } catch (err) {
       if (err?.code === 'INCOMING_PREP_CANCELLED') throw err;
-      console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err.message);
+      log.warn({ event: 'audio.normalize.fallback', err });
       if (track.videoId) this.#analysis.probedDurationCache.delete(track.videoId);
       const source = createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStreamFn, startSec });
       source.tempoHonored = false;
@@ -447,7 +445,7 @@ export class SourcePreparer {
     this.#incomingMeasured = null;
     if (filePath) {
       cleanupTempFile(filePath).catch((err) => {
-        console.error('[GuildPlayer] prepared incoming temp cleanup error:', err);
+        log.error({ event: 'guildplayer.prepared.incoming.temp.cleanup.error', err: err });
       });
     }
   }
@@ -712,15 +710,15 @@ export class SourcePreparer {
         })
         .catch((err) => {
           if (err?.code === 'ANALYSIS_KILLED') {
-            console.warn('[GuildPlayer] low-priority stem prefetch yielded to mixer:', err.message);
+            log.warn({ event: 'guildplayer.low.priority.stem.prefetch.yielded.to.mixer', err: err });
           } else {
-            console.warn('[GuildPlayer] low-priority stem prefetch failed:', err.message);
+            log.warn({ event: 'guildplayer.low.priority.stem.prefetch.failed', err: err });
           }
           this.#stemPrefetchTracker.markFailed(videoId);
         })
         .finally(() => this.#lowPriorityStemPrefetch.delete(videoId));
     }).catch((err) => {
-      console.warn('[GuildPlayer] stem prefetch cache check failed:', err.message);
+      log.warn({ event: 'guildplayer.stem.prefetch.cache.check.failed', err: err });
     });
   }
 
@@ -768,7 +766,7 @@ export class SourcePreparer {
       try {
         throwIfAborted(signal);
         const stagedPath = await this.#stageTempFileCopyFn(downloaded.filePath).catch((err) => {
-          console.warn('[GuildPlayer] failed to stage file for low-priority stem prefetch:', err.message);
+          log.warn({ event: 'guildplayer.failed.to.stage.file.for.low.priority.stem.prefetch', err: err });
           return null;
         });
         if (!stagedPath) return null;
@@ -838,7 +836,7 @@ export class SourcePreparer {
         return { analyzed: true };
       }).then((value) => ({ value }), (error) => {
         if (error?.code !== 'ANALYSIS_KILLED') {
-          console.warn('[GuildPlayer] lookahead analysis failed:', error.message);
+          log.warn({ event: 'guildplayer.lookahead.analysis.failed', err: error });
         }
         return { error };
       }),
@@ -860,7 +858,7 @@ export class SourcePreparer {
     entry.promise.then((result) => {
       if (result.value?.filePath) {
         cleanupTempFile(result.value.filePath).catch((err) => {
-          console.error('[GuildPlayer] prefetch cleanup error:', err);
+          log.error({ event: 'guildplayer.prefetch.cleanup.error', err: err });
         });
       }
     }).catch(() => {});
