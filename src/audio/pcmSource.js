@@ -2,6 +2,10 @@ import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
 import { resolveAudioStream } from '../media/search.js';
 import { FRAME_BYTES } from './fade.js';
+import { getLogger } from '../logging/botLogger.js';
+import { scrubString } from '../logging/redact.js';
+
+const log = getLogger('pcmSource');
 
 const LOUDNORM_TARGET = 'I=-16:TP=-1.5:LRA=11';
 const MAX_BUFFER_BYTES = FRAME_BYTES * 100;
@@ -157,6 +161,7 @@ export class PcmSource extends EventEmitter {
     proc.on('close', (code) => {
       if (code !== 0 && !source.ended && !source.#destroyed) {
         const detail = stderrTail.trim();
+        log.error({ event: 'audio.ffmpeg.exited', exitCode: code, stderrTail: scrubString(detail.slice(-500)) }, 'ffmpeg exited abnormally');
         source.#fail(new Error(
           detail ? `ffmpeg exited with ${code}: ${detail}` : `ffmpeg exited with ${code}`,
         ));
@@ -207,6 +212,7 @@ export class PcmSource extends EventEmitter {
     proc.on('close', (code) => {
       if (code !== 0 && !source.ended && !source.#destroyed) {
         const detail = stderrTail.trim();
+        log.error({ event: 'audio.ffmpeg.exited', exitCode: code, stderrTail: scrubString(detail.slice(-500)) }, 'ffmpeg exited abnormally');
         source.#fail(new Error(
           detail ? `ffmpeg exited with ${code}: ${detail}` : `ffmpeg exited with ${code}`,
         ));

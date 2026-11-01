@@ -2,6 +2,9 @@ import { getGuildSettings } from '../shared/settings.js'
 import { resolveRelated } from '../media/search.js'
 import { createTrack } from './queue.js'
 import { fmtDuration } from '../shared/format.js'
+import { getLogger } from '../logging/botLogger.js'
+
+const log = getLogger('autoplay')
 
 export const HALF_LIFE_DAYS = 14
 export const STABLE_MIN_WEIGHT = 3.0
@@ -44,7 +47,7 @@ async function tryResolveRelated(resolveRelatedFn, videoId, limit) {
     const candidates = await resolveRelatedFn(videoId, { limit })
     return candidates.length > 0 ? candidates : null
   } catch (err) {
-    console.error('[autoplay] resolveRelated failed:', err.message)
+    log.error({ event: 'playback.resolverelated_failed', err }, 'resolveRelated failed')
     return null
   }
 }

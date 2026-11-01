@@ -1,5 +1,9 @@
 import { spawn } from 'node:child_process';
 import { createTrack } from '../playback/queue.js';
+import { getLogger } from '../logging/botLogger.js';
+import { scrubString } from '../logging/redact.js';
+
+const log = getLogger('ytdlp');
 
 export class YtdlpError extends Error {}
 
@@ -54,6 +58,7 @@ export function spawnAsync(cmd, args, { timeoutMs } = {}) {
     proc.on('error', (err) => settle(() => reject(err)));
     proc.on('close', code => {
       settle(() => {
+        if (code !== 0) log.warn({ event: 'media.ytdlp.exited', exitCode: code, stderrTail: scrubString(stderr.trim().slice(-500)) }, 'yt-dlp exited abnormally');
         if (code !== 0) reject(new YtdlpError(stderr.trim() || `yt-dlp exited with ${code}`));
         else resolve(stdout.trim());
       });
@@ -187,6 +192,7 @@ export function resolveAudioStream(url, { startSec } = {}) {
   });
   proc.on('close', code => {
     if (code !== 0) {
+      log.error({ event: 'media.ytdlp.stream_exited', exitCode: code, stderrTail: scrubString(stderrBuf.trim().slice(-500)) }, 'yt-dlp stream exited abnormally');
       proc.stdout.destroy(new YtdlpError(stderrBuf.trim() || `yt-dlp exited ${code}`));
     }
   });

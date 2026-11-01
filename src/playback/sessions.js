@@ -1,6 +1,9 @@
 import { joinVoiceChannel, VoiceConnectionStatus, entersState } from '@discordjs/voice'
 import { GuildQueue } from './queue.js'
 import { GuildPlayer } from './player.js'
+import { getLogger } from '../logging/botLogger.js'
+
+const log = getLogger('sessions')
 import { PendingChoiceStore } from '../shared/pendingChoiceStore.js'
 import { createWebClient } from '../shared/webClient.js'
 import {
@@ -49,6 +52,7 @@ export async function destroySession(sessionsMap, guildId) {
   const session = sessionsMap.get(guildId)
   if (!session) return
   sessionsMap.delete(guildId)
+  log.info({ event: 'voice.session_destroyed', guildId }, 'voice session destroyed')
   // Uses the session's own injected hooks rather than
   // cancelPendingRecommendations(sessionsMap, guildId): the map entry is
   // already gone by this point, so a map lookup could not find it anyway.
@@ -136,6 +140,8 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     return existing
   }
 
+  const joinStartedAt = Date.now()
+  log.info({ event: 'voice.join_started', guildId, channelId: channel.id }, 'joining voice channel')
   const connection = joinVoiceChannel({
     channelId: channel.id,
     guildId,
@@ -145,10 +151,17 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
 
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000)
-  } catch {
+  } catch (err) {
+    log.error({ event: 'voice.join_failed', guildId, channelId: channel.id, durationMs: Date.now() - joinStartedAt, err }, 'voice join failed')
     connection.destroy()
     throw new Error('VC への接続がタイムアウトしました')
   }
+  log.info({ event: 'voice.joined', guildId, channelId: channel.id, durationMs: Date.now() - joinStartedAt }, 'voice connection ready')
+  connection.on('stateChange', (oldState, newState) => {
+    if (oldState.status !== newState.status) {
+      log.info({ event: 'voice.state_change', guildId, from: oldState.status, to: newState.status }, 'voice connection state change')
+    }
+  })
 
   const queue = new GuildQueue()
 
@@ -170,6 +183,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     // new one for the same guild. Without this identity check, this stale
     // closure would delete and destroy that brand new, unrelated session.
     if (s && s === session) {
+      log.info({ event: 'voice.disconnected', guildId }, 'voice disconnected, dropping session')
       sessions.delete(guildId)
       hooks.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
       if (s.connection.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -196,7 +210,10 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   // snapshot) so it can read session.recentPlayedVideoIds once playback
   // actually starts, even though GuildPlayer is constructed before `session`
   // is assigned below.
-  const onTrackStart = (videoId) => recordPlayedVideoId(session, videoId)
+  const onTrackStart = (videoId) => {
+    log.info({ event: 'playback.track.started', guildId, trackId: videoId }, 'track started')
+    return recordPlayedVideoId(session, videoId)
+  }
 
   const player = new GuildPlayer({
     guildId,
