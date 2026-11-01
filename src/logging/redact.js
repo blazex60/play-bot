@@ -60,6 +60,8 @@ export function serializeError(err) {
   if (!base || typeof base !== 'object') return base
   if (base.message) base.message = scrubString(base.message)
   if (base.stack) base.stack = scrubString(base.stack)
+  // Upstream error objects often carry raw response bodies / request config.
+  for (const key of ['body', 'headers', 'config', 'request', 'response']) delete base[key]
   return base
 }
 

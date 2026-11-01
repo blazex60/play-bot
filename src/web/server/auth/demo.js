@@ -83,12 +83,14 @@ export function registerDemoAuthRoutes(app, { db, config } = {}) {
     const ip = request.ip
     const now = Date.now()
     if (isRateLimited(ip, now)) {
+      request.log.warn({ event: 'auth.demo.rate_limited' }, 'demo login rate limited')
       return reply.code(429).send({ error: 'too_many_attempts' })
     }
 
     const password = request.body?.password
     if (typeof password !== 'string' || !passwordMatches(password, config.demoLogin.password)) {
       recordFailure(ip, now)
+      request.log.warn({ event: 'auth.demo.invalid_password' }, 'demo login failed')
       return reply.code(401).send({ error: 'invalid_password' })
     }
 

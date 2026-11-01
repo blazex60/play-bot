@@ -203,3 +203,17 @@ test('parseLogFileName', () => {
   assert.deepEqual(parseLogFileName('2026-10-28.3.jsonl'), { date: '2026-10-28', index: 3 })
   assert.equal(parseLogFileName('x.jsonl'), null)
 })
+
+test('getLogger is lazy: importing/creating child loggers opens no log files', async () => {
+  const dir = tmp()
+  try {
+    const { getLogger } = await import('./webLogger.js')
+    process.env.LOG_DIR = dir
+    const log = getLogger('lazy-test')
+    assert.deepEqual(readdirSync(dir), [])
+    assert.equal(typeof log.info, 'function')
+  } finally {
+    delete process.env.LOG_DIR
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

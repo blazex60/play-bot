@@ -24,9 +24,9 @@ export function startCleanupJob({
   const run = () => {
     try {
       const deleted = sweepExpiredRows({ db, now: now() })
-      logger.info?.({ event: 'web.cleanup.sweep', deleted })
+      logger.debug?.({ event: 'web.cleanup.sweep', deleted })
     } catch (error) {
-      logger.error?.({ event: 'web.cleanup.error', error: error.message })
+      logger.error?.({ event: 'web.cleanup.error', err: error })
     }
   }
   const timer = setInterval(run, intervalMs)
