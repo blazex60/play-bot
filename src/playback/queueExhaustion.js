@@ -1,6 +1,6 @@
 import { getGuildSettings } from '../shared/settings.js'
 import { planAutoTrack, planRecommendations, formatAutoAddNotification } from './autoplay.js'
-import { getLogger } from '../logging/botLogger.js'
+import { getLogger } from '../logging/appLogger.js'
 
 const log = getLogger('queueExhaustion')
 

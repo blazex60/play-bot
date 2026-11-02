@@ -1,7 +1,7 @@
 import { joinVoiceChannel, VoiceConnectionStatus, entersState } from '@discordjs/voice'
 import { GuildQueue } from './queue.js'
 import { GuildPlayer } from './player.js'
-import { getLogger } from '../logging/botLogger.js'
+import { getLogger } from '../logging/appLogger.js'
 
 const log = getLogger('sessions')
 import { PendingChoiceStore } from '../shared/pendingChoiceStore.js'

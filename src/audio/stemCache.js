@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnCapture } from './spawnCapture.js';
 import { resolveDemucsBin, DEMUCS_MODEL } from './vocalActivity.js';
-import { getLogger } from '../logging/botLogger.js';
+import { getLogger } from '../logging/appLogger.js';
 
 const log = getLogger('stemCache');
 

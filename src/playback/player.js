@@ -26,7 +26,7 @@ import { getCachedStems, separateTrackStems } from '../audio/stemCache.js';
 import { planStemTransition } from '../audio/stemTransition.js';
 import { logTransitionPlan, logGaplessTransition } from '../audio/transitionLog.js';
 import { StemPreparationState, StemPrefetchTracker } from '../audio/stemPrefetch.js';
-import { getLogger } from '../logging/botLogger.js'
+import { getLogger } from '../logging/appLogger.js'
 
 const log = getLogger('GuildPlayer')
 

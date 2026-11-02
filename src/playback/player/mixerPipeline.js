@@ -1,6 +1,6 @@
 import { StreamType } from '@discordjs/voice';
 import { MixStream } from '../../audio/mixStream.js';
-import { getLogger } from '../../logging/botLogger.js'
+import { getLogger } from '../../logging/appLogger.js'
 
 const log = getLogger('GuildPlayer')
 

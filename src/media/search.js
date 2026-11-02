@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createTrack } from '../playback/queue.js';
-import { getLogger } from '../logging/botLogger.js';
+import { getLogger } from '../logging/appLogger.js';
 import { scrubString } from '../logging/redact.js';
 
 const log = getLogger('ytdlp');

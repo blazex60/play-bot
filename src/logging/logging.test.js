@@ -75,7 +75,7 @@ test('sanitizeUrl / scrubString', () => {
   assert.equal(sanitizeUrl('/a?code=1&page=2#frag'), '/a?code=[REDACTED]&page=2')
   assert.equal(sanitizeUrl('/a'), '/a')
   assert.equal(sanitizeUrl('/a?access_token=z'), '/a?access_token=[REDACTED]')
-  assert.equal(scrubString('Authorization: Bot abcdefghijk'), 'Authorization: Bot [REDACTED]')
+  assert.equal(scrubString('Authorization: Bot abcdefghijklmnopqrstuvwx'), 'Authorization: Bot [REDACTED]')
 })
 
 test('file sink: writes to date-named jsonl and survives restart (appends)', () => {
@@ -207,7 +207,7 @@ test('parseLogFileName', () => {
 test('getLogger is lazy: importing/creating child loggers opens no log files', async () => {
   const dir = tmp()
   try {
-    const { getLogger } = await import('./webLogger.js')
+    const { getLogger } = await import('./appLogger.js')
     process.env.LOG_DIR = dir
     const log = getLogger('lazy-test')
     assert.deepEqual(readdirSync(dir), [])

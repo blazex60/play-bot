@@ -5,7 +5,7 @@ import cookie from '@fastify/cookie'
 import fastifyStatic from '@fastify/static'
 import Fastify, { LogController } from 'fastify'
 import { randomUUID } from 'node:crypto'
-import { getWebLogger, getLogger, installProcessHandlers } from '../../logging/webLogger.js'
+import { getAppLogger, getLogger, installProcessHandlers, setLogService } from '../../logging/appLogger.js'
 import { createBotClient } from './botClient.js'
 import { startCleanupJob } from './cleanup.js'
 import { createWebConfig, defaultConfig } from './config.js'
@@ -54,9 +54,10 @@ export async function buildWebServer({
 } = {}) {
   // logger: false -> silent (tests); a pino-compatible instance -> used as is;
   // undefined/true -> the shared music-web logger (stdout + rotated files).
+  if (logger !== false && !(logger && typeof logger === 'object')) setLogService('music-web')
   const loggerOptions = logger === false
     ? { logger: false }
-    : { loggerInstance: logger && typeof logger === 'object' ? logger : getWebLogger() }
+    : { loggerInstance: logger && typeof logger === 'object' ? logger : getAppLogger() }
   const app = Fastify({
     ...loggerOptions,
     // Request lines are emitted by the onResponse hook below (route pattern,
@@ -176,6 +177,7 @@ export async function startWebServer({
   db,
   fetchImpl = globalThis.fetch,
 } = {}) {
+  setLogService('music-web')
   let app
   const log = getLogger('web')
   installProcessHandlers({ onShutdown: () => app?.close() })
@@ -185,7 +187,7 @@ export async function startWebServer({
     await app.listen({ host: config.host, port: config.port })
   } catch (err) {
     log.fatal({ event: 'web.start_failed', err })
-    getWebLogger().flushLogs?.()
+    getAppLogger().flushLogs?.()
     throw err
   }
   log.info({ event: 'web.listening', host: config.host, port: config.port })

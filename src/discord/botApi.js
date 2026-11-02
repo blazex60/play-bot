@@ -1,5 +1,5 @@
 import Fastify from 'fastify';
-import { getLogger } from '../logging/botLogger.js';
+import { getLogger } from '../logging/appLogger.js';
 
 const log = getLogger('bot-api');
 

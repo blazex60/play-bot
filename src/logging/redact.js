@@ -40,7 +40,10 @@ export function sanitizeUrl(input) {
 }
 
 const SECRET_PATTERNS = [
-  [/\b(Bearer|Bot|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [REDACTED]'],
+  // Case-sensitive for Bot/Basic and long tokens only, so prose such as
+  // "bot requires ManageMessages" or "Basic authentication" is left intact.
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/gi, 'Bearer [REDACTED]'],
+  [/\b(Bot|Basic)\s+[A-Za-z0-9._~+/=-]{20,}/g, '$1 [REDACTED]'],
   // Discord bot token: three base64url segments
   [/\b[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}\b/g, '[REDACTED_DISCORD_TOKEN]'],
   [/([?&](?:token|access_token|refresh_token|client_secret|signature|sig|key)=)[^&\s"']+/gi, '$1[REDACTED]'],

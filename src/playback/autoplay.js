@@ -2,7 +2,7 @@ import { getGuildSettings } from '../shared/settings.js'
 import { resolveRelated } from '../media/search.js'
 import { createTrack } from './queue.js'
 import { fmtDuration } from '../shared/format.js'
-import { getLogger } from '../logging/botLogger.js'
+import { getLogger } from '../logging/appLogger.js'
 
 const log = getLogger('autoplay')
 

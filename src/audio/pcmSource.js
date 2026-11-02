@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
 import { resolveAudioStream } from '../media/search.js';
 import { FRAME_BYTES } from './fade.js';
-import { getLogger } from '../logging/botLogger.js';
+import { getLogger } from '../logging/appLogger.js';
 import { scrubString } from '../logging/redact.js';
 
 const log = getLogger('pcmSource');

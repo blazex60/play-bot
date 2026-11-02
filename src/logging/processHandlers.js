@@ -5,7 +5,7 @@ const installed = new WeakSet()
  * buffered lines before the process goes away. Call once per entrypoint.
  * `onShutdown` (optional, may be async) runs before exit on SIGTERM/SIGINT.
  */
-export function installProcessHandlers(logger, { exit = code => process.exit(code), proc = process, onShutdown = null } = {}) {
+export function installProcessHandlers(logger, { exit = code => process.exit(code), proc = process, onShutdown = null, shutdownTimeoutMs = 8000 } = {}) {
   if (installed.has(logger)) return
   installed.add(logger)
   const log = logger.child({ component: 'process' })
@@ -22,13 +22,32 @@ export function installProcessHandlers(logger, { exit = code => process.exit(cod
     flush()
     exit(1)
   })
+  let shuttingDown = false
   for (const signal of ['SIGTERM', 'SIGINT']) {
     proc.on(signal, async () => {
+      if (shuttingDown) {
+        // A second signal means "stop waiting".
+        log.warn({ event: 'process.shutdown_forced', signal })
+        flush()
+        exit(1)
+        return
+      }
+      shuttingDown = true
       log.info({ event: 'process.shutdown', signal })
+      let timer
       try {
-        await onShutdown?.()
+        // Bounded so a hung close() cannot outlive `docker stop`'s grace period.
+        await Promise.race([
+          Promise.resolve().then(() => onShutdown?.()),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`shutdown exceeded ${shutdownTimeoutMs}ms`)), shutdownTimeoutMs)
+            timer.unref?.()
+          }),
+        ])
       } catch (err) {
         log.error({ event: 'process.shutdown_error', err })
+      } finally {
+        clearTimeout(timer)
       }
       flush()
       exit(0)

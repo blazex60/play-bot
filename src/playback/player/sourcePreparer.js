@@ -7,7 +7,7 @@ import { probeDurationSec } from '../../audio/duration.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../../audio/analysisQueue.js';
 import { StemPrefetchPriority } from '../../audio/stemPrefetch.js';
 import { LoopMode } from '../queue.js';
-import { getLogger } from '../../logging/botLogger.js'
+import { getLogger } from '../../logging/appLogger.js'
 
 const log = getLogger('GuildPlayer')
 

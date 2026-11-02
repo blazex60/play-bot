@@ -6,7 +6,7 @@ import { PlaybackService } from '../playback/playbackService.js'
 import { sessionPlanToken, isSessionStale } from '../playback/sessionAccessors.js'
 import { fmtDuration } from '../shared/format.js'
 import { resolveAdminRoleId } from '../shared/settings.js'
-import { getLogger } from '../logging/botLogger.js'
+import { getLogger } from '../logging/appLogger.js'
 
 const log = getLogger('recommendFlow')
 

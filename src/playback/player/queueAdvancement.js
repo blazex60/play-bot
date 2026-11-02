@@ -1,6 +1,6 @@
 import { shouldReconnectRetry } from './playbackPolicy.js';
 import { LoopMode } from '../queue.js';
-import { getLogger } from '../../logging/botLogger.js'
+import { getLogger } from '../../logging/appLogger.js'
 
 const log = getLogger('GuildPlayer')
 

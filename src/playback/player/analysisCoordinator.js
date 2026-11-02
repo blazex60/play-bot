@@ -2,7 +2,7 @@ import { cleanupTempFile } from '../../audio/normalize.js';
 import { ANALYSIS_VERSION } from '../../audio/trackAnalysis.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../../audio/analysisQueue.js';
 import { StemPrefetchPriority } from '../../audio/stemPrefetch.js';
-import { getLogger } from '../../logging/botLogger.js'
+import { getLogger } from '../../logging/appLogger.js'
 
 const log = getLogger('GuildPlayer')
 

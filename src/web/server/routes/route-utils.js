@@ -1,4 +1,4 @@
-import { getLogger } from '../../../logging/webLogger.js'
+import { getLogger } from '../../../logging/appLogger.js'
 
 const log = getLogger('operationLog')
 

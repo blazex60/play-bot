@@ -13,7 +13,7 @@ import { cleanupStaleTempDir } from '../audio/normalize.js'
 import { pruneStemCache, cleanupStaleStemStaging } from '../audio/stemCache.js'
 import { startBotApi } from './botApi.js'
 import { checkCommandAllowed } from './permissions.js'
-import { getBotLogger, getLogger, installProcessHandlers } from '../logging/botLogger.js'
+import { getAppLogger, getLogger, installProcessHandlers } from '../logging/appLogger.js'
 import { randomUUID } from 'node:crypto'
 
 const log = getLogger('main')
@@ -161,6 +161,6 @@ client.on(Events.VoiceStateUpdate, async (oldState) => {
 
 client.login(process.env.DISCORD_TOKEN).catch(err => {
   log.fatal({ event: 'bot.login_failed', err }, 'discord login failed')
-  getBotLogger().flushLogs?.()
+  getAppLogger().flushLogs?.()
   process.exit(1)
 })

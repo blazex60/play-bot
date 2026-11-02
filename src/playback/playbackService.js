@@ -14,7 +14,7 @@
  * `playback` singleton and exports `playbackFor(map)` for callers handed a
  * sessions Map (tests inject their own).
  */
-import { getLogger } from '../logging/botLogger.js'
+import { getLogger } from '../logging/appLogger.js'
 
 const log = getLogger('playbackService')
 

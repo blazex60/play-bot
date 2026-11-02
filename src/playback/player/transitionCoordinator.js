@@ -10,7 +10,7 @@ import {
 import { TAIL_WINDOW_SEC } from '../../audio/vocalActivity.js';
 import { LoopMode } from '../queue.js';
 import { buildTransitionPlanReport, exitInfo } from '../../audio/transitionLog.js';
-import { getLogger } from '../../logging/botLogger.js'
+import { getLogger } from '../../logging/appLogger.js'
 
 const log = getLogger('GuildPlayer')
 

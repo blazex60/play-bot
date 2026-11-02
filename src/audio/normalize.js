@@ -12,7 +12,7 @@ import {
   buildAtrimFilter,
 } from './silenceTrim.js'
 import { probeDurationSec } from './duration.js'
-import { getLogger } from '../logging/botLogger.js'
+import { getLogger } from '../logging/appLogger.js'
 
 const log = getLogger('normalize')
 

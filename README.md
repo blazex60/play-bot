@@ -173,14 +173,14 @@ logs/                      # ホスト側。コンテナの /app/logs にバイ�
 | `LOG_RETENTION_DAYS` | `7` | UTC 日付単位の保持日数(当日を含む) |
 | `LOG_MAX_FILE_MIB` | `10` | これを超えると同日内で世代を進める |
 | `LOG_MAX_FILES_PER_DAY` | `5` | 1 日・1 サービスあたりの最大世代数 |
-| `LOG_MAX_TOTAL_MIB` | `500` | 総容量の上限(超えたら古い順に削除) |
+| `LOG_MAX_TOTAL_MIB` | `500` | サービスごとの総容量の上限(超えたら古い順に削除。Bot と Web で合計はこの 2 倍まで) |
 | `LOG_FILE_ENABLED` | `true` | `false` でファイル出力を無効化(テスト時は自動で無効) |
 
 期限切れファイルの削除は起動時と 1 時間ごとに行い、書き込み中のファイルは消さない。保存先に書けない場合は stderr に警告を出すだけで、Bot の再生は止まらない。
 
 ```bash
 docker compose logs -f music-bot                      # 標準出力
-tail -f logs/music-bot/$(date -u +%F).jsonl | jq .     # ファイル
+tail -F "$(ls -t logs/music-bot/*.jsonl | head -1)" | jq .   # ファイル(最新世代)
 jq -c 'select(.event=="command.failed")' logs/music-bot/*.jsonl
 jq -c 'select(.correlationId=="<id>")' logs/music-bot/*.jsonl   # 1 コマンドの追跡
 ```
