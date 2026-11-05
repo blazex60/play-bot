@@ -6,7 +6,7 @@
   "main": "src/discord/main.js",
   "license": "MIT",
   "engines": {
-    "node": ">=20",
+    "node": ">=22",
     "bun": ">=1.2.0"
   },
   "scripts": {
