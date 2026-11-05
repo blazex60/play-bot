@@ -49,17 +49,17 @@ for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js') && !f
 client.once(Events.ClientReady, c => {
   log.info({ event: 'bot.ready', clientId: c.user.id, guildCount: c.guilds.cache.size, commandCount: commands.size })
   startBotApi({ client, sessions, commandNames: [...commands.keys()] }).catch(err => {
-    log.error({ event: 'botapi.failed_to_start', err }, 'failed to start')
+    log.error({ event: 'botapi.failed_to_start', err }, '起動に失敗')
     process.exitCode = 1
   })
 })
 
-client.on(Events.Error, err => log.error({ event: 'discord.client_error', err }, 'discord client error'))
+client.on(Events.Error, err => log.error({ event: 'discord.client_error', err }, 'Discord クライアントエラー'))
 client.on(Events.Warn, message => log.warn({ event: 'discord.client_warn' }, message))
-client.on(Events.ShardDisconnect, (event, shardId) => log.warn({ event: 'discord.shard_disconnect', shardId, code: event?.code }, 'shard disconnected'))
-client.on(Events.ShardReconnecting, shardId => log.info({ event: 'discord.shard_reconnecting', shardId }, 'shard reconnecting'))
-client.on(Events.ShardResume, (shardId, replayedEvents) => log.info({ event: 'discord.shard_resume', shardId, replayedEvents }, 'shard resumed'))
-client.on(Events.ShardError, (err, shardId) => log.error({ event: 'discord.shard_error', shardId, err }, 'shard error'))
+client.on(Events.ShardDisconnect, (event, shardId) => log.warn({ event: 'discord.shard_disconnect', shardId, code: event?.code }, 'シャード切断'))
+client.on(Events.ShardReconnecting, shardId => log.info({ event: 'discord.shard_reconnecting', shardId }, 'シャード再接続中'))
+client.on(Events.ShardResume, (shardId, replayedEvents) => log.info({ event: 'discord.shard_resume', shardId, replayedEvents }, 'シャード再開'))
+client.on(Events.ShardError, (err, shardId) => log.error({ event: 'discord.shard_error', shardId, err }, 'シャードエラー'))
 
 client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isChatInputCommand()) {
@@ -81,7 +81,7 @@ client.on(Events.InteractionCreate, async interaction => {
     const startedAt = Date.now()
 
     if (!checkCommandAllowed(interaction, resolveAdminRoleId(interaction.guildId))) {
-      cmdLog.info({ event: 'command.blocked' }, 'command blocked by permission')
+      cmdLog.info({ event: 'command.blocked' }, '権限によりコマンドをブロック')
       logOperation(false, 'blocked')
       return
     }
@@ -105,7 +105,7 @@ client.on(Events.InteractionCreate, async interaction => {
         logOperation(result !== false)
       }
     } catch (err) {
-      cmdLog.error({ event: 'command.failed', durationMs: Date.now() - startedAt, err }, 'command failed')
+      cmdLog.error({ event: 'command.failed', durationMs: Date.now() - startedAt, err }, 'コマンド失敗')
       logOperation(false, err.message)
       const reply = { content: '❌ コマンドの実行中にエラーが発生しました', flags: MessageFlags.Ephemeral }
       if (interaction.replied || interaction.deferred) {
@@ -154,13 +154,13 @@ client.on(Events.VoiceStateUpdate, async (oldState) => {
   if (!channel) return
   const humans = channel.members.filter(m => !m.user.bot)
   if (humans.size === 0) {
-    log.info({ event: 'voice.auto_disconnect', guildId: oldState.guild.id, reason: 'all_humans_left' }, 'all humans left, auto-disconnecting')
-    destroySession(sessions, oldState.guild.id).catch((err) => log.error({ event: 'voice.disconnect_failed', guildId: oldState.guild.id, err }, 'disconnect failed'))
+    log.info({ event: 'voice.auto_disconnect', guildId: oldState.guild.id, reason: 'all_humans_left' }, 'ユーザー全員が退出したため自動切断')
+    destroySession(sessions, oldState.guild.id).catch((err) => log.error({ event: 'voice.disconnect_failed', guildId: oldState.guild.id, err }, '切断に失敗'))
   }
 })
 
 client.login(process.env.DISCORD_TOKEN).catch(err => {
-  log.fatal({ event: 'bot.login_failed', err }, 'discord login failed')
+  log.fatal({ event: 'bot.login_failed', err }, 'Discord ログイン失敗')
   getAppLogger().flushLogs?.()
   process.exit(1)
 })

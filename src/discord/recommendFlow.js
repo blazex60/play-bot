@@ -106,7 +106,7 @@ async function reconsiderTeardown(guildId, pendingStore, recommendRounds) {
   try {
     await onTimeout()
   } catch (err) {
-    log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout failed')
+    log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout 失敗')
   }
 }
 
@@ -173,7 +173,7 @@ function scheduleExpiry(entry, pendingStore, guildId, recommendRounds, onTimeout
       try {
         await onTimeout()
       } catch (err) {
-        log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout failed')
+        log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout 失敗')
       }
     }
   }, RECOMMEND_TIMEOUT_MS)
@@ -200,7 +200,7 @@ function scheduleRoundExpiry(entry, recommendRounds, pendingStore, guildId, onTi
       try {
         await onTimeout()
       } catch (err) {
-        log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout failed')
+        log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout 失敗')
       }
     }
   }, RECOMMEND_TIMEOUT_MS)
@@ -235,7 +235,7 @@ export async function postRecommendationPrompt({ channel, guildId, guildName, pl
   try {
     message = await channel.send({ embeds: [embed], components })
   } catch (err) {
-    log.error({ event: 'recommend.failed_to_post_recommendation_prompt', err }, 'failed to post recommendation prompt')
+    log.error({ event: 'recommend.failed_to_post_recommendation_prompt', err }, 'おすすめプロンプトの投稿に失敗')
     return 0
   }
 

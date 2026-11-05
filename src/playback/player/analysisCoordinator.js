@@ -149,7 +149,7 @@ export class AnalysisCoordinator {
     // exactly that scenario. Best-effort: if staging fails, separation for
     // this track is simply skipped below.
     const stagedPathPromise = this.#stageTempFileCopyFn(filePath).catch((err) => {
-      log.warn({ event: 'playback.failed_to_stage_file_for_stem_separation', err }, 'failed to stage file for stem separation');
+      log.warn({ event: 'playback.failed_to_stage_file_for_stem_separation', err }, 'ステム分離用ファイルの配置に失敗');
       return null;
     });
 
@@ -270,7 +270,7 @@ export class AnalysisCoordinator {
               }
             },
             (err) => {
-              log.warn({ event: 'playback.stem_separation_failed', err }, 'stem separation failed');
+              log.warn({ event: 'playback.stem_separation_failed', err }, 'ステム分離に失敗');
               if (this.#stemPrefetchTracker.get(track.videoId)) {
                 this.#stemPrefetchTracker.markFailed(track.videoId);
               }
@@ -331,7 +331,7 @@ export class AnalysisCoordinator {
         this.#stemPrefetchTracker.markFailed(track.videoId);
       }
       if (err?.code === 'ANALYSIS_KILLED') {
-        log.warn({ event: 'playback.analysis_yielded_to_mixer', err }, 'analysis yielded to mixer');
+        log.warn({ event: 'playback.analysis_yielded_to_mixer', err }, '解析をミキサーに譲渡');
         // Codex review (PR #44, P2): specifically an ANALYSIS_KILLED abort
         // (a real-time-pressure preemption, e.g. a mixer underrun stopping
         // this job mid-run) is the transient case worth retrying — unlike
@@ -350,7 +350,7 @@ export class AnalysisCoordinator {
         }
         return;
       }
-      log.warn({ event: 'playback.analysis_failed', err }, 'analysis failed');
+      log.warn({ event: 'playback.analysis_failed', err }, '解析に失敗');
     });
   }
 

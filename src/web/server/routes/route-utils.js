@@ -110,7 +110,7 @@ export function recordOperationLog(db, { guildId, discordUserId, username, sourc
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(guildId, discordUserId ?? null, username ?? null, source, action, detail ?? null, success ? 1 : 0, nowUnix())
   } catch (error) {
-    log.error({ event: 'web.operation_log.record_failed', err: error }, 'failed to record operation log')
+    log.error({ event: 'web.operation_log.record_failed', err: error }, '操作ログの記録に失敗')
   }
 }
 

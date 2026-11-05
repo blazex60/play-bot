@@ -201,7 +201,7 @@ export function buildBotApi({
     request.startedAt = process.hrtime.bigint();
     if (request.url === '/healthz') return;
     if (!token || getBearerToken(request) !== token) {
-      log.warn({ event: 'botapi.auth_rejected', method: request.method, route: request.routeOptions?.url }, 'unauthorized bot api call');
+      log.warn({ event: 'botapi.auth_rejected', method: request.method, route: request.routeOptions?.url }, '未認可の Bot API 呼び出し');
       return reply.code(401).send({ error: 'unauthorized' });
     }
   });
@@ -445,6 +445,6 @@ export async function startBotApi(options) {
   const app = buildBotApi(options);
   const port = parsePort(process.env.BOT_API_PORT);
   await app.listen({ host: LOOPBACK_HOST, port });
-  log.info({ event: 'botapi.listening', host: LOOPBACK_HOST, port }, 'bot api listening');
+  log.info({ event: 'botapi.listening', host: LOOPBACK_HOST, port }, 'Bot API 待受開始');
   return app;
 }

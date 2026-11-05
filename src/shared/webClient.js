@@ -63,7 +63,7 @@ export function createWebClient({
           body: { guildId, discordUserId, username, trackTitle, trackUrl, videoId, channel },
         })
       } catch (err) {
-        log.error({ event: 'webclient.recordplay_failed', err }, 'recordPlay failed')
+        log.error({ event: 'webclient.recordplay_failed', err }, 'recordPlay 失敗')
       }
     },
     async getRecentHistory({ guildId, userIds, limit } = {}) {
@@ -73,7 +73,7 @@ export function createWebClient({
         if (limit) search.set('limit', String(limit))
         return (await request(`/internal/play-history/recent?${search.toString()}`)) ?? {}
       } catch (err) {
-        log.error({ event: 'webclient.getrecenthistory_failed', err }, 'getRecentHistory failed')
+        log.error({ event: 'webclient.getrecenthistory_failed', err }, 'getRecentHistory 失敗')
         return {}
       }
     },
@@ -84,7 +84,7 @@ export function createWebClient({
           body: { guildId, discordUserId, username, source, action, detail, success },
         })
       } catch (err) {
-        log.error({ event: 'webclient.logoperation_failed', err }, 'logOperation failed')
+        log.error({ event: 'webclient.logoperation_failed', err }, 'logOperation 失敗')
       }
     },
     async getTrackAnalysis(videoId) {
@@ -94,7 +94,7 @@ export function createWebClient({
         return payload?.analysis ?? null
       } catch (err) {
         if (err?.status === 404) return null
-        log.error({ event: 'webclient.gettrackanalysis_failed', err }, 'getTrackAnalysis failed')
+        log.error({ event: 'webclient.gettrackanalysis_failed', err }, 'getTrackAnalysis 失敗')
         return null
       }
     },
@@ -107,7 +107,7 @@ export function createWebClient({
         })
         return true
       } catch (err) {
-        log.error({ event: 'webclient.puttrackanalysis_failed', err }, 'putTrackAnalysis failed')
+        log.error({ event: 'webclient.puttrackanalysis_failed', err }, 'putTrackAnalysis 失敗')
         return false
       }
     },

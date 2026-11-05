@@ -212,11 +212,11 @@ export class SourcePreparer {
         trackId: track.videoId,
         measuredLufs: prefetched.measured.measured_I,
         targetLufs: -16,
-      }, 'normalize applied');
+      }, 'ノーマライズ適用');
       if (forIncoming) {
         if (prepId != null && prepId !== this.#incomingPrepId) {
           cleanupTempFile(prefetched.filePath).catch((err) => {
-            log.error({ event: 'playback.abandoned_incoming_temp_cleanup_error', err }, 'abandoned incoming temp cleanup error');
+            log.error({ event: 'playback.abandoned_incoming_temp_cleanup_error', err }, '破棄された次曲の一時ファイル削除でエラー');
           });
           // Do not schedule analysis or open a FileSource on a temp we are
           // deleting — callers treat rejection as a cancelled/failed prep.
@@ -235,7 +235,7 @@ export class SourcePreparer {
       return source;
     } catch (err) {
       if (err?.code === 'INCOMING_PREP_CANCELLED') throw err;
-      log.warn({ event: 'audio.normalize.fallback', trackId: track.videoId, err }, 'normalize fallback to stream source');
+      log.warn({ event: 'audio.normalize.fallback', trackId: track.videoId, err }, 'ノーマライズ失敗、ストリームソースにフォールバック');
       if (track.videoId) this.#analysis.probedDurationCache.delete(track.videoId);
       const source = createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStreamFn, startSec });
       source.tempoHonored = false;
@@ -452,7 +452,7 @@ export class SourcePreparer {
     this.#incomingMeasured = null;
     if (filePath) {
       cleanupTempFile(filePath).catch((err) => {
-        log.error({ event: 'playback.prepared_incoming_temp_cleanup_error', err }, 'prepared incoming temp cleanup error');
+        log.error({ event: 'playback.prepared_incoming_temp_cleanup_error', err }, '準備済み次曲の一時ファイル削除でエラー');
       });
     }
   }
@@ -717,15 +717,15 @@ export class SourcePreparer {
         })
         .catch((err) => {
           if (err?.code === 'ANALYSIS_KILLED') {
-            log.warn({ event: 'playback.low_priority_stem_prefetch_yielded_to_mixer', err }, 'low-priority stem prefetch yielded to mixer');
+            log.warn({ event: 'playback.low_priority_stem_prefetch_yielded_to_mixer', err }, '低優先度ステム先読みをミキサーに譲渡');
           } else {
-            log.warn({ event: 'playback.low_priority_stem_prefetch_failed', err }, 'low-priority stem prefetch failed');
+            log.warn({ event: 'playback.low_priority_stem_prefetch_failed', err }, '低優先度ステム先読みに失敗');
           }
           this.#stemPrefetchTracker.markFailed(videoId);
         })
         .finally(() => this.#lowPriorityStemPrefetch.delete(videoId));
     }).catch((err) => {
-      log.warn({ event: 'playback.stem_prefetch_cache_check_failed', err }, 'stem prefetch cache check failed');
+      log.warn({ event: 'playback.stem_prefetch_cache_check_failed', err }, 'ステム先読みのキャッシュ確認に失敗');
     });
   }
 
@@ -773,7 +773,7 @@ export class SourcePreparer {
       try {
         throwIfAborted(signal);
         const stagedPath = await this.#stageTempFileCopyFn(downloaded.filePath).catch((err) => {
-          log.warn({ event: 'playback.failed_to_stage_file_for_low_priority_stem_prefetc', err }, 'failed to stage file for low-priority stem prefetch');
+          log.warn({ event: 'playback.failed_to_stage_file_for_low_priority_stem_prefetc', err }, '低優先度ステム先読み用ファイルの配置に失敗');
           return null;
         });
         if (!stagedPath) return null;
@@ -843,7 +843,7 @@ export class SourcePreparer {
         return { analyzed: true };
       }).then((value) => ({ value }), (error) => {
         if (error?.code !== 'ANALYSIS_KILLED') {
-          log.warn({ event: 'playback.lookahead_analysis_failed', err: error }, 'lookahead analysis failed');
+          log.warn({ event: 'playback.lookahead_analysis_failed', err: error }, '先読み解析に失敗');
         }
         return { error };
       }),
@@ -865,7 +865,7 @@ export class SourcePreparer {
     entry.promise.then((result) => {
       if (result.value?.filePath) {
         cleanupTempFile(result.value.filePath).catch((err) => {
-          log.error({ event: 'playback.prefetch_cleanup_error', err }, 'prefetch cleanup error');
+          log.error({ event: 'playback.prefetch_cleanup_error', err }, '先読みクリーンアップエラー');
         });
       }
     }).catch(() => {});

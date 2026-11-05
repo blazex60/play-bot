@@ -36,12 +36,12 @@ export function createBotClient({ baseUrl, token, fetchImpl = globalThis.fetch }
       })
       text = await response.text()
     } catch (err) {
-      log.error({ event: 'web.botapi.unreachable', method, route, durationMs: Date.now() - startedAt, err }, 'bot api unreachable')
+      log.error({ event: 'web.botapi.unreachable', method, route, durationMs: Date.now() - startedAt, err }, 'Bot API に到達不能')
       throw err
     }
     const payload = text ? JSON.parse(text) : null
     if (!response.ok) {
-      log.warn({ event: 'web.botapi.error_response', method, route, status: response.status, durationMs: Date.now() - startedAt }, 'bot api returned an error')
+      log.warn({ event: 'web.botapi.error_response', method, route, status: response.status, durationMs: Date.now() - startedAt }, 'Bot API がエラーを返却')
       throw new BotApiError(`Bot API request failed: ${method} ${path}`, {
         status: response.status,
         body: payload,

@@ -47,7 +47,7 @@ async function tryResolveRelated(resolveRelatedFn, videoId, limit) {
     const candidates = await resolveRelatedFn(videoId, { limit })
     return candidates.length > 0 ? candidates : null
   } catch (err) {
-    log.error({ event: 'playback.resolverelated_failed', err }, 'resolveRelated failed')
+    log.error({ event: 'playback.resolverelated_failed', err }, 'resolveRelated 失敗')
     return null
   }
 }

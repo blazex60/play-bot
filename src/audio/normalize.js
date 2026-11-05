@@ -216,7 +216,7 @@ export async function trimSilence(filePath, {
     } catch {
       await cleanupTempFile(backupPath)
     }
-    log.warn({ event: 'audio.normalize.silence_trim_skipped', err }, 'silence trim skipped')
+    log.warn({ event: 'audio.normalize.silence_trim_skipped', err }, '無音トリムをスキップ')
     return false
   }
 }

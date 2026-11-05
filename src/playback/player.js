@@ -211,7 +211,7 @@ export class GuildPlayer {
         // Mid-fade incoming failure: MixStream already cleared overlap and
         // kept outgoing. Reset arm state so #maybeStartCrossfade can retry,
         // and drop any normalize temp created for the failed incoming leg.
-        log.warn({ event: 'playback.mix_incoming_error', err }, 'mix incoming error');
+        log.warn({ event: 'playback.mix_incoming_error', err }, '次曲ミックスエラー');
         this.#transitions.crossfadeStarted = false;
         this.#transitions.crossfadeTargetTrack = null;
         // §2.3/§8.4: this attempt never reached promotion — a stashed
@@ -221,7 +221,7 @@ export class GuildPlayer {
         this.#transitions.pendingSessionTempo = null;
         this.#transitions.pendingIncomingEntrySec = 0;
         this.#sourcePreparer.cleanupIncomingTempFile().catch((cleanupErr) => {
-          log.warn({ event: 'playback.incoming_temp_cleanup_failed', err: cleanupErr }, 'incoming temp cleanup failed');
+          log.warn({ event: 'playback.incoming_temp_cleanup_failed', err: cleanupErr }, '次曲の一時ファイル削除に失敗');
         });
       },
       playNext: () => this.playNext(),
@@ -297,7 +297,7 @@ export class GuildPlayer {
         this.#lastActiveAt = Date.now();
       },
       onStall: () => {
-        log.warn({ event: 'playback.watchdog_stall_detected' }, 'watchdog: stall detected');
+        log.warn({ event: 'playback.watchdog_stall_detected' }, 'ウォッチドッグ: 停止を検知');
         this.#hadError = true;
         this.mixStream?.dropCurrent();
         // Codex review (PR #45, P1): same silent underrun-state reset as the
@@ -338,7 +338,7 @@ export class GuildPlayer {
     this.#pipeline.initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
       if (!this.#pipeline.mixerStarted || this.#pipeline.idleRecovering) return;
-      log.warn({ event: 'playback.unexpected_idle_recovering_mixer_playback' }, 'unexpected Idle, recovering mixer playback');
+      log.warn({ event: 'playback.unexpected_idle_recovering_mixer_playback' }, '想定外の Idle、ミキサー再生を復旧中');
       this.#pipeline.idleRecovering = true;
       // Never play the rebuilt mixer empty: MixStream's 8s underrun guard
       // would sourceerror while playNext is still downloading/analyzing.
@@ -348,7 +348,7 @@ export class GuildPlayer {
       const done = () => { this.#pipeline.idleRecovering = false; };
       if (restartCurrent) {
         this.playNext().catch((err) => {
-          log.error({ event: 'playback.mixer_idle_restart_failed', err }, 'mixer Idle restart failed');
+          log.error({ event: 'playback.mixer_idle_restart_failed', err }, 'ミキサー Idle 再起動に失敗');
         }).finally(done);
       } else {
         done();
@@ -362,7 +362,7 @@ export class GuildPlayer {
     });
 
     this.#audioPlayer.on('error', err => {
-      log.error({ event: 'playback.audioplayer_error', err }, 'audioPlayer error');
+      log.error({ event: 'playback.audioplayer_error', err }, 'audioPlayer エラー');
       this.#hadError = true;
       this.#pipeline.abortSourceAudioWait();
       this.mixStream?.dropCurrent();
@@ -435,7 +435,7 @@ export class GuildPlayer {
     try {
       source = await this.#sourcePreparer.takePreparedIncoming(track, { forPlayback: true });
     } catch (err) {
-      log.warn({ event: 'playback.pcm_source_failed', trackId: track.videoId, err }, 'pcm source failed');
+      log.warn({ event: 'playback.pcm_source_failed', trackId: track.videoId, err }, 'PCM ソース失敗');
       this.#hadError = true;
       // A stop() that began during the prep await owns teardown — kicking
       // the advancement drain here could end in a disconnect the stop
@@ -722,7 +722,7 @@ export class GuildPlayer {
       if (this.#queue.current !== target) {
         const advanced = this.#queue.next({ forceAdvance: true });
         if (advanced !== target && this.#queue.current !== target) {
-          log.warn({ event: 'playback.crossfade_promote_queue_desync' }, 'crossfade promote queue desync');
+          log.warn({ event: 'playback.crossfade_promote_queue_desync' }, 'クロスフェード昇格時にキューが不整合');
         }
       }
     } else {
@@ -841,7 +841,7 @@ export class GuildPlayer {
       videoId: track.videoId,
       channel: track.channel,
     }).catch((err) => {
-      log.error({ event: 'playback.recordplayfn_failed', err }, 'recordPlayFn failed');
+      log.error({ event: 'playback.recordplayfn_failed', err }, 'recordPlayFn 失敗');
     });
   }
 
@@ -933,7 +933,7 @@ export class GuildPlayer {
         source = await this.#sourcePreparer.createPcmSource(track, { startSec: target });
       }
     } catch (err) {
-      log.error({ event: 'playback.seek_source_failed', err }, 'seek source failed');
+      log.error({ event: 'playback.seek_source_failed', err }, 'シーク用ソース失敗');
       return false;
     }
     if (this.#stopGeneration !== generation) {
