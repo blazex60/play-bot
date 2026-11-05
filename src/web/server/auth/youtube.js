@@ -47,12 +47,12 @@ export function registerYoutubeAuthRoutes(
     const code = request.query?.code
     const state = request.query?.state
     if (!code || !state) {
-      request.log.warn({ event: 'auth.oauth.callback_rejected', service: 'youtube', reason: 'missing_params' }, 'oauth callback rejected')
+      request.log.warn({ event: 'auth.oauth.callback_rejected', service: 'youtube', reason: 'missing_params' }, 'OAuth コールバックを拒否')
       return reply.code(400).send({ error: 'missing_oauth_callback_params' })
     }
     const consumed = consumeOauthState({ db, service: 'youtube', state })
     if (!consumed.ok) {
-      request.log.warn({ event: 'auth.oauth.callback_rejected', service: 'youtube', reason: consumed.error }, 'oauth callback rejected')
+      request.log.warn({ event: 'auth.oauth.callback_rejected', service: 'youtube', reason: consumed.error }, 'OAuth コールバックを拒否')
       return reply.code(400).send({ error: consumed.error })
     }
 

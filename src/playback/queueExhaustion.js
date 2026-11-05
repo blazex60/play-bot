@@ -101,7 +101,7 @@ export function createQueueExhaustionHandler({
             // Notification delivery is optional and must not keep the bounded
             // queue-exhaustion continuation open after playback has started.
             void textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
-              log.error({ event: 'playback.failed_to_post_autoplay_notification', err }, 'failed to post autoplay notification')
+              log.error({ event: 'playback.failed_to_post_autoplay_notification', err }, 'オートプレイ通知の投稿に失敗')
             })
           }
         }

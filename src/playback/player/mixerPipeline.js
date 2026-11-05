@@ -121,7 +121,7 @@ export class MixerPipeline {
     this.mixerResource = null;
     this.mixerStarted = false;
     this.mixStream.on('trackend', (info) => {
-      log.info({ event: 'playback.track.ended', promoted: Boolean(info?.promoted) }, 'track ended');
+      log.info({ event: 'playback.track.ended', promoted: Boolean(info?.promoted) }, '曲終了');
       if (info?.promoted) {
         this.#onCrossfadePromoted();
         return;
@@ -129,7 +129,7 @@ export class MixerPipeline {
       this.#advanceAfterPlayback();
     });
     this.mixStream.on('sourceerror', (err) => {
-      log.error({ event: 'playback.mix_source_error', err }, 'mix source error');
+      log.error({ event: 'playback.mix_source_error', err }, 'ミックスソースエラー');
       this.#markHadError();
       this.abortSourceAudioWait();
       this.mixStream.dropCurrent();
@@ -143,7 +143,7 @@ export class MixerPipeline {
     });
     this.mixStream.on('snaphandoff', ({ adopt }) => {
       this.#onSnapHandoff(adopt).catch((err) => {
-        log.warn({ event: 'playback.snap_handoff_failed', err }, 'snap handoff failed');
+        log.warn({ event: 'playback.snap_handoff_failed', err }, 'スナップハンドオフに失敗');
       });
     });
     this.mixStream.on('underrun', () => {
@@ -181,7 +181,7 @@ export class MixerPipeline {
     // own recoverable signals). Same recovery shape as the Idle handler
     // above: rebuild the mixer pipeline and restart the current track.
     this.mixStream.on('error', (err) => {
-      log.error({ event: 'playback.mixstream_error', err }, 'mixStream error');
+      log.error({ event: 'playback.mixstream_error', err }, 'mixStream エラー');
       if (this.idleRecovering) return;
       this.idleRecovering = true;
       this.#markHadError();
@@ -192,7 +192,7 @@ export class MixerPipeline {
       const done = () => { this.idleRecovering = false; };
       if (restartCurrent) {
         this.#playNext().catch((restartErr) => {
-          log.error({ event: 'playback.mixstream_error_recovery_restart_failed', err: restartErr }, 'mixStream error recovery restart failed');
+          log.error({ event: 'playback.mixstream_error_recovery_restart_failed', err: restartErr }, 'mixStream エラー復旧の再起動に失敗');
         }).finally(done);
       } else {
         done();
@@ -290,7 +290,7 @@ export class MixerPipeline {
    */
   recoverMixerPlayback({ play = false } = {}) {
     if (this.isMixerDead()) {
-      log.warn({ event: 'playback.mixer_resource_ended_rebuilding_pipeline' }, 'mixer resource ended; rebuilding pipeline');
+      log.warn({ event: 'playback.mixer_resource_ended_rebuilding_pipeline' }, 'ミキサーリソースが終了、パイプラインを再構築');
       try {
         this.mixStream?.removeAllListeners();
         if (this.mixStream && !this.mixStream.destroyed) {
@@ -320,7 +320,7 @@ export class MixerPipeline {
       this.#audioPlayer.play(this.mixerResource);
       this.mixerStarted = true;
     } catch (err) {
-      log.error({ event: 'playback.mixer_play_failed_rebuilding', err }, 'mixer play failed, rebuilding');
+      log.error({ event: 'playback.mixer_play_failed_rebuilding', err }, 'ミキサー再生に失敗、再構築中');
       this.recoverMixerPlayback({ play: false });
       if (this.#isMixerStreamDead() || !this.mixStream.currentSource) return;
       this.#attachMixerResource();
@@ -329,7 +329,7 @@ export class MixerPipeline {
         this.#audioPlayer.play(this.mixerResource);
         this.mixerStarted = true;
       } catch (err2) {
-        log.error({ event: 'playback.mixer_recovery_rebuild_play_failed', err: err2 }, 'mixer recovery rebuild play failed');
+        log.error({ event: 'playback.mixer_recovery_rebuild_play_failed', err: err2 }, 'ミキサー復旧後の再構築再生に失敗');
       }
     }
   }

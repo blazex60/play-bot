@@ -127,7 +127,7 @@ export class QueueAdvancement {
     this.handlingAfter = true;
     this.#drainAfterPlayback()
       .catch(err => {
-        log.error({ event: 'playback.handleafter_error', err }, 'handleAfter error');
+        log.error({ event: 'playback.handleafter_error', err }, 'handleAfter エラー');
       })
       .finally(() => {
         this.handlingAfter = false;
@@ -260,7 +260,7 @@ export class QueueAdvancement {
     try {
       return await Promise.race([this.#handleQueueExhausted(finishedTrack), timeout]);
     } catch (err) {
-      log.error({ event: 'playback.handlequeueexhausted_error', err }, 'handleQueueExhausted error');
+      log.error({ event: 'playback.handlequeueexhausted_error', err }, 'handleQueueExhausted エラー');
       return false;
     } finally {
       clearTimeout(timeoutHandle);
@@ -299,7 +299,7 @@ export class QueueAdvancement {
         if (handled) this.#sourcePreparer.prefetchUpcoming();
       })
       .catch((err) => {
-        log.warn({ event: 'playback.early_queue_refill_failed', err }, 'early queue refill failed');
+        log.warn({ event: 'playback.early_queue_refill_failed', err }, 'キュー早期補充に失敗');
       });
   }
 }

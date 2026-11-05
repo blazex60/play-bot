@@ -161,7 +161,7 @@ export class PcmSource extends EventEmitter {
     proc.on('close', (code) => {
       if (code !== 0 && !source.ended && !source.#destroyed) {
         const detail = stderrTail.trim();
-        log.error({ event: 'audio.ffmpeg.exited', exitCode: code, stderrTail: scrubString(detail.slice(-500)) }, 'ffmpeg exited abnormally');
+        log.error({ event: 'audio.ffmpeg.exited', exitCode: code, stderrTail: scrubString(detail.slice(-500)) }, 'ffmpeg が異常終了');
         source.#fail(new Error(
           detail ? `ffmpeg exited with ${code}: ${detail}` : `ffmpeg exited with ${code}`,
         ));
@@ -212,7 +212,7 @@ export class PcmSource extends EventEmitter {
     proc.on('close', (code) => {
       if (code !== 0 && !source.ended && !source.#destroyed) {
         const detail = stderrTail.trim();
-        log.error({ event: 'audio.ffmpeg.exited', exitCode: code, stderrTail: scrubString(detail.slice(-500)) }, 'ffmpeg exited abnormally');
+        log.error({ event: 'audio.ffmpeg.exited', exitCode: code, stderrTail: scrubString(detail.slice(-500)) }, 'ffmpeg が異常終了');
         source.#fail(new Error(
           detail ? `ffmpeg exited with ${code}: ${detail}` : `ffmpeg exited with ${code}`,
         ));

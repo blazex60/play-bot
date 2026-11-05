@@ -169,11 +169,11 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal }) 
     // Enforce the size cap after every write, not just at Bot startup —
     // a long-running process would otherwise grow the cache unbounded.
     pruneStemCache().catch((err) => {
-      log.warn({ event: 'audio.stemcache.prune_failed', err }, 'prune after separation failed');
+      log.warn({ event: 'audio.stemcache.prune_failed', err }, '分離後のキャッシュ整理に失敗');
     });
     return { vocalPath, instrumentalPath };
   } catch (err) {
-    log.warn({ event: 'audio.stemcache.separation_failed', trackId: videoId, err }, 'stem separation failed');
+    log.warn({ event: 'audio.stemcache.separation_failed', trackId: videoId, err }, 'ステム分離に失敗');
     return null;
   } finally {
     await rm(jobTmpRoot, { recursive: true, force: true }).catch(() => {});
