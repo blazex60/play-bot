@@ -2,6 +2,9 @@ import { cleanupTempFile } from '../../audio/normalize.js';
 import { ANALYSIS_VERSION } from '../../audio/trackAnalysis.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../../audio/analysisQueue.js';
 import { StemPrefetchPriority } from '../../audio/stemPrefetch.js';
+import { getLogger } from '../../logging/appLogger.js'
+
+const log = getLogger('GuildPlayer')
 
 const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 
@@ -146,7 +149,7 @@ export class AnalysisCoordinator {
     // exactly that scenario. Best-effort: if staging fails, separation for
     // this track is simply skipped below.
     const stagedPathPromise = this.#stageTempFileCopyFn(filePath).catch((err) => {
-      console.warn('[GuildPlayer] failed to stage file for stem separation:', err.message);
+      log.warn({ event: 'playback.failed_to_stage_file_for_stem_separation', err }, 'failed to stage file for stem separation');
       return null;
     });
 
@@ -267,7 +270,7 @@ export class AnalysisCoordinator {
               }
             },
             (err) => {
-              console.warn('[GuildPlayer] stem separation failed:', err.message);
+              log.warn({ event: 'playback.stem_separation_failed', err }, 'stem separation failed');
               if (this.#stemPrefetchTracker.get(track.videoId)) {
                 this.#stemPrefetchTracker.markFailed(track.videoId);
               }
@@ -328,7 +331,7 @@ export class AnalysisCoordinator {
         this.#stemPrefetchTracker.markFailed(track.videoId);
       }
       if (err?.code === 'ANALYSIS_KILLED') {
-        console.warn('[GuildPlayer] analysis yielded to mixer:', err.message);
+        log.warn({ event: 'playback.analysis_yielded_to_mixer', err }, 'analysis yielded to mixer');
         // Codex review (PR #44, P2): specifically an ANALYSIS_KILLED abort
         // (a real-time-pressure preemption, e.g. a mixer underrun stopping
         // this job mid-run) is the transient case worth retrying — unlike
@@ -347,7 +350,7 @@ export class AnalysisCoordinator {
         }
         return;
       }
-      console.warn('[GuildPlayer] analysis failed:', err.message);
+      log.warn({ event: 'playback.analysis_failed', err }, 'analysis failed');
     });
   }
 

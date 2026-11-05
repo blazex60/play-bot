@@ -1,4 +1,7 @@
 import Fastify from 'fastify';
+import { getLogger } from '../logging/appLogger.js';
+
+const log = getLogger('bot-api');
 
 import { getOrCreateSession, bumpPlanToken, playbackFor } from '../playback/sessions.js';
 import { recommendHooks } from './recommendHooks.js';
@@ -195,10 +198,25 @@ export function buildBotApi({
   const app = Fastify({ logger: false });
 
   app.addHook('onRequest', async (request, reply) => {
+    request.startedAt = process.hrtime.bigint();
     if (request.url === '/healthz') return;
     if (!token || getBearerToken(request) !== token) {
+      log.warn({ event: 'botapi.auth_rejected', method: request.method, route: request.routeOptions?.url }, 'unauthorized bot api call');
       return reply.code(401).send({ error: 'unauthorized' });
     }
+  });
+
+  app.addHook('onResponse', async (request, reply) => {
+    if (request.url === '/healthz') return;
+    const status = reply.statusCode;
+    const durationMs = Math.round(Number(process.hrtime.bigint() - request.startedAt) / 1e6);
+    // Successful polling is frequent; keep it at debug and surface failures.
+    const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : 'debug';
+    log[level]({ event: 'botapi.request', method: request.method, route: request.routeOptions?.url, status, durationMs });
+  });
+
+  app.addHook('onError', async (request, _reply, err) => {
+    log.error({ event: 'botapi.request_error', method: request.method, route: request.routeOptions?.url, err });
   });
 
   app.get('/healthz', async () => ({ ok: true }));
@@ -427,6 +445,6 @@ export async function startBotApi(options) {
   const app = buildBotApi(options);
   const port = parsePort(process.env.BOT_API_PORT);
   await app.listen({ host: LOOPBACK_HOST, port });
-  console.log(`[bot-api] listening on http://${LOOPBACK_HOST}:${port}`);
+  log.info({ event: 'botapi.listening', host: LOOPBACK_HOST, port }, 'bot api listening');
   return app;
 }

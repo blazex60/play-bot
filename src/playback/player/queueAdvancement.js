@@ -1,5 +1,8 @@
 import { shouldReconnectRetry } from './playbackPolicy.js';
 import { LoopMode } from '../queue.js';
+import { getLogger } from '../../logging/appLogger.js'
+
+const log = getLogger('GuildPlayer')
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -124,7 +127,7 @@ export class QueueAdvancement {
     this.handlingAfter = true;
     this.#drainAfterPlayback()
       .catch(err => {
-        console.error('[GuildPlayer] handleAfter error:', err);
+        log.error({ event: 'playback.handleafter_error', err }, 'handleAfter error');
       })
       .finally(() => {
         this.handlingAfter = false;
@@ -257,7 +260,7 @@ export class QueueAdvancement {
     try {
       return await Promise.race([this.#handleQueueExhausted(finishedTrack), timeout]);
     } catch (err) {
-      console.error('[GuildPlayer] handleQueueExhausted error:', err);
+      log.error({ event: 'playback.handlequeueexhausted_error', err }, 'handleQueueExhausted error');
       return false;
     } finally {
       clearTimeout(timeoutHandle);
@@ -296,7 +299,7 @@ export class QueueAdvancement {
         if (handled) this.#sourcePreparer.prefetchUpcoming();
       })
       .catch((err) => {
-        console.warn('[GuildPlayer] early queue refill failed:', err.message);
+        log.warn({ event: 'playback.early_queue_refill_failed', err }, 'early queue refill failed');
       });
   }
 }

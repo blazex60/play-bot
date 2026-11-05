@@ -1,11 +1,23 @@
+# Docker's own log driver can only rotate by size; the 7-day retention of the
+# structured application logs is handled by src/logging into ./logs.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   music-bot:
     build: .
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      LOG_DIR: /app/logs
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
+    logging: *default-logging
     network_mode: "host"
 
   music-web:
@@ -14,8 +26,12 @@ services:
     command: ["node", "src/web/server/index.js"]
     env_file:
       - .env
+    environment:
+      LOG_DIR: /app/logs
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
+    logging: *default-logging
     network_mode: "host"
     depends_on:
       - music-bot
@@ -26,6 +42,7 @@ services:
     env_file:
       - .env
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    logging: *default-logging
     network_mode: "host"
     depends_on:
       - music-web

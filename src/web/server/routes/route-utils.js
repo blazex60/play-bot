@@ -1,3 +1,7 @@
+import { getLogger } from '../../../logging/appLogger.js'
+
+const log = getLogger('operationLog')
+
 export function getSessionUser(request) {
   const user = request.user
   const discordId = user?.discordId ?? user?.discord_id ?? user?.id
@@ -106,7 +110,7 @@ export function recordOperationLog(db, { guildId, discordUserId, username, sourc
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(guildId, discordUserId ?? null, username ?? null, source, action, detail ?? null, success ? 1 : 0, nowUnix())
   } catch (error) {
-    console.error('[operationLog] failed to record:', error.message)
+    log.error({ event: 'web.operation_log.record_failed', err: error }, 'failed to record operation log')
   }
 }
 

@@ -12,6 +12,9 @@ import {
   buildAtrimFilter,
 } from './silenceTrim.js'
 import { probeDurationSec } from './duration.js'
+import { getLogger } from '../logging/appLogger.js'
+
+const log = getLogger('normalize')
 
 export const MAX_NORMALIZE_DURATION_SEC = 1800
 export const TEMP_DIR = path.join(os.tmpdir(), 'music-bot-normalize')
@@ -213,7 +216,7 @@ export async function trimSilence(filePath, {
     } catch {
       await cleanupTempFile(backupPath)
     }
-    console.warn(`[normalize] silence trim skipped: ${err.message}`)
+    log.warn({ event: 'audio.normalize.silence_trim_skipped', err }, 'silence trim skipped')
     return false
   }
 }

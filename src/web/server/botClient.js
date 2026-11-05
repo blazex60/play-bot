@@ -1,3 +1,7 @@
+import { getLogger } from '../../logging/appLogger.js'
+
+const log = getLogger('botClient')
+
 export class BotApiError extends Error {
   constructor(message, { status, body }) {
     super(message)
@@ -16,17 +20,28 @@ export function createBotClient({ baseUrl, token, fetchImpl = globalThis.fetch }
   }
 
   async function request(path, { method = 'GET', body } = {}) {
-    const response = await fetchImpl(new URL(path, `${baseUrl}/`), {
-      method,
-      headers: {
-        authorization: `Bearer ${token}`,
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    })
-    const text = await response.text()
+    // Log the path without its query string or ids: it is only a coarse route.
+    const route = path.split('?')[0].replace(/\/\d{5,}/g, '/:id')
+    const startedAt = Date.now()
+    let response
+    let text
+    try {
+      response = await fetchImpl(new URL(path, `${baseUrl}/`), {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      })
+      text = await response.text()
+    } catch (err) {
+      log.error({ event: 'web.botapi.unreachable', method, route, durationMs: Date.now() - startedAt, err }, 'bot api unreachable')
+      throw err
+    }
     const payload = text ? JSON.parse(text) : null
     if (!response.ok) {
+      log.warn({ event: 'web.botapi.error_response', method, route, status: response.status, durationMs: Date.now() - startedAt }, 'bot api returned an error')
       throw new BotApiError(`Bot API request failed: ${method} ${path}`, {
         status: response.status,
         body: payload,

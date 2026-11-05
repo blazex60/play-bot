@@ -1,5 +1,8 @@
 import { getGuildSettings } from '../shared/settings.js'
 import { planAutoTrack, planRecommendations, formatAutoAddNotification } from './autoplay.js'
+import { getLogger } from '../logging/appLogger.js'
+
+const log = getLogger('queueExhaustion')
 
 // This is a re-entrancy lock for a single in-flight queue-exhaustion round,
 // not a "used up" marker: it's claimed at the start of handleQueueExhausted
@@ -98,7 +101,7 @@ export function createQueueExhaustionHandler({
             // Notification delivery is optional and must not keep the bounded
             // queue-exhaustion continuation open after playback has started.
             void textChannel.send(formatAutoAddNotification(autoTrack)).catch((err) => {
-              console.error('[sessions] failed to post autoplay notification:', err.message)
+              log.error({ event: 'playback.failed_to_post_autoplay_notification', err }, 'failed to post autoplay notification')
             })
           }
         }

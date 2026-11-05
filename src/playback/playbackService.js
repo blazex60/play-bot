@@ -14,6 +14,10 @@
  * `playback` singleton and exports `playbackFor(map)` for callers handed a
  * sessions Map (tests inject their own).
  */
+import { getLogger } from '../logging/appLogger.js'
+
+const log = getLogger('playbackService')
+
 
 export class PlaybackService {
   #getSession;
@@ -133,6 +137,7 @@ export class PlaybackService {
     const stopInFlightAtEntry = session.player.isStopping === true;
     const stopGeneration = session.player.stopGeneration ?? 0;
     for (const track of tracks) session.queue.add(track);
+    log.info({ event: 'queue.tracks_added', guildId, count: tracks.length, wasEmpty }, 'tracks added to queue');
     if (onEnqueued) await onEnqueued({ wasEmpty });
     // The await above is an open async window: /leave may have destroyed or
     // replaced the session and /stop may have cleared the queue. Never touch
@@ -160,7 +165,7 @@ export class PlaybackService {
           // Fire-and-forget: callers in a bounded continuation can't afford to
           // await mixer startup (download + loudnorm can take tens of seconds).
           session.player.playNext().catch((err) => {
-            console.error('[playback] playNext failed:', err?.message ?? err);
+            log.error({ event: 'playback.playnext_failed', err }, 'playNext failed');
           });
         }
       }
@@ -181,6 +186,7 @@ export class PlaybackService {
   async skip(guildId) {
     const session = this.#getSession(guildId);
     if (!session) return false;
+    log.info({ event: 'queue.skip', guildId }, 'skip');
     await session.player.skip();
     return true;
   }
@@ -188,6 +194,7 @@ export class PlaybackService {
   async stop(guildId) {
     const session = this.#getSession(guildId);
     if (!session) return false;
+    log.info({ event: 'playback.stop_requested', guildId }, 'stop requested');
     // Stop-start invalidation fires BEFORE the async teardown: a
     // recommend plan or autoplay continuation resolving during stop()'s
     // cleanup window must already see a bumped planToken / cancelled

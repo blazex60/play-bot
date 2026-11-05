@@ -156,6 +156,39 @@ docker compose up --build
 - Bot API は loopback + bearer token 前提で、Cloudflare Tunnel には出さない
 - Web permissions は Bot API が Discord live voice state と実効管理者ロール（ギルド別 `/adminrole` 設定、未設定時は `ADMIN_ROLE_ID`）で判定する
 
+## ログ
+
+`music-bot` と `music-web` は Pino による JSON Lines のシステム診断ログを、標準出力とファイルの両方に出力する(`src/logging/`)。Web 管理画面の `operation_logs`(監査ログ)とは別物で、そちらは SQLite に残る。
+
+```text
+logs/                      # ホスト側。コンテナの /app/logs にバインドマウント(Git 管理外)
+├── music-bot/2026-10-28.jsonl
+└── music-web/2026-10-28.jsonl
+```
+
+| 環境変数 | 既定値 | 内容 |
+|---|---|---|
+| `LOG_LEVEL` | `info` | `fatal` / `error` / `warn` / `info` / `debug` / `trace` |
+| `LOG_DIR` | `<repo>/logs`(compose では `/app/logs`) | 保存先 |
+| `LOG_RETENTION_DAYS` | `7` | UTC 日付単位の保持日数(当日を含む) |
+| `LOG_MAX_FILE_MIB` | `10` | これを超えると同日内で世代を進める |
+| `LOG_MAX_FILES_PER_DAY` | `5` | 1 日・1 サービスあたりの最大世代数 |
+| `LOG_MAX_TOTAL_MIB` | `500` | サービスごとの総容量の上限(超えたら古い順に削除。Bot と Web で合計はこの 2 倍まで) |
+| `LOG_FILE_ENABLED` | `true` | `false` でファイル出力を無効化(テスト時は自動で無効) |
+
+期限切れファイルの削除は起動時と 1 時間ごとに行い、書き込み中のファイルは消さない。保存先に書けない場合は stderr に警告を出すだけで、Bot の再生は止まらない。
+
+```bash
+docker compose logs -f music-bot                      # 標準出力
+tail -F "$(ls -t logs/music-bot/*.jsonl | head -1)" | jq .   # ファイル(最新世代)
+jq -c 'select(.event=="command.failed")' logs/music-bot/*.jsonl
+jq -c 'select(.correlationId=="<id>")' logs/music-bot/*.jsonl   # 1 コマンドの追跡
+```
+
+イベント名は `playback.track.started` のようなドメイン別の形式。Token・Cookie・Authorization・URL の機密クエリは出力前に伏せる。ユーザー名やメッセージ本文は記録しない。
+
+**復旧**: `logs/` が書き込み不可なら `sudo chown -R "$(id -u)" logs`(コンテナは root で書き込む)。ディスクが逼迫したら `LOG_MAX_TOTAL_MIB` を下げるか古い日付のファイルを手動で削除してよい。`docker-compose.yml` を変更するデプロイは `music-bot` を再作成するため VC セッションが切れる。
+
 ## Cloudflare Pages 法務ページ
 
 `legal/` は利用規約・プライバシーポリシー公開用の静的サイト。Cloudflare Pages の Git integration でこのリポジトリを接続すると、`main` への push で自動更新できる。

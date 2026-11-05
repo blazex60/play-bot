@@ -26,6 +26,9 @@ import { getCachedStems, separateTrackStems } from '../audio/stemCache.js';
 import { planStemTransition } from '../audio/stemTransition.js';
 import { logTransitionPlan, logGaplessTransition } from '../audio/transitionLog.js';
 import { StemPreparationState, StemPrefetchTracker } from '../audio/stemPrefetch.js';
+import { getLogger } from '../logging/appLogger.js'
+
+const log = getLogger('GuildPlayer')
 
 const QUEUE_EXHAUSTED_TIMEOUT = 30_000;
 // Codex review (PR #43, round 4): #pendingGaplessFrom is stashed instance
@@ -208,7 +211,7 @@ export class GuildPlayer {
         // Mid-fade incoming failure: MixStream already cleared overlap and
         // kept outgoing. Reset arm state so #maybeStartCrossfade can retry,
         // and drop any normalize temp created for the failed incoming leg.
-        console.warn('[GuildPlayer] mix incoming error:', err.message);
+        log.warn({ event: 'playback.mix_incoming_error', err }, 'mix incoming error');
         this.#transitions.crossfadeStarted = false;
         this.#transitions.crossfadeTargetTrack = null;
         // §2.3/§8.4: this attempt never reached promotion — a stashed
@@ -218,7 +221,7 @@ export class GuildPlayer {
         this.#transitions.pendingSessionTempo = null;
         this.#transitions.pendingIncomingEntrySec = 0;
         this.#sourcePreparer.cleanupIncomingTempFile().catch((cleanupErr) => {
-          console.warn('[GuildPlayer] incoming temp cleanup failed:', cleanupErr.message);
+          log.warn({ event: 'playback.incoming_temp_cleanup_failed', err: cleanupErr }, 'incoming temp cleanup failed');
         });
       },
       playNext: () => this.playNext(),
@@ -294,7 +297,7 @@ export class GuildPlayer {
         this.#lastActiveAt = Date.now();
       },
       onStall: () => {
-        console.warn('[GuildPlayer] watchdog: stall detected');
+        log.warn({ event: 'playback.watchdog_stall_detected' }, 'watchdog: stall detected');
         this.#hadError = true;
         this.mixStream?.dropCurrent();
         // Codex review (PR #45, P1): same silent underrun-state reset as the
@@ -335,7 +338,7 @@ export class GuildPlayer {
     this.#pipeline.initMixerPipeline();
     this.#audioPlayer.on(AudioPlayerStatus.Idle, () => {
       if (!this.#pipeline.mixerStarted || this.#pipeline.idleRecovering) return;
-      console.warn('[GuildPlayer] unexpected Idle, recovering mixer playback');
+      log.warn({ event: 'playback.unexpected_idle_recovering_mixer_playback' }, 'unexpected Idle, recovering mixer playback');
       this.#pipeline.idleRecovering = true;
       // Never play the rebuilt mixer empty: MixStream's 8s underrun guard
       // would sourceerror while playNext is still downloading/analyzing.
@@ -345,7 +348,7 @@ export class GuildPlayer {
       const done = () => { this.#pipeline.idleRecovering = false; };
       if (restartCurrent) {
         this.playNext().catch((err) => {
-          console.error('[GuildPlayer] mixer Idle restart failed:', err.message);
+          log.error({ event: 'playback.mixer_idle_restart_failed', err }, 'mixer Idle restart failed');
         }).finally(done);
       } else {
         done();
@@ -359,7 +362,7 @@ export class GuildPlayer {
     });
 
     this.#audioPlayer.on('error', err => {
-      console.error('[GuildPlayer] audioPlayer error:', err);
+      log.error({ event: 'playback.audioplayer_error', err }, 'audioPlayer error');
       this.#hadError = true;
       this.#pipeline.abortSourceAudioWait();
       this.mixStream?.dropCurrent();
@@ -432,7 +435,7 @@ export class GuildPlayer {
     try {
       source = await this.#sourcePreparer.takePreparedIncoming(track, { forPlayback: true });
     } catch (err) {
-      console.warn(`[GuildPlayer] pcm source failed for ${track.title}:`, err.message);
+      log.warn({ event: 'playback.pcm_source_failed', trackId: track.videoId, err }, 'pcm source failed');
       this.#hadError = true;
       // A stop() that began during the prep await owns teardown — kicking
       // the advancement drain here could end in a disconnect the stop
@@ -719,7 +722,7 @@ export class GuildPlayer {
       if (this.#queue.current !== target) {
         const advanced = this.#queue.next({ forceAdvance: true });
         if (advanced !== target && this.#queue.current !== target) {
-          console.warn('[GuildPlayer] crossfade promote queue desync');
+          log.warn({ event: 'playback.crossfade_promote_queue_desync' }, 'crossfade promote queue desync');
         }
       }
     } else {
@@ -838,7 +841,7 @@ export class GuildPlayer {
       videoId: track.videoId,
       channel: track.channel,
     }).catch((err) => {
-      console.error('[GuildPlayer] recordPlayFn failed:', err.message);
+      log.error({ event: 'playback.recordplayfn_failed', err }, 'recordPlayFn failed');
     });
   }
 
@@ -930,7 +933,7 @@ export class GuildPlayer {
         source = await this.#sourcePreparer.createPcmSource(track, { startSec: target });
       }
     } catch (err) {
-      console.error('[GuildPlayer] seek source failed:', err);
+      log.error({ event: 'playback.seek_source_failed', err }, 'seek source failed');
       return false;
     }
     if (this.#stopGeneration !== generation) {

@@ -1,3 +1,7 @@
+import { getLogger } from '../logging/appLogger.js'
+
+const log = getLogger('webClient')
+
 export class WebApiError extends Error {
   constructor(message, { status, body }) {
     super(message)
@@ -59,7 +63,7 @@ export function createWebClient({
           body: { guildId, discordUserId, username, trackTitle, trackUrl, videoId, channel },
         })
       } catch (err) {
-        console.error('[webClient] recordPlay failed:', err.message)
+        log.error({ event: 'webclient.recordplay_failed', err }, 'recordPlay failed')
       }
     },
     async getRecentHistory({ guildId, userIds, limit } = {}) {
@@ -69,7 +73,7 @@ export function createWebClient({
         if (limit) search.set('limit', String(limit))
         return (await request(`/internal/play-history/recent?${search.toString()}`)) ?? {}
       } catch (err) {
-        console.error('[webClient] getRecentHistory failed:', err.message)
+        log.error({ event: 'webclient.getrecenthistory_failed', err }, 'getRecentHistory failed')
         return {}
       }
     },
@@ -80,7 +84,7 @@ export function createWebClient({
           body: { guildId, discordUserId, username, source, action, detail, success },
         })
       } catch (err) {
-        console.error('[webClient] logOperation failed:', err.message)
+        log.error({ event: 'webclient.logoperation_failed', err }, 'logOperation failed')
       }
     },
     async getTrackAnalysis(videoId) {
@@ -90,7 +94,7 @@ export function createWebClient({
         return payload?.analysis ?? null
       } catch (err) {
         if (err?.status === 404) return null
-        console.error('[webClient] getTrackAnalysis failed:', err.message)
+        log.error({ event: 'webclient.gettrackanalysis_failed', err }, 'getTrackAnalysis failed')
         return null
       }
     },
@@ -103,7 +107,7 @@ export function createWebClient({
         })
         return true
       } catch (err) {
-        console.error('[webClient] putTrackAnalysis failed:', err.message)
+        log.error({ event: 'webclient.puttrackanalysis_failed', err }, 'putTrackAnalysis failed')
         return false
       }
     },
