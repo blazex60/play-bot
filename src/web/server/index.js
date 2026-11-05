@@ -3,7 +3,9 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import cookie from '@fastify/cookie'
 import fastifyStatic from '@fastify/static'
-import Fastify from 'fastify'
+import Fastify, { LogController } from 'fastify'
+import { randomUUID } from 'node:crypto'
+import { getAppLogger, getLogger, installProcessHandlers, setLogService } from '../../logging/appLogger.js'
 import { createBotClient } from './botClient.js'
 import { startCleanupJob } from './cleanup.js'
 import { createWebConfig, defaultConfig } from './config.js'
@@ -47,15 +49,49 @@ export async function buildWebServer({
   config = defaultConfig,
   db,
   fetchImpl = globalThis.fetch,
-  logger = true,
+  logger,
   startCleanup = true,
 } = {}) {
+  // logger: false -> silent (tests); a pino-compatible instance -> used as is;
+  // undefined/true -> the shared music-web logger (stdout + rotated files).
+  if (logger !== false && !(logger && typeof logger === 'object')) setLogService('music-web')
+  const loggerOptions = logger === false
+    ? { logger: false }
+    : { loggerInstance: logger && typeof logger === 'object' ? logger : getAppLogger() }
   const app = Fastify({
-    logger,
+    ...loggerOptions,
+    // Request lines are emitted by the onResponse hook below (route pattern,
+    // no raw URL/query), so Fastify's own incoming/completed lines are off.
+    logController: new LogController({ disableRequestLogging: true }),
+    // Never trust a client-supplied request id; generate our own.
+    genReqId: () => randomUUID(),
     trustProxy: config.trustProxy,
   })
+
+  app.addHook('onRequest', async (request) => {
+    request.startedAt = process.hrtime.bigint()
+  })
+  // disableRequestLogging also silences Fastify's default error-handler lines,
+  // so unexpected (5xx) errors are logged explicitly with their stack.
+  app.addHook('onError', async (request, _reply, err) => {
+    // Errors without a statusCode become 500s (reply.statusCode is still 200 here).
+    const status = err?.statusCode ?? 500
+    if (status >= 500) {
+      request.log.error({ event: 'web.request_error', method: request.method, route: request.routeOptions?.url ?? 'unmatched', err })
+    }
+  })
+  app.addHook('onResponse', async (request, reply) => {
+    const route = request.routeOptions?.url
+    if (route === '/healthz') return
+    const status = reply.statusCode
+    const durationMs = Math.round(Number(process.hrtime.bigint() - request.startedAt) / 1e6)
+    // Dashboard polling GETs are frequent: keep successes at debug.
+    const level = status >= 500 ? 'error' : status >= 400 ? 'warn' : request.method === 'GET' ? 'debug' : 'info'
+    request.log[level]({ event: 'web.request', method: request.method, route: route ?? 'unmatched', status, durationMs })
+  })
   const database = db ?? await loadDefaultDb()
-  runMigrations(database)
+  const migration = runMigrations(database)
+  app.log.info({ event: 'web.db.migrated', applied: migration.applied, total: migration.total })
 
   await app.register(cookie, {
     secret: config.session.secret,
@@ -141,8 +177,20 @@ export async function startWebServer({
   db,
   fetchImpl = globalThis.fetch,
 } = {}) {
-  const app = await buildWebServer({ config, db, fetchImpl })
-  await app.listen({ host: config.host, port: config.port })
+  setLogService('music-web')
+  let app
+  const log = getLogger('web')
+  installProcessHandlers({ onShutdown: () => app?.close() })
+  log.info({ event: 'web.starting', nodeVersion: process.version, pid: process.pid })
+  try {
+    app = await buildWebServer({ config, db, fetchImpl })
+    await app.listen({ host: config.host, port: config.port })
+  } catch (err) {
+    log.fatal({ event: 'web.start_failed', err })
+    getAppLogger().flushLogs?.()
+    throw err
+  }
+  log.info({ event: 'web.listening', host: config.host, port: config.port })
   return app
 }
 

@@ -10,6 +10,9 @@ import {
 import { TAIL_WINDOW_SEC } from '../../audio/vocalActivity.js';
 import { LoopMode } from '../queue.js';
 import { buildTransitionPlanReport, exitInfo } from '../../audio/transitionLog.js';
+import { getLogger } from '../../logging/appLogger.js'
+
+const log = getLogger('GuildPlayer')
 
 const CROSSFADE_ARM_INTERVAL_MS = 200;
 /** Start downloading/decoding the next track this many seconds before overlap. */
@@ -480,7 +483,7 @@ export class TransitionCoordinator {
     this.clearCrossfadeArm();
     this.#crossfadeArmTimer = setInterval(() => {
       this.#maybeStartCrossfade().catch((err) => {
-        console.error('[GuildPlayer] crossfade arm error:', err.message);
+        log.error({ event: 'playback.crossfade_arm_error', err }, 'crossfade arm error');
       });
     }, CROSSFADE_ARM_INTERVAL_MS);
   }
@@ -851,11 +854,11 @@ export class TransitionCoordinator {
             this.#sourcePreparer.ensureOutgoingStemPrep(outCachedStems, current.videoId, {
               startSec: norm.exitStartSec ?? 0,
               tempoFilter: outgoingStemTempoFilter,
-            }).catch((err) => console.warn('[GuildPlayer] outgoing stem prep failed:', err.message));
+            }).catch((err) => log.warn({ event: 'playback.outgoing_stem_prep_failed', err }, 'outgoing stem prep failed'));
             this.#sourcePreparer.ensureIncomingStemPrep(inCachedStems, next.videoId, {
               startSec: norm.entrySec,
               tempoFilter: norm.tempoFilter,
-            }).catch((err) => console.warn('[GuildPlayer] incoming stem prep failed:', err.message));
+            }).catch((err) => log.warn({ event: 'playback.incoming_stem_prep_failed', err }, 'incoming stem prep failed'));
           }
         }
       }
@@ -869,7 +872,7 @@ export class TransitionCoordinator {
       try {
         source = await this.#sourcePreparer.takePreparedIncoming(next, { startSec: norm.entrySec, tempoFilter: norm.tempoFilter });
       } catch (err) {
-        console.warn('[GuildPlayer] incoming pcm source failed:', err.message);
+        log.warn({ event: 'playback.incoming_pcm_source_failed', err }, 'incoming pcm source failed');
         await this.#sourcePreparer.cleanupIncomingTempFile();
         return;
       }

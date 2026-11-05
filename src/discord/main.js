@@ -13,6 +13,12 @@ import { cleanupStaleTempDir } from '../audio/normalize.js'
 import { pruneStemCache, cleanupStaleStemStaging } from '../audio/stemCache.js'
 import { startBotApi } from './botApi.js'
 import { checkCommandAllowed } from './permissions.js'
+import { getAppLogger, getLogger, installProcessHandlers } from '../logging/appLogger.js'
+import { randomUUID } from 'node:crypto'
+
+const log = getLogger('main')
+installProcessHandlers()
+log.info({ event: 'bot.starting', nodeVersion: process.version, pid: process.pid })
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -41,12 +47,19 @@ for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js') && !f
 }
 
 client.once(Events.ClientReady, c => {
-  console.log(`Bot ready: ${c.user.tag} (id=${c.user.id})`)
+  log.info({ event: 'bot.ready', clientId: c.user.id, guildCount: c.guilds.cache.size, commandCount: commands.size })
   startBotApi({ client, sessions, commandNames: [...commands.keys()] }).catch(err => {
-    console.error('[bot-api] failed to start:', err)
+    log.error({ event: 'botapi.failed_to_start', err }, 'failed to start')
     process.exitCode = 1
   })
 })
+
+client.on(Events.Error, err => log.error({ event: 'discord.client_error', err }, 'discord client error'))
+client.on(Events.Warn, message => log.warn({ event: 'discord.client_warn' }, message))
+client.on(Events.ShardDisconnect, (event, shardId) => log.warn({ event: 'discord.shard_disconnect', shardId, code: event?.code }, 'shard disconnected'))
+client.on(Events.ShardReconnecting, shardId => log.info({ event: 'discord.shard_reconnecting', shardId }, 'shard reconnecting'))
+client.on(Events.ShardResume, (shardId, replayedEvents) => log.info({ event: 'discord.shard_resume', shardId, replayedEvents }, 'shard resumed'))
+client.on(Events.ShardError, (err, shardId) => log.error({ event: 'discord.shard_error', shardId, err }, 'shard error'))
 
 client.on(Events.InteractionCreate, async interaction => {
   if (interaction.isChatInputCommand()) {
@@ -63,10 +76,16 @@ client.on(Events.InteractionCreate, async interaction => {
       detail,
     })
 
+    const correlationId = randomUUID()
+    const cmdLog = log.child({ correlationId, command: interaction.commandName, guildId: interaction.guildId })
+    const startedAt = Date.now()
+
     if (!checkCommandAllowed(interaction, resolveAdminRoleId(interaction.guildId))) {
+      cmdLog.info({ event: 'command.blocked' }, 'command blocked by permission')
       logOperation(false, 'blocked')
       return
     }
+    cmdLog.info({ event: 'command.started' })
 
     try {
       // Commands return `false` on an expected-failure path they've already
@@ -77,11 +96,16 @@ client.on(Events.InteractionCreate, async interaction => {
       // just shows a panel; the real result is logged later from onSelect)
       // and is skipped entirely rather than logged as a success.
       const result = await command.execute(interaction, sessions)
+      cmdLog.info({
+        event: result === false ? 'command.rejected' : 'command.completed',
+        outcome: result === null ? 'pending' : result === false ? 'expected_failure' : 'success',
+        durationMs: Date.now() - startedAt,
+      })
       if (result !== null) {
         logOperation(result !== false)
       }
     } catch (err) {
-      console.error(`[${interaction.commandName}] error:`, err)
+      cmdLog.error({ event: 'command.failed', durationMs: Date.now() - startedAt, err }, 'command failed')
       logOperation(false, err.message)
       const reply = { content: '❌ コマンドの実行中にエラーが発生しました', flags: MessageFlags.Ephemeral }
       if (interaction.replied || interaction.deferred) {
@@ -130,9 +154,13 @@ client.on(Events.VoiceStateUpdate, async (oldState) => {
   if (!channel) return
   const humans = channel.members.filter(m => !m.user.bot)
   if (humans.size === 0) {
-    console.log(`[VoiceState] All humans left ${channel.name}, auto-disconnecting`)
-    destroySession(sessions, oldState.guild.id).catch((err) => console.error('[VoiceState] disconnect failed:', err))
+    log.info({ event: 'voice.auto_disconnect', guildId: oldState.guild.id, reason: 'all_humans_left' }, 'all humans left, auto-disconnecting')
+    destroySession(sessions, oldState.guild.id).catch((err) => log.error({ event: 'voice.disconnect_failed', guildId: oldState.guild.id, err }, 'disconnect failed'))
   }
 })
 
-client.login(process.env.DISCORD_TOKEN)
+client.login(process.env.DISCORD_TOKEN).catch(err => {
+  log.fatal({ event: 'bot.login_failed', err }, 'discord login failed')
+  getAppLogger().flushLogs?.()
+  process.exit(1)
+})

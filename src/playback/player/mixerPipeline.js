@@ -1,5 +1,8 @@
 import { StreamType } from '@discordjs/voice';
 import { MixStream } from '../../audio/mixStream.js';
+import { getLogger } from '../../logging/appLogger.js'
+
+const log = getLogger('GuildPlayer')
 
 /** How long GuildPlayer waits for ffmpeg/yt-dlp to produce the first PCM. */
 export const PCM_WAIT_TIMEOUT_MS = 15_000;
@@ -118,6 +121,7 @@ export class MixerPipeline {
     this.mixerResource = null;
     this.mixerStarted = false;
     this.mixStream.on('trackend', (info) => {
+      log.info({ event: 'playback.track.ended', promoted: Boolean(info?.promoted) }, 'track ended');
       if (info?.promoted) {
         this.#onCrossfadePromoted();
         return;
@@ -125,7 +129,7 @@ export class MixerPipeline {
       this.#advanceAfterPlayback();
     });
     this.mixStream.on('sourceerror', (err) => {
-      console.error('[GuildPlayer] mix source error:', err.message);
+      log.error({ event: 'playback.mix_source_error', err }, 'mix source error');
       this.#markHadError();
       this.abortSourceAudioWait();
       this.mixStream.dropCurrent();
@@ -139,7 +143,7 @@ export class MixerPipeline {
     });
     this.mixStream.on('snaphandoff', ({ adopt }) => {
       this.#onSnapHandoff(adopt).catch((err) => {
-        console.warn('[GuildPlayer] snap handoff failed:', err.message);
+        log.warn({ event: 'playback.snap_handoff_failed', err }, 'snap handoff failed');
       });
     });
     this.mixStream.on('underrun', () => {
@@ -177,7 +181,7 @@ export class MixerPipeline {
     // own recoverable signals). Same recovery shape as the Idle handler
     // above: rebuild the mixer pipeline and restart the current track.
     this.mixStream.on('error', (err) => {
-      console.error('[GuildPlayer] mixStream error:', err);
+      log.error({ event: 'playback.mixstream_error', err }, 'mixStream error');
       if (this.idleRecovering) return;
       this.idleRecovering = true;
       this.#markHadError();
@@ -188,7 +192,7 @@ export class MixerPipeline {
       const done = () => { this.idleRecovering = false; };
       if (restartCurrent) {
         this.#playNext().catch((restartErr) => {
-          console.error('[GuildPlayer] mixStream error recovery restart failed:', restartErr.message);
+          log.error({ event: 'playback.mixstream_error_recovery_restart_failed', err: restartErr }, 'mixStream error recovery restart failed');
         }).finally(done);
       } else {
         done();
@@ -286,7 +290,7 @@ export class MixerPipeline {
    */
   recoverMixerPlayback({ play = false } = {}) {
     if (this.isMixerDead()) {
-      console.warn('[GuildPlayer] mixer resource ended; rebuilding pipeline');
+      log.warn({ event: 'playback.mixer_resource_ended_rebuilding_pipeline' }, 'mixer resource ended; rebuilding pipeline');
       try {
         this.mixStream?.removeAllListeners();
         if (this.mixStream && !this.mixStream.destroyed) {
@@ -316,7 +320,7 @@ export class MixerPipeline {
       this.#audioPlayer.play(this.mixerResource);
       this.mixerStarted = true;
     } catch (err) {
-      console.error('[GuildPlayer] mixer play failed, rebuilding:', err.message);
+      log.error({ event: 'playback.mixer_play_failed_rebuilding', err }, 'mixer play failed, rebuilding');
       this.recoverMixerPlayback({ play: false });
       if (this.#isMixerStreamDead() || !this.mixStream.currentSource) return;
       this.#attachMixerResource();
@@ -325,7 +329,7 @@ export class MixerPipeline {
         this.#audioPlayer.play(this.mixerResource);
         this.mixerStarted = true;
       } catch (err2) {
-        console.error('[GuildPlayer] mixer recovery rebuild play failed:', err2.message);
+        log.error({ event: 'playback.mixer_recovery_rebuild_play_failed', err: err2 }, 'mixer recovery rebuild play failed');
       }
     }
   }

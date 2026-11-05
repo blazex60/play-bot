@@ -6,6 +6,9 @@ import { PlaybackService } from '../playback/playbackService.js'
 import { sessionPlanToken, isSessionStale } from '../playback/sessionAccessors.js'
 import { fmtDuration } from '../shared/format.js'
 import { resolveAdminRoleId } from '../shared/settings.js'
+import { getLogger } from '../logging/appLogger.js'
+
+const log = getLogger('recommendFlow')
 
 export const RECOMMEND_CUSTOM_ID_PREFIX = 'autoplay'
 export const RECOMMEND_SHOW_CUSTOM_ID = 'recommend-show'
@@ -103,7 +106,7 @@ async function reconsiderTeardown(guildId, pendingStore, recommendRounds) {
   try {
     await onTimeout()
   } catch (err) {
-    console.error('[recommendFlow] onTimeout failed:', err.message)
+    log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout failed')
   }
 }
 
@@ -170,7 +173,7 @@ function scheduleExpiry(entry, pendingStore, guildId, recommendRounds, onTimeout
       try {
         await onTimeout()
       } catch (err) {
-        console.error('[recommendFlow] onTimeout failed:', err.message)
+        log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout failed')
       }
     }
   }, RECOMMEND_TIMEOUT_MS)
@@ -197,7 +200,7 @@ function scheduleRoundExpiry(entry, recommendRounds, pendingStore, guildId, onTi
       try {
         await onTimeout()
       } catch (err) {
-        console.error('[recommendFlow] onTimeout failed:', err.message)
+        log.error({ event: 'recommend.ontimeout_failed', err }, 'onTimeout failed')
       }
     }
   }, RECOMMEND_TIMEOUT_MS)
@@ -232,7 +235,7 @@ export async function postRecommendationPrompt({ channel, guildId, guildName, pl
   try {
     message = await channel.send({ embeds: [embed], components })
   } catch (err) {
-    console.error('[recommendFlow] failed to post recommendation prompt:', err.message)
+    log.error({ event: 'recommend.failed_to_post_recommendation_prompt', err }, 'failed to post recommendation prompt')
     return 0
   }
 

@@ -7,6 +7,9 @@ import { probeDurationSec } from '../../audio/duration.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../../audio/analysisQueue.js';
 import { StemPrefetchPriority } from '../../audio/stemPrefetch.js';
 import { LoopMode } from '../queue.js';
+import { getLogger } from '../../logging/appLogger.js'
+
+const log = getLogger('GuildPlayer')
 
 function analysisKilledError() {
   const err = new Error('analysis killed');
@@ -204,14 +207,16 @@ export class SourcePreparer {
         this.#analysis.probedDurationCache.set(track.videoId, probedDuration);
         this.#applyAnalysisDuration(track, { durationSec: probedDuration });
       }
-      console.info(
-        `[normalize] applying: ${track.title} ` +
-        `(${prefetched.measured.measured_I} LUFS -> -16 LUFS)`
-      );
+      log.debug({
+        event: 'audio.normalize.applied',
+        trackId: track.videoId,
+        measuredLufs: prefetched.measured.measured_I,
+        targetLufs: -16,
+      }, 'normalize applied');
       if (forIncoming) {
         if (prepId != null && prepId !== this.#incomingPrepId) {
           cleanupTempFile(prefetched.filePath).catch((err) => {
-            console.error('[GuildPlayer] abandoned incoming temp cleanup error:', err);
+            log.error({ event: 'playback.abandoned_incoming_temp_cleanup_error', err }, 'abandoned incoming temp cleanup error');
           });
           // Do not schedule analysis or open a FileSource on a temp we are
           // deleting — callers treat rejection as a cancelled/failed prep.
@@ -230,7 +235,7 @@ export class SourcePreparer {
       return source;
     } catch (err) {
       if (err?.code === 'INCOMING_PREP_CANCELLED') throw err;
-      console.warn(`[GuildPlayer] normalize fallback for ${track.title}:`, err.message);
+      log.warn({ event: 'audio.normalize.fallback', trackId: track.videoId, err }, 'normalize fallback to stream source');
       if (track.videoId) this.#analysis.probedDurationCache.delete(track.videoId);
       const source = createStreamSource(track, { resolveAudioStreamFn: this.#resolveAudioStreamFn, startSec });
       source.tempoHonored = false;
@@ -447,7 +452,7 @@ export class SourcePreparer {
     this.#incomingMeasured = null;
     if (filePath) {
       cleanupTempFile(filePath).catch((err) => {
-        console.error('[GuildPlayer] prepared incoming temp cleanup error:', err);
+        log.error({ event: 'playback.prepared_incoming_temp_cleanup_error', err }, 'prepared incoming temp cleanup error');
       });
     }
   }
@@ -712,15 +717,15 @@ export class SourcePreparer {
         })
         .catch((err) => {
           if (err?.code === 'ANALYSIS_KILLED') {
-            console.warn('[GuildPlayer] low-priority stem prefetch yielded to mixer:', err.message);
+            log.warn({ event: 'playback.low_priority_stem_prefetch_yielded_to_mixer', err }, 'low-priority stem prefetch yielded to mixer');
           } else {
-            console.warn('[GuildPlayer] low-priority stem prefetch failed:', err.message);
+            log.warn({ event: 'playback.low_priority_stem_prefetch_failed', err }, 'low-priority stem prefetch failed');
           }
           this.#stemPrefetchTracker.markFailed(videoId);
         })
         .finally(() => this.#lowPriorityStemPrefetch.delete(videoId));
     }).catch((err) => {
-      console.warn('[GuildPlayer] stem prefetch cache check failed:', err.message);
+      log.warn({ event: 'playback.stem_prefetch_cache_check_failed', err }, 'stem prefetch cache check failed');
     });
   }
 
@@ -768,7 +773,7 @@ export class SourcePreparer {
       try {
         throwIfAborted(signal);
         const stagedPath = await this.#stageTempFileCopyFn(downloaded.filePath).catch((err) => {
-          console.warn('[GuildPlayer] failed to stage file for low-priority stem prefetch:', err.message);
+          log.warn({ event: 'playback.failed_to_stage_file_for_low_priority_stem_prefetc', err }, 'failed to stage file for low-priority stem prefetch');
           return null;
         });
         if (!stagedPath) return null;
@@ -838,7 +843,7 @@ export class SourcePreparer {
         return { analyzed: true };
       }).then((value) => ({ value }), (error) => {
         if (error?.code !== 'ANALYSIS_KILLED') {
-          console.warn('[GuildPlayer] lookahead analysis failed:', error.message);
+          log.warn({ event: 'playback.lookahead_analysis_failed', err: error }, 'lookahead analysis failed');
         }
         return { error };
       }),
@@ -860,7 +865,7 @@ export class SourcePreparer {
     entry.promise.then((result) => {
       if (result.value?.filePath) {
         cleanupTempFile(result.value.filePath).catch((err) => {
-          console.error('[GuildPlayer] prefetch cleanup error:', err);
+          log.error({ event: 'playback.prefetch_cleanup_error', err }, 'prefetch cleanup error');
         });
       }
     }).catch(() => {});

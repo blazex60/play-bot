@@ -4,6 +4,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnCapture } from './spawnCapture.js';
 import { resolveDemucsBin, DEMUCS_MODEL } from './vocalActivity.js';
+import { getLogger } from '../logging/appLogger.js';
+
+const log = getLogger('stemCache');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -166,11 +169,11 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal }) 
     // Enforce the size cap after every write, not just at Bot startup —
     // a long-running process would otherwise grow the cache unbounded.
     pruneStemCache().catch((err) => {
-      console.warn(`[stemCache] prune after separation failed: ${err.message}`);
+      log.warn({ event: 'audio.stemcache.prune_failed', err }, 'prune after separation failed');
     });
     return { vocalPath, instrumentalPath };
   } catch (err) {
-    console.warn(`[stemCache] separation failed for ${videoId}: ${err.message}`);
+    log.warn({ event: 'audio.stemcache.separation_failed', trackId: videoId, err }, 'stem separation failed');
     return null;
   } finally {
     await rm(jobTmpRoot, { recursive: true, force: true }).catch(() => {});

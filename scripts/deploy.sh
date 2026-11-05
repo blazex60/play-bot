@@ -35,7 +35,9 @@ if echo "$CHANGED" | grep -E '^src/' | grep -Ev '^src/web/' | grep -q .; then
   BOT_CHANGED=true
 fi
 
-if echo "$CHANGED" | grep -Eq '^(web/|src/web/)'; then
+# src/logging/ is shared by music-bot and music-web, so a change there must
+# rebuild both (the bot rule above already fires for it; this adds web).
+if echo "$CHANGED" | grep -Eq '^(web/|src/web/|src/logging/)'; then
   WEB_CHANGED=true
 fi
 
