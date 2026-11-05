@@ -67,7 +67,7 @@ test('request ids are server generated, not taken from client headers', async (t
 test('unexpected 5xx errors are logged with a stack even though request logging is custom', async (t) => {
   const cap = capture()
   const app = await build(t, cap.logger)
-  app.get('/boom', async () => { throw new Error('kaboom Bearer abcdefghijklmnop') })
+  app.get('/boom', async () => { throw new Error(`kaboom Bearer ${'x'.repeat(20)}`) })
   const res = await app.inject({ method: 'GET', url: '/boom' })
   assert.equal(res.statusCode, 500)
   const rec = cap.records().find(r => r.event === 'web.request_error')

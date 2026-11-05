@@ -62,10 +62,10 @@ test('logger: secrets are redacted', () => {
     token: 'abc',
     req: { method: 'GET', url: '/cb?code=SECRET&x=1', headers: { authorization: 'Bearer abc', cookie: 'sid=1' } },
     nested: { password: 'pw', accessToken: 'at' },
-    err: new Error('failed with Bearer abcdefghijklmnop'),
+    err: new Error(`failed with Bearer ${'x'.repeat(20)}`),
   })
   const text = out.lines.join('')
-  for (const secret of ['"abc"', 'SECRET', 'sid=1', '"pw"', '"at"', 'abcdefghijklmnop']) {
+  for (const secret of ['"abc"', 'SECRET', 'sid=1', '"pw"', '"at"', 'x'.repeat(20)]) {
     assert.ok(!text.includes(secret), `leaked ${secret}: ${text}`)
   }
   assert.ok(text.includes('x=1'))
@@ -75,7 +75,7 @@ test('sanitizeUrl / scrubString', () => {
   assert.equal(sanitizeUrl('/a?code=1&page=2#frag'), '/a?code=[REDACTED]&page=2')
   assert.equal(sanitizeUrl('/a'), '/a')
   assert.equal(sanitizeUrl('/a?access_token=z'), '/a?access_token=[REDACTED]')
-  assert.equal(scrubString('Authorization: Bot abcdefghijklmnopqrstuvwx'), 'Authorization: Bot [REDACTED]')
+  assert.equal(scrubString(`Authorization: Bot ${'x'.repeat(24)}`), 'Authorization: Bot [REDACTED]')
 })
 
 test('file sink: writes to date-named jsonl and survives restart (appends)', () => {

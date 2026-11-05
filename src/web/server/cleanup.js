@@ -23,8 +23,13 @@ export function startCleanupJob({
 } = {}) {
   const run = () => {
     try {
-      const deleted = sweepExpiredRows({ db, now: now() })
-      logger.debug?.({ event: 'web.cleanup.sweep', deleted })
+      const swept = sweepExpiredRows({ db, now: now() })
+      // Only row counts are logged (never row contents).
+      logger.debug?.({
+        event: 'web.cleanup.sweep',
+        expiredStateRows: swept.oauthStates,
+        expiredSessionRows: swept.webSessions,
+      })
     } catch (error) {
       logger.error?.({ event: 'web.cleanup.error', err: error })
     }
