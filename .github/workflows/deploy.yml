@@ -9,12 +9,20 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
+
       - name: Connect Tailscale
-        uses: tailscale/github-action@v2
+        uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
+          version: latest
+
+      - name: Verify Tailscale
+        run: |
+          tailscale version
+          tailscale status
+
       - name: Deploy music-bot
         uses: appleboy/ssh-action@v1
         with:
