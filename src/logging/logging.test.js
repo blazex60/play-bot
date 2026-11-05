@@ -217,3 +217,33 @@ test('getLogger is lazy: importing/creating child loggers opens no log files', a
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('file sink: normal flush is asynchronous and still lands, in order, across rotation', async () => {
+  const dir = tmp()
+  try {
+    const s = new RotatingFileStream({ dir, now: () => T0, maxFileBytes: 30, maxFilesPerDay: 10, flushIntervalMs: 5, cleanupIntervalMs: 0 })
+    for (let i = 0; i < 6; i += 1) s.write(`${String(i).repeat(9)}\n`)
+    assert.deepEqual(readdirSync(dir), [], 'write() must not touch the disk synchronously')
+    await new Promise(r => setTimeout(r, 100))
+    const names = readdirSync(dir).sort()
+    assert.ok(names.length >= 2)
+    const all = ['2026-10-28.jsonl', ...names.filter(n => n !== '2026-10-28.jsonl')]
+      .filter(n => names.includes(n))
+      .map(n => readFileSync(join(dir, n), 'utf8')).join('')
+    assert.equal(all, [0, 1, 2, 3, 4, 5].map(i => `${String(i).repeat(9)}\n`).join(''))
+    s.close()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('file sink: directory removed at runtime is recreated by the async path', async () => {
+  const dir = tmp()
+  try {
+    const target = join(dir, 'logs')
+    const s = new RotatingFileStream({ dir: target, now: () => T0, flushIntervalMs: 5, cleanupIntervalMs: 0 })
+    rmSync(target, { recursive: true, force: true })
+    s.write('x\n')
+    await new Promise(r => setTimeout(r, 60))
+    assert.equal(readFileSync(join(target, '2026-10-28.jsonl'), 'utf8'), 'x\n')
+    s.close()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})

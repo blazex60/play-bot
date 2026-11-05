@@ -1,4 +1,5 @@
 import { appendFileSync, mkdirSync, statSync, unlinkSync } from 'node:fs'
+import { appendFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { listLogFiles, logFileName, pruneLogs, utcDate } from './retention.js'
@@ -11,8 +12,10 @@ const WARN_INTERVAL_MS = 60_000
  * `<dir>/YYYY-MM-DD[.n].jsonl`, rotating by UTC date and size, and pruning
  * expired files at startup and on a timer.
  *
- * Writes are buffered and flushed in batches so logging never blocks the
- * audio path per line. I/O failures never throw: they are reported on stderr
+ * Writes are buffered and appended in batches with async fs calls (serialised
+ * through a queue), so logging never blocks the event loop that feeds the
+ * audio path. Only startup/rotation housekeeping (readdir/stat/unlink, at most
+ * daily or per 10 MiB) and the exit-time flushSync() use sync I/O. I/O failures never throw: they are reported on stderr
  * (rate limited) and the process keeps running.
  */
 export class RotatingFileStream {
@@ -25,6 +28,8 @@ export class RotatingFileStream {
   #warn
   #flushIntervalMs
   #buffer = []
+  #queue = []
+  #draining = false
   #bufferBytes = 0
   #flushTimer = null
   #cleanupTimer = null
@@ -78,15 +83,39 @@ export class RotatingFileStream {
     this.#buffer.push(text)
     this.#bufferBytes += bytes
     if (this.#bufferBytes >= 64 * 1024) {
-      this.flushSync()
+      this.#flush()
     } else if (!this.#flushTimer) {
-      this.#flushTimer = setTimeout(() => this.flushSync(), this.#flushIntervalMs)
+      this.#flushTimer = setTimeout(() => this.#flush(), this.#flushIntervalMs)
       this.#flushTimer.unref?.()
     }
     return true
   }
 
+  /** Move buffered lines into the write queue and start draining it asynchronously. */
+  #flush() {
+    this.#enqueueBuffered()
+    this.#drain().catch(error => this.#reportError(error))
+  }
+
+  /**
+   * Synchronously write everything still buffered or queued. Only for exit /
+   * fatal paths (and tests): the normal path never blocks the event loop.
+   */
   flushSync() {
+    this.#enqueueBuffered()
+    while (this.#queue.length > 0) {
+      const op = this.#queue.shift()
+      try {
+        this.#runOpSync(op)
+      } catch (error) {
+        this.#active = null
+        this.#reportError(error)
+      }
+    }
+  }
+
+  /** Decide target files for buffered lines (cheap, no write I/O) and queue the writes. */
+  #enqueueBuffered() {
     if (this.#flushTimer) {
       clearTimeout(this.#flushTimer)
       this.#flushTimer = null
@@ -96,27 +125,78 @@ export class RotatingFileStream {
     this.#buffer = []
     this.#bufferBytes = 0
     try {
-      this.#ensureDir()
       // Lines are grouped per target file so a batch never straddles rotation.
       let batch = ''
       let batchFile = null
+      const land = () => {
+        if (batch) this.#queue.push({ type: 'append', file: batchFile, text: batch })
+        batch = ''
+      }
       for (const line of lines) {
         const bytes = Buffer.byteLength(line)
         const { rotated } = this.#target(bytes)
         if (rotated) {
-          // Land the previous file on disk first so generation counting is accurate.
-          if (batch) this.#append(batch, batchFile)
-          batch = ''
-          this.#enforceGenerations(this.#active.date)
+          land()
+          // Runs after the previous file's appends, so generation counting is accurate.
+          this.#queue.push({ type: 'enforce', date: this.#active.date })
         }
         batchFile = { date: this.#active.date, index: this.#active.index }
         batch += line
         this.#active.size += bytes
       }
-      if (batch) this.#append(batch, batchFile)
+      land()
     } catch (error) {
       this.#active = null
       this.#reportError(error)
+    }
+  }
+
+  async #drain() {
+    if (this.#draining) return
+    this.#draining = true
+    try {
+      while (this.#queue.length > 0) {
+        const op = this.#queue.shift()
+        try {
+          await this.#runOp(op)
+        } catch (error) {
+          this.#active = null
+          this.#reportError(error)
+        }
+      }
+    } finally {
+      this.#draining = false
+    }
+  }
+
+  async #runOp(op) {
+    if (op.type === 'enforce') {
+      this.#enforceGenerations(op.date)
+      return
+    }
+    const path = join(this.#dir, logFileName(op.file.date, op.file.index))
+    try {
+      await appendFile(path, op.text)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+      // Directory was removed underneath us: recreate it once and retry.
+      await mkdir(this.#dir, { recursive: true })
+      await appendFile(path, op.text)
+    }
+  }
+
+  #runOpSync(op) {
+    if (op.type === 'enforce') {
+      this.#enforceGenerations(op.date)
+      return
+    }
+    const path = join(this.#dir, logFileName(op.file.date, op.file.index))
+    try {
+      appendFileSync(path, op.text)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+      mkdirSync(this.#dir, { recursive: true })
+      appendFileSync(path, op.text)
     }
   }
 
@@ -151,10 +231,6 @@ export class RotatingFileStream {
 
   #ensureDir() {
     mkdirSync(this.#dir, { recursive: true })
-  }
-
-  #append(text, file) {
-    appendFileSync(join(this.#dir, logFileName(file.date, file.index)), text)
   }
 
   /** Pick (and if necessary rotate to) the file for the next line. */
