@@ -87,6 +87,10 @@ export class AnalysisCoordinator {
   #stemPrefetchTracker;
   #analysisQueue;
   #stemQueue;
+  /** videoId -> whether a queued stem job for it is still worth running (current / next / next+1). */
+  #isStemJobRelevant;
+  /** Feature switch + circuit breaker gate (stemCache.js isStemSeparationAvailable). */
+  #isStemSeparationAvailableFn;
   /** Routes a settled analysis result back to the player's duration/tempo apply step. */
   #applyAnalysisDuration;
 
@@ -100,6 +104,8 @@ export class AnalysisCoordinator {
     analysisQueue = null,
     stemQueue = null,
     applyAnalysisDuration,
+    isStemJobRelevant = () => true,
+    isStemSeparationAvailableFn = () => true,
   }) {
     this.#analyzeTrackFileFn = analyzeTrackFileFn;
     this.#getTrackAnalysisFn = getTrackAnalysisFn;
@@ -110,6 +116,8 @@ export class AnalysisCoordinator {
     this.#analysisQueue = analysisQueue;
     this.#stemQueue = stemQueue;
     this.#applyAnalysisDuration = applyAnalysisDuration;
+    this.#isStemJobRelevant = isStemJobRelevant;
+    this.#isStemSeparationAvailableFn = isStemSeparationAvailableFn;
   }
 
   #analysisQ() {
@@ -199,7 +207,7 @@ export class AnalysisCoordinator {
         // Skip rather than start a many-minute Demucs run against a job
         // the (realtime) queue already decided to cancel (e.g. a mixer
         // underrun killed this job right as runAnalysis finished).
-        if (!signal?.aborted && stagedPath) {
+        if (!signal?.aborted && stagedPath && this.#isStemSeparationAvailableFn()) {
           // Phase 9C (docs/mix-transition-phase9.md §5): dispatch the
           // heavy full-track Demucs step on the dedicated
           // StemPreparationQueue instead of this (realtime) queue —
@@ -247,9 +255,17 @@ export class AnalysisCoordinator {
           // retry back this same doomed (killed → resolves null) promise,
           // silently burning the one retry for nothing.
           let currentAttemptSeparation = null;
-          const runSeparation = (allowRetry) => this.#stemQ().enqueue(async ({ spawnNice: stemSpawnNice, signal: stemSignal } = {}) => {
+          const runSeparation = (allowRetry) => this.#stemQ().enqueue(async ({ spawnNice: stemSpawnNice, signal: stemSignal, pausedMs: stemPausedMs } = {}) => {
             if (stemSignal?.aborted) return null;
-            currentAttemptSeparation = this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: stemSpawnNice, signal: stemSignal });
+            // Plan Phase 1 #2: the stem queue is serial and a job can wait
+            // minutes for its turn. By then the track may have been played,
+            // skipped or removed — separating it would only delay the jobs
+            // for tracks that are still coming up.
+            if (!this.#isStemJobRelevant(track.videoId)) {
+              log.debug({ event: 'playback.stem_job_stale', trackId: track.videoId }, '不要になったステム分離ジョブを破棄');
+              return null;
+            }
+            currentAttemptSeparation = this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: stemSpawnNice, signal: stemSignal, getPausedMs: stemPausedMs });
             return currentAttemptSeparation;
           }, { priority: stemJobPriority }).then(
             (stems) => {

@@ -14,6 +14,7 @@ import { FRAME_BYTES } from '../audio/fade.js';
 import { PcmSource } from '../audio/pcmSource.js';
 import { ANALYSIS_VERSION } from '../audio/trackAnalysis.js';
 import { planBeatSyncedTransition } from '../audio/beatmixTransition.js';
+import { createAnalysisQueue } from '../audio/analysisQueue.js';
 import {
   configureSettingsPathForTest,
   getSettingsPathForTest,
@@ -1996,6 +1997,91 @@ test('acceptance (mixer): stem separation input is staged before the analysis qu
   await player.stop();
 });
 
+// Plan Phase 1 #2: the stem queue is serial, so a job can wait minutes. If
+// its track was removed from the queue meanwhile, running it only delays the
+// tracks that are still coming.
+for (const [label, removeTrack, expectedCalls] of [
+  ['still queued → separated', false, 1],
+  ['removed while waiting → skipped', true, 0],
+]) {
+  test(`acceptance (mixer): a queued stem job whose track is ${label}`, async () => {
+    const frame = Buffer.alloc(FRAME_BYTES);
+    const separateCalls = [];
+    const stemQueue = createAnalysisQueue({ useNice: false });
+    let releaseBlocker;
+    const blocker = stemQueue.enqueue(() => new Promise((resolve) => { releaseBlocker = resolve; }));
+    const { player, queue } = makePlayer({
+      trackDuration: 60,
+      getTrackAnalysisFn: async () => null,
+      analyzeTrackFileFn: async () => ({ version: ANALYSIS_VERSION, durationSec: 60, confidence: 0.8 }),
+      prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-original-${track.videoId}`, measured: {} }),
+      stageTempFileCopyFn: async (filePath) => `${filePath}-staged`,
+      separateTrackStemsFn: async (filePath, videoId) => {
+        separateCalls.push(videoId);
+        return null;
+      },
+      isStemSeparationAvailableFn: () => true,
+      stemQueue,
+      createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+    });
+    queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+    try {
+      await player.playNext();
+      for (let i = 0; i < 40 && stemQueue.pending === 0; i += 1) await waitMs(10);
+      assert.ok(stemQueue.pending >= 1, 'B\'s separation should be waiting behind the blocker');
+      if (removeTrack) queue.removeUpcoming(0);
+      releaseBlocker();
+      await blocker;
+      await waitMs(50);
+      assert.equal(separateCalls.filter((id) => id === 'vid-b').length, expectedCalls);
+    } finally {
+      releaseBlocker?.();
+      await player.stop();
+    }
+  });
+}
+
+// Review follow-up: C's LOW-priority prefetch downloads/normalizes audio only
+// to separate it, so it must not run at all when separation is unavailable.
+for (const [label, available, expectDownload] of [
+  ['runs when separation is available', true, true],
+  ['is skipped when separation is disabled / breaker open', false, false],
+]) {
+  test(`acceptance (mixer): C's low-priority stem prefetch ${label}`, async () => {
+    const frame = Buffer.alloc(FRAME_BYTES);
+    const prefetched = [];
+    const { player, queue } = makePlayer({
+      trackDuration: 60,
+      track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+      getTrackAnalysisFn: async () => null,
+      analyzeTrackFileFn: async () => ({ version: ANALYSIS_VERSION, durationSec: 60, confidence: 0.8 }),
+      // Only the LOW stem-prefetch job downloads through the stem queue's
+      // spawnNice; B's playback prefetch and C's analysis lookahead call
+      // prefetchTrackFn(track) without it and are unaffected by the gate.
+      prefetchTrackFn: async (track, opts) => {
+        prefetched.push(opts?.spawnFn ? `stem:${track.videoId}` : track.videoId);
+        return { filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} };
+      },
+      stageTempFileCopyFn: async (filePath) => `${filePath}-staged`,
+      separateTrackStemsFn: async () => null,
+      getCachedStemsFn: async () => null,
+      isStemSeparationAvailableFn: () => available,
+      createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+    });
+    queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+    queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+    try {
+      await player.playNext();
+      for (let i = 0; i < 50 && !(expectDownload ? prefetched.includes('stem:vid-c') : prefetched.includes('vid-b')); i += 1) await waitMs(20);
+      await waitMs(50);
+      assert.ok(prefetched.includes('vid-b'), 'B is still prefetched for playback either way');
+      assert.equal(prefetched.includes('stem:vid-c'), expectDownload, `prefetch calls: ${prefetched.join(', ')}`);
+    } finally {
+      await player.stop();
+    }
+  });
+}
+
 test('acceptance (mixer): staged copy is cleaned up even when analysis fails before separation (CodeRabbit)', async () => {
   // CodeRabbit (PR #39, round 15): the round-14 fix's try/finally only
   // wrapped the separation call, not the earlier #lookupPersistentAnalysis()/
@@ -2161,7 +2247,12 @@ test('acceptance (mixer): lookahead analysis does not persist YouTube metadata d
   }));
 
   await player.playNext();
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  // Poll instead of a fixed 80 ms sleep: the lookahead path stages a temp
+  // copy and goes through the shared realtime analysis queue, which can
+  // take longer than 80 ms on a busy machine (this failed on main too).
+  for (let i = 0; i < 100 && seenDurations.length === 0; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 
   assert.ok(seenDurations.length > 0, 'lookahead must still run analysis on a cache miss');
   assert.ok(
@@ -2262,6 +2353,103 @@ test('acceptance (mixer): stem-mix transition is chosen when both sides have cac
     assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-a.instrumental.wav'));
     assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-b.vocal.wav'));
     assert.ok(stemSourceCalls.some((c) => c.filePath === '/tmp/vid-b.instrumental.wav'));
+  } finally {
+    await player.stop();
+  }
+});
+
+// Plan Phase 2 (stem windows): only part of each track is separated.
+function windowedStems(videoId, name, startSec, endSec) {
+  return {
+    windows: [{
+      name,
+      startSec,
+      endSec,
+      vocalPath: `/tmp/${videoId}.${name}.vocal.wav`,
+      instrumentalPath: `/tmp/${videoId}.${name}.instrumental.wav`,
+    }],
+  };
+}
+
+test('acceptance (mixer): windowed stems are opened at the plan position minus the window start', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  const stemSourceCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    // A: exit at 1.0 s, so its tail window must start at or before it.
+    // B: entry at 0.2 s inside a head window starting at 0.
+    getCachedStemsFn: async (videoId) => (videoId === 'vid-a'
+      ? windowedStems('vid-a', 'tail', 0.5, 9.5)
+      : windowedStems('vid-b', 'head', 0, 12)),
+    createFileSourceFn: (filePath, opts) => {
+      stemSourceCalls.push({ filePath, opts });
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.ok(startedPlan, 'expected a crossfade to have armed');
+    assert.equal(startedPlan.mode, 'stem-mix');
+    const outVocal = stemSourceCalls.find((c) => c.filePath === '/tmp/vid-a.tail.vocal.wav');
+    const inVocal = stemSourceCalls.find((c) => c.filePath === '/tmp/vid-b.head.vocal.wav');
+    assert.ok(outVocal && inVocal, `expected window files to be opened, got ${stemSourceCalls.map((c) => c.filePath).join(', ')}`);
+    assert.ok(Math.abs(outVocal.opts.startSec - (startedPlan.startSec - 0.5)) < 1e-6,
+      `outgoing stem must seek relative to the tail window: plan ${startedPlan.startSec}, got ${outVocal.opts.startSec}`);
+    assert.ok(Math.abs(inVocal.opts.startSec - 0.2) < 1e-6, `incoming stem seeks to the entry, got ${inVocal.opts.startSec}`);
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): stem-mix is not chosen when the exit lies outside the outgoing stem window', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  new Int16Array(frame.buffer).fill(4000);
+  const { outgoingAnalysis, incomingAnalysis } = stemFixtures();
+
+  const stemSourceCalls = [];
+  const { player, queue } = makePlayer({
+    trackDuration: 8,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 8, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async (videoId) => (videoId === 'vid-a' ? outgoingAnalysis : incomingAnalysis),
+    analyzeTrackFileFn: null,
+    probeTempoBackendFn: async () => 'rubberband',
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame))),
+    getCachedStemsFn: async (videoId) => (videoId === 'vid-a'
+      ? windowedStems('vid-a', 'tail', 3.0, 9.5)
+      : windowedStems('vid-b', 'head', 0, 12)),
+    createFileSourceFn: (filePath, opts) => {
+      stemSourceCalls.push({ filePath, opts });
+      return PcmSource.fromBuffers(Array.from({ length: 400 }, () => Buffer.from(frame)));
+    },
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 8, videoId: 'vid-b' }));
+
+  let startedPlan = null;
+  player.mixStream.on('crossfadestart', (plan) => { startedPlan = plan; });
+
+  try {
+    await player.playNext();
+    for (let i = 0; i < 60; i += 1) player.mixStream.read(FRAME_BYTES);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    assert.notEqual(startedPlan?.mode, 'stem-mix');
+    assert.equal(stemSourceCalls.length, 0, 'no stem sources should be spawned');
   } finally {
     await player.stop();
   }
@@ -3661,7 +3849,11 @@ test('acceptance (mixer): a track removed from the queue is pruned from stem pre
     resolveC(null); // the pending getCachedStemsFn() call for C finally resolves (a miss)
     await nextTurn();
     await pollUntil(() => byIdState(player, 'vid-c') != null && byIdState(player, 'vid-c') !== 'processing');
-    assert.equal(byIdState(player, 'vid-c'), 'ready', 'the LOW pipeline dispatched before removal still completes (no cancellation API)');
+    // Stem plan Phase 1: the LOW job re-checks relevance when it reaches the
+    // front of the stem queue, so a track removed meanwhile is dropped
+    // instead of being downloaded and separated for nothing — it settles as
+    // failed (terminal) rather than ready.
+    assert.equal(byIdState(player, 'vid-c'), 'failed', 'a LOW job whose track left the queue is dropped when it starts');
 
     // The next #prefetchUpcoming() checkpoint (B being promoted to current)
     // prunes it, now that it has reached a terminal state and is no longer

@@ -1,14 +1,15 @@
 import { spawn } from 'node:child_process';
+import { stemSeparationConfig } from './stemConfig.js';
 
 export const ANALYSIS_NICE = 15;
 export const UNDERRUN_PAUSE_MS = 150;
 export const MAX_PAUSES = 3;
 export const MAX_STOPPED_MS = 2000;
 
-const THREAD_ENV = {
-  OMP_NUM_THREADS: '1',
-  MKL_NUM_THREADS: '1',
-};
+function threadEnv(threadCount) {
+  const n = String(threadCount);
+  return { OMP_NUM_THREADS: n, MKL_NUM_THREADS: n };
+}
 
 let defaultQueue = null;
 let defaultStemQueue = null;
@@ -36,6 +37,10 @@ export function createAnalysisQueue({
   maxStoppedMs = MAX_STOPPED_MS,
   clock = () => Date.now(),
   useNice = true,
+  // OMP/MKL threads for spawned children. The realtime queue stays at 1 so
+  // BPM/phrase analysis never competes with playback; the stem queue takes
+  // DEMUCS_THREADS (see getStemPreparationQueue()).
+  threadCount = 1,
 } = {}) {
   const jobs = [];
   /** @type {Set<import('node:child_process').ChildProcess>} */
@@ -49,6 +54,9 @@ export function createAnalysisQueue({
   let underrunSince = null;
   let spawnEpoch = 0;
   let stopTimeoutHandle = null;
+  // Milliseconds the CURRENT job has spent SIGSTOP'd, so a job's own
+  // wall-clock timeout can exclude time it was frozen on purpose.
+  let jobStoppedMs = 0;
   const underrunSources = new Set();
   const ANON_UNDERRUN = Symbol('analysis-underrun');
 
@@ -89,6 +97,14 @@ export function createAnalysisQueue({
         // already gone
       }
     }
+  }
+
+  function noteResumed() {
+    if (stoppedAt) jobStoppedMs += Math.max(0, clock() - stoppedAt);
+  }
+
+  function pausedMs() {
+    return jobStoppedMs + (paused && stoppedAt ? Math.max(0, clock() - stoppedAt) : 0);
   }
 
   function killCurrent(reason) {
@@ -137,7 +153,7 @@ export function createAnalysisQueue({
     const epoch = spawnEpoch;
     const env = {
       ...process.env,
-      ...THREAD_ENV,
+      ...threadEnv(threadCount),
       TORCH_HOME: process.env.TORCH_HOME || '/opt/torch-cache',
       ...options.env,
     };
@@ -165,6 +181,7 @@ export function createAnalysisQueue({
     if (!job) return;
     running = true;
     pauseCount = 0;
+    jobStoppedMs = 0;
     // Codex review (PR #45, P2): don't blindly clear pause state on every
     // job start — pause()/noteUnderrun() can be called while idle (no job
     // running yet), and previously this unconditional reset threw that
@@ -199,6 +216,7 @@ export function createAnalysisQueue({
       spawnNice,
       register,
       signal: abortController.signal,
+      pausedMs,
     }));
     try {
       const result = await Promise.race([work, aborted]);
@@ -266,6 +284,7 @@ export function createAnalysisQueue({
     if (underrunSources.size > 0) return;
     underrunSince = null;
     if (!paused) return;
+    noteResumed();
     paused = false;
     stoppedAt = 0;
     clearStopTimeout();
@@ -365,7 +384,7 @@ export function getAnalysisQueue() {
  */
 export function getStemPreparationQueue() {
   if (!defaultStemQueue) {
-    defaultStemQueue = createAnalysisQueue();
+    defaultStemQueue = createAnalysisQueue({ threadCount: stemSeparationConfig().threads });
   }
   return defaultStemQueue;
 }

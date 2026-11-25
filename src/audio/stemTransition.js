@@ -1,4 +1,5 @@
 import { planBeatmixTransition } from './beatmixTransition.js';
+import { stemPairCovered } from './stemConfig.js';
 
 /**
  * Phase 8 (docs/mix-transition-phase8.md): margin (playback seconds) kept
@@ -297,6 +298,12 @@ export function deriveStemEnvelopesFromEvents(events, mixZone, curve = 'equal-po
 export function planStemTransition(outgoing, incoming, options = {}) {
   const vocalCrossoverMarginSec = options.vocalCrossoverMarginSec ?? DEFAULT_VOCAL_CROSSOVER_MARGIN_SEC;
   const outVocalReleaseSec = options.outVocalReleaseSec ?? DEFAULT_OUTVOCAL_RELEASE_SEC;
+  // Plan Phase 2: with windowed stems, a pair is only usable if its whole
+  // overlap sits inside both sides' separated windows. Absent (tests,
+  // callers predating windows) means "stems cover the whole track".
+  const stemCoverage = options.stemCoverage ?? null;
+  let rejectedForWindow = false;
+  let rejectedForVocalRoom = false;
   const plan = planBeatmixTransition(outgoing, incoming, {
     ...options,
     requireExitVocalSafe: false,
@@ -325,17 +332,31 @@ export function planStemTransition(outgoing, incoming, options = {}) {
     // buildStemEnvelopes() below will end up using — otherwise a caller
     // overriding it would have the search validate room against one
     // release duration while the final envelope build uses another.
-    pairFilter: ({ exit, fadeSec, outgoingRatio }) => estimateInVocalFadeSec(
-      outgoing, { exitStartSec: exit.sec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec, outVocalReleaseSec,
-    ) >= MIN_MEANINGFUL_INVOCAL_FADE_SEC,
+    pairFilter: ({ exit, entry, fadeSec, outgoingRatio }) => {
+      if (stemCoverage && !stemPairCovered(stemCoverage, { exitSec: exit.sec, entrySec: entry.sec, fadeSec, outgoingRatio })) {
+        rejectedForWindow = true;
+        return false;
+      }
+      const roomOk = estimateInVocalFadeSec(
+        outgoing, { exitStartSec: exit.sec, outgoingRatio, fadeSec }, vocalCrossoverMarginSec, outVocalReleaseSec,
+      ) >= MIN_MEANINGFUL_INVOCAL_FADE_SEC;
+      if (!roomOk) rejectedForVocalRoom = true;
+      return roomOk;
+    },
   });
   if (!plan.eligible) {
     // Surface the same specific reason external callers/tests have always
     // seen for this case — pairFilter itself is a generic beatmixTransition
     // ()-level concept with no idea WHY a pair was rejected, so the mapping
     // back to this plan's own domain-specific rejection reason happens here.
+    // Vocal room wins when both happened: it is the long-standing reason,
+    // and a window miss on some other pair does not change why the in-window
+    // pairs failed.
     if (plan.reasons?.includes('pair-filter-rejected')) {
-      return { mode: null, eligible: false, reasons: ['stem-mix-no-invocal-fade-room'] };
+      const reason = rejectedForVocalRoom || !rejectedForWindow
+        ? 'stem-mix-no-invocal-fade-room'
+        : 'stem-mix-outside-stem-window';
+      return { mode: null, eligible: false, reasons: [reason] };
     }
     return plan;
   }

@@ -8,6 +8,7 @@ import { getAnalysisQueue, getStemPreparationQueue } from '../../audio/analysisQ
 import { StemPrefetchPriority } from '../../audio/stemPrefetch.js';
 import { LoopMode } from '../queue.js';
 import { getLogger } from '../../logging/appLogger.js'
+import { findStemWindow } from '../../audio/stemConfig.js';
 
 const log = getLogger('GuildPlayer')
 
@@ -73,6 +74,8 @@ export class SourcePreparer {
   #createFileSourceFn;
   #getCachedStemsFn;
   #separateTrackStemsFn;
+  #isStemJobRelevant;
+  #isStemSeparationAvailableFn;
   #stageTempFileCopyFn;
   /** (filePath, measured) -> assigns the player's #currentTempFile/#currentMeasured pair — the current track's temp ownership stays there. */
   #setCurrentTemp;
@@ -118,6 +121,8 @@ export class SourcePreparer {
     createFileSourceFn,
     getCachedStemsFn,
     separateTrackStemsFn,
+    isStemJobRelevant = () => true,
+    isStemSeparationAvailableFn = () => true,
     stageTempFileCopyFn,
     setCurrentTemp,
     getCurrentMeasured,
@@ -134,6 +139,8 @@ export class SourcePreparer {
     this.#createFileSourceFn = createFileSourceFn;
     this.#getCachedStemsFn = getCachedStemsFn;
     this.#separateTrackStemsFn = separateTrackStemsFn;
+    this.#isStemJobRelevant = isStemJobRelevant;
+    this.#isStemSeparationAvailableFn = isStemSeparationAvailableFn;
     this.#stageTempFileCopyFn = stageTempFileCopyFn;
     this.#setCurrentTemp = setCurrentTemp;
     this.#getCurrentMeasured = getCurrentMeasured;
@@ -292,12 +299,19 @@ export class SourcePreparer {
       // downgrade, ...) superseded this attempt while it awaited — the
       // caller no longer wants this result; do not install it.
       if (this.#preparingOutgoingStemsKey !== key) return;
-      if (!fresh) {
+      // Phase 2 (stem windows): a long track only has its head/tail
+      // separated, so open the window holding startSec and seek relative to
+      // where that window begins. The planner already checked the whole
+      // overlap fits (stemConfig.js stemPairCovered); no window here means
+      // the cache changed underneath it, so give up on stems.
+      const window = findStemWindow(fresh, startSec);
+      if (!window) {
         this.clearPreparedOutgoingStems();
         return;
       }
-      const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
-      const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
+      const localStartSec = Math.max(0, startSec - window.startSec);
+      const vocal = this.#createFileSourceFn(window.vocalPath, { startSec: localStartSec, tempoFilter, measured });
+      const instrumental = this.#createFileSourceFn(window.instrumentalPath, { startSec: localStartSec, tempoFilter, measured });
       this.clearPreparedOutgoingStems();
       this.#preparedOutgoingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
     } finally {
@@ -377,12 +391,19 @@ export class SourcePreparer {
       // see #ensureOutgoingStemPrep()'s matching comment (Codex).
       const fresh = await this.#getCachedStemsFn(videoId);
       if (this.#preparingIncomingStemsKey !== key) return;
-      if (!fresh) {
+      // Phase 2 (stem windows): a long track only has its head/tail
+      // separated, so open the window holding startSec and seek relative to
+      // where that window begins. The planner already checked the whole
+      // overlap fits (stemConfig.js stemPairCovered); no window here means
+      // the cache changed underneath it, so give up on stems.
+      const window = findStemWindow(fresh, startSec);
+      if (!window) {
         this.clearPreparedIncomingStems();
         return;
       }
-      const vocal = this.#createFileSourceFn(fresh.vocalPath, { startSec, tempoFilter, measured });
-      const instrumental = this.#createFileSourceFn(fresh.instrumentalPath, { startSec, tempoFilter, measured });
+      const localStartSec = Math.max(0, startSec - window.startSec);
+      const vocal = this.#createFileSourceFn(window.vocalPath, { startSec: localStartSec, tempoFilter, measured });
+      const instrumental = this.#createFileSourceFn(window.instrumentalPath, { startSec: localStartSec, tempoFilter, measured });
       this.clearPreparedIncomingStems();
       this.#preparedIncomingStems = { videoId, prep: { startSec, tempoFilter, measured }, vocal, instrumental };
     } finally {
@@ -708,6 +729,10 @@ export class SourcePreparer {
       }
 
       if (this.#lowPriorityStemPrefetch.has(videoId)) return;
+      // C's prefetch downloads, normalizes and stages audio only so it can be
+      // separated; with separation switched off or the circuit breaker open
+      // that is pure waste, and it would be retried on every prefetch pass.
+      if (!this.#isStemSeparationAvailableFn()) return;
       this.#lowPriorityStemPrefetch.add(videoId);
       this.#stemPrefetchTracker.markProcessing(videoId);
       this.#runLowPriorityStemPrefetch(track)
@@ -749,7 +774,7 @@ export class SourcePreparer {
    * from the realtime queue's underrun event (see #initMixerPipeline()).
    */
   async #runLowPriorityStemPrefetch(track) {
-    return this.#stemQ().enqueue(async ({ spawnNice, signal } = {}) => {
+    return this.#stemQ().enqueue(async ({ spawnNice, signal, pausedMs } = {}) => {
       throwIfAborted(signal);
       // Codex review (PR #44, P2): recheck the stem cache now that this LOW
       // job has actually reached the front of the (possibly minutes-long,
@@ -761,6 +786,12 @@ export class SourcePreparer {
       // cache too, but only after all of that expensive work is done.
       const alreadyCached = await this.#getCachedStemsFn(track.videoId).catch(() => null);
       if (alreadyCached) return alreadyCached;
+      // Same staleness rule as AnalysisCoordinator's separation job: by the
+      // time this job's turn comes C may have been removed or skipped past.
+      if (!this.#isStemJobRelevant(track.videoId) || !this.#isStemSeparationAvailableFn()) {
+        log.debug({ event: 'playback.stem_job_stale', trackId: track.videoId }, '不要になったステム分離ジョブを破棄');
+        return null;
+      }
       throwIfAborted(signal);
       // Codex review (PR #44, P1): without spawnFn, prefetchTrackFn's
       // default implementation (normalize.js's prefetchTrack) spawns
@@ -779,7 +810,7 @@ export class SourcePreparer {
         if (!stagedPath) return null;
         throwIfAborted(signal);
         try {
-          return await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal });
+          return await this.#separateTrackStemsFn(stagedPath, track.videoId, { spawnFn: spawnNice, signal, getPausedMs: pausedMs });
         } finally {
           cleanupTempFile(stagedPath).catch(() => {});
         }

@@ -6,9 +6,10 @@ import { spawn } from 'node:child_process';
  * `signal`, when given an already-aborted or later-aborting AbortSignal,
  * kills the process and rejects — lets a long-running spawn (e.g. Demucs)
  * actually stop when its caller's job is cancelled, instead of running to
- * completion orphaned.
+ * completion orphaned. Time the queue keeps the process SIGSTOP'd (reported
+ * via `getPausedMs`) is not charged against `timeoutMs`.
  */
-export function spawnCapture(spawnFn, cmd, args, { timeoutMs = 120_000, signal } = {}) {
+export function spawnCapture(spawnFn, cmd, args, { timeoutMs = 120_000, signal, getPausedMs } = {}) {
   const run = spawnFn ?? spawn;
   if (signal?.aborted) {
     return Promise.reject(new Error(`${cmd} aborted before spawn`));
@@ -27,11 +28,25 @@ export function spawnCapture(spawnFn, cmd, args, { timeoutMs = 120_000, signal }
       reject(new Error(`${cmd} aborted`));
     };
     signal?.addEventListener('abort', onAbort);
-    const timer = setTimeout(() => {
+    // `getPausedMs` (from analysisQueue's job context) reports how long the
+    // queue has kept this job SIGSTOP'd; that frozen time does not count
+    // against the timeout, so the deadline is pushed out by it on expiry.
+    const pausedAtStart = getPausedMs?.() ?? 0;
+    let credited = 0;
+    let timer;
+    const onTimeout = () => {
+      const pausedSince = (getPausedMs?.() ?? 0) - pausedAtStart;
+      const extendMs = pausedSince - credited;
+      if (extendMs > 0) {
+        credited += extendMs;
+        timer = setTimeout(onTimeout, extendMs);
+        return;
+      }
       proc.kill('SIGKILL');
       cleanup();
       reject(new Error(`${cmd} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
+    };
+    timer = setTimeout(onTimeout, timeoutMs);
     proc.stdout?.on('data', (d) => { stdout += d; });
     proc.stderr?.on('data', (d) => { stderr += d; });
     proc.on('error', (err) => {

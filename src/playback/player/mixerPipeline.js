@@ -1,6 +1,7 @@
 import { StreamType } from '@discordjs/voice';
 import { MixStream } from '../../audio/mixStream.js';
 import { getLogger } from '../../logging/appLogger.js'
+import { UnderrunStats } from './underrunStats.js';
 
 const log = getLogger('GuildPlayer')
 
@@ -77,6 +78,7 @@ export class MixerPipeline {
   #playNext;
   #getAnalysisQueue;
   #getStemQueue;
+  #underrunStats = new UnderrunStats();
 
   constructor({
     audioPlayer,
@@ -147,6 +149,7 @@ export class MixerPipeline {
       });
     });
     this.mixStream.on('underrun', () => {
+      this.#underrunStats.noteUnderrun();
       this.#getAnalysisQueue().noteUnderrun(this.#pauseSource);
       // Phase 9C §5.4 "Playback Safety": a Demucs job actively running
       // during a live mixer underrun is exactly the CPU pressure the
@@ -167,6 +170,14 @@ export class MixerPipeline {
       this.#getStemQueue().noteUnderrun(this.#pauseSource);
     });
     this.mixStream.on('underrunClear', () => {
+      const summary = this.#underrunStats.noteCleared();
+      if (summary) {
+        log.info({
+          event: 'playback.mixer_underrun',
+          ...summary,
+          stemJobRunning: this.#getStemQueue().isRunning === true,
+        }, 'ミキサーのアンダーラン');
+      }
       this.#getAnalysisQueue().noteUnderrunCleared(this.#pauseSource);
       this.#getStemQueue().noteUnderrunCleared(this.#pauseSource);
     });

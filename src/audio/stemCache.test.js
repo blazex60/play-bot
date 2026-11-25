@@ -9,8 +9,11 @@ import {
   separateTrackStems,
   pruneStemCache,
   cleanupStaleStemStaging,
+  isStemSeparationAvailable,
+  resetStemCircuitForTest,
 } from './stemCache.js';
 import { DEMUCS_MODEL } from './vocalActivity.js';
+import { STEM_HEAD_WINDOW_SEC, STEM_TAIL_WINDOW_SEC } from './stemConfig.js';
 
 function uniqueVideoId(label) {
   return `stem-test-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -30,7 +33,7 @@ async function cleanup(videoId) {
  * effect can't stand in for it the way vocalActivity.js's stderr-only fake
  * can for a read-only ffmpeg -f null pass.
  */
-function fakeSpawn({ cutFails = false, demucsFails = false, cmds = [] } = {}) {
+function fakeSpawn({ cutFails = false, demucsFails = false, cmds = [], durationSec = 100 } = {}) {
   return (cmd, args = []) => {
     cmds.push({ cmd, args });
     const proc = new EventEmitter();
@@ -39,6 +42,11 @@ function fakeSpawn({ cutFails = false, demucsFails = false, cmds = [] } = {}) {
     proc.kill = () => {};
     queueMicrotask(async () => {
       try {
+        if (cmd === 'ffprobe') {
+          proc.stdout.emit('data', `${durationSec ?? 'N/A'}\n`);
+          proc.emit('close', 0);
+          return;
+        }
         if (cmd === 'ffmpeg') {
           if (cutFails) {
             proc.emit('close', 1);
@@ -55,12 +63,16 @@ function fakeSpawn({ cutFails = false, demucsFails = false, cmds = [] } = {}) {
           proc.emit('close', 1);
           return;
         }
+        // Demucs writes <out>/<model>/<input basename>/{vocals,no_vocals}.wav
+        // for every input file it was given (after the -o <dir> pair).
         const oIndex = args.indexOf('-o');
         const outRoot = args[oIndex + 1];
-        const stemDir = path.join(outRoot, DEMUCS_MODEL, 'input');
-        await mkdir(stemDir, { recursive: true });
-        await writeFile(path.join(stemDir, 'vocals.wav'), Buffer.from('fake-vocal'));
-        await writeFile(path.join(stemDir, 'no_vocals.wav'), Buffer.from('fake-instrumental'));
+        for (const input of args.slice(oIndex + 2)) {
+          const stemDir = path.join(outRoot, DEMUCS_MODEL, path.basename(input, '.wav'));
+          await mkdir(stemDir, { recursive: true });
+          await writeFile(path.join(stemDir, 'vocals.wav'), Buffer.from(`fake-vocal-${path.basename(input, '.wav')}`));
+          await writeFile(path.join(stemDir, 'no_vocals.wav'), Buffer.from(`fake-instrumental-${path.basename(input, '.wav')}`));
+        }
         proc.emit('close', 0);
       } catch (err) {
         proc.emit('error', err);
@@ -82,8 +94,9 @@ test('separateTrackStems writes vocal/instrumental into the persistent cache and
     assert.ok(result);
     assert.ok(result.vocalPath.endsWith('vocal.wav'));
     assert.ok(result.instrumentalPath.endsWith('instrumental.wav'));
-    assert.equal((await readFile(result.vocalPath)).toString(), 'fake-vocal');
-    assert.equal((await readFile(result.instrumentalPath)).toString(), 'fake-instrumental');
+    assert.equal((await readFile(result.vocalPath)).toString(), 'fake-vocal-input');
+    assert.equal((await readFile(result.instrumentalPath)).toString(), 'fake-instrumental-input');
+    assert.deepEqual(result.windows.map((w) => [w.name, w.startSec, w.endSec]), [['full', 0, 100]]);
 
     const cached = await getCachedStems(videoId);
     assert.deepEqual(cached, result);
@@ -140,9 +153,9 @@ test('separateTrackStems dedupes concurrent calls for the same videoId (only one
       separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn }),
     ]);
     assert.deepEqual(a, b);
-    // ffmpeg cut + demucs = 2 spawns for ONE separation; a duplicate run
-    // would double this to 4.
-    assert.equal(cmds.length, 2, `expected exactly one separation's worth of spawns, got ${cmds.length}`);
+    // ffprobe + ffmpeg cut + demucs = 3 spawns for ONE separation; a
+    // duplicate run would double this to 6.
+    assert.equal(cmds.length, 3, `expected exactly one separation's worth of spawns, got ${cmds.length}`);
   } finally {
     await cleanup(videoId);
   }
@@ -282,5 +295,125 @@ test('cleanupStaleStemStaging leaves real videoId cache entries untouched', asyn
     assert.ok(await getCachedStems(videoId), 'expected a real cache entry to survive staging cleanup');
   } finally {
     await cleanup(videoId);
+  }
+});
+
+test('separateTrackStems separates only the head and tail windows of a long track, in one Demucs run', async () => {
+  resetStemCircuitForTest();
+  const videoId = uniqueVideoId('windows');
+  try {
+    const cmds = [];
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn({ cmds, durationSec: 300 }) });
+    assert.deepEqual(result.windows.map((w) => [w.name, w.startSec, w.endSec]), [
+      ['head', 0, STEM_HEAD_WINDOW_SEC],
+      ['tail', 300 - STEM_TAIL_WINDOW_SEC, 300],
+    ]);
+    assert.equal(result.vocalPath, undefined, 'a windowed entry must not pose as a whole-track pair');
+    const cuts = cmds.filter((c) => c.cmd === 'ffmpeg');
+    assert.equal(cuts.length, 2);
+    assert.deepEqual(cuts[1].args.slice(cuts[1].args.indexOf('-ss'), cuts[1].args.indexOf('-ss') + 4), ['-ss', '225.000', '-t', '75.000']);
+    const demucsRuns = cmds.filter((c) => c.cmd !== 'ffmpeg' && c.cmd !== 'ffprobe');
+    assert.equal(demucsRuns.length, 1, 'both windows go through one Demucs process');
+    assert.equal((await readFile(result.windows[1].vocalPath)).toString(), 'fake-vocal-tail');
+    assert.deepEqual(await getCachedStems(videoId), result);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('getCachedStems still reads a v1 (whole-track, no windows) entry', async () => {
+  const videoId = uniqueVideoId('v1');
+  const dir = path.join(STEM_CACHE_DIR, videoId);
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, 'vocal.wav'), 'v');
+    await writeFile(path.join(dir, 'instrumental.wav'), 'i');
+    await writeFile(path.join(dir, 'meta.json'), JSON.stringify({ demucsModel: DEMUCS_MODEL, separatedAt: Date.now() }));
+    const cached = await getCachedStems(videoId);
+    assert.equal(cached.vocalPath, path.join(dir, 'vocal.wav'));
+    assert.deepEqual(cached.windows.map((w) => [w.name, w.startSec, w.endSec]), [['full', 0, null]]);
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('STEM_SEPARATION_ENABLED=false skips separation without spawning anything', async () => {
+  const videoId = uniqueVideoId('disabled');
+  const cmds = [];
+  const result = await separateTrackStems('/tmp/fake-track-source', videoId, {
+    spawnFn: fakeSpawn({ cmds }),
+    env: { STEM_SEPARATION_ENABLED: 'false' },
+  });
+  assert.equal(result, null);
+  assert.equal(cmds.length, 0);
+  assert.equal(isStemSeparationAvailable({ env: { STEM_SEPARATION_ENABLED: 'false' } }), false);
+});
+
+test('consecutive failures open the circuit breaker, which then skips new separations until the cooldown ends', async () => {
+  resetStemCircuitForTest();
+  const env = { STEM_CIRCUIT_FAILURES: '2', STEM_CIRCUIT_COOLDOWN_MS: '60000' };
+  const ids = [uniqueVideoId('cb1'), uniqueVideoId('cb2'), uniqueVideoId('cb3')];
+  try {
+    for (const id of ids.slice(0, 2)) {
+      assert.equal(await separateTrackStems('/tmp/fake-track-source', id, { spawnFn: fakeSpawn({ demucsFails: true }), env }), null);
+    }
+    assert.equal(isStemSeparationAvailable({ env }), false, 'two failures in a row open the breaker');
+    assert.equal(isStemSeparationAvailable({ env, now: Date.now() + 61_000 }), true, 'and it closes after the cooldown');
+    const cmds = [];
+    assert.equal(await separateTrackStems('/tmp/fake-track-source', ids[2], { spawnFn: fakeSpawn({ cmds }), env }), null);
+    assert.equal(cmds.length, 0, 'no work starts while the breaker is open');
+  } finally {
+    resetStemCircuitForTest();
+    for (const id of ids) await cleanup(id);
+  }
+});
+
+test('a success resets the consecutive-failure count', async () => {
+  resetStemCircuitForTest();
+  const env = { STEM_CIRCUIT_FAILURES: '2' };
+  const ids = [uniqueVideoId('rs1'), uniqueVideoId('rs2'), uniqueVideoId('rs3')];
+  try {
+    await separateTrackStems('/tmp/fake-track-source', ids[0], { spawnFn: fakeSpawn({ demucsFails: true }), env });
+    assert.ok(await separateTrackStems('/tmp/fake-track-source', ids[1], { spawnFn: fakeSpawn(), env }));
+    await separateTrackStems('/tmp/fake-track-source', ids[2], { spawnFn: fakeSpawn({ demucsFails: true }), env });
+    assert.equal(isStemSeparationAvailable({ env }), true);
+  } finally {
+    resetStemCircuitForTest();
+    for (const id of ids) await cleanup(id);
+  }
+});
+
+test('separateTrackStems skips (without counting a failure) when the track length is unknown', async () => {
+  resetStemCircuitForTest();
+  const env = { STEM_CIRCUIT_FAILURES: '1' };
+  const videoId = uniqueVideoId('no-duration');
+  const cmds = [];
+  try {
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, { spawnFn: fakeSpawn({ cmds, durationSec: null }), env });
+    assert.equal(result, null);
+    assert.deepEqual(cmds.map((c) => c.cmd), ['ffprobe'], 'no cut and no Demucs run without a length');
+    assert.equal(isStemSeparationAvailable({ env }), true, 'a skip is not a failure');
+  } finally {
+    resetStemCircuitForTest();
+    await cleanup(videoId);
+  }
+});
+
+test('after the cooldown the breaker is half-open: one more failure reopens it', async () => {
+  resetStemCircuitForTest();
+  const env = { STEM_CIRCUIT_FAILURES: '3', STEM_CIRCUIT_COOLDOWN_MS: '0' };
+  const ids = [1, 2, 3, 4].map((i) => uniqueVideoId(`ho${i}`));
+  try {
+    for (const id of ids.slice(0, 3)) {
+      await separateTrackStems('/tmp/fake-track-source', id, { spawnFn: fakeSpawn({ demucsFails: true }), env });
+    }
+    // Cooldown 0 → closed again right away, but the next single failure
+    // must reopen it rather than needing three more.
+    const reopenEnv = { ...env, STEM_CIRCUIT_COOLDOWN_MS: '60000' };
+    await separateTrackStems('/tmp/fake-track-source', ids[3], { spawnFn: fakeSpawn({ demucsFails: true }), env: reopenEnv });
+    assert.equal(isStemSeparationAvailable({ env: reopenEnv }), false);
+  } finally {
+    resetStemCircuitForTest();
+    for (const id of ids) await cleanup(id);
   }
 });
