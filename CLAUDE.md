@@ -120,6 +120,7 @@ resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
 
 - **selfDeaf はネイティブ対応** — `joinVoiceChannel({ selfDeaf: true })` を使用
 - **AudioPlayerStatus.Idle イベント** — ミキサー経路では曲終了の合図ではない。想定外の Idle は mixer resource の再 `play()` による復旧トリガ
+- **キュー枯渇時は遅延退出** — 再生するものが尽きても即退出せず、テキストチャンネルに予告して `IDLE_LEAVE_DELAY_MS`（既定 3 分、`0` で即退出）後もアイドルなら退出する（`src/playback/idleLeave.js`）。曲が開始されたら予約を取り消す。`/leave` と VC 無人化は従来どおり即時
 - **循環インポート防止** — `sessions.js` が共有状態を管理。`index.js` と `play.js` の双方向依存を排除
 
 ## シークレット管理

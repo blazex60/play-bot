@@ -10,6 +10,15 @@ export const HALF_LIFE_DAYS = 14
 export const STABLE_MIN_WEIGHT = 3.0
 export const TOP_K = 3
 const SECONDS_PER_DAY = 86400
+// Extra recently-played seeds planAutoTrack tries when the primary seed(s)
+// yield no usable candidate. Each costs one yt-dlp call, so keep it small.
+export const AUTOPLAY_FALLBACK_SEEDS = 2
+// GuildPlayer gives the whole queue-exhaustion round 30s. planAutoTrack keeps
+// its seed loop inside this smaller budget (leaving room for history fetch and
+// enqueue), and caps each yt-dlp call so one slow lookup can't eat it all.
+export const AUTOPLAY_PLAN_BUDGET_MS = 20_000
+export const AUTOPLAY_RELATED_TIMEOUT_MS = 7_000
+const AUTOPLAY_MIN_LOOKUP_MS = 1_000
 
 // Recency-decayed per-user preference vectors, keyed by videoId and by
 // channel/uploader. Older plays fade toward zero instead of counting the
@@ -41,10 +50,18 @@ function getHumanIds(channel) {
   return [...channel.members.values()].filter((member) => !member.user.bot).map((member) => member.id)
 }
 
-async function tryResolveRelated(resolveRelatedFn, videoId, limit) {
+function chooseAutoTrack(candidates, { guildId, lastTrack, attempts, groupChannelWeights }) {
+  if (attempts.length > 1) {
+    log.info({ event: 'playback.autoplay.fallback_seed_used', guildId, lastVideoId: lastTrack.videoId, attempts }, '別の曲を起点に自動再生候補を取得')
+  }
+  const [chosen] = rankByChannelAffinity(candidates, groupChannelWeights)
+  return toAutoplayTrack(chosen)
+}
+
+async function tryResolveRelated(resolveRelatedFn, videoId, limit, timeoutMs) {
   if (!videoId) return null
   try {
-    const candidates = await resolveRelatedFn(videoId, { limit })
+    const candidates = await resolveRelatedFn(videoId, { limit, timeoutMs })
     return candidates.length > 0 ? candidates : null
   } catch (err) {
     log.error({ event: 'playback.resolverelated_failed', err }, 'resolveRelated 失敗')
@@ -104,7 +121,8 @@ function findMajorityConsensusVideoId(stableVectors) {
   return bestCount > stableVectors.length / 2 ? bestVideoId : null
 }
 
-export async function planAutoTrack({ guildId, channel, lastTrack, webClient, now, resolveRelatedFn = resolveRelated, recentVideoIds = [] } = {}) {
+export async function planAutoTrack({ guildId, channel, lastTrack, webClient, now, resolveRelatedFn = resolveRelated, recentVideoIds = [], budgetMs = AUTOPLAY_PLAN_BUDGET_MS, nowMs = Date.now } = {}) {
+  const deadline = nowMs() + budgetMs
   const settings = getGuildSettings(guildId)
   if (settings.autoplayMode !== 'auto') return null
   if (!lastTrack?.videoId) return null
@@ -130,34 +148,59 @@ export async function planAutoTrack({ guildId, channel, lastTrack, webClient, no
     }
   }
 
-  // RD mix playlists conventionally include the seed video itself among the
-  // results, so whichever seed actually produced these candidates must be
-  // excluded too, not just the just-finished track.
-  let usedSeedVideoId = null
-  let candidates = null
-  if (consensusVideoId && consensusVideoId !== lastTrack.videoId) {
-    candidates = await tryResolveRelated(resolveRelatedFn, consensusVideoId, 20)
-    if (candidates) usedSeedVideoId = consensusVideoId
-  }
-  if (!candidates) {
-    candidates = await tryResolveRelated(resolveRelatedFn, lastTrack.videoId, 20)
-    if (candidates) usedSeedVideoId = lastTrack.videoId
-  }
-  if (!candidates) return null
+  // Seeds tried in order: the personalized consensus pick, the just-finished
+  // track, then up to AUTOPLAY_FALLBACK_SEEDS of the session's most recent
+  // other plays. A single seed can legitimately yield nothing usable (no RD
+  // mix for that video, or the mix holds only already-excluded videos); before
+  // the fallback seeds existed, that ended autoplay — and the session — on
+  // the spot.
+  const seeds = []
+  if (consensusVideoId && consensusVideoId !== lastTrack.videoId) seeds.push(consensusVideoId)
+  seeds.push(lastTrack.videoId)
+  const fallbackSeeds = [...recentVideoIds]
+    .reverse()
+    .filter((id, index, all) => id && !seeds.includes(id) && all.indexOf(id) === index)
+    .slice(0, AUTOPLAY_FALLBACK_SEEDS)
+  seeds.push(...fallbackSeeds)
 
-  const baseExclude = new Set([lastTrack.videoId, usedSeedVideoId].filter(Boolean))
-  const strictExclude = new Set([...baseExclude, ...recentVideoIds])
-  let filtered = candidates.filter((candidate) => !candidate.videoId || !strictExclude.has(candidate.videoId))
-  if (filtered.length === 0) {
-    // Exhausting candidates against the last-100 history would stall or
-    // disconnect autoplay, so fall back to excluding only the just-played
-    // track and seed when the recent-history exclusion leaves nothing.
-    filtered = candidates.filter((candidate) => !candidate.videoId || !baseExclude.has(candidate.videoId))
+  // Pass 1 (strict) excludes the session's recent plays; only if no seed
+  // yields a fresh candidate does pass 2 (relaxed) allow recent plays again,
+  // reusing the lists already fetched — so a fallback seed gets the chance to
+  // produce something new before autoplay settles for a repeat.
+  const attempts = []
+  const fetched = []
+  for (const seedVideoId of seeds) {
+    const remaining = deadline - nowMs()
+    if (remaining < AUTOPLAY_MIN_LOOKUP_MS) {
+      attempts.push({ seedVideoId, skipped: 'budget_exhausted' })
+      break
+    }
+    const candidates = await tryResolveRelated(resolveRelatedFn, seedVideoId, 20, Math.min(AUTOPLAY_RELATED_TIMEOUT_MS, remaining))
+    if (!candidates) {
+      attempts.push({ seedVideoId, fetched: 0, usable: 0 })
+      continue
+    }
+    // RD mix playlists conventionally include the seed video itself among the
+    // results, so whichever seed actually produced these candidates must be
+    // excluded too, not just the just-finished track.
+    const baseExclude = new Set([lastTrack.videoId, seedVideoId])
+    const strictExclude = new Set([...baseExclude, ...recentVideoIds])
+    const strict = candidates.filter((candidate) => !candidate.videoId || !strictExclude.has(candidate.videoId))
+    attempts.push({ seedVideoId, fetched: candidates.length, usable: strict.length })
+    if (strict.length > 0) return chooseAutoTrack(strict, { guildId, lastTrack, attempts, groupChannelWeights })
+    fetched.push({ candidates, baseExclude })
   }
-  if (filtered.length === 0) return null
 
-  const [chosen] = rankByChannelAffinity(filtered, groupChannelWeights)
-  return toAutoplayTrack(chosen)
+  // Exhausting candidates against the last-100 history would stall or
+  // disconnect autoplay, so fall back to excluding only the just-played track
+  // and each list's own seed when the recent-history exclusion leaves nothing.
+  for (const { candidates, baseExclude } of fetched) {
+    const relaxed = candidates.filter((candidate) => !candidate.videoId || !baseExclude.has(candidate.videoId))
+    if (relaxed.length > 0) return chooseAutoTrack(relaxed, { guildId, lastTrack, attempts, groupChannelWeights })
+  }
+
+  log.warn({ event: 'playback.autoplay.no_candidates', guildId, lastVideoId: lastTrack.videoId, attempts }, '自動再生の候補が見つからない')
+  return null
 }
 
 export async function planRecommendations({ guildId, channel, lastTrack, webClient, now, resolveRelatedFn = resolveRelated, recentVideoIds = [] } = {}) {

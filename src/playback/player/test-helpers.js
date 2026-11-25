@@ -84,6 +84,7 @@ export function makePlayer({
   logTransitionPlanFn,
   logGaplessTransitionFn,
   pcmWaitTimeoutMs,
+  queueExhaustedTimeoutMs,
   connection,
   analysisQueue,
   stemQueue,
@@ -121,6 +122,7 @@ export function makePlayer({
     logTransitionPlanFn,
     logGaplessTransitionFn,
     pcmWaitTimeoutMs,
+    queueExhaustedTimeoutMs,
     analysisQueue,
     stemQueue,
     connection: connection ?? {
