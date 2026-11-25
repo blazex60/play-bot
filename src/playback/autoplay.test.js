@@ -4,6 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
+  AUTOPLAY_FALLBACK_SEEDS,
+  AUTOPLAY_RELATED_TIMEOUT_MS,
   buildDecayedVector,
   formatAutoAddNotification,
   planAutoTrack,
@@ -258,6 +260,132 @@ test('planAutoTrack: falls back to picking from recent history when exclusion le
     })
     assert.ok(result, 'should fall back to a candidate instead of returning null')
     assert.ok(['recent-1', 'recent-2'].includes(result.videoId))
+  })
+})
+
+test('planAutoTrack: when the last track yields no usable candidate, falls back to the newest other recent play as seed', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'auto')
+    await setPersonalize('g1', false)
+    const calls = []
+    const resolveRelatedFn = async (videoId) => {
+      calls.push(videoId)
+      // The RD mix of 'last' holds only itself (no real mix available).
+      if (videoId === 'last') return [makeCandidate('last')]
+      return [makeCandidate(videoId), makeCandidate(`rel-of-${videoId}`)]
+    }
+    const result = await planAutoTrack({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      // oldest -> newest, as session.recentPlayedVideoIds is recorded
+      recentVideoIds: ['older', 'newer', 'last'],
+    })
+    assert.deepEqual(calls, ['last', 'newer'])
+    assert.equal(result.videoId, 'rel-of-newer')
+  })
+})
+
+test('planAutoTrack: an empty or failing related lookup also moves on to a fallback seed', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'auto')
+    await setPersonalize('g1', false)
+    const calls = []
+    const resolveRelatedFn = async (videoId) => {
+      calls.push(videoId)
+      if (videoId === 'last') return []
+      if (videoId === 'newer') throw new Error('yt-dlp exited 1')
+      return [makeCandidate('rel-of-older')]
+    }
+    const result = await planAutoTrack({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      recentVideoIds: ['older', 'newer', 'last'],
+    })
+    assert.deepEqual(calls, ['last', 'newer', 'older'])
+    assert.equal(result.videoId, 'rel-of-older')
+  })
+})
+
+test('planAutoTrack: fallback seeds are bounded and the result is null when none yields a candidate', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'auto')
+    await setPersonalize('g1', false)
+    const calls = []
+    const resolveRelatedFn = async (videoId) => {
+      calls.push(videoId)
+      return []
+    }
+    const result = await planAutoTrack({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      recentVideoIds: ['r1', 'r2', 'r3', 'r4', 'r2', 'last'],
+    })
+    assert.equal(result, null)
+    assert.equal(calls.length, 1 + AUTOPLAY_FALLBACK_SEEDS)
+    assert.deepEqual(calls, ['last', 'r2', 'r4'].slice(0, 1 + AUTOPLAY_FALLBACK_SEEDS))
+  })
+})
+
+test('planAutoTrack: a fresh candidate from a fallback seed beats repeating a recent play', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'auto')
+    await setPersonalize('g1', false)
+    const resolveRelatedFn = async (videoId) => {
+      if (videoId === 'last') return [makeCandidate('newer'), makeCandidate('older')] // all recently played
+      return [makeCandidate('fresh-from-newer')]
+    }
+    const result = await planAutoTrack({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      recentVideoIds: ['older', 'newer', 'last'],
+    })
+    assert.equal(result.videoId, 'fresh-from-newer')
+  })
+})
+
+test('planAutoTrack: each related lookup gets a bounded timeout and the seed loop stops at the budget', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'auto')
+    await setPersonalize('g1', false)
+    let clock = 0
+    const calls = []
+    const resolveRelatedFn = async (videoId, { timeoutMs }) => {
+      calls.push({ videoId, timeoutMs })
+      clock += 6_000 // each lookup is slow
+      return []
+    }
+    const result = await planAutoTrack({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: makeWebClient({}),
+      resolveRelatedFn,
+      now: NOW,
+      recentVideoIds: ['r1', 'r2', 'last'],
+      budgetMs: 10_000,
+      nowMs: () => clock,
+    })
+    assert.equal(result, null)
+    assert.deepEqual(calls, [
+      { videoId: 'last', timeoutMs: AUTOPLAY_RELATED_TIMEOUT_MS },
+      { videoId: 'r2', timeoutMs: 4_000 },
+    ], 'second lookup is capped by the remaining budget, third is skipped')
   })
 })
 

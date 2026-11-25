@@ -164,13 +164,13 @@ export async function resolveMetadata(url, { requestedBy, requestedById = null }
   });
 }
 
-export async function resolveRelated(videoId, { limit = 10 } = {}) {
+export async function resolveRelated(videoId, { limit = 10, timeoutMs } = {}) {
   const output = await spawnAsync('yt-dlp', buildYtdlpArgs(
     '--dump-json',
     '--flat-playlist',
     '--playlist-end', String(limit + 1),
     `https://www.youtube.com/watch?v=${videoId}&list=RD${videoId}`,
-  ));
+  ), { timeoutMs });
   const entries = parseJsonLines(output, 'related videos');
   return entries.slice(0, limit).map(entry => mapEntryToTrack(entry, { requestedBy: '🔀 自動再生', requestedById: null }));
 }

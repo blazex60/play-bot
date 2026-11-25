@@ -148,6 +148,15 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     adapterCreator: guild.voiceAdapterCreator,
     selfDeaf: true,
   })
+  // @discordjs/voice forwards networking errors (e.g. a voice WebSocket
+  // handshake answered with Cloudflare 521 during a reconnect) via
+  // connection.emit('error'). With no listener, EventEmitter throws, the
+  // process-level uncaughtException handler exits, and every guild's playback
+  // dies. Registered before entersState so a failure mid-join is covered
+  // too. Log it and let the library's own reconnect state machine recover.
+  connection.on('error', (err) => {
+    log.warn({ event: 'voice.connection_error', guildId, err }, 'ボイス接続エラー')
+  })
 
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000)
