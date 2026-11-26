@@ -44,7 +44,9 @@ export function spawnCapture(spawnFn, cmd, args, { timeoutMs = 120_000, signal, 
       }
       proc.kill('SIGKILL');
       cleanup();
-      reject(new Error(`${cmd} timed out after ${timeoutMs}ms`));
+      const err = new Error(`${cmd} timed out after ${timeoutMs}ms`);
+      err.timedOut = true;
+      reject(err);
     };
     timer = setTimeout(onTimeout, timeoutMs);
     proc.stdout?.on('data', (d) => { stdout += d; });

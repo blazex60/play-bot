@@ -248,10 +248,11 @@ export class GuildPlayer {
       const current = queue.current;
       const durationSec = current ? this.#resolvePlaybackDurationSec(current) : null;
       const currentRemainingSec = Number.isFinite(durationSec) ? durationSec - this.trackPositionSec : null;
+      const device = currentDemucsDevice();
       return isStemJobRelevantFor(queue, videoId, {
         currentRemainingSec,
         // 1.2×: production CPU runs came in up to ~17% over the configured RTF.
-        minRemainingSec: estimateSeparationSec(stemSeparationConfig(process.env, { device: currentDemucsDevice() }), stemWindowsAudioSec(planStemWindows(durationSec, { wholeTrack: currentDemucsDevice() === 'cuda' })) ?? undefined) * 1.2,
+        minRemainingSec: estimateSeparationSec(stemSeparationConfig(process.env, { device }), stemWindowsAudioSec(planStemWindows(durationSec, { wholeTrack: device === 'cuda' })) ?? undefined) * 1.2,
       });
     };
     const stemSeparationAvailable = isStemSeparationAvailableFn ?? (() => isStemSeparationAvailable());

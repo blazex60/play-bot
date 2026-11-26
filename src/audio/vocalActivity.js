@@ -5,6 +5,7 @@ import path from 'node:path';
 import { getAnalysisQueue } from './analysisQueue.js';
 import { spawnCapture } from './spawnCapture.js';
 import { findStemWindow } from './stemConfig.js';
+import { looksLikeCudaError, markCudaFailed, resolveDemucsDevice } from './demucsDevice.js';
 
 /** Relative threshold: vocals are "present" when within this dB of the mix. */
 export const VOCAL_RELATIVE_DB = 25;
@@ -188,14 +189,32 @@ async function cutClip(run, filePath, outPath, { startSec = null, lengthSec = nu
   return spawnCapture(run, 'ffmpeg', args);
 }
 
-async function runDemucsVocals(run, tmpRoot, combinedWav) {
+async function runDemucsVocals(run, tmpRoot, combinedWav, { deviceFn = resolveDemucsDevice } = {}) {
   const demucsBin = resolveDemucsBin();
-  const demucs = await spawnCapture(run, demucsBin, [
+  const once = (device) => spawnCapture(run, demucsBin, [
     '--two-stems=vocals',
     '-n', DEMUCS_MODEL,
+    '-d', device,
     '-o', tmpRoot,
     combinedWav,
   ], { timeoutMs: 300_000 });
+  // Same device policy as stemCache: honor DEMUCS_DEVICE, and a CUDA failure
+  // (CUDA-looking stderr or a timeout) degrades the process to CPU and this
+  // clip is retried there once.
+  const device = await deviceFn();
+  let demucs;
+  try {
+    demucs = await once(device);
+  } catch (err) {
+    if (device !== 'cuda' || !err?.timedOut) throw err;
+    markCudaFailed(err);
+    demucs = await once('cpu');
+  }
+  if (demucs.code !== 0 && device === 'cuda'
+    && looksLikeCudaError(demucs.stderr?.trim().split('\n').slice(-5).join('\n'))) {
+    markCudaFailed(new Error(`demucs exited with ${demucs.code}`));
+    demucs = await once('cpu');
+  }
   if (demucs.code !== 0) return null;
   return path.join(tmpRoot, DEMUCS_MODEL, 'combined', 'vocals.wav');
 }
@@ -220,7 +239,7 @@ function emptyResult() {
  * invocation: the two windows are cut and concatenated into one clip before
  * separation, instead of running `--two-stems=vocals` twice per track.
  * @param {string} filePath
- * @param {{ durationSec: number, tailWindowSec?: number, headWindowSec?: number, queue?: object, spawnFn?: Function }} [opts]
+ * @param {{ durationSec: number, tailWindowSec?: number, headWindowSec?: number, queue?: object, spawnFn?: Function, deviceFn?: Function }} [opts]
  */
 export async function analyzeVocalActivity(filePath, {
   durationSec,
@@ -228,6 +247,7 @@ export async function analyzeVocalActivity(filePath, {
   headWindowSec = HEAD_WINDOW_SEC,
   queue = null,
   spawnFn = null,
+  deviceFn = resolveDemucsDevice,
 } = {}) {
   if (!filePath || !(durationSec > 0)) return emptyResult();
 
@@ -279,7 +299,7 @@ export async function analyzeVocalActivity(filePath, {
       tailSliceStart = headSliceEnd;
     }
 
-    const vocalsWav = await runDemucsVocals(run, tmpRoot, combinedWav);
+    const vocalsWav = await runDemucsVocals(run, tmpRoot, combinedWav, { deviceFn });
     if (!vocalsWav) return emptyResult();
 
     const [vocalEnv, mixEnv] = await Promise.all([

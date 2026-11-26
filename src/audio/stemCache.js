@@ -269,16 +269,26 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, ge
         if (signal?.aborted) return null;
         inputs.push({ window: w, wav, base });
       }
-      const demucs = await spawnCapture(spawnFn, resolveDemucsBin(), [
-        '--two-stems=vocals',
-        '-n', DEMUCS_MODEL,
-        '-d', device,
-        '-o', jobTmpRoot,
-        ...inputs.map((i) => i.wav),
-      ], { timeoutMs: demucsTimeoutMs, signal, getPausedMs });
+      let demucs;
+      try {
+        demucs = await spawnCapture(spawnFn, resolveDemucsBin(), [
+          '--two-stems=vocals',
+          '-n', DEMUCS_MODEL,
+          '-d', device,
+          '-o', jobTmpRoot,
+          ...inputs.map((i) => i.wav),
+        ], { timeoutMs: demucsTimeoutMs, signal, getPausedMs });
+      } catch (err) {
+        // A hung GPU (driver wedge, lost passthrough) shows up as a timeout
+        // with nothing CUDA-ish in stderr; treat it as a CUDA failure so the
+        // following jobs stop waiting on the GPU too.
+        if (err?.timedOut && device === 'cuda') err.cudaRelated = true;
+        throw err;
+      }
       if (demucs.code !== 0) {
-        const err = new Error(`demucs exited with ${demucs.code}: ${demucs.stderr?.trim().split('\n').slice(-3).join(' | ') ?? ''}`);
-        err.cudaRelated = device === 'cuda' && looksLikeCudaError(demucs.stderr);
+        const tail = demucs.stderr?.trim().split('\n').slice(-5).join('\n') ?? '';
+        const err = new Error(`demucs exited with ${demucs.code}: ${tail.split('\n').slice(-3).join(' | ')}`);
+        err.cudaRelated = device === 'cuda' && looksLikeCudaError(tail);
         throw err;
       }
       return inputs;
@@ -339,7 +349,7 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, ge
       // Compute seconds per audio second, excluding time the queue froze
       // the job — the number to calibrate STEM_SEPARATION_RTF against.
       rtf: audioSec ? Number(((elapsedMs - pausedMs) / 1000 / audioSec).toFixed(3)) : null,
-      threads: config.threads,
+      threads: usedDevice === 'cuda' ? undefined : config.threads,
       device: usedDevice,
     }, 'ステム分離に成功');
     return getCachedStems(videoId);
@@ -354,7 +364,7 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, ge
       trackDurationSec,
       elapsedMs: Date.now() - startedAt,
       timeoutMs: demucsTimeoutMs,
-      threads: config.threads,
+      threads: usedDevice === 'cuda' ? undefined : config.threads,
       device: usedDevice,
       err,
     }, 'ステム分離に失敗');

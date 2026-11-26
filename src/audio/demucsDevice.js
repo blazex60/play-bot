@@ -31,6 +31,9 @@ export function requestedDemucsDevice(env = process.env) {
   return v === 'cuda' || v === 'cpu' ? v : 'auto';
 }
 
+// Resolves true/false for a definite answer, null when the probe itself
+// could not run (spawn error, timeout) — that is not cached, so a slow first
+// import of torch does not pin the whole process to CPU.
 function defaultProbe(env) {
   return new Promise((resolve) => {
     let out = '';
@@ -38,12 +41,12 @@ function defaultProbe(env) {
     try {
       proc = spawn(pythonBin(env), ['-c', 'import torch; print(torch.cuda.is_available())'], { stdio: ['ignore', 'pipe', 'ignore'] });
     } catch {
-      resolve(false);
+      resolve(null);
       return;
     }
-    const timer = setTimeout(() => { proc.kill('SIGKILL'); resolve(false); }, 60_000);
+    const timer = setTimeout(() => { proc.kill('SIGKILL'); resolve(null); }, 60_000);
     proc.stdout.on('data', (d) => { out += d; });
-    proc.on('error', () => { clearTimeout(timer); resolve(false); });
+    proc.on('error', () => { clearTimeout(timer); resolve(null); });
     proc.on('close', (code) => { clearTimeout(timer); resolve(code === 0 && out.trim() === 'True'); });
   });
 }
@@ -59,6 +62,10 @@ export async function resolveDemucsDevice({ env = process.env, probeFn = default
   if (requested === 'cuda') return 'cuda';
   if (resolved) return resolved;
   probing ??= probeFn(env).then((ok) => {
+    if (ok == null) {
+      log.warn({ event: 'audio.demucs.device_probe_failed' }, 'GPU の確認に失敗したため、今回は CPU を使う（次回また確認する）');
+      return 'cpu';
+    }
     resolved = ok ? 'cuda' : 'cpu';
     log.info({ event: 'audio.demucs.device', device: resolved }, `Demucs の実行デバイス: ${resolved}`);
     return resolved;

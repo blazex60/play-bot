@@ -45,3 +45,15 @@ test('looksLikeCudaError separates GPU failures from bad input', () => {
   assert.equal(looksLikeCudaError('torch.AcceleratorError: no kernel image is available'), true)
   assert.equal(looksLikeCudaError('Could not load file input.wav'), false)
 })
+
+test('a probe that could not run (null) falls back to cpu without caching, so the next call probes again', async () => {
+  resetDemucsDeviceForTest()
+  const answers = [null, true]
+  let probes = 0
+  const probeFn = async () => { probes += 1; return answers.shift() }
+  assert.equal(await resolveDemucsDevice({ env: {}, probeFn }), 'cpu')
+  assert.equal(currentDemucsDevice({}), 'cpu')
+  assert.equal(await resolveDemucsDevice({ env: {}, probeFn }), 'cuda')
+  assert.equal(probes, 2)
+  resetDemucsDeviceForTest()
+})
