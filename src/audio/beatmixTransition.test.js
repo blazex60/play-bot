@@ -13,6 +13,9 @@ import {
   MIN_OVERLAP_BARS,
   EXTENDED_PHRASE_CONFIDENCE_MIN,
   EXTENDED_VOCAL_CONFIDENCE_MIN,
+  sideBeatConfidence,
+  sideDownbeatConfidence,
+  isBeatmixTempoCompatible,
 } from './beatmixTransition.js';
 
 function makeAnalysis({
@@ -319,6 +322,45 @@ test('planBeatmixTransition rejects on low downbeat confidence', () => {
   const lowDownbeat = { ...outgoing, downbeatGrid: { ...outgoing.downbeatGrid, confidence: 0.1 } };
   const plan = planBeatmixTransition(lowDownbeat, incoming);
   assert.deepEqual(plan.reasons, ['downbeat-confidence-low']);
+});
+
+test('planBeatmixTransition judges beat confidence on the outgoing tail and incoming head only', () => {
+  const { outgoing, incoming } = happyPathTracks();
+  // Shaky outgoing intro / incoming outro do not matter for this transition.
+  const okPlan = planBeatmixTransition(
+    { ...outgoing, beatConfidence: 0.3, headBeatConfidence: 0.1, tailBeatConfidence: 0.9 },
+    { ...incoming, beatConfidence: 0.3, headBeatConfidence: 0.9, tailBeatConfidence: 0.1 },
+  );
+  assert.equal(okPlan.eligible, true, `reasons: ${okPlan.reasons}`);
+  // A shaky outgoing tail does, even when the track-wide average looks fine.
+  const lowTail = planBeatmixTransition({ ...outgoing, beatConfidence: 0.8, headBeatConfidence: 1, tailBeatConfidence: 0.2 }, incoming);
+  assert.deepEqual(lowTail.reasons, ['beat-confidence-low']);
+});
+
+test('planBeatmixTransition judges downbeat confidence on the outgoing tail and incoming head only', () => {
+  const { outgoing, incoming } = happyPathTracks();
+  const withSides = (a, head, tail) => ({
+    ...a,
+    downbeatGrid: {
+      ...a.downbeatGrid,
+      confidence: (head + tail) / 2,
+      head: { ...a.downbeatGrid.head, confidence: head },
+      tail: { ...a.downbeatGrid.tail, confidence: tail },
+    },
+  });
+  // Track-wide 0.35 (< 0.4) on both sides, but the windows in use are 0.6.
+  const okPlan = planBeatmixTransition(withSides(outgoing, 0.1, 0.6), withSides(incoming, 0.6, 0.1));
+  assert.equal(okPlan.eligible, true, `reasons: ${okPlan.reasons}`);
+  const lowHead = planBeatmixTransition(outgoing, withSides(incoming, 0.2, 1));
+  assert.deepEqual(lowHead.reasons, ['downbeat-confidence-low']);
+});
+
+test('sideBeatConfidence / sideDownbeatConfidence fall back to the track-wide value for older analyses', () => {
+  assert.equal(sideBeatConfidence({ beatConfidence: 0.7 }, 'tail'), 0.7);
+  assert.equal(sideBeatConfidence({ beatConfidence: 0.7, headBeatConfidence: 0.2 }, 'head'), 0.2);
+  assert.equal(sideDownbeatConfidence({ downbeatGrid: { confidence: 0.5, head: { downbeatsSec: [] } } }, 'head'), 0.5);
+  assert.equal(sideDownbeatConfidence({ downbeatGrid: { confidence: 0.5, tail: { confidence: 0.9 } } }, 'tail'), 0.9);
+  assert.equal(sideBeatConfidence(null, 'head'), 0);
 });
 
 test('planBeatmixTransition rejects when the tempo ratio exceeds the hard limit', () => {
@@ -1370,4 +1412,15 @@ test('planPhraseCrossfade ranks candidate pairs by the full comparable score, no
   assert.equal(plan.eligible, true);
   assert.equal(plan.startSec, 154,
     `expected the search to prefer the fuller-margin exit (154) over the higher-phrase-score boundary-hugging one (150) under comparable ranking, got ${plan.startSec}`);
+});
+
+test('isBeatmixTempoCompatible matches the planner: within 6%, same octave only', () => {
+  assert.equal(isBeatmixTempoCompatible(122, 120), true);
+  assert.equal(isBeatmixTempoCompatible(130, 120), false);
+  assert.equal(isBeatmixTempoCompatible(99, 196), false, 'half tempo: octave-bar-mismatch');
+  assert.equal(isBeatmixTempoCompatible(null, 120), false);
+  const { outgoing, incoming } = happyPathTracks();
+  const half = planBeatmixTransition(outgoing, { ...incoming, bpm: outgoing.bpm / 2, headBpm: outgoing.bpm / 2, tailBpm: outgoing.bpm / 2 });
+  assert.equal(half.eligible, false);
+  assert.equal(isBeatmixTempoCompatible(outgoing.bpm / 2, outgoing.bpm), false);
 });

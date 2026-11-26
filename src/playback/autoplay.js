@@ -3,6 +3,7 @@ import { resolveRelated } from '../media/search.js'
 import { createTrack } from './queue.js'
 import { fmtDuration } from '../shared/format.js'
 import { getLogger } from '../logging/appLogger.js'
+import { isBeatmixTempoCompatible } from '../audio/beatmixTransition.js'
 
 const log = getLogger('autoplay')
 
@@ -18,6 +19,14 @@ export const AUTOPLAY_FALLBACK_SEEDS = 2
 // enqueue), and caps each yt-dlp call so one slow lookup can't eat it all.
 export const AUTOPLAY_PLAN_BUDGET_MS = 20_000
 export const AUTOPLAY_RELATED_TIMEOUT_MS = 7_000
+// Tempo preference: among the top few candidates (already ranked by the
+// related list and channel affinity), take the first whose analyzed tempo is
+// within beatmix's 6% of the outgoing track (same octave: the planner
+// rejects half/double matches), so the transition can beat-sync.
+// Only already-analyzed candidates can win; unknown tempos never displace
+// the top pick, and nothing outside the top few is considered.
+export const TEMPO_PREFERENCE_TOP_N = 5
+export const TEMPO_LOOKUP_TIMEOUT_MS = 1_500
 const AUTOPLAY_MIN_LOOKUP_MS = 1_000
 
 // Recency-decayed per-user preference vectors, keyed by videoId and by
@@ -50,12 +59,52 @@ function getHumanIds(channel) {
   return [...channel.members.values()].filter((member) => !member.user.bot).map((member) => member.id)
 }
 
-function chooseAutoTrack(candidates, { guildId, lastTrack, attempts, groupChannelWeights }) {
+async function chooseAutoTrack(candidates, { guildId, lastTrack, attempts, groupChannelWeights, webClient, timeoutMs }) {
   if (attempts.length > 1) {
     log.info({ event: 'playback.autoplay.fallback_seed_used', guildId, lastVideoId: lastTrack.videoId, attempts }, '別の曲を起点に自動再生候補を取得')
   }
-  const [chosen] = rankByChannelAffinity(candidates, groupChannelWeights)
+  const ranked = rankByChannelAffinity(candidates, groupChannelWeights)
+  const chosen = await preferTempoCompatible(ranked, { guildId, lastTrack, webClient, timeoutMs })
   return toAutoplayTrack(chosen)
+}
+
+/**
+ * @returns the first of the top TEMPO_PREFERENCE_TOP_N candidates whose
+ * analyzed head tempo can beat-sync with lastTrack's tail, else ranked[0].
+ * Lookups go through the internal API's analysis cache and are bounded by
+ * `timeoutMs`; any failure just keeps the original top pick.
+ */
+export async function preferTempoCompatible(ranked, { guildId = null, lastTrack, webClient, timeoutMs = TEMPO_LOOKUP_TIMEOUT_MS } = {}) {
+  const [first] = ranked
+  if (!webClient?.getTrackAnalysis || !lastTrack?.videoId || ranked.length < 2 || !(timeoutMs > 0)) return first
+  const top = ranked.slice(0, TEMPO_PREFERENCE_TOP_N)
+  const lookup = (id) => (id ? Promise.resolve(webClient.getTrackAnalysis(id)).catch(() => null) : Promise.resolve(null))
+  let timer
+  const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs) })
+  const analyses = await Promise.race([
+    Promise.all([lookup(lastTrack.videoId), ...top.map((c) => lookup(c.videoId))]),
+    timeout,
+  ])
+  clearTimeout(timer)
+  if (!analyses) return first
+  const [last, ...cands] = analyses
+  const outgoingBpm = last?.tailBpm ?? last?.bpm
+  if (!(outgoingBpm > 0)) return first
+  const tempoOf = (a) => a?.headBpm ?? a?.bpm
+  const index = cands.findIndex((a) => tempoOf(a) > 0 && isBeatmixTempoCompatible(tempoOf(a), outgoingBpm))
+  if (index <= 0) return first
+  log.info({
+    event: 'playback.autoplay.tempo_preferred',
+    guildId,
+    lastVideoId: lastTrack.videoId,
+    outgoingBpm,
+    chosenVideoId: top[index].videoId,
+    chosenBpm: tempoOf(cands[index]),
+    skippedVideoId: first.videoId,
+    skippedBpm: tempoOf(cands[0]) ?? null,
+    rank: index,
+  }, 'テンポの近い曲を自動再生に選んだ')
+  return top[index]
 }
 
 async function tryResolveRelated(resolveRelatedFn, videoId, limit, timeoutMs) {
@@ -187,7 +236,7 @@ export async function planAutoTrack({ guildId, channel, lastTrack, webClient, no
     const strictExclude = new Set([...baseExclude, ...recentVideoIds])
     const strict = candidates.filter((candidate) => !candidate.videoId || !strictExclude.has(candidate.videoId))
     attempts.push({ seedVideoId, fetched: candidates.length, usable: strict.length })
-    if (strict.length > 0) return chooseAutoTrack(strict, { guildId, lastTrack, attempts, groupChannelWeights })
+    if (strict.length > 0) return chooseAutoTrack(strict, { guildId, lastTrack, attempts, groupChannelWeights, webClient, timeoutMs: Math.min(TEMPO_LOOKUP_TIMEOUT_MS, deadline - nowMs()) })
     fetched.push({ candidates, baseExclude })
   }
 
@@ -196,7 +245,7 @@ export async function planAutoTrack({ guildId, channel, lastTrack, webClient, no
   // and each list's own seed when the recent-history exclusion leaves nothing.
   for (const { candidates, baseExclude } of fetched) {
     const relaxed = candidates.filter((candidate) => !candidate.videoId || !baseExclude.has(candidate.videoId))
-    if (relaxed.length > 0) return chooseAutoTrack(relaxed, { guildId, lastTrack, attempts, groupChannelWeights })
+    if (relaxed.length > 0) return chooseAutoTrack(relaxed, { guildId, lastTrack, attempts, groupChannelWeights, webClient, timeoutMs: Math.min(TEMPO_LOOKUP_TIMEOUT_MS, deadline - nowMs()) })
   }
 
   log.warn({ event: 'playback.autoplay.no_candidates', guildId, lastVideoId: lastTrack.videoId, attempts }, '自動再生の候補が見つからない')

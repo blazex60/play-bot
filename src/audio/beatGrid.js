@@ -188,8 +188,8 @@ export function buildBeatThisGrids({ beatsSec, downbeatsSec }, { headWindowSec, 
     downbeatGrid: {
       source: 'beat_this',
       meter,
-      head: { downbeatsSec: headDown.downbeatsSec },
-      tail: { downbeatsSec: tailDown.downbeatsSec },
+      head: { downbeatsSec: headDown.downbeatsSec, confidence: headDown.confidence },
+      tail: { downbeatsSec: tailDown.downbeatsSec, confidence: tailDown.confidence },
       confidence: Number((((headDown.confidence ?? 0) + (tailDown.confidence ?? 0)) / 2).toFixed(3)),
     },
   };
