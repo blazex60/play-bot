@@ -13,7 +13,11 @@ import { spawnCapture } from './spawnCapture.js';
 // staleness check would keep serving those narrower cached windows forever,
 // silently defeating the widened search range for every already-analyzed
 // track (Codex review, PR #52).
-export const ANALYSIS_VERSION = 4;
+// v5: vocal activity now comes from the stem cache after separation
+// (applyVocalActivity) instead of a single-threaded Demucs pass that timed
+// out for most v4 rows; bumping re-analyzes those (and v4 rows stuck with
+// bpm: null) the next time each track is played.
+export const ANALYSIS_VERSION = 5;
 // Phase 7 §9.2 prefers entry points in the first 0-30s of the incoming
 // track; keep the BPM window and the vocal head window (vocalActivity.js
 // HEAD_WINDOW_SEC) the same length so beatGrid/vocal boundaries line up.
@@ -249,11 +253,75 @@ export function recommendOverlapSec(shape, durationSec) {
   return Math.min(sec, cap);
 }
 
+function noVocalResult() {
+  return {
+    ok: false, lastVocalEndSec: null, vocalGaps: [], vocalConfidence: 0, source: 'none',
+    firstVocalStartSec: null, headVocalGaps: [],
+  };
+}
+
+const VOCAL_CONFIDENCE_WEIGHT = 0.5;
+
 function compositeConfidence({ vocalConfidence, bpmConfidence, tailOk }) {
   const vocal = vocalConfidence ?? 0;
   const bpm = bpmConfidence ?? 0;
   const tail = tailOk ? 0.8 : 0.3;
-  return Number(((vocal * 0.5) + (bpm * 0.3) + (tail * 0.2)).toFixed(3));
+  return Number(((vocal * VOCAL_CONFIDENCE_WEIGHT) + (bpm * 0.3) + (tail * 0.2)).toFixed(3));
+}
+
+function buildPhrases({ downbeatGrid, durationSec, headLevels, tailLevels, vocal }) {
+  const tailStart = Math.max(0, durationSec - TAIL_BPM_WINDOW_SEC);
+  return {
+    head: buildPhraseCandidates({
+      downbeatsSec: downbeatGrid?.head?.downbeatsSec ?? [],
+      features: { frameSec: PHRASE_FEATURE_FRAME_SEC, startSec: 0, rmsLevels: headLevels ?? [] },
+      vocalActivity: { boundariesSec: collectBoundaries(vocal.firstVocalStartSec, vocal.headVocalGaps) },
+    }),
+    tail: buildPhraseCandidates({
+      downbeatsSec: downbeatGrid?.tail?.downbeatsSec ?? [],
+      features: { frameSec: PHRASE_FEATURE_FRAME_SEC, startSec: tailStart, rmsLevels: tailLevels ?? [] },
+      vocalActivity: { boundariesSec: collectBoundaries(vocal.lastVocalEndSec, vocal.vocalGaps) },
+    }),
+  };
+}
+
+/**
+ * Fill a deferred (or failed) analysis' vocal fields from a later vocal
+ * result — analyzeVocalActivityFromStems(), run once the stems exist.
+ * Rebuilds what depends on vocal activity: the phrase candidates (vocal
+ * boundaries; RMS features come from the result's mixed-stem levels, the
+ * same 30 s head / 60 s tail windows at the same 100 ms frame as
+ * measureRmsEnvelope()) and the composite confidence, whose other terms
+ * are unchanged so only the vocal term is swapped.
+ * @returns {object} a new analysis object; the input is not mutated
+ */
+export function applyVocalActivity(analysis, vocal) {
+  if (!analysis || !vocal?.ok) return analysis;
+  const vocalConfidence = vocal.vocalConfidence ?? 0;
+  const confidence = Number((
+    (analysis.confidence ?? 0) + (vocalConfidence - (analysis.vocalConfidence ?? 0)) * VOCAL_CONFIDENCE_WEIGHT
+  ).toFixed(3));
+  const hasLevels = Array.isArray(vocal.headMixLevels) && Array.isArray(vocal.tailMixLevels);
+  return {
+    ...analysis,
+    vocalConfidence,
+    lastVocalEndSec: vocal.lastVocalEndSec ?? null,
+    vocalGaps: vocal.vocalGaps ?? [],
+    firstVocalStartSec: vocal.firstVocalStartSec ?? null,
+    headVocalGaps: vocal.headVocalGaps ?? [],
+    analysisSource: vocal.source ?? 'demucs',
+    phrases: hasLevels
+      ? buildPhrases({
+        downbeatGrid: analysis.downbeatGrid,
+        durationSec: analysis.durationSec,
+        headLevels: vocal.headMixLevels,
+        tailLevels: vocal.tailMixLevels,
+        vocal,
+      })
+      : analysis.phrases,
+    confidence,
+    vocalAnalyzedAt: Math.floor(Date.now() / 1000),
+  };
 }
 
 /**
@@ -263,7 +331,18 @@ function compositeConfidence({ vocalConfidence, bpmConfidence, tailOk }) {
  * the Phase 6 payload; it does not change playback (transition.js, MixStream,
  * player.js are untouched by this file).
  */
-export async function analyzeTrackFile(filePath, { videoId = null, durationSec = null, spawnFn, signal = null } = {}) {
+export async function analyzeTrackFile(filePath, {
+  videoId = null,
+  durationSec = null,
+  spawnFn,
+  signal = null,
+  // 'demucs' runs analyzeVocalActivity()'s own Demucs pass (the original
+  // behavior). 'deferred' skips it and returns analysisSource: 'none'; the
+  // caller fills vocal fields in later via applyVocalActivity() once stems
+  // exist. hasVocalAnalysis() treats 'none' as "not verified", so a deferred
+  // analysis is never mistaken for a vocal-safe one in the meantime.
+  vocalActivity: vocalMode = 'demucs',
+} = {}) {
   throwIfAborted(signal);
   let duration = durationSec;
   if (duration == null || !Number.isFinite(duration)) {
@@ -290,11 +369,9 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
       .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null, beatsSec: [] })),
     analyzeBpmWindow(filePath, { startSec: tailStart, windowSec: tailWindow, spawnFn, role: 'tail' })
       .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null, beatsSec: [] })),
-    analyzeVocalActivity(filePath, { durationSec: duration, spawnFn })
-      .catch(() => ({
-        ok: false, lastVocalEndSec: null, vocalGaps: [], vocalConfidence: 0, source: 'none',
-        firstVocalStartSec: null, headVocalGaps: [],
-      })),
+    (vocalMode === 'deferred'
+      ? Promise.resolve(noVocalResult())
+      : analyzeVocalActivity(filePath, { durationSec: duration, spawnFn }).catch(() => noVocalResult())),
     analyzeKeys(filePath, duration, { spawnFn })
       .catch(() => ({ headKey: null, tailKey: null, harmonicConfidence: 0 })),
   ]);
@@ -337,18 +414,13 @@ export async function analyzeTrackFile(filePath, { videoId = null, durationSec =
   ]);
   throwIfAborted(signal);
 
-  const phrases = {
-    head: buildPhraseCandidates({
-      downbeatsSec: downbeatGrid.head?.downbeatsSec ?? [],
-      features: { frameSec: PHRASE_FEATURE_FRAME_SEC, startSec: 0, rmsLevels: headFeatures.levels ?? [] },
-      vocalActivity: { boundariesSec: collectBoundaries(vocal.firstVocalStartSec, vocal.headVocalGaps) },
-    }),
-    tail: buildPhraseCandidates({
-      downbeatsSec: downbeatGrid.tail?.downbeatsSec ?? [],
-      features: { frameSec: PHRASE_FEATURE_FRAME_SEC, startSec: tailStart, rmsLevels: tailFeatures.levels ?? [] },
-      vocalActivity: { boundariesSec: collectBoundaries(vocal.lastVocalEndSec, vocal.vocalGaps) },
-    }),
-  };
+  const phrases = buildPhrases({
+    downbeatGrid,
+    durationSec: duration,
+    headLevels: headFeatures.levels,
+    tailLevels: tailFeatures.levels,
+    vocal,
+  });
 
   return {
     version: ANALYSIS_VERSION,

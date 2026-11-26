@@ -24,6 +24,8 @@ import { LoopMode } from './queue.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../audio/analysisQueue.js';
 import { getCachedStems, isStemSeparationAvailable, separateTrackStems } from '../audio/stemCache.js';
 import { isStemJobRelevantFor } from './player/stemRelevance.js';
+import { analyzeVocalActivityFromStems } from '../audio/vocalActivity.js';
+import { stemSeparationConfig } from '../audio/stemConfig.js';
 import { planStemTransition } from '../audio/stemTransition.js';
 import { logTransitionPlan, logGaplessTransition } from '../audio/transitionLog.js';
 import { StemPreparationState, StemPrefetchTracker } from '../audio/stemPrefetch.js';
@@ -165,6 +167,7 @@ export class GuildPlayer {
     separateTrackStemsFn = separateTrackStems,
     getCachedStemsFn = getCachedStems,
     isStemSeparationAvailableFn = null,
+    analyzeVocalFromStemsFn = analyzeVocalActivityFromStems,
     planStemTransitionFn = planStemTransition,
     createFileSourceFn = createFileSource,
     logTransitionPlanFn = logTransitionPlan,
@@ -252,6 +255,9 @@ export class GuildPlayer {
       applyAnalysisDuration: (track, analysis) => this.#maybeApplyAnalysisDuration(track, analysis),
       isStemJobRelevant,
       isStemSeparationAvailableFn: stemSeparationAvailable,
+      analyzeVocalFromStemsFn,
+      isStemSeparationEnabledFn: () => stemSeparationConfig().enabled,
+      getCachedStemsFn,
     });
     // Next-source preparation — the prefetch window, the prepared incoming
     // source, and the prepared stem pairs — lives in the SourcePreparer

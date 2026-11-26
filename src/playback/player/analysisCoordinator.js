@@ -1,10 +1,25 @@
 import { cleanupTempFile } from '../../audio/normalize.js';
-import { ANALYSIS_VERSION } from '../../audio/trackAnalysis.js';
+import { ANALYSIS_VERSION, applyVocalActivity } from '../../audio/trackAnalysis.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../../audio/analysisQueue.js';
 import { StemPrefetchPriority } from '../../audio/stemPrefetch.js';
 import { getLogger } from '../../logging/appLogger.js'
 
 const log = getLogger('GuildPlayer')
+
+/**
+ * A cached analysis with no BPM is usually a run that failed part-way
+ * (production had v4 rows stuck at bpm: null, reused forever because the
+ * cache never expires). Re-analyze those once they are this old; the age
+ * gate keeps a genuinely beatless track from being re-analyzed on every play.
+ */
+const BPM_LESS_ANALYSIS_RETRY_AFTER_SEC = 24 * 60 * 60;
+
+export function isReusableAnalysis(cached, { nowSec = Math.floor(Date.now() / 1000) } = {}) {
+  if (!cached || (cached.version ?? 1) < ANALYSIS_VERSION) return false;
+  if (cached.bpm == null && Number.isFinite(cached.analyzedAt)
+    && nowSec - cached.analyzedAt >= BPM_LESS_ANALYSIS_RETRY_AFTER_SEC) return false;
+  return true;
+}
 
 const ANALYSIS_MISS_BACKOFF_MS = 30_000;
 
@@ -91,6 +106,12 @@ export class AnalysisCoordinator {
   #isStemJobRelevant;
   /** Feature switch + circuit breaker gate (stemCache.js isStemSeparationAvailable). */
   #isStemSeparationAvailableFn;
+  /** vocalActivity.js analyzeVocalActivityFromStems; null keeps the in-analysis Demucs pass. */
+  #analyzeVocalFromStemsFn;
+  /** STEM_SEPARATION_ENABLED only (not the circuit breaker). */
+  #isStemSeparationEnabledFn;
+  /** stemCache.js getCachedStems — lets enrichment use stems already on disk. */
+  #getCachedStemsFn;
   /** Routes a settled analysis result back to the player's duration/tempo apply step. */
   #applyAnalysisDuration;
 
@@ -106,6 +127,9 @@ export class AnalysisCoordinator {
     applyAnalysisDuration,
     isStemJobRelevant = () => true,
     isStemSeparationAvailableFn = () => true,
+    analyzeVocalFromStemsFn = null,
+    isStemSeparationEnabledFn = () => true,
+    getCachedStemsFn = null,
   }) {
     this.#analyzeTrackFileFn = analyzeTrackFileFn;
     this.#getTrackAnalysisFn = getTrackAnalysisFn;
@@ -118,6 +142,9 @@ export class AnalysisCoordinator {
     this.#applyAnalysisDuration = applyAnalysisDuration;
     this.#isStemJobRelevant = isStemJobRelevant;
     this.#isStemSeparationAvailableFn = isStemSeparationAvailableFn;
+    this.#analyzeVocalFromStemsFn = analyzeVocalFromStemsFn;
+    this.#isStemSeparationEnabledFn = isStemSeparationEnabledFn;
+    this.#getCachedStemsFn = getCachedStemsFn;
   }
 
   #analysisQ() {
@@ -284,6 +311,11 @@ export class AnalysisCoordinator {
                 if (stems) this.#stemPrefetchTracker.markReady(track.videoId);
                 else this.#stemPrefetchTracker.markFailed(track.videoId);
               }
+              if (stems) {
+                this.enrichVocalFromStems(track, stems).catch((err) => {
+                  log.warn({ event: 'playback.vocal_analysis_from_stems_failed', trackId: track.videoId, err }, 'ステムからのボーカル解析に失敗');
+                });
+              }
             },
             (err) => {
               log.warn({ event: 'playback.stem_separation_failed', err }, 'ステム分離に失敗');
@@ -312,7 +344,20 @@ export class AnalysisCoordinator {
           );
           runSeparation(true).finally(() => finishAnalysisAttempt(stagedPath));
           return analysis;
-        } else if (this.#stemPrefetchTracker.get(track.videoId)) {
+        } else {
+          // Separation is off or the circuit breaker is open: no new stems,
+          // but ones already on disk can still fill a deferred analysis.
+          if (!signal?.aborted && analysis && this.#getCachedStemsFn) {
+            this.#getCachedStemsFn(track.videoId)
+              .then((stems) => (stems ? this.enrichVocalFromStems(track, stems) : null))
+              .catch((err) => {
+                log.warn({ event: 'playback.vocal_analysis_from_stems_failed', trackId: track.videoId, err }, 'ステムからのボーカル解析に失敗');
+              });
+          }
+        }
+        // Reaching here means separation was not dispatched (the branch
+        // above returns), so the tracker entry would otherwise stay stuck.
+        if (this.#stemPrefetchTracker.get(track.videoId)) {
           // Codex review (PR #44, carried into Phase 9C's stem-queue
           // restructure): staging failed (stagedPath null), or this job
           // was aborted before separation was even attempted — either way
@@ -379,7 +424,7 @@ export class AnalysisCoordinator {
     }
     if (!this.#getTrackAnalysisFn) return null;
     const cached = await this.#getTrackAnalysisFn(track.videoId);
-    if (cached && (cached.version ?? 1) >= ANALYSIS_VERSION) {
+    if (isReusableAnalysis(cached)) {
       this.#analysisMissAt.delete(track.videoId);
       this.analysisCache.set(track.videoId, cached);
       this.#applyAnalysisDuration(track, cached);
@@ -401,7 +446,7 @@ export class AnalysisCoordinator {
         return null;
       }
       const cached = await this.#getTrackAnalysisFn(track.videoId);
-      if (cached && (cached.version ?? 1) >= ANALYSIS_VERSION) {
+      if (isReusableAnalysis(cached)) {
         this.#analysisMissAt.delete(track.videoId);
         this.analysisCache.set(track.videoId, cached);
         this.#applyAnalysisDuration(track, cached);
@@ -423,6 +468,17 @@ export class AnalysisCoordinator {
       durationSec: probedDuration,
       spawnFn,
       signal,
+      // Vocal activity comes from the stems once separation finishes
+      // (enrichVocalFromStems below). Running Demucs here, single-threaded on
+      // the realtime queue, took ~300 s and timed out for most tracks — so
+      // BPM/phrase data was routinely not ready by the time the track hit
+      // its transition.
+      // Only while stem separation is switched on: with it disabled no stems
+      // will ever arrive, so keep the in-analysis pass (slow, but the only
+      // source of vocal data then). A merely open circuit breaker still
+      // defers — falling back to single-threaded Demucs would bring the
+      // ~300 s analysis stall right back.
+      vocalActivity: this.#analyzeVocalFromStemsFn && this.#isStemSeparationEnabledFn() ? 'deferred' : 'demucs',
     });
     throwIfAborted(signal);
     if (!analysis) return null;
@@ -435,6 +491,44 @@ export class AnalysisCoordinator {
     }
     this.#applyAnalysisDuration(track, analysis);
     return analysis;
+  }
+
+  /**
+   * Fills a deferred analysis' vocal fields from freshly separated (or
+   * already cached) stems. Runs on the realtime analysis queue — it is only
+   * a few ffmpeg level passes, no Demucs.
+   * @returns {Promise<object|null>} the updated analysis, or null when nothing changed
+   */
+  async enrichVocalFromStems(track, stems) {
+    if (!this.#analyzeVocalFromStemsFn || !track?.videoId || !stems) return null;
+    const before = this.analysisCache.get(track.videoId) ?? await this.lookupPersistentAnalysis(track);
+    if (!before || before.analysisSource === 'demucs' || !(before.durationSec > 0)) return null;
+    const vocal = await this.#analysisQ().enqueue(({ spawnNice } = {}) => this.#analyzeVocalFromStemsFn(stems, {
+      durationSec: before.durationSec,
+      spawnFn: spawnNice,
+    }));
+    if (!vocal?.ok) {
+      log.info({ event: 'playback.vocal_analysis_from_stems_failed', trackId: track.videoId }, 'ステムからのボーカル解析に失敗');
+      return null;
+    }
+    // A re-analysis may have replaced the entry while the queue job ran;
+    // apply onto whatever is current so it is not silently reverted.
+    const current = this.analysisCache.get(track.videoId) ?? before;
+    if (current.analysisSource === 'demucs') return null;
+    // Vocal boundaries were computed against before.durationSec; a
+    // re-analysis that changed the length would misplace them.
+    if (current.durationSec !== before.durationSec) return null;
+    const enriched = applyVocalActivity(current, vocal);
+    this.analysisCache.set(track.videoId, enriched);
+    this.#putTrackAnalysisFn?.(track.videoId, enriched);
+    log.info({
+      event: 'playback.vocal_analysis_from_stems',
+      trackId: track.videoId,
+      firstVocalStartSec: enriched.firstVocalStartSec,
+      lastVocalEndSec: enriched.lastVocalEndSec,
+      vocalConfidence: enriched.vocalConfidence,
+    }, 'ステムからボーカル解析を反映');
+    return enriched;
   }
 
   async resolveAnalysis(track, filePath = null) {
