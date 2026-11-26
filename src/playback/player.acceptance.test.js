@@ -2082,6 +2082,117 @@ for (const [label, available, expectDownload] of [
   });
 }
 
+// Follow-up to the stem fix: vocal activity comes from the stems. The
+// realtime analysis must skip its own Demucs pass ('deferred') and the
+// vocal fields get filled — and persisted — once separation hands back stems.
+test('acceptance (mixer): vocal analysis is deferred, then filled from the stems and persisted', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const analyzeOpts = [];
+  const puts = [];
+  const vocalCalls = [];
+  const stems = { windows: [
+    { name: 'head', startSec: 0, endSec: 60, vocalPath: '/tmp/vid-b.head.vocal.wav', instrumentalPath: '/tmp/vid-b.head.instrumental.wav' },
+    { name: 'tail', startSec: 165, endSec: 240, vocalPath: '/tmp/vid-b.tail.vocal.wav', instrumentalPath: '/tmp/vid-b.tail.instrumental.wav' },
+  ] };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    putTrackAnalysisFn: (videoId, analysis) => { puts.push({ videoId, analysis }); },
+    analyzeTrackFileFn: async (_filePath, opts) => {
+      analyzeOpts.push(opts.vocalActivity);
+      return { version: ANALYSIS_VERSION, videoId: opts.videoId, durationSec: 240, bpm: 120, confidence: 0.34, vocalConfidence: 0, analysisSource: 'none', lastVocalEndSec: null };
+    },
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}-staged`,
+    separateTrackStemsFn: async () => stems,
+    isStemSeparationAvailableFn: () => true,
+    analyzeVocalFromStemsFn: async (gotStems, opts) => {
+      vocalCalls.push({ gotStems, durationSec: opts.durationSec });
+      return { ok: true, source: 'demucs', vocalConfidence: 0.85, lastVocalEndSec: 228, vocalGaps: [], firstVocalStartSec: 14, headVocalGaps: [] };
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 240, videoId: 'vid-b' }));
+  try {
+    await player.playNext();
+    for (let i = 0; i < 100 && !puts.some((p) => p.videoId === 'vid-b' && p.analysis.analysisSource === 'demucs'); i += 1) await waitMs(20);
+
+    assert.ok(analyzeOpts.length > 0 && analyzeOpts.every((m) => m === 'deferred'), `realtime analysis must defer vocals, got ${analyzeOpts.join(',')}`);
+    const vocalForB = vocalCalls.find((c) => c.gotStems === stems);
+    assert.ok(vocalForB, 'vocal activity must be computed from the separated stems');
+    assert.equal(vocalForB.durationSec, 240);
+    const enrichedPut = puts.find((p) => p.videoId === 'vid-b' && p.analysis.analysisSource === 'demucs');
+    assert.ok(enrichedPut, 'the enriched analysis must be persisted');
+    assert.equal(enrichedPut.analysis.lastVocalEndSec, 228);
+    assert.equal(enrichedPut.analysis.firstVocalStartSec, 14);
+  } finally {
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): with stem separation disabled the analysis keeps its own vocal pass', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const modes = [];
+  const previous = process.env.STEM_SEPARATION_ENABLED;
+  process.env.STEM_SEPARATION_ENABLED = 'false';
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async (_filePath, opts) => {
+      modes.push(opts.vocalActivity);
+      return { version: ANALYSIS_VERSION, videoId: opts.videoId, durationSec: 240, bpm: 120, analysisSource: 'none' };
+    },
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}-staged`,
+    separateTrackStemsFn: async () => null,
+    isStemSeparationAvailableFn: () => false,
+    analyzeVocalFromStemsFn: async () => ({ ok: true, source: 'demucs' }),
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 240, videoId: 'vid-b' }));
+  try {
+    await player.playNext();
+    for (let i = 0; i < 50 && modes.length === 0; i += 1) await waitMs(20);
+    assert.ok(modes.length > 0);
+    assert.ok(modes.every((m) => m === 'demucs'), `no stems will ever come, so vocals must not be deferred: ${modes.join(',')}`);
+  } finally {
+    if (previous === undefined) delete process.env.STEM_SEPARATION_ENABLED;
+    else process.env.STEM_SEPARATION_ENABLED = previous;
+    await player.stop();
+  }
+});
+
+test('acceptance (mixer): with the breaker open, stems already on disk still fill a deferred analysis', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const puts = [];
+  const separations = [];
+  const stems = { vocalPath: '/tmp/vid-b.vocal.wav', instrumentalPath: '/tmp/vid-b.instrumental.wav' };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    putTrackAnalysisFn: (videoId, analysis) => { puts.push({ videoId, analysis }); },
+    analyzeTrackFileFn: async (_filePath, opts) => ({ version: ANALYSIS_VERSION, videoId: opts.videoId, durationSec: 120, bpm: 120, confidence: 0.3, vocalConfidence: 0, analysisSource: 'none' }),
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}-staged`,
+    separateTrackStemsFn: async (fp, videoId) => { separations.push(videoId); return null; },
+    getCachedStemsFn: async (videoId) => (videoId === 'vid-b' ? stems : null),
+    isStemSeparationAvailableFn: () => false,
+    analyzeVocalFromStemsFn: async () => ({ ok: true, source: 'demucs', vocalConfidence: 0.85, lastVocalEndSec: 110, vocalGaps: [], firstVocalStartSec: 8, headVocalGaps: [] }),
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 120, videoId: 'vid-b' }));
+  try {
+    await player.playNext();
+    for (let i = 0; i < 100 && !puts.some((p) => p.videoId === 'vid-b' && p.analysis.analysisSource === 'demucs'); i += 1) await waitMs(20);
+    assert.equal(separations.includes('vid-b'), false, 'no new separation while unavailable');
+    const enriched = puts.find((p) => p.videoId === 'vid-b' && p.analysis.analysisSource === 'demucs');
+    assert.ok(enriched, 'cached stems must still be used to fill vocal data');
+    assert.equal(enriched.analysis.lastVocalEndSec, 110);
+  } finally {
+    await player.stop();
+  }
+});
+
 test('acceptance (mixer): staged copy is cleaned up even when analysis fails before separation (CodeRabbit)', async () => {
   // CodeRabbit (PR #39, round 15): the round-14 fix's try/finally only
   // wrapped the separation call, not the earlier #lookupPersistentAnalysis()/

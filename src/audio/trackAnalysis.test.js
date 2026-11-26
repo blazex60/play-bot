@@ -13,6 +13,7 @@ import {
   isHalfDouble,
   dampIfHalfDouble,
   analyzeTrackFile,
+  applyVocalActivity,
   TAIL_BPM_WINDOW_SEC,
 } from './trackAnalysis.js'
 
@@ -251,3 +252,60 @@ test(
     }
   },
 )
+
+// --- vocal activity from stems (follow-up to the stem-window fix) ----------
+
+function recordingSpawn(cmds) {
+  return (cmd, args = []) => {
+    cmds.push(path.basename(cmd))
+    const proc = new EventEmitter()
+    proc.stdout = new EventEmitter()
+    proc.stderr = new EventEmitter()
+    proc.kill = () => {}
+    queueMicrotask(() => proc.emit('close', cmd === 'bash' ? 1 : 0))
+    return proc
+  }
+}
+
+test('analyzeTrackFile with vocalActivity: deferred never starts Demucs and reports no vocal analysis', async () => {
+  const deferredCmds = []
+  const deferred = await analyzeTrackFile('/tmp/fake-deferred.wav', { durationSec: 200, spawnFn: recordingSpawn(deferredCmds), vocalActivity: 'deferred' })
+  assert.ok(!deferredCmds.includes('demucs'), `unexpected Demucs run: ${deferredCmds.join(',')}`)
+  assert.equal(deferred.analysisSource, 'none', 'hasVocalAnalysis() must keep treating it as unverified')
+  assert.equal(deferred.lastVocalEndSec, null)
+
+  const defaultCmds = []
+  await analyzeTrackFile('/tmp/fake-default.wav', { durationSec: 200, spawnFn: recordingSpawn(defaultCmds) })
+  assert.ok(defaultCmds.includes('demucs'), 'the default still runs the in-analysis Demucs pass')
+})
+
+test('applyVocalActivity fills vocal fields, swaps only the vocal confidence term, and does not mutate the input', async () => {
+  const base = await analyzeTrackFile('/tmp/fake-apply.wav', { durationSec: 200, spawnFn: recordingSpawn([]), vocalActivity: 'deferred' })
+  const snapshot = JSON.stringify(base)
+  const vocal = {
+    ok: true,
+    source: 'demucs',
+    vocalConfidence: 0.85,
+    lastVocalEndSec: 185,
+    vocalGaps: [{ startSec: 185, endSec: 200 }],
+    firstVocalStartSec: 12,
+    headVocalGaps: [],
+    headMixLevels: Array.from({ length: 300 }, () => -20),
+    tailMixLevels: Array.from({ length: 600 }, () => -20),
+  }
+  const enriched = applyVocalActivity(base, vocal)
+  assert.equal(JSON.stringify(base), snapshot, 'input untouched')
+  assert.equal(enriched.analysisSource, 'demucs')
+  assert.equal(enriched.lastVocalEndSec, 185)
+  assert.equal(enriched.firstVocalStartSec, 12)
+  assert.deepEqual(enriched.vocalGaps, [{ startSec: 185, endSec: 200 }])
+  assert.equal(enriched.vocalConfidence, 0.85)
+  assert.equal(enriched.confidence, Number((base.confidence + 0.85 * 0.5).toFixed(3)))
+  assert.equal(enriched.headMixLevels, undefined, 'raw level arrays are not persisted')
+  assert.ok(Number.isFinite(enriched.vocalAnalyzedAt))
+})
+
+test('applyVocalActivity leaves the analysis alone when the vocal result failed', async () => {
+  const base = await analyzeTrackFile('/tmp/fake-apply2.wav', { durationSec: 200, spawnFn: recordingSpawn([]), vocalActivity: 'deferred' })
+  assert.equal(applyVocalActivity(base, { ok: false, source: 'none' }), base)
+})

@@ -72,6 +72,7 @@ export function makePlayer({
   track,
   createPcmSourceFn = null,
   getTrackAnalysisFn = null,
+  putTrackAnalysisFn = null,
   analyzeTrackFileFn = null,
   prefetchTrackFn = async () => ({ filePath: '/tmp/musicbot-test-prefetch', measured: { measured_I: -16 } }),
   probeTempoBackendFn,
@@ -89,6 +90,9 @@ export function makePlayer({
   analysisQueue,
   stemQueue,
   isStemSeparationAvailableFn,
+  // Tests use fake stem paths; never run real ffmpeg on them unless a test
+  // injects its own implementation.
+  analyzeVocalFromStemsFn = null,
 } = {}) {
   const queue = new GuildQueue();
   queue.add(track ?? createTrack({
@@ -112,6 +116,7 @@ export function makePlayer({
     onTrackStart,
     createPcmSourceFn: resolvedCreatePcmSourceFn,
     getTrackAnalysisFn,
+    putTrackAnalysisFn,
     analyzeTrackFileFn,
     prefetchTrackFn,
     probeTempoBackendFn,
@@ -127,6 +132,7 @@ export function makePlayer({
     analysisQueue,
     stemQueue,
     isStemSeparationAvailableFn,
+    analyzeVocalFromStemsFn,
     connection: connection ?? {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer);

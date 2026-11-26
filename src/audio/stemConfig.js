@@ -135,14 +135,17 @@ export function stemWindowsOf(stems) {
  * The window that holds native [startSec, startSec + spanSec], or null.
  * `endSec: null` means "to the end of the track".
  */
-export function findStemWindow(stems, startSec, spanSec = 0) {
+export function findStemWindow(stems, startSec, spanSec = 0, { endMarginSec = COVERAGE_MARGIN_SEC } = {}) {
   if (!Number.isFinite(startSec)) return null;
   const endNeeded = startSec + Math.max(0, spanSec);
   for (const w of stemWindowsOf(stems)) {
     // Never accept a start before the window: the opener clamps the seek to
     // 0, which would play stem audio offset from the full mix it replaces.
+    // `endMarginSec` defaults to the playback margin; analysis that only
+    // reads levels (and tolerates ffmpeg stopping at EOF) may pass a
+    // negative value to accept a window ending a hair before the span.
     const startsOk = startSec >= w.startSec;
-    const endsOk = w.endSec == null || endNeeded <= w.endSec - COVERAGE_MARGIN_SEC;
+    const endsOk = w.endSec == null || endNeeded <= w.endSec - endMarginSec;
     if (startsOk && endsOk) return w;
   }
   return null;

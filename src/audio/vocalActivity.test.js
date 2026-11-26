@@ -6,6 +6,7 @@ import {
   classifyFirstVocalStart,
   parseRmsLevels,
   analyzeVocalActivity,
+  analyzeVocalActivityFromStems,
 } from './vocalActivity.js';
 
 test('parseRmsLevels extracts ffmpeg astats lines', () => {
@@ -227,4 +228,71 @@ test('analyzeVocalActivity returns the neutral empty result when the ffmpeg/Demu
   assert.equal(result.source, 'none');
   assert.equal(result.firstVocalStartSec, null);
   assert.deepEqual(result.headVocalGaps, []);
+});
+
+
+// --- vocal activity from already-separated stems ---------------------------
+
+function levelSpawn(calls, { vocalDb = -20, mixDb = -15, frames = 10, fail = false } = {}) {
+  return (cmd, args = []) => {
+    calls.push(args);
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.kill = () => {};
+    const isMix = args.includes('-filter_complex');
+    queueMicrotask(() => {
+      if (!fail) {
+        const db = isMix ? mixDb : vocalDb;
+        proc.stderr.emit('data', Array.from({ length: frames }, () => `lavfi.astats.Overall.RMS_level=${db}\n`).join(''));
+      }
+      proc.emit('close', fail ? 1 : 0);
+    });
+    return proc;
+  };
+}
+
+const windowedStems = {
+  windows: [
+    { name: 'head', startSec: 0, endSec: 60, vocalPath: '/s/head.vocal.wav', instrumentalPath: '/s/head.instrumental.wav' },
+    { name: 'tail', startSec: 225, endSec: 300, vocalPath: '/s/tail.vocal.wav', instrumentalPath: '/s/tail.instrumental.wav' },
+  ],
+};
+
+test('analyzeVocalActivityFromStems reads the head and tail windows at the right offsets, summing stems for the mix', async () => {
+  const calls = [];
+  const result = await analyzeVocalActivityFromStems(windowedStems, { durationSec: 300, spawnFn: levelSpawn(calls) });
+  assert.equal(result.ok, true);
+  assert.equal(result.source, 'demucs');
+  const ssOf = (args) => args[args.indexOf('-ss') + 1];
+  const inputsOf = (args) => args.filter((_, i) => args[i - 1] === '-i');
+  const tailVocal = calls.find((a) => inputsOf(a).join() === '/s/tail.vocal.wav');
+  // Tail analysis covers the last 60 s (240-300); the tail stem starts at 225.
+  assert.equal(ssOf(tailVocal), '15.000');
+  const tailMix = calls.find((a) => inputsOf(a).length === 2 && inputsOf(a)[0] === '/s/tail.vocal.wav');
+  assert.deepEqual(inputsOf(tailMix), ['/s/tail.vocal.wav', '/s/tail.instrumental.wav']);
+  assert.match(tailMix[tailMix.indexOf('-filter_complex') + 1], /amix=inputs=2:normalize=0/);
+  const headVocal = calls.find((a) => inputsOf(a).join() === '/s/head.vocal.wav');
+  assert.equal(ssOf(headVocal), '0.000');
+  assert.equal(result.lastVocalEndSec, 240 + 10 * 0.1, 'vocal present through the 10 reported frames of the tail');
+  assert.equal(result.firstVocalStartSec, 0);
+  assert.equal(result.tailMixLevels.length, 10);
+});
+
+test('analyzeVocalActivityFromStems gives up (source none) when a window is missing or ffmpeg fails', async () => {
+  const headOnly = { windows: [windowedStems.windows[0]] };
+  const missing = await analyzeVocalActivityFromStems(headOnly, { durationSec: 300, spawnFn: levelSpawn([]) });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.source, 'none');
+  const failed = await analyzeVocalActivityFromStems(windowedStems, { durationSec: 300, spawnFn: levelSpawn([], { fail: true }) });
+  assert.equal(failed.source, 'none');
+});
+
+test('analyzeVocalActivityFromStems works on a whole-track (short track / legacy) entry', async () => {
+  const calls = [];
+  const whole = { vocalPath: '/s/vocal.wav', instrumentalPath: '/s/instrumental.wav' };
+  const result = await analyzeVocalActivityFromStems(whole, { durationSec: 120, spawnFn: levelSpawn(calls) });
+  assert.equal(result.ok, true);
+  const tailVocal = calls.find((a) => a.includes('/s/vocal.wav') && !a.includes('-filter_complex') && a[a.indexOf('-ss') + 1] !== '0.000');
+  assert.equal(tailVocal[tailVocal.indexOf('-ss') + 1], '60.000', 'tail = last 60 s of a 120 s track, read from the whole-track file');
 });

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { getAnalysisQueue } from './analysisQueue.js';
 import { spawnCapture } from './spawnCapture.js';
+import { findStemWindow } from './stemConfig.js';
 
 /** Relative threshold: vocals are "present" when within this dB of the mix. */
 export const VOCAL_RELATIVE_DB = 25;
@@ -308,6 +309,94 @@ export async function analyzeVocalActivity(filePath, {
     return emptyResult();
   } finally {
     await rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * RMS envelope of one segment of one or more files, summed. With two
+ * inputs (vocal + instrumental stems) the sum stands in for the original
+ * mix, which is what the vocal-vs-mix thresholds compare against.
+ */
+async function rmsEnvelopeSegment(run, inputs, { offsetSec, lengthSec }) {
+  const args = ['-hide_banner', '-nostats'];
+  for (const input of inputs) {
+    args.push('-ss', Math.max(0, offsetSec).toFixed(3), '-t', lengthSec.toFixed(3), '-i', input);
+  }
+  const envelope = `aresample=${VOCAL_ENVELOPE_SAMPLE_RATE},asetnsamples=n=${VOCAL_ENVELOPE_SAMPLES_PER_FRAME}:p=0,`
+    + 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level';
+  if (inputs.length > 1) {
+    const labels = inputs.map((_, i) => `[${i}:a]`).join('');
+    args.push('-filter_complex', `${labels}amix=inputs=${inputs.length}:normalize=0:duration=longest,${envelope}`);
+  } else {
+    args.push('-af', envelope);
+  }
+  args.push('-f', 'null', '-');
+  const { stderr, code } = await spawnCapture(run, 'ffmpeg', args);
+  return { ok: code === 0, levels: parseRmsLevels(stderr) };
+}
+
+/**
+ * Vocal activity from already-separated stems (stem plan, follow-up).
+ *
+ * analyzeVocalActivity() runs its own Demucs pass on a 90 s head+tail clip;
+ * on the realtime queue that is single-threaded and in production it hit
+ * its 300 s timeout for 92% of tracks (1942/2103), which also made every
+ * track's analysis take ~300 s. The stem cache already holds the head
+ * (0-60 s) and tail (last 75 s) separated at DEMUCS_THREADS, which cover
+ * the 30 s head / 60 s tail windows this analysis needs, so the same
+ * classification can run on those files with only ffmpeg.
+ *
+ * Also returns the mixed-stem RMS levels of both windows (`headMixLevels`,
+ * `tailMixLevels`) so the caller can rebuild phrase candidates with the
+ * vocal boundaries without reading the original file again.
+ * @param {object} stems getCachedStems()'s shape
+ * @param {{ durationSec: number, spawnFn?: Function, headWindowSec?: number, tailWindowSec?: number }} opts
+ */
+export async function analyzeVocalActivityFromStems(stems, {
+  durationSec,
+  spawnFn = null,
+  headWindowSec = HEAD_WINDOW_SEC,
+  tailWindowSec = TAIL_WINDOW_SEC,
+} = {}) {
+  if (!stems || !(durationSec > 0)) return emptyResult();
+  const run = spawnFn ?? defaultSpawn;
+  const headLen = Math.min(headWindowSec, durationSec);
+  const tailStart = Math.max(0, durationSec - tailWindowSec);
+  const tailLen = durationSec - tailStart;
+  // Levels only: a window that stops a fraction of a second short of the
+  // probed duration is fine (ffmpeg just ends early).
+  const lenient = { endMarginSec: -1 };
+  const headWindow = findStemWindow(stems, 0, headLen, lenient);
+  const tailWindow = findStemWindow(stems, tailStart, tailLen, lenient);
+  if (!headWindow || !tailWindow) return emptyResult();
+
+  const segment = (w, startSec, lengthSec) => {
+    const offsetSec = startSec - w.startSec;
+    return Promise.all([
+      rmsEnvelopeSegment(run, [w.vocalPath], { offsetSec, lengthSec }),
+      rmsEnvelopeSegment(run, [w.vocalPath, w.instrumentalPath], { offsetSec, lengthSec }),
+    ]);
+  };
+  try {
+    const [[headVocal, headMix], [tailVocal, tailMix]] = await Promise.all([
+      segment(headWindow, 0, headLen),
+      segment(tailWindow, tailStart, tailLen),
+    ]);
+    const usable = (env) => env.ok && env.levels.length > 0;
+    if (![headVocal, headMix, tailVocal, tailMix].every(usable)) return emptyResult();
+    const tailResult = classifyVocalEnvelope({
+      vocalLevels: tailVocal.levels,
+      mixLevels: tailMix.levels,
+      tailStartSec: tailStart,
+    });
+    const headResult = classifyFirstVocalStart({
+      vocalLevels: headVocal.levels,
+      mixLevels: headMix.levels,
+      headStartSec: 0,
+    });
+    return { ...tailResult, ...headResult, headMixLevels: headMix.levels, tailMixLevels: tailMix.levels };
+  } catch {
+    return emptyResult();
   }
 }
 
