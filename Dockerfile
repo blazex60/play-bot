@@ -36,12 +36,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=web-build /usr/local/bin/bun /usr/local/bin/bun
 
 # demucs 4.1.0 only declares numpy on Intel macOS, but transformer.py
-# imports it on Linux too. Install numpy explicitly after the CPU torch
-# wheel (which no longer pulls numpy in as a hard dependency).
+# imports it on Linux too. Install numpy explicitly after the torch wheel
+# (which no longer pulls numpy in as a hard dependency).
+#
+# CUDA 12.6 build, pinned: the production GPU is a GTX 970 (Maxwell, sm_52)
+# and 2.7.1+cu126 still ships sm_50 kernels (verified on the host
+# 2026-11-26: full track in 27 s vs 410 s on 4 CPU threads). Newer CUDA
+# builds are dropping Maxwell — re-check `torch.cuda.get_arch_list()`
+# before bumping. The same wheel runs on CPU when no GPU is present
+# (DEMUCS_DEVICE=auto falls back; src/audio/demucsDevice.js).
 RUN python3 -m venv /opt/demucs-venv \
   && /opt/demucs-venv/bin/pip install --no-cache-dir --upgrade pip \
   && /opt/demucs-venv/bin/pip install --no-cache-dir \
-      --index-url https://download.pytorch.org/whl/cpu torch \
+      --index-url https://download.pytorch.org/whl/cu126 torch==2.7.1 torchaudio==2.7.1 \
   && /opt/demucs-venv/bin/pip install --no-cache-dir numpy demucs \
   && /opt/demucs-venv/bin/python -c "from demucs.pretrained import get_model; get_model('htdemucs')"
 

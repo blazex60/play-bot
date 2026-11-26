@@ -25,7 +25,8 @@ import { getAnalysisQueue, getStemPreparationQueue } from '../audio/analysisQueu
 import { getCachedStems, isStemSeparationAvailable, separateTrackStems } from '../audio/stemCache.js';
 import { isStemJobRelevantFor } from './player/stemRelevance.js';
 import { analyzeVocalActivityFromStems } from '../audio/vocalActivity.js';
-import { estimateSeparationSec, stemSeparationConfig } from '../audio/stemConfig.js';
+import { estimateSeparationSec, planStemWindows, stemSeparationConfig, stemWindowsAudioSec } from '../audio/stemConfig.js';
+import { currentDemucsDevice } from '../audio/demucsDevice.js';
 import { planStemTransition } from '../audio/stemTransition.js';
 import { logTransitionPlan, logGaplessTransition } from '../audio/transitionLog.js';
 import { StemPreparationState, StemPrefetchTracker } from '../audio/stemPrefetch.js';
@@ -250,7 +251,7 @@ export class GuildPlayer {
       return isStemJobRelevantFor(queue, videoId, {
         currentRemainingSec,
         // 1.2×: production CPU runs came in up to ~17% over the configured RTF.
-        minRemainingSec: estimateSeparationSec(stemSeparationConfig()) * 1.2,
+        minRemainingSec: estimateSeparationSec(stemSeparationConfig(process.env, { device: currentDemucsDevice() }), stemWindowsAudioSec(planStemWindows(durationSec, { wholeTrack: currentDemucsDevice() === 'cuda' })) ?? undefined) * 1.2,
       });
     };
     const stemSeparationAvailable = isStemSeparationAvailableFn ?? (() => isStemSeparationAvailable());

@@ -121,7 +121,7 @@ resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
 - **selfDeaf はネイティブ対応** — `joinVoiceChannel({ selfDeaf: true })` を使用
 - **AudioPlayerStatus.Idle イベント** — ミキサー経路では曲終了の合図ではない。想定外の Idle は mixer resource の再 `play()` による復旧トリガ
 - **キュー枯渇時は遅延退出** — 再生するものが尽きても即退出せず、テキストチャンネルに予告して `IDLE_LEAVE_DELAY_MS`（既定 3 分、`0` で即退出）後もアイドルなら退出する（`src/playback/idleLeave.js`）。曲が開始されたら予約を取り消す。`/leave` と VC 無人化は従来どおり即時
-- **ステム分離は区間のみ** — Demucs（htdemucs）は CPU では再生より遅い（本番 8 vCPU・4 スレッドで RTF 約 1.24、曲全体の分離は次の曲に間に合わない）。そのため、各曲の冒頭 60 秒と末尾 75 秒だけを 1 回の Demucs 実行で分離する（`src/audio/stemConfig.js`）。stem-mix は、両側のフェード範囲がこの区間に収まる候補だけを選ぶ。スレッド数・タイムアウトの係数・機能スイッチは `.env` で変えられる。値を変えたら `scripts/bench-demucs.mjs` で測り直す
+- **ステム分離は GPU なら曲全体、CPU なら区間** — 本番には GTX 970 がパススルーされていて、Demucs（htdemucs、torch 2.7.1+cu126）は曲全体を約 27 秒で分離できる（`DEMUCS_DEVICE=auto` で自動判定、`src/audio/demucsDevice.js`）。CUDA で失敗したら、その 1 件を CPU でやり直し、以降の処理も CPU に切り替える。CPU では再生より遅い（8 vCPU・4 スレッドで RTF 約 1.24）ので、各曲の冒頭 60 秒と末尾 75 秒だけを 1 回の Demucs 実行で分離する（`src/audio/stemConfig.js`）。torch を上げるときは、Maxwell（sm_50）に対応しているか確認する。stem-mix は、両側のフェード範囲がこの区間に収まる候補だけを選ぶ。スレッド数・タイムアウトの係数・機能スイッチは `.env` で変えられる。値を変えたら `scripts/bench-demucs.mjs` で測り直す
 - **ボーカル解析はステムから取る** — 曲の解析（BPM・ダウンビート・フレーズ）では Demucs を動かさない（`analyzeTrackFile` の `vocalActivity: 'deferred'`）。ステム分離が終わったら、分離した区間のボーカルと伴奏の音量からボーカルの有無を判定し、解析結果に後から反映して保存する（`analyzeVocalActivityFromStems` → `applyVocalActivity`）。反映されるまでは `analysisSource: 'none'` のままなので、ボーカルについて安全かどうかは「未確認」として扱われる。以前は realtime キューの 1 スレッドで Demucs を回していて、9 割の曲が 300 秒でタイムアウトし、解析そのものが切り替えに間に合っていなかった
 - **循環インポート防止** — `sessions.js` が共有状態を管理。`index.js` と `play.js` の双方向依存を排除
 

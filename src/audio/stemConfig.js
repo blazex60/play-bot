@@ -62,8 +62,10 @@ function readBool(env, name, fallback) {
  * Read at call time (not module load) so tests and a restarted bot both see
  * the current environment.
  */
-export function stemSeparationConfig(env = process.env) {
+export function stemSeparationConfig(env = process.env, { device = 'cpu' } = {}) {
+  const cuda = device === 'cuda';
   return {
+    device,
     /** STEM_SEPARATION_ENABLED=false turns separation off entirely (stem-mix then never qualifies). */
     enabled: readBool(env, 'STEM_SEPARATION_ENABLED', true),
     /** OMP/MKL threads for Demucs on the stem queue. 4 is the measured sweet spot. */
@@ -73,9 +75,14 @@ export function stemSeparationConfig(env = process.env) {
      * The idle benchmark gave 1.24; live production runs (sharing the host
      * with playback and other bots) came in at 1.31-1.76, so 1.5.
      */
-    rtf: readNumber(env, 'STEM_SEPARATION_RTF', 1.5, { min: 0.05 }),
+    // GPU (GTX 970, measured 0.08 incl. model load) gets its own knob.
+    rtf: cuda
+      ? readNumber(env, 'STEM_SEPARATION_RTF_CUDA', 0.15, { min: 0.01 })
+      : readNumber(env, 'STEM_SEPARATION_RTF', 1.5, { min: 0.05 }),
     /** Fixed per-run cost (model load etc.). */
-    fixedSec: readNumber(env, 'STEM_SEPARATION_FIXED_SEC', 10, { min: 0 }),
+    fixedSec: cuda
+      ? readNumber(env, 'STEM_SEPARATION_FIXED_SEC_CUDA', 10, { min: 0 })
+      : readNumber(env, 'STEM_SEPARATION_FIXED_SEC', 10, { min: 0 }),
     /** Headroom for CPU contention with playback and other bots. */
     safetyFactor: readNumber(env, 'STEM_SEPARATION_SAFETY', 2, { min: 1 }),
     /** Hard upper bound on any single separation run. */
@@ -105,8 +112,10 @@ export function estimateSeparationTimeoutMs(audioSec, config = stemSeparationCon
  * file as one open-ended window, i.e. the pre-window behavior.
  * @returns {{ name: 'full'|'head'|'tail', startSec: number, endSec: number|null }[]}
  */
-export function planStemWindows(durationSec) {
-  if (!Number.isFinite(durationSec) || durationSec <= 0 || durationSec <= STEM_FULL_TRACK_MAX_SEC) {
+export function planStemWindows(durationSec, { wholeTrack = false } = {}) {
+  // On the GPU a whole track separates in ~30 s, so there is no reason to
+  // limit stem-mix to the head/tail windows (any exit point stays usable).
+  if (wholeTrack || !Number.isFinite(durationSec) || durationSec <= 0 || durationSec <= STEM_FULL_TRACK_MAX_SEC) {
     return [{ name: 'full', startSec: 0, endSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null }];
   }
   return [

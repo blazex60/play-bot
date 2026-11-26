@@ -19,6 +19,17 @@ services:
       - ./logs:/app/logs
     logging: *default-logging
     network_mode: "host"
+    # GTX 970 passed through to the host VM, used by Demucs for stem
+    # separation (src/audio/demucsDevice.js). Requires nvidia-container-
+    # toolkit; without a GPU the container will not start, so remove this
+    # block (Demucs then runs on CPU) if the GPU is taken out.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   music-web:
     build: .

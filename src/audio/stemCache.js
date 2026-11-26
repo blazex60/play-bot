@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnCapture } from './spawnCapture.js';
 import { resolveDemucsBin, DEMUCS_MODEL } from './vocalActivity.js';
 import { probeDurationSec } from './duration.js';
+import { looksLikeCudaError, markCudaFailed, resolveDemucsDevice } from './demucsDevice.js';
 import {
   estimateSeparationTimeoutMs,
   planStemWindows,
@@ -185,6 +186,7 @@ export async function separateTrackStems(filePath, videoId, {
   getPausedMs,
   probeDurationFn = probeDurationSec,
   env = process.env,
+  deviceFn = resolveDemucsDevice,
 } = {}) {
   if (!filePath || !isSafeVideoId(videoId)) return null;
   if (signal?.aborted) return null;
@@ -212,13 +214,13 @@ export async function separateTrackStems(filePath, videoId, {
     return null;
   }
 
-  const job = runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, getPausedMs, probeDurationFn, config })
+  const job = runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, getPausedMs, probeDurationFn, config, env, deviceFn })
     .finally(() => inFlight.delete(videoId));
   inFlight.set(videoId, job);
   return job;
 }
 
-async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, getPausedMs, probeDurationFn, config }) {
+async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, getPausedMs, probeDurationFn, config, env, deviceFn }) {
   // Re-check inside the (de-duplicated) job in case a concurrent caller for
   // the same videoId finished between the caller's first check and now.
   const cached = await getCachedStems(videoId);
@@ -236,6 +238,7 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, ge
   let audioSec = null;
   let demucsTimeoutMs = null;
   let windows = [];
+  let usedDevice = null;
   try {
     trackDurationSec = await probeDurationFn(filePath, { spawnFn }).catch(() => null);
     if (signal?.aborted) return null;
@@ -246,33 +249,51 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, ge
       log.info({ event: 'audio.stemcache.skipped_unknown_duration', trackId: videoId }, '曲の長さが取れないためステム分離をスキップ');
       return null;
     }
-    windows = planStemWindows(trackDurationSec);
-    audioSec = stemWindowsAudioSec(windows);
-    demucsTimeoutMs = timeoutMs ?? estimateSeparationTimeoutMs(audioSec, config);
+    // GPU: whole track (~30 s). CPU: head/tail windows. A CUDA-looking
+    // failure degrades the process to CPU and this job is retried once there.
+    const attempt = async (device) => {
+      const runConfig = stemSeparationConfig(env, { device });
+      windows = planStemWindows(trackDurationSec, { wholeTrack: device === 'cuda' });
+      audioSec = stemWindowsAudioSec(windows);
+      demucsTimeoutMs = timeoutMs ?? estimateSeparationTimeoutMs(audioSec, runConfig);
+      usedDevice = device;
+      const inputs = [];
+      for (const w of windows) {
+        const base = w.name === 'full' ? 'input' : w.name;
+        const wav = path.join(jobTmpRoot, `${base}.wav`);
+        const args = ['-hide_banner', '-loglevel', 'error', '-y'];
+        if (w.name !== 'full') args.push('-ss', w.startSec.toFixed(3), '-t', (w.endSec - w.startSec).toFixed(3));
+        args.push('-i', filePath, '-ac', '2', '-ar', '44100', wav);
+        const cut = await spawnCapture(spawnFn, 'ffmpeg', args, { timeoutMs: CUT_TIMEOUT_MS, signal, getPausedMs });
+        if (cut.code !== 0) throw new Error(`ffmpeg cut of ${w.name} window exited with ${cut.code}`);
+        if (signal?.aborted) return null;
+        inputs.push({ window: w, wav, base });
+      }
+      const demucs = await spawnCapture(spawnFn, resolveDemucsBin(), [
+        '--two-stems=vocals',
+        '-n', DEMUCS_MODEL,
+        '-d', device,
+        '-o', jobTmpRoot,
+        ...inputs.map((i) => i.wav),
+      ], { timeoutMs: demucsTimeoutMs, signal, getPausedMs });
+      if (demucs.code !== 0) {
+        const err = new Error(`demucs exited with ${demucs.code}: ${demucs.stderr?.trim().split('\n').slice(-3).join(' | ') ?? ''}`);
+        err.cudaRelated = device === 'cuda' && looksLikeCudaError(demucs.stderr);
+        throw err;
+      }
+      return inputs;
+    };
 
-    const inputs = [];
-    for (const w of windows) {
-      const base = w.name === 'full' ? 'input' : w.name;
-      const wav = path.join(jobTmpRoot, `${base}.wav`);
-      const args = ['-hide_banner', '-loglevel', 'error'];
-      if (w.name !== 'full') args.push('-ss', w.startSec.toFixed(3), '-t', (w.endSec - w.startSec).toFixed(3));
-      args.push('-i', filePath, '-ac', '2', '-ar', '44100', wav);
-      const cut = await spawnCapture(spawnFn, 'ffmpeg', args, { timeoutMs: CUT_TIMEOUT_MS, signal, getPausedMs });
-      if (cut.code !== 0) throw new Error(`ffmpeg cut of ${w.name} window exited with ${cut.code}`);
-      if (signal?.aborted) return null;
-      inputs.push({ window: w, wav, base });
+    const device = await deviceFn({ env });
+    let inputs;
+    try {
+      inputs = await attempt(device);
+    } catch (err) {
+      if (!err?.cudaRelated || signal?.aborted) throw err;
+      markCudaFailed(err);
+      inputs = await attempt('cpu');
     }
-
-    const demucsBin = resolveDemucsBin();
-    const demucs = await spawnCapture(spawnFn, demucsBin, [
-      '--two-stems=vocals',
-      '-n', DEMUCS_MODEL,
-      '-o', jobTmpRoot,
-      ...inputs.map((i) => i.wav),
-    ], { timeoutMs: demucsTimeoutMs, signal, getPausedMs });
-    if (demucs.code !== 0) {
-      throw new Error(`demucs exited with ${demucs.code}: ${demucs.stderr?.trim().split('\n').slice(-3).join(' | ') ?? ''}`);
-    }
+    if (!inputs) return null;
 
     const outputs = [];
     for (const { window: w, base } of inputs) {
@@ -319,6 +340,7 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, ge
       // the job — the number to calibrate STEM_SEPARATION_RTF against.
       rtf: audioSec ? Number(((elapsedMs - pausedMs) / 1000 / audioSec).toFixed(3)) : null,
       threads: config.threads,
+      device: usedDevice,
     }, 'ステム分離に成功');
     return getCachedStems(videoId);
   } catch (err) {
@@ -333,6 +355,7 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, ge
       elapsedMs: Date.now() - startedAt,
       timeoutMs: demucsTimeoutMs,
       threads: config.threads,
+      device: usedDevice,
       err,
     }, 'ステム分離に失敗');
     return null;

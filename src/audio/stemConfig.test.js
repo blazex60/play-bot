@@ -89,3 +89,17 @@ test('stemPairCovered: both sides must hold the overlap, scaled by tempo ratio',
   assert.equal(stemPairCovered(both, { exitSec: 226, entrySec: 0, fadeSec: 54 }), true) // out 280 ≤ 299.5, in 58.3 ≤ 59.5
   assert.equal(stemPairCovered(both, { exitSec: 226, entrySec: 3, fadeSec: 54 }), false) // in 61.3 > 59.5
 })
+
+test('stemSeparationConfig: cuda has its own RTF/fixed defaults and env knobs', () => {
+  const cuda = stemSeparationConfig({}, { device: 'cuda' })
+  assert.equal(cuda.device, 'cuda')
+  assert.equal(cuda.rtf, 0.15)
+  assert.equal(stemSeparationConfig({ STEM_SEPARATION_RTF: '9' }, { device: 'cuda' }).rtf, 0.15, 'the CPU knob does not leak into cuda')
+  assert.equal(stemSeparationConfig({ STEM_SEPARATION_RTF_CUDA: '0.3' }, { device: 'cuda' }).rtf, 0.3)
+  assert.equal(stemSeparationConfig({}).rtf, 1.5, 'cpu stays the default')
+})
+
+test('planStemWindows: wholeTrack (GPU) separates long tracks whole', () => {
+  assert.deepEqual(planStemWindows(300, { wholeTrack: true }), [{ name: 'full', startSec: 0, endSec: 300 }])
+  assert.equal(planStemWindows(300).length, 2)
+})

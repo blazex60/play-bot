@@ -23,6 +23,7 @@
  *   --models htdemucs     comma-separated Demucs models (e.g. htdemucs,mdx_extra_q)
  *   --clip-sec 0,90       0 = full track; N = only the last N seconds (transition window)
  *   --nice 15             nice level (15 = what the bot uses; 0 = no nice)
+ *   --device cpu          Demucs device: cpu or cuda
  *   --timeout-sec 1800    per-run hard limit
  *   --label <text>        free-form tag, e.g. "idle" or "while-playing"
  *   --out <file.json>     where to write the JSON report (default: /tmp/bench-demucs-<time>.json)
@@ -45,6 +46,7 @@ export function parseArgs(argv) {
     models: ['htdemucs'],
     clipSec: [0, 90],
     nice: 15,
+    device: 'cpu',
     timeoutSec: 1800,
     label: '',
     out: null,
@@ -67,6 +69,7 @@ export function parseArgs(argv) {
       case '--models': opts.models = list(next(), false); break;
       case '--clip-sec': opts.clipSec = list(next(), true); break;
       case '--nice': opts.nice = Number(next()); break;
+      case '--device': opts.device = next(); break;
       case '--timeout-sec': opts.timeoutSec = Number(next()); break;
       case '--label': opts.label = next(); break;
       case '--out': opts.out = next(); break;
@@ -81,6 +84,7 @@ export function parseArgs(argv) {
   if (bad(opts.threads) || opts.threads.includes(0)) throw new Error('--threads must be positive integers');
   if (bad(opts.clipSec)) throw new Error('--clip-sec must be >= 0');
   if (!Number.isFinite(opts.nice)) throw new Error('--nice must be a number');
+  if (!['cpu', 'cuda'].includes(opts.device)) throw new Error('--device must be cpu or cuda');
   if (!Number.isFinite(opts.timeoutSec) || opts.timeoutSec <= 0) throw new Error('--timeout-sec must be > 0');
   if (!opts.help && !opts.video && !opts.input) throw new Error('give --video <id|url> or --input <file>');
   return opts;
@@ -127,7 +131,7 @@ export function renderMarkdown(report) {
   lines.push(`- cgroup CPU 制限: ${h.cgroupCpuMax ?? '不明'} / メモリ制限: ${h.cgroupMemMax ?? '不明'}`);
   lines.push(`- メモリ: 合計 ${fmt(h.totalMemGiB, 1)} GiB / 空き ${fmt(h.freeMemGiB, 1)} GiB、loadavg ${h.loadavg.map((x) => fmt(x)).join(' ')}`);
   lines.push(`- Demucs: ${h.demucsVersion ?? '不明'} / torch: ${h.torchVersion ?? '不明'}`);
-  lines.push(`- 入力: ${report.input.source}（${fmt(report.input.durationSec, 1)} 秒）、nice ${report.nice}`);
+  lines.push(`- 入力: ${report.input.source}（${fmt(report.input.durationSec, 1)} 秒）、nice ${report.nice}、デバイス ${report.device ?? 'cpu'}`);
   lines.push('');
   lines.push('| モデル | 区間 | スレッド | 所要(秒) | RTF | CPU 使用率 | ピーク RSS(MiB) | 600秒以内 | 再生より速い | 並行 Demucs | 結果 |');
   lines.push('|---|---|---|---|---|---|---|---|---|---|---|');
@@ -301,7 +305,7 @@ async function benchOne({ model, threads, clipSec }, { opts, workDir, sourceFile
   await cutWav(sourceFile, wav, clipSec);
   const audioSec = await probeDurationSec(wav);
   const outDir = path.join(workDir, `out-${model}-${threads}-${clipSec}`);
-  const demucsArgs = ['--two-stems=vocals', '-n', model, '-o', outDir, wav];
+  const demucsArgs = ['--two-stems=vocals', '-n', model, '-d', opts.device, '-o', outDir, wav];
   const [cmd, args] = opts.nice > 0
     ? ['nice', ['-n', String(opts.nice), demucsBin(), ...demucsArgs]]
     : [demucsBin(), demucsArgs];
@@ -363,7 +367,7 @@ async function main() {
   }
 
   const workDir = await mkdtemp(path.join(tmpdir(), 'bench-demucs-'));
-  const report = { startedAt, label: opts.label, nice: opts.nice, host, input: null, runs: [] };
+  const report = { startedAt, label: opts.label, nice: opts.nice, device: opts.device, host, input: null, runs: [] };
   const outFile = opts.out ?? path.join(tmpdir(), `bench-demucs-${startedAt.replace(/[:.]/g, '-')}.json`);
   try {
     const { file, source } = await prepareSource(opts, workDir);
