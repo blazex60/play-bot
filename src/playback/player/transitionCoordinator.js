@@ -661,6 +661,9 @@ export class TransitionCoordinator {
         tempoBackend,
         maxOverlapSec: MAX_CROSSFADE_SEC,
         stemsAvailable: Boolean(outCachedStems && inCachedStems),
+        stemCoverage: outCachedStems && inCachedStems
+          ? { outgoingStems: outCachedStems, incomingStems: inCachedStems }
+          : null,
         planStemTransitionFn: this.#planStemTransitionFn,
       });
       // Phase 9A: snapshot the ranker's decision (before any later downgrade

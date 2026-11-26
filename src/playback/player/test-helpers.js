@@ -88,6 +88,7 @@ export function makePlayer({
   connection,
   analysisQueue,
   stemQueue,
+  isStemSeparationAvailableFn,
 } = {}) {
   const queue = new GuildQueue();
   queue.add(track ?? createTrack({
@@ -125,6 +126,7 @@ export function makePlayer({
     queueExhaustedTimeoutMs,
     analysisQueue,
     stemQueue,
+    isStemSeparationAvailableFn,
     connection: connection ?? {
       subscribe(subscribedPlayer) {
         assert.equal(subscribedPlayer, audioPlayer);

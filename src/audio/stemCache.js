@@ -4,6 +4,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnCapture } from './spawnCapture.js';
 import { resolveDemucsBin, DEMUCS_MODEL } from './vocalActivity.js';
+import { probeDurationSec } from './duration.js';
+import {
+  estimateSeparationTimeoutMs,
+  planStemWindows,
+  stemSeparationConfig,
+  stemWindowsAudioSec,
+} from './stemConfig.js';
 import { getLogger } from '../logging/appLogger.js';
 
 const log = getLogger('stemCache');
@@ -36,14 +43,72 @@ const SAFE_VIDEO_ID = /^[A-Za-z0-9_-]{1,128}$/;
 function isSafeVideoId(videoId) {
   return typeof videoId === 'string' && SAFE_VIDEO_ID.test(videoId);
 }
-/** Provisional — full-track Demucs is unbenchmarked in this repo (see doc's 未決事項). */
+/**
+ * Upper bound for one Demucs run; the actual per-run timeout is derived from
+ * how much audio is separated (stemConfig.js estimateSeparationTimeoutMs).
+ * Kept as an export for callers/tests that reference the old constant.
+ */
 export const STEM_SEPARATION_TIMEOUT_MS = 600_000;
+/** ffmpeg cutting one window out of the normalized file. */
+const CUT_TIMEOUT_MS = 120_000;
+/** Bumped when the on-disk layout changes; v1 = single full-track pair, no `windows`. */
+const META_VERSION = 2;
 /** Provisional cap — see doc's 未決事項. */
 export const DEFAULT_STEM_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 
 const META_FILE = 'meta.json';
 const VOCAL_FILE = 'vocal.wav';
 const INSTRUMENTAL_FILE = 'instrumental.wav';
+
+/** 'full' keeps the original file names so v1 entries stay readable. */
+function windowFileNames(name) {
+  return name === 'full'
+    ? { vocal: VOCAL_FILE, instrumental: INSTRUMENTAL_FILE }
+    : { vocal: `${name}.${VOCAL_FILE}`, instrumental: `${name}.${INSTRUMENTAL_FILE}` };
+}
+
+/**
+ * Circuit breaker (plan Phase 1 #7): after N consecutive failed separations
+ * stop starting new ones for a cooldown, instead of burning a CPU core on
+ * runs that keep timing out (production: 409/409 failed before this fix).
+ */
+const circuit = { consecutiveFailures: 0, openUntil: 0 };
+let loggedDisabled = false;
+
+export function resetStemCircuitForTest() {
+  circuit.consecutiveFailures = 0;
+  circuit.openUntil = 0;
+  loggedDisabled = false;
+}
+
+function circuitOpen(now) {
+  return circuit.openUntil > now;
+}
+
+function recordOutcome(ok, config, now) {
+  if (ok) {
+    circuit.consecutiveFailures = 0;
+    return;
+  }
+  circuit.consecutiveFailures += 1;
+  if (circuit.consecutiveFailures >= config.circuitFailures && !circuitOpen(now)) {
+    circuit.openUntil = now + config.circuitCooldownMs;
+    log.warn({
+      event: 'audio.stemcache.circuit_open',
+      consecutiveFailures: circuit.consecutiveFailures,
+      cooldownMs: config.circuitCooldownMs,
+    }, 'ステム分離の連続失敗により一時停止');
+    // Half-open after the cooldown: one more failure reopens immediately
+    // instead of burning another N full-length runs to find out.
+    circuit.consecutiveFailures = config.circuitFailures - 1;
+  }
+}
+
+/** Whether new separations may start right now (feature switch + circuit breaker). */
+export function isStemSeparationAvailable({ now = Date.now(), env = process.env } = {}) {
+  const config = stemSeparationConfig(env);
+  return config.enabled && !circuitOpen(now);
+}
 /** @type {Map<string, Promise<{vocalPath:string,instrumentalPath:string}|null>>} */
 const inFlight = new Map();
 
@@ -53,20 +118,33 @@ function entryDir(videoId) {
 
 /**
  * @param {string} videoId
- * @returns {Promise<{ vocalPath: string, instrumentalPath: string } | null>}
+ * @returns {Promise<{
+ *   windows: { name: string, startSec: number, endSec: number|null, vocalPath: string, instrumentalPath: string }[],
+ *   vocalPath?: string, instrumentalPath?: string,
+ * } | null>} `vocalPath`/`instrumentalPath` are only set for a whole-track
+ *   entry (kept for callers that predate windows); windowed entries must be
+ *   read through `windows` (stemConfig.js findStemWindow()).
  */
 export async function getCachedStems(videoId) {
   if (!isSafeVideoId(videoId)) return null;
   const dir = entryDir(videoId);
-  const vocalPath = path.join(dir, VOCAL_FILE);
-  const instrumentalPath = path.join(dir, INSTRUMENTAL_FILE);
   try {
     const meta = JSON.parse(await readFile(path.join(dir, META_FILE), 'utf8'));
     // A model change invalidates every existing entry rather than mixing
     // separations from two different Demucs models across a session.
     if (meta.demucsModel !== DEMUCS_MODEL) return null;
-    await access(vocalPath);
-    await access(instrumentalPath);
+    const declared = Array.isArray(meta.windows) && meta.windows.length > 0
+      ? meta.windows
+      : [{ name: 'full', startSec: 0, endSec: null }];
+    const windows = [];
+    for (const w of declared) {
+      const names = windowFileNames(w.name);
+      const vocalPath = path.join(dir, names.vocal);
+      const instrumentalPath = path.join(dir, names.instrumental);
+      await access(vocalPath);
+      await access(instrumentalPath);
+      windows.push({ name: w.name, startSec: w.startSec ?? 0, endSec: w.endSec ?? null, vocalPath, instrumentalPath });
+    }
     // Touch meta.json's mtime on every hit — pruneStemCache() sorts by each
     // entry's max file mtime, so without this a track reused on every
     // transition looks no more recent than one separated once and never
@@ -74,32 +152,50 @@ export async function getCachedStems(videoId) {
     // Best-effort: a failed touch must not turn a real cache hit into a miss.
     const now = new Date();
     await utimes(path.join(dir, META_FILE), now, now).catch(() => {});
-    return { vocalPath, instrumentalPath };
+    const full = windows.length === 1 && windows[0].name === 'full' ? windows[0] : null;
+    return full
+      ? { windows, vocalPath: full.vocalPath, instrumentalPath: full.instrumentalPath }
+      : { windows };
   } catch {
     return null;
   }
 }
 
 /**
- * Full-track two-stem Demucs separation, written into the persistent cache.
- * Always cuts the input to a deterministically-named `input.wav` first
- * (matching vocalActivity.js's `combined.wav` convention) rather than
- * relying on Demucs' own basename-derived output subdirectory — the
- * downloaded track's temp path (normalize.js's `tempFilePath()`) has no
- * file extension, and this sidesteps needing to reason about how Demucs
- * would name that subdirectory.
+ * Two-stem Demucs separation of the windows a stem-mix transition can use,
+ * written into the persistent cache (plan Phase 2). Tracks longer than
+ * STEM_FULL_TRACK_MAX_SEC get only a head window (entry side) and a tail
+ * window (exit side), cut from the normalized file and fed to ONE Demucs
+ * process so the model loads once; shorter tracks and tracks of unknown
+ * length are separated whole. Each window is cut to a deterministically
+ * named WAV (`head.wav`, `tail.wav`, or `input.wav` for the whole track)
+ * so Demucs' basename-derived output directory is predictable — the
+ * downloaded track's temp path has no file extension.
  * @param {string} filePath already-downloaded/normalized full-track audio
  * @param {string} videoId
- * @param {{ spawnFn?: Function, timeoutMs?: number, signal?: AbortSignal }} [opts]
- * @returns {Promise<{ vocalPath: string, instrumentalPath: string } | null>}
+ * @param {{ spawnFn?: Function, timeoutMs?: number, signal?: AbortSignal,
+ *   getPausedMs?: () => number, probeDurationFn?: Function, env?: object }} [opts]
+ *   `timeoutMs` overrides the duration-derived Demucs timeout.
+ * @returns {Promise<object | null>} getCachedStems()'s shape
  */
 export async function separateTrackStems(filePath, videoId, {
   spawnFn,
-  timeoutMs = STEM_SEPARATION_TIMEOUT_MS,
+  timeoutMs,
   signal,
+  getPausedMs,
+  probeDurationFn = probeDurationSec,
+  env = process.env,
 } = {}) {
   if (!filePath || !isSafeVideoId(videoId)) return null;
   if (signal?.aborted) return null;
+  const config = stemSeparationConfig(env);
+  if (!config.enabled) {
+    if (!loggedDisabled) {
+      loggedDisabled = true;
+      log.info({ event: 'audio.stemcache.disabled' }, 'ステム分離は無効化されています');
+    }
+    return null;
+  }
 
   const cached = await getCachedStems(videoId);
   if (cached) return cached;
@@ -111,13 +207,18 @@ export async function separateTrackStems(filePath, videoId, {
   // an abort from any one caller's signal cancels the shared in-flight job
   // for all of them, same as analysisQueue's own kill-current semantics
   // (queue-wide, not per-caller).
-  const job = runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal })
+  if (circuitOpen(Date.now())) {
+    log.debug({ event: 'audio.stemcache.skipped_circuit_open', trackId: videoId }, 'ステム分離は一時停止中のためスキップ');
+    return null;
+  }
+
+  const job = runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, getPausedMs, probeDurationFn, config })
     .finally(() => inFlight.delete(videoId));
   inFlight.set(videoId, job);
   return job;
 }
 
-async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal }) {
+async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal, getPausedMs, probeDurationFn, config }) {
   // Re-check inside the (de-duplicated) job in case a concurrent caller for
   // the same videoId finished between the caller's first check and now.
   const cached = await getCachedStems(videoId);
@@ -130,50 +231,110 @@ async function runSeparation(filePath, videoId, { spawnFn, timeoutMs, signal }) 
   // container's own /tmp, a different filesystem entirely.
   await mkdir(STEM_CACHE_DIR, { recursive: true });
   const jobTmpRoot = await mkdtemp(path.join(STEM_CACHE_DIR, '.stemsep-'));
+  const startedAt = Date.now();
+  let trackDurationSec = null;
+  let audioSec = null;
+  let demucsTimeoutMs = null;
+  let windows = [];
   try {
-    const inputWav = path.join(jobTmpRoot, 'input.wav');
-    const cut = await spawnCapture(spawnFn, 'ffmpeg', [
-      '-hide_banner', '-loglevel', 'error',
-      '-i', filePath,
-      '-ac', '2', '-ar', '44100',
-      inputWav,
-    ], { timeoutMs, signal });
-    if (cut.code !== 0) return null;
+    trackDurationSec = await probeDurationFn(filePath, { spawnFn }).catch(() => null);
     if (signal?.aborted) return null;
+    // Without a length there is no tail window to cut, and separating the
+    // whole file is exactly the run that kept timing out in production.
+    // Not counted against the circuit breaker: nothing was attempted.
+    if (!Number.isFinite(trackDurationSec) || trackDurationSec <= 0) {
+      log.info({ event: 'audio.stemcache.skipped_unknown_duration', trackId: videoId }, '曲の長さが取れないためステム分離をスキップ');
+      return null;
+    }
+    windows = planStemWindows(trackDurationSec);
+    audioSec = stemWindowsAudioSec(windows);
+    demucsTimeoutMs = timeoutMs ?? estimateSeparationTimeoutMs(audioSec, config);
+
+    const inputs = [];
+    for (const w of windows) {
+      const base = w.name === 'full' ? 'input' : w.name;
+      const wav = path.join(jobTmpRoot, `${base}.wav`);
+      const args = ['-hide_banner', '-loglevel', 'error'];
+      if (w.name !== 'full') args.push('-ss', w.startSec.toFixed(3), '-t', (w.endSec - w.startSec).toFixed(3));
+      args.push('-i', filePath, '-ac', '2', '-ar', '44100', wav);
+      const cut = await spawnCapture(spawnFn, 'ffmpeg', args, { timeoutMs: CUT_TIMEOUT_MS, signal, getPausedMs });
+      if (cut.code !== 0) throw new Error(`ffmpeg cut of ${w.name} window exited with ${cut.code}`);
+      if (signal?.aborted) return null;
+      inputs.push({ window: w, wav, base });
+    }
 
     const demucsBin = resolveDemucsBin();
     const demucs = await spawnCapture(spawnFn, demucsBin, [
       '--two-stems=vocals',
       '-n', DEMUCS_MODEL,
       '-o', jobTmpRoot,
-      inputWav,
-    ], { timeoutMs, signal });
-    if (demucs.code !== 0) return null;
+      ...inputs.map((i) => i.wav),
+    ], { timeoutMs: demucsTimeoutMs, signal, getPausedMs });
+    if (demucs.code !== 0) {
+      throw new Error(`demucs exited with ${demucs.code}: ${demucs.stderr?.trim().split('\n').slice(-3).join(' | ') ?? ''}`);
+    }
 
-    const stemDir = path.join(jobTmpRoot, DEMUCS_MODEL, 'input');
-    const vocalsOut = path.join(stemDir, 'vocals.wav');
-    const instrumentalOut = path.join(stemDir, 'no_vocals.wav');
-    await access(vocalsOut);
-    await access(instrumentalOut);
+    const outputs = [];
+    for (const { window: w, base } of inputs) {
+      const stemDir = path.join(jobTmpRoot, DEMUCS_MODEL, base);
+      const vocalsOut = path.join(stemDir, 'vocals.wav');
+      const instrumentalOut = path.join(stemDir, 'no_vocals.wav');
+      await access(vocalsOut);
+      await access(instrumentalOut);
+      outputs.push({ window: w, vocalsOut, instrumentalOut });
+    }
 
     const dir = entryDir(videoId);
     await mkdir(dir, { recursive: true });
-    const vocalPath = path.join(dir, VOCAL_FILE);
-    const instrumentalPath = path.join(dir, INSTRUMENTAL_FILE);
-    await rename(vocalsOut, vocalPath);
-    await rename(instrumentalOut, instrumentalPath);
+    for (const { window: w, vocalsOut, instrumentalOut } of outputs) {
+      const names = windowFileNames(w.name);
+      await rename(vocalsOut, path.join(dir, names.vocal));
+      await rename(instrumentalOut, path.join(dir, names.instrumental));
+    }
+    // meta.json last: getCachedStems() treats its presence as "entry complete".
     await writeFile(path.join(dir, META_FILE), JSON.stringify({
+      version: META_VERSION,
       demucsModel: DEMUCS_MODEL,
       separatedAt: Date.now(),
+      trackDurationSec,
+      windows: windows.map(({ name, startSec, endSec }) => ({ name, startSec, endSec })),
     }));
     // Enforce the size cap after every write, not just at Bot startup —
     // a long-running process would otherwise grow the cache unbounded.
     pruneStemCache().catch((err) => {
       log.warn({ event: 'audio.stemcache.prune_failed', err }, '分離後のキャッシュ整理に失敗');
     });
-    return { vocalPath, instrumentalPath };
+    const elapsedMs = Date.now() - startedAt;
+    const pausedMs = getPausedMs?.() ?? 0;
+    recordOutcome(true, config, Date.now());
+    log.info({
+      event: 'audio.stemcache.separated',
+      trackId: videoId,
+      windows: windows.map((w) => w.name),
+      audioSec,
+      trackDurationSec,
+      elapsedMs,
+      pausedMs,
+      // Compute seconds per audio second, excluding time the queue froze
+      // the job — the number to calibrate STEM_SEPARATION_RTF against.
+      rtf: audioSec ? Number(((elapsedMs - pausedMs) / 1000 / audioSec).toFixed(3)) : null,
+      threads: config.threads,
+    }, 'ステム分離に成功');
+    return getCachedStems(videoId);
   } catch (err) {
-    log.warn({ event: 'audio.stemcache.separation_failed', trackId: videoId, err }, 'ステム分離に失敗');
+    if (signal?.aborted) return null;
+    recordOutcome(false, config, Date.now());
+    log.warn({
+      event: 'audio.stemcache.separation_failed',
+      trackId: videoId,
+      windows: windows.map((w) => w.name),
+      audioSec,
+      trackDurationSec,
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs: demucsTimeoutMs,
+      threads: config.threads,
+      err,
+    }, 'ステム分離に失敗');
     return null;
   } finally {
     await rm(jobTmpRoot, { recursive: true, force: true }).catch(() => {});

@@ -22,7 +22,8 @@ import { analyzeTrackFile } from '../audio/trackAnalysis.js';
 import { resetSessionTempo, probeTempoBackend, compensateDurationSec } from '../audio/tempo.js';
 import { LoopMode } from './queue.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../audio/analysisQueue.js';
-import { getCachedStems, separateTrackStems } from '../audio/stemCache.js';
+import { getCachedStems, isStemSeparationAvailable, separateTrackStems } from '../audio/stemCache.js';
+import { isStemJobRelevantFor } from './player/stemRelevance.js';
 import { planStemTransition } from '../audio/stemTransition.js';
 import { logTransitionPlan, logGaplessTransition } from '../audio/transitionLog.js';
 import { StemPreparationState, StemPrefetchTracker } from '../audio/stemPrefetch.js';
@@ -163,6 +164,7 @@ export class GuildPlayer {
     stageTempFileCopyFn = stageTempFileCopy,
     separateTrackStemsFn = separateTrackStems,
     getCachedStemsFn = getCachedStems,
+    isStemSeparationAvailableFn = null,
     planStemTransitionFn = planStemTransition,
     createFileSourceFn = createFileSource,
     logTransitionPlanFn = logTransitionPlan,
@@ -232,6 +234,12 @@ export class GuildPlayer {
     // Analysis/stem-separation scheduling + caches live in the coordinator;
     // the player only applies settled results (duration/tempo) via the
     // applyAnalysisDuration callback.
+    // A queued stem job is only worth running for the tracks a stem-mix
+    // transition can still involve: the one playing (its tail) and the next
+    // two (B's head now, C's once B plays). Same window as
+    // SourcePreparer.prefetchUpcoming(), including the QUEUE-loop wrap.
+    const isStemJobRelevant = (videoId) => isStemJobRelevantFor(queue, videoId);
+    const stemSeparationAvailable = isStemSeparationAvailableFn ?? (() => isStemSeparationAvailable());
     this.#analysis = new AnalysisCoordinator({
       analyzeTrackFileFn,
       getTrackAnalysisFn,
@@ -242,6 +250,8 @@ export class GuildPlayer {
       analysisQueue,
       stemQueue,
       applyAnalysisDuration: (track, analysis) => this.#maybeApplyAnalysisDuration(track, analysis),
+      isStemJobRelevant,
+      isStemSeparationAvailableFn: stemSeparationAvailable,
     });
     // Next-source preparation — the prefetch window, the prepared incoming
     // source, and the prepared stem pairs — lives in the SourcePreparer
@@ -258,6 +268,8 @@ export class GuildPlayer {
       createPcmSourceFn,
       createFileSourceFn,
       getCachedStemsFn,
+      isStemJobRelevant,
+      isStemSeparationAvailableFn: stemSeparationAvailable,
       separateTrackStemsFn,
       stageTempFileCopyFn,
       setCurrentTemp: (filePath, measured) => {

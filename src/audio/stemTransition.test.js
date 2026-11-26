@@ -360,3 +360,36 @@ test('buildStemEnvelopes clamps inVocal to a zero-length window (not negative) w
   assert.equal(stems.inVocal.startOffsetSec, 8); // clamped, never exceeds fadeSec
   assert.equal(stems.inVocal.fadeSec, 0);
 });
+
+// Plan Phase 2 (stem windows): stems only exist for a track's head and tail.
+const stemsWindow = (name, startSec, endSec) => ({ windows: [{ name, startSec, endSec, vocalPath: `/${name}.v`, instrumentalPath: `/${name}.i` }] });
+
+test('planStemTransition accepts a pair whose overlap fits both sides\' stem windows', () => {
+  const plan = planStemTransition(richOutgoing(), richIncoming(), {
+    stemCoverage: { outgoingStems: stemsWindow('tail', 125, 200), incomingStems: stemsWindow('head', 0, 60) },
+  });
+  assert.equal(plan.eligible, true);
+  assert.equal(plan.outgoing.exitStartSec, 158);
+});
+
+test('planStemTransition rejects with stem-mix-outside-stem-window when the exit lies outside the outgoing stems', () => {
+  const plan = planStemTransition(richOutgoing(), richIncoming(), {
+    stemCoverage: { outgoingStems: stemsWindow('tail', 170, 200), incomingStems: stemsWindow('head', 0, 60) },
+  });
+  assert.equal(plan.eligible, false);
+  assert.deepEqual(plan.reasons, ['stem-mix-outside-stem-window']);
+});
+
+test('planStemTransition rejects when the incoming overlap runs past the head window', () => {
+  const plan = planStemTransition(richOutgoing(), richIncoming(), {
+    stemCoverage: { outgoingStems: stemsWindow('tail', 125, 200), incomingStems: stemsWindow('head', 0, 6) },
+  });
+  assert.equal(plan.eligible, false);
+  assert.deepEqual(plan.reasons, ['stem-mix-outside-stem-window']);
+});
+
+test('planStemTransition treats legacy whole-track stems as covering everything', () => {
+  const whole = { vocalPath: '/v', instrumentalPath: '/i' };
+  const plan = planStemTransition(richOutgoing(), richIncoming(), { stemCoverage: { outgoingStems: whole, incomingStems: whole } });
+  assert.equal(plan.eligible, true);
+});

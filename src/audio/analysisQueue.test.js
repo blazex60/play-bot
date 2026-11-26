@@ -392,3 +392,36 @@ test('killed analysis callback does not commit after abort', async () => {
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(committed, false);
 });
+
+test('analysisQueue reports how long the current job spent SIGSTOP\'d (pausedMs)', async () => {
+  let now = 1000;
+  const queue = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc(), pauseAfterUnderrunMs: 0, maxStoppedMs: 60_000, clock: () => now });
+  let ctx;
+  let release;
+  const job = queue.enqueue((c) => { ctx = c; return new Promise((r) => { release = r; }); });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(ctx.pausedMs(), 0);
+  queue.noteUnderrun();
+  now += 500;
+  assert.equal(ctx.pausedMs(), 500, 'counts the ongoing pause');
+  queue.noteUnderrunCleared();
+  now += 1000;
+  assert.equal(ctx.pausedMs(), 500, 'stops counting once resumed');
+  queue.noteUnderrun();
+  now += 250;
+  queue.noteUnderrunCleared();
+  assert.equal(ctx.pausedMs(), 750, 'accumulates across pauses');
+  release('done');
+  assert.equal(await job, 'done');
+});
+
+test('analysisQueue passes its threadCount to children as OMP/MKL threads', async () => {
+  const envs = [];
+  const queue = createAnalysisQueue({ useNice: false, threadCount: 4, spawnFn: (cmd, args, opts) => { envs.push(opts.env); const p = fakeProc(); queueMicrotask(() => p.emit('close', 0)); return p; } });
+  await queue.enqueue(async ({ spawnNice }) => { spawnNice('demucs', []); });
+  assert.equal(envs[0].OMP_NUM_THREADS, '4');
+  assert.equal(envs[0].MKL_NUM_THREADS, '4');
+  const realtime = createAnalysisQueue({ useNice: false, spawnFn: (cmd, args, opts) => { envs.push(opts.env); const p = fakeProc(); queueMicrotask(() => p.emit('close', 0)); return p; } });
+  await realtime.enqueue(async ({ spawnNice }) => { spawnNice('aubio', []); });
+  assert.equal(envs[1].OMP_NUM_THREADS, '1', 'the realtime queue stays single-threaded');
+});

@@ -108,6 +108,9 @@ function selectWinner(candidates, plans, keys, legacyPlan) {
  *   cache itself is the caller's job (an async fs lookup — see player.js's
  *   #maybeStartCrossfade()); this function stays synchronous like
  *   planBeatSyncedTransition() before it.
+ * @param {{ outgoingStems: object, incomingStems: object }} [options.stemCoverage]
+ *   both sides' cached stem entries; restricts stem-mix to pairs whose
+ *   overlap lies inside the separated windows (stemConfig.js).
  * @param {Function} [options.planStemTransitionFn] DI hook, defaults to the
  *   real planStemTransition() — mirrors player.js's existing
  *   `#planStemTransitionFn` constructor injection point.
@@ -123,12 +126,13 @@ export function rankTransitionCandidates(outgoing, incoming, {
   tempoBackend = 'rubberband',
   maxOverlapSec = 6,
   stemsAvailable = false,
+  stemCoverage = null,
   planStemTransitionFn = planStemTransition,
 } = {}) {
   const beatmixPlan = planBeatmixTransition(outgoing, incoming, { outgoingPlaybackBpm, tempoBackend });
   const phraseCrossfadePlan = planPhraseCrossfade(outgoing, incoming, { outgoingPlaybackBpm, maxOverlapSec });
   const stemMixPlan = stemsAvailable
-    ? planStemTransitionFn(outgoing, incoming, { outgoingPlaybackBpm, tempoBackend })
+    ? planStemTransitionFn(outgoing, incoming, { outgoingPlaybackBpm, tempoBackend, ...(stemCoverage ? { stemCoverage } : {}) })
     : { mode: null, eligible: false, reasons: ['stems-unavailable'] };
   const legacyPlan = planTransition(outgoing, incoming, { maxOverlapSec });
 

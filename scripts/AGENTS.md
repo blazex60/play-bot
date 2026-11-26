@@ -20,6 +20,7 @@
 | `claude-code-cloud-setup.sh` | Claude Code Cloud のキャッシュ対象VMにOSツールを導入する、環境設定欄への貼り付け用スクリプト |
 | `claude-code-session-start.sh` | Claude Code Cloud の各セッションでNode依存とPlaywright Chromiumを同期する |
 | `cloud-setup-common.sh` | 両クラウド環境の Ubuntu パッケージ、Bun、Node依存、yt-dlp、Playwrightを準備する共通処理 |
+| `bench-demucs.mjs` | ステム分離（Demucs）の実測ベンチマーク。本番コンテナに `docker compose cp` で `/app/` に持ち込み、スレッド数・モデル・曲全体/末尾区間ごとの所要時間と RTF、ピーク RSS、ホスト情報を Markdown 表と JSON で出す。純粋関数は `bench-demucs.test.js` でテスト |
 | `qa-manifest.mjs` | QA manifest（`test/qa/manifests/*.json`）を zod スキーマで検証・パースする。`assertionSchema`（`outputIncludes`/`pathExists`）や `resourceSchema`（port/database/browserProfile/composeProject の割り当て）を定義 |
 | `qa-safety.mjs` | QA タスク実行時のサンドボックス化ヘルパー: 環境変数のホワイトリスト化（`createChildEnvironment`）、シンボリックリンク拒否、出力の秘匿情報redaction、排他的ファイル書き込み |
 | `qa-task.mjs` | manifest 駆動で QA ケース（一連のコマンド + assertion + cleanup 検証）を実行するランナー（`bun run qa:task`） |
