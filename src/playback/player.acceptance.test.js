@@ -2205,6 +2205,101 @@ test('acceptance (mixer): early queue refill is a single shared attempt', async 
   await player.stop();
 });
 
+// Production incident (2026-11-23/24): the mid-track early refill returned
+// false, that cached result was reused verbatim at track end, and the bot
+// disconnected in the same millisecond as track.ended without ever planning
+// again. Track end must retry once when it would reuse a failed early attempt.
+test('acceptance (mixer): a failed early refill is retried once at track end', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let calls = 0;
+  let disconnected = false;
+  const { player } = makePlayer({
+    trackDuration: 3,
+    onDisconnect: async () => { disconnected = true; },
+    handleQueueExhausted: async () => {
+      calls += 1;
+      return calls >= 2; // early attempt fails, track-end retry succeeds
+    },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+  });
+
+  await player.playNext();
+  for (let i = 0; i < 10; i += 1) player.mixStream.read(FRAME_BYTES);
+  for (let i = 0; i < 40 && calls === 0; i += 1) await waitMs(25);
+  assert.equal(calls, 1, 'expected the early refill to have run once mid-track');
+
+  triggerTrackEnd({ mixStream: player.mixStream });
+  await waitMs(50);
+  assert.equal(calls, 2, 'track end must re-plan instead of reusing the failed early result');
+  assert.equal(disconnected, false);
+  await player.stop();
+});
+
+test('acceptance (mixer): track end retries a failed early refill only once before disconnecting', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  let calls = 0;
+  let disconnected = false;
+  const { player } = makePlayer({
+    trackDuration: 3,
+    onDisconnect: async () => { disconnected = true; },
+    handleQueueExhausted: async () => { calls += 1; return false; },
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+  });
+
+  await player.playNext();
+  for (let i = 0; i < 10; i += 1) player.mixStream.read(FRAME_BYTES);
+  for (let i = 0; i < 40 && calls === 0; i += 1) await waitMs(25);
+  triggerTrackEnd({ mixStream: player.mixStream });
+  await waitMs(50);
+  assert.equal(calls, 2);
+  assert.equal(disconnected, true);
+});
+
+// Reviewer-found follow-up: an early round that times out keeps running and
+// keeps the autoplay lock, so the track-end retry gets null. Track end must
+// then wait for that orphaned round instead of idling with no trigger left.
+for (const [label, orphanResult, expectDisconnect] of [
+  ['enqueued a track → stays connected', true, false],
+  ['found nothing → disconnects', false, true],
+]) {
+  test(`acceptance (mixer): track end waits for a timed-out early round that ${label}`, async () => {
+    const frame = Buffer.alloc(FRAME_BYTES);
+    let calls = 0;
+    let lockHeld = false;
+    let disconnected = false;
+    const { player } = makePlayer({
+      trackDuration: 3,
+      queueExhaustedTimeoutMs: 150,
+      onDisconnect: async () => { disconnected = true; },
+      handleQueueExhausted: async () => {
+        calls += 1;
+        if (lockHeld) return null;
+        lockHeld = true;
+        // Outlives the 150ms refill timeout, but settles well within the
+        // 150ms the track-end path then waits for it.
+        await waitMs(250);
+        lockHeld = false;
+        return orphanResult;
+      },
+      createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 180 }, () => frame)),
+    });
+
+    await player.playNext();
+    for (let i = 0; i < 10; i += 1) player.mixStream.read(FRAME_BYTES);
+    for (let i = 0; i < 40 && calls === 0; i += 1) await waitMs(25);
+    await waitMs(170); // early attempt has timed out; its round still holds the lock
+
+    triggerTrackEnd({ mixStream: player.mixStream });
+    await waitMs(20);
+    assert.equal(calls, 2, 'track end should have retried and bounced off the lock');
+    assert.equal(disconnected, false, 'must not decide before the orphaned round settles');
+
+    await waitMs(250);
+    assert.equal(disconnected, expectDisconnect);
+    if (!expectDisconnect) await player.stop();
+  });
+}
+
 test('acceptance (mixer): lookahead analysis does not persist YouTube metadata duration', async () => {
   const frame = Buffer.alloc(FRAME_BYTES);
   const seenDurations = [];

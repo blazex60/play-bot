@@ -13,8 +13,9 @@ import {
   hasAutoplayContinuationBeenUsed,
 } from './queueExhaustion.js'
 import { PlaybackService } from './playbackService.js'
+import { cancelIdleLeave, postponeIdleLeave, resolveIdleLeaveDelayMs, scheduleIdleLeave } from './idleLeave.js'
 
-// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed, recentPlayedVideoIds, recommendHooks }>
+// Map<guildId, { guildId, connection, player, queue, textChannelId, planToken, autoplayContinuationUsed, recentPlayedVideoIds, recommendHooks, idleLeave }>
 export const sessions = new Map()
 
 // Builds the in-process playback facade bound to a given sessions Map.
@@ -52,6 +53,7 @@ export async function destroySession(sessionsMap, guildId) {
   const session = sessionsMap.get(guildId)
   if (!session) return
   sessionsMap.delete(guildId)
+  cancelIdleLeave(session)
   log.info({ event: 'voice.session_destroyed', guildId }, 'ボイスセッション破棄')
   // Uses the session's own injected hooks rather than
   // cancelPendingRecommendations(sessionsMap, guildId): the map entry is
@@ -133,10 +135,15 @@ export {
   isSessionStale,
 } from './sessionAccessors.js'
 
+const IDLE_LEAVE_COMMAND_GRACE_MS = 60_000
+
 export async function getOrCreateSession({ guildId, guild, channel, textChannelId = null, recommendHooks }) {
   const existing = sessions.get(guildId)
   if (existing && existing.connection.state.status !== VoiceConnectionStatus.Destroyed) {
     if (textChannelId) existing.textChannelId = textChannelId
+    // Give the reusing command room to enqueue before a pending idle leave
+    // fires; the leave still happens if it ends up adding nothing.
+    postponeIdleLeave(existing, IDLE_LEAVE_COMMAND_GRACE_MS)
     return existing
   }
 
@@ -147,6 +154,15 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     guildId,
     adapterCreator: guild.voiceAdapterCreator,
     selfDeaf: true,
+  })
+  // @discordjs/voice forwards networking errors (e.g. a voice WebSocket
+  // handshake answered with Cloudflare 521 during a reconnect) via
+  // connection.emit('error'). With no listener, EventEmitter throws, the
+  // process-level uncaughtException handler exits, and every guild's playback
+  // dies. Registered before entersState so a failure mid-join is covered
+  // too. Log it and let the library's own reconnect state machine recover.
+  connection.on('error', (err) => {
+    log.warn({ event: 'voice.connection_error', guildId, err }, 'ボイス接続エラー')
   })
 
   try {
@@ -176,7 +192,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   // current session for the guild by the time it actually runs.
   let session
 
-  const onDisconnect = async () => {
+  const leaveNow = () => {
     const s = sessions.get(guildId)
     // handleQueueExhausted's async planning can still be in flight when
     // /leave deletes this session and a fresh /play immediately creates a
@@ -185,10 +201,39 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
     if (s && s === session) {
       log.info({ event: 'voice.disconnected', guildId }, 'ボイス切断、セッションを破棄')
       sessions.delete(guildId)
+      cancelIdleLeave(s)
       hooks.cancelRecommendations(guildId, recommendPendingStore, recommendRounds)
       if (s.connection.state.status !== VoiceConnectionStatus.Destroyed) {
         s.connection.destroy()
       }
+    }
+  }
+
+  // Called by GuildPlayer / the exhaustion handler when nothing is left to
+  // play. Issue #61: rather than leaving on the spot, announce it and leave
+  // only if the session is still idle after IDLE_LEAVE_DELAY_MS (default 3
+  // min; 0 = leave immediately as before). A track starting in the meantime
+  // cancels it (onTrackStart below); /leave and the VC emptying out still
+  // end the session at once via destroySession.
+  const onDisconnect = async () => {
+    const s = sessions.get(guildId)
+    if (!s || s !== session) return
+    const delayMs = resolveIdleLeaveDelayMs()
+    const result = await scheduleIdleLeave(s, {
+      delayMs,
+      isStillIdle: () => sessions.get(guildId) === s && playback.queueIsEmpty(guildId),
+      leave: async () => {
+        log.info({ event: 'voice.idle_leave', guildId, delayMs }, 'キューが空のまま待機時間が過ぎたため退出')
+        leaveNow()
+      },
+      notify: async (text) => {
+        const textChannel = s.textChannelId ? guild.channels.cache.get(s.textChannelId) : null
+        if (textChannel) await textChannel.send(text)
+      },
+      onNotifyError: (err) => log.warn({ event: 'voice.idle_leave_notify_failed', guildId, err }, '退出予告の投稿に失敗'),
+    })
+    if (result === 'scheduled') {
+      log.info({ event: 'voice.idle_leave_scheduled', guildId, delayMs }, 'キュー枯渇のため退出を予約')
     }
   }
 
@@ -212,6 +257,9 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   // is assigned below.
   const onTrackStart = (videoId) => {
     log.info({ event: 'playback.track.started', guildId, trackId: videoId }, '曲開始')
+    if (cancelIdleLeave(session)) {
+      log.info({ event: 'voice.idle_leave_cancelled', guildId }, '再生再開のため退出予約を取り消し')
+    }
     return recordPlayedVideoId(session, videoId)
   }
 
@@ -231,7 +279,7 @@ export async function getOrCreateSession({ guildId, guild, channel, textChannelI
   // that starts playback with no /play command in the picture) still gets
   // somewhere to post recommend-mode choices instead of recommend mode
   // silently falling through to a disconnect at the next queue exhaustion.
-  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0, autoplayContinuationUsed: false, recentPlayedVideoIds: [], recommendHooks: hooks }
+  session = { guildId, connection, player, queue, textChannelId: textChannelId ?? channel.id, planToken: 0, autoplayContinuationUsed: false, recentPlayedVideoIds: [], recommendHooks: hooks, idleLeave: null }
   sessions.set(guildId, session)
   return session
 }

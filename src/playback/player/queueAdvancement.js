@@ -59,6 +59,7 @@ export class QueueAdvancement {
   playbackCount = 0;
   /** @type {{ key: *, promise: Promise<boolean|null> } | null} */
   queueRefill = null;
+  inflightRound = null;
   #queue;
   #handleQueueExhausted;
   #queueExhaustedTimeoutMs;
@@ -217,7 +218,7 @@ export class QueueAdvancement {
       if (!shouldForceAdvance) {
         this.#transitions.pendingGaplessFrom = { track: finishedTrack, setAt: Date.now() };
       }
-      const handled = await this.#startQueueRefill(finishedTrack);
+      const handled = await this.#refillForTrackEnd(finishedTrack, generation);
       // A stop that began (or finished) while the refill was in flight owns
       // the queue and the disconnect decision — a stale handled=false must
       // not disconnect, and the gapless stash this drain set belongs to a
@@ -257,8 +258,18 @@ export class QueueAdvancement {
         this.#queueExhaustedTimeoutMs
       );
     });
+    // Promise.race only stops *waiting*: a round that times out keeps running
+    // and keeps holding the autoplay lock until it settles. Remember it so a
+    // later attempt that bounces off that lock (null) can wait for its real
+    // outcome instead of idling forever (see #refillForTrackEnd).
+    const round = Promise.resolve(this.#handleQueueExhausted(finishedTrack));
+    const tracked = round.finally(() => {
+      if (this.inflightRound === tracked) this.inflightRound = null;
+    });
+    tracked.catch(() => {});
+    this.inflightRound = tracked;
     try {
-      return await Promise.race([this.#handleQueueExhausted(finishedTrack), timeout]);
+      return await Promise.race([round, timeout]);
     } catch (err) {
       log.error({ event: 'playback.handlequeueexhausted_error', err }, 'handleQueueExhausted エラー');
       return false;
@@ -271,12 +282,48 @@ export class QueueAdvancement {
     return track?.videoId || track?.webpageUrl || track || null;
   }
 
-  #startQueueRefill(track) {
+  #startQueueRefill(track, { early = false } = {}) {
     const key = this.queueRefillKey(track);
     if (this.queueRefill?.key === key) return this.queueRefill.promise;
     const promise = this.#tryHandleQueueExhausted(track);
-    this.queueRefill = { key, promise };
+    this.queueRefill = { key, early, promise };
     return promise;
+  }
+
+  // The early refill (maybeRefillQueue, mid-track) is cached per track so arm
+  // polls never start overlapping rounds. But if that early attempt came back
+  // false (e.g. autoplay found no candidates at that moment), reusing it at
+  // track end would disconnect immediately with no fresh attempt — the
+  // "same-millisecond track.ended + voice.disconnected" seen in production.
+  // So the track-end path retries exactly once when it reused a failed early
+  // attempt; a refill started by the track end itself is never retried.
+  async #refillForTrackEnd(track, generation) {
+    const key = this.queueRefillKey(track);
+    const reusedEarly = this.queueRefill?.key === key && this.queueRefill.early === true;
+    const handled = await this.#startQueueRefill(track);
+    if (handled !== false || !reusedEarly) return handled;
+    if (this.#stopGeneration() !== generation) return handled;
+    log.info({ event: 'playback.queue_refill_retry', trackId: track?.videoId ?? null }, '先行補充が失敗したため曲終了時に再試行');
+    this.queueRefill = null;
+    const orphan = this.inflightRound;
+    const retried = await this.#startQueueRefill(track);
+    if (retried !== null || !orphan) return retried;
+    // The retry bounced off the lock still held by the timed-out early round.
+    // Returning null here would leave the player silent with no trigger left
+    // if that round then finds nothing, so wait (bounded) for its outcome:
+    // true means it enqueued a track; anything else ends the session as before.
+    if (this.#stopGeneration() !== generation) return null;
+    log.info({ event: 'playback.queue_refill_await_orphan', trackId: track?.videoId ?? null }, 'タイムアウトした補充ラウンドの完了を待機');
+    let timeoutHandle;
+    const timeout = new Promise((resolve) => {
+      timeoutHandle = setTimeout(() => resolve(false), this.#queueExhaustedTimeoutMs);
+    });
+    try {
+      const outcome = await Promise.race([orphan.catch(() => false), timeout]);
+      return outcome === true ? true : false;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
   }
 
   maybeRefillQueue() {
@@ -290,7 +337,7 @@ export class QueueAdvancement {
     if (!current) return;
     if (this.queueRefill?.key === this.queueRefillKey(current)) return;
     const generation = this.#stopGeneration();
-    this.#startQueueRefill(current)
+    this.#startQueueRefill(current, { early: true })
       .then((handled) => {
         // Same stale-work guard as #handleAfter: a stop that began while
         // the refill planned owns the queue now — prefetching on top of it

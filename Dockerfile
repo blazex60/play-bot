@@ -35,8 +35,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=web-build /usr/local/bin/bun /usr/local/bin/bun
 
-RUN pip3 install --break-system-packages -U "yt-dlp[default]"
-
 # demucs 4.1.0 only declares numpy on Intel macOS, but transformer.py
 # imports it on Linux too. Install numpy explicitly after the CPU torch
 # wheel (which no longer pulls numpy in as a hard dependency).
@@ -46,6 +44,16 @@ RUN python3 -m venv /opt/demucs-venv \
       --index-url https://download.pytorch.org/whl/cpu torch \
   && /opt/demucs-venv/bin/pip install --no-cache-dir numpy demucs \
   && /opt/demucs-venv/bin/python -c "from demucs.pretrained import get_model; get_model('htdemucs')"
+
+# Pinned so a version bump changes this line and busts the Docker layer
+# cache. An unpinned `pip install -U` stayed cached across
+# `docker compose up --build` deploys and kept running a months-old
+# yt-dlp (2026.08.19 in Nov 2026 logs, with YouTube 403s). Installed after
+# the demucs/torch layer so bumping it does not rebuild that one.
+# Bump to the latest release on https://pypi.org/project/yt-dlp/ when
+# YouTube extraction starts failing.
+ARG YTDLP_VERSION=2026.11.23
+RUN pip3 install --break-system-packages --no-cache-dir "yt-dlp[default]==${YTDLP_VERSION}"
 
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --omit=dev

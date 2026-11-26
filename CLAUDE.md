@@ -120,6 +120,7 @@ resolveAudioStream(url) → yt-dlp stdout → ffmpeg s16le (PcmSource)
 
 - **selfDeaf はネイティブ対応** — `joinVoiceChannel({ selfDeaf: true })` を使用
 - **AudioPlayerStatus.Idle イベント** — ミキサー経路では曲終了の合図ではない。想定外の Idle は mixer resource の再 `play()` による復旧トリガ
+- **キュー枯渇時は遅延退出** — 再生するものが尽きても即退出せず、テキストチャンネルに予告して `IDLE_LEAVE_DELAY_MS`（既定 3 分、`0` で即退出）後もアイドルなら退出する（`src/playback/idleLeave.js`）。曲が開始されたら予約を取り消す。`/leave` と VC 無人化は従来どおり即時
 - **ステム分離は区間のみ** — Demucs（htdemucs）は CPU では再生より遅い（本番 8 vCPU・4 スレッドで RTF 約 1.24、曲全体の分離は次の曲に間に合わない）。そのため、各曲の冒頭 60 秒と末尾 75 秒だけを 1 回の Demucs 実行で分離する（`src/audio/stemConfig.js`）。stem-mix は、両側のフェード範囲がこの区間に収まる候補だけを選ぶ。スレッド数・タイムアウトの係数・機能スイッチは `.env` で変えられる。値を変えたら `scripts/bench-demucs.mjs` で測り直す
 - **循環インポート防止** — `sessions.js` が共有状態を管理。`index.js` と `play.js` の双方向依存を排除
 
