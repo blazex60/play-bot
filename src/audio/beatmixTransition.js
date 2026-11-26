@@ -22,6 +22,17 @@ export const DOWNBEAT_CONFIDENCE_MIN = 0.4;
 export const HARMONIC_CONFIDENCE_MIN = 0.55; // matches src/mix/ordering.js's harmonicOk threshold
 
 /**
+ * Can these two tempos beat-sync under planBeatmixTransition()'s tempo
+ * rules? Within the hard stretch limit, and NOT only via a 2x/0.5x octave
+ * correction — the planner rejects that as `octave-bar-mismatch` because the
+ * bar lengths would not line up. Shared with autoplay's tempo preference so
+ * it never picks a track the planner will then refuse.
+ */
+export function isBeatmixTempoCompatible(incomingBpm, targetBpm) {
+  return canTempoMatch(incomingBpm, targetBpm).ok && !isHalfDouble(incomingBpm, targetBpm);
+}
+
+/**
  * Confidence of the part of a track a transition actually uses: the
  * outgoing track's tail, the incoming track's head. Analyses from before
  * per-window values were stored (v6 rows written before this change, or any

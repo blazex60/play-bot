@@ -3,7 +3,7 @@ import { resolveRelated } from '../media/search.js'
 import { createTrack } from './queue.js'
 import { fmtDuration } from '../shared/format.js'
 import { getLogger } from '../logging/appLogger.js'
-import { canTempoMatch } from '../audio/tempo.js'
+import { isBeatmixTempoCompatible } from '../audio/beatmixTransition.js'
 
 const log = getLogger('autoplay')
 
@@ -21,7 +21,8 @@ export const AUTOPLAY_PLAN_BUDGET_MS = 20_000
 export const AUTOPLAY_RELATED_TIMEOUT_MS = 7_000
 // Tempo preference: among the top few candidates (already ranked by the
 // related list and channel affinity), take the first whose analyzed tempo is
-// within beatmix's 6% of the outgoing track, so the transition can beat-sync.
+// within beatmix's 6% of the outgoing track (same octave: the planner
+// rejects half/double matches), so the transition can beat-sync.
 // Only already-analyzed candidates can win; unknown tempos never displace
 // the top pick, and nothing outside the top few is considered.
 export const TEMPO_PREFERENCE_TOP_N = 5
@@ -90,7 +91,7 @@ export async function preferTempoCompatible(ranked, { guildId = null, lastTrack,
   const outgoingBpm = last?.tailBpm ?? last?.bpm
   if (!(outgoingBpm > 0)) return first
   const tempoOf = (a) => a?.headBpm ?? a?.bpm
-  const index = cands.findIndex((a) => tempoOf(a) > 0 && canTempoMatch(tempoOf(a), outgoingBpm).ok)
+  const index = cands.findIndex((a) => tempoOf(a) > 0 && isBeatmixTempoCompatible(tempoOf(a), outgoingBpm))
   if (index <= 0) return first
   log.info({
     event: 'playback.autoplay.tempo_preferred',

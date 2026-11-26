@@ -526,10 +526,14 @@ test('preferTempoCompatible picks the first top candidate within beatmix tempo r
   assert.equal(chosen.videoId, 'c')
 })
 
-test('preferTempoCompatible treats half/double tempo as compatible', async () => {
-  const ranked = ['a', 'b'].map((id) => makeCandidate(id))
-  const chosen = await preferTempoCompatible(ranked, { lastTrack: { videoId: 'last' }, webClient: analysisClient({ last: 196, a: 140, b: 99 }) })
-  assert.equal(chosen.videoId, 'b')
+test('preferTempoCompatible skips half/double-tempo matches the beatmix planner would reject', async () => {
+  // Review case: last 196; 140 (too far), 99 (half: octave-bar-mismatch), 196 (real match).
+  const ranked = ['a', 'b', 'c'].map((id) => makeCandidate(id))
+  const chosen = await preferTempoCompatible(ranked, { lastTrack: { videoId: 'last' }, webClient: analysisClient({ last: 196, a: 140, b: 99, c: 196 }) })
+  assert.equal(chosen.videoId, 'c')
+  // only a half-tempo candidate: keep the original top pick
+  const onlyHalf = await preferTempoCompatible(ranked.slice(0, 2), { lastTrack: { videoId: 'last' }, webClient: analysisClient({ last: 196, a: 140, b: 99 }) })
+  assert.equal(onlyHalf.videoId, 'a')
 })
 
 test('preferTempoCompatible keeps the top pick when nothing is known, nothing matches, or lookups are slow', async () => {
