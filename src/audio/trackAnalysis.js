@@ -460,6 +460,11 @@ export async function analyzeTrackFile(filePath, {
     bpm,
     bpmConfidence,
     beatConfidence,
+    // Per-window beat confidence: a transition only uses the outgoing tail
+    // and the incoming head (beatmixTransition.js sideBeatConfidence()).
+    // aubio's windows get the same half/double damping as the track-wide value.
+    headBeatConfidence: beatThis ? headBeatConfidence : dampIfHalfDouble(headBeatConfidence, headBpm.bpm, tailBpm.bpm),
+    tailBeatConfidence: beatThis ? tailBeatConfidence : dampIfHalfDouble(tailBeatConfidence, headBpm.bpm, tailBpm.bpm),
     headBpm: headBpm.bpm ?? null,
     tailBpm: tailBpm.bpm ?? null,
     headBeatOffsetSec: headBpm.firstBeatSec ?? 0,

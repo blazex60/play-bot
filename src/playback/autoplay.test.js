@@ -10,6 +10,8 @@ import {
   formatAutoAddNotification,
   planAutoTrack,
   planRecommendations,
+  preferTempoCompatible,
+  TEMPO_PREFERENCE_TOP_N,
   topEntries,
   totalWeight,
 } from './autoplay.js'
@@ -502,4 +504,64 @@ test('planRecommendations: falls back to picking from recent history when exclus
 test('formatAutoAddNotification: includes the title and formatted duration', () => {
   const message = formatAutoAddNotification({ title: 'Some Song', duration: 100 })
   assert.equal(message, '🔀 自動再生: **Some Song** (1:40) をキューに追加しました')
+})
+
+// --- tempo preference (beatmix needs tempos within 6%) ---------------------
+
+function analysisClient(bpmById, { delayMs = 0 } = {}) {
+  return {
+    ...makeWebClient({}),
+    async getTrackAnalysis(videoId) {
+      if (delayMs) await new Promise((r) => setTimeout(r, delayMs))
+      const bpm = bpmById[videoId]
+      return bpm == null ? null : { bpm, headBpm: bpm, tailBpm: bpm }
+    },
+  }
+}
+
+test('preferTempoCompatible picks the first top candidate within beatmix tempo range', async () => {
+  const ranked = ['a', 'b', 'c', 'd'].map((id) => makeCandidate(id))
+  // last = 120; a is 150 (too far), b unknown, c = 122 (1.7%), d = 120
+  const chosen = await preferTempoCompatible(ranked, { lastTrack: { videoId: 'last' }, webClient: analysisClient({ last: 120, a: 150, c: 122, d: 120 }) })
+  assert.equal(chosen.videoId, 'c')
+})
+
+test('preferTempoCompatible treats half/double tempo as compatible', async () => {
+  const ranked = ['a', 'b'].map((id) => makeCandidate(id))
+  const chosen = await preferTempoCompatible(ranked, { lastTrack: { videoId: 'last' }, webClient: analysisClient({ last: 196, a: 140, b: 99 }) })
+  assert.equal(chosen.videoId, 'b')
+})
+
+test('preferTempoCompatible keeps the top pick when nothing is known, nothing matches, or lookups are slow', async () => {
+  const ranked = ['a', 'b', 'c'].map((id) => makeCandidate(id))
+  const last = { videoId: 'last' }
+  assert.equal((await preferTempoCompatible(ranked, { lastTrack: last, webClient: analysisClient({ last: 120 }) })).videoId, 'a')
+  assert.equal((await preferTempoCompatible(ranked, { lastTrack: last, webClient: analysisClient({ a: 120, b: 120 }) })).videoId, 'a', 'outgoing tempo unknown')
+  assert.equal((await preferTempoCompatible(ranked, { lastTrack: last, webClient: analysisClient({ last: 120, a: 150, b: 90, c: 170 }) })).videoId, 'a')
+  assert.equal((await preferTempoCompatible(ranked, { lastTrack: last, webClient: analysisClient({ last: 120, b: 120 }, { delayMs: 50 }), timeoutMs: 10 })).videoId, 'a')
+  assert.equal((await preferTempoCompatible(ranked, { lastTrack: last, webClient: makeWebClient({}) })).videoId, 'a', 'no getTrackAnalysis')
+})
+
+test('preferTempoCompatible never looks past the top candidates', async () => {
+  const ranked = Array.from({ length: TEMPO_PREFERENCE_TOP_N + 2 }, (_, i) => makeCandidate(`c${i}`))
+  const bpm = { last: 120 }
+  ranked.forEach((c, i) => { bpm[c.videoId] = i < TEMPO_PREFERENCE_TOP_N ? 150 : 120 })
+  const chosen = await preferTempoCompatible(ranked, { lastTrack: { videoId: 'last' }, webClient: analysisClient(bpm) })
+  assert.equal(chosen.videoId, 'c0')
+})
+
+test('planAutoTrack applies the tempo preference to the related candidates', async () => {
+  await withTempSettings(async () => {
+    await setAutoplayMode('g1', 'auto')
+    await setPersonalize('g1', false)
+    const result = await planAutoTrack({
+      guildId: 'g1',
+      channel: makeChannel(['u1']),
+      lastTrack: { videoId: 'last' },
+      webClient: analysisClient({ last: 128, 'related-1': 175, 'related-2': 130 }),
+      resolveRelatedFn: async () => [makeCandidate('related-1'), makeCandidate('related-2')],
+      now: NOW,
+    })
+    assert.equal(result.videoId, 'related-2')
+  })
 })

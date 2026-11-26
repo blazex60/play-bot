@@ -331,6 +331,9 @@ test('analyzeTrackFile takes beats and downbeats from Beat This! when it returns
   assert.ok(r.beatConfidence >= 0.5, `beat confidence ${r.beatConfidence}`)
   assert.ok(r.downbeatGrid.confidence >= 0.4, `downbeat confidence ${r.downbeatGrid.confidence}`)
   assert.ok(r.beatGrid.tail.beatsSec.every((t) => t >= r.beatGrid.tail.startSec))
+  // per-window values for the transition gates (outgoing tail / incoming head)
+  assert.ok(r.headBeatConfidence > 0.5 && r.tailBeatConfidence > 0.5)
+  assert.ok(r.downbeatGrid.head.confidence > 0.4 && r.downbeatGrid.tail.confidence > 0.4)
 })
 
 test('analyzeTrackFile falls back to aubio when Beat This! returns nothing', async () => {

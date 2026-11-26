@@ -172,8 +172,8 @@ export async function analyzeDownbeats(filePath, { durationSec = null, beatGrid,
   return {
     source: 'heuristic',
     meter,
-    head: { downbeatsSec: headWindow.downbeatsSec },
-    tail: { downbeatsSec: tailWindow.downbeatsSec },
+    head: { downbeatsSec: headWindow.downbeatsSec, confidence: headWindow.confidence ?? 0 },
+    tail: { downbeatsSec: tailWindow.downbeatsSec, confidence: tailWindow.confidence ?? 0 },
     confidence,
   };
 }

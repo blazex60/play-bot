@@ -22,6 +22,25 @@ export const DOWNBEAT_CONFIDENCE_MIN = 0.4;
 export const HARMONIC_CONFIDENCE_MIN = 0.55; // matches src/mix/ordering.js's harmonicOk threshold
 
 /**
+ * Confidence of the part of a track a transition actually uses: the
+ * outgoing track's tail, the incoming track's head. Analyses from before
+ * per-window values were stored (v6 rows written before this change, or any
+ * row without them) fall back to the track-wide average.
+ * @param {object} analysis
+ * @param {'head'|'tail'} side
+ */
+export function sideBeatConfidence(analysis, side) {
+  const v = side === 'head' ? analysis?.headBeatConfidence : analysis?.tailBeatConfidence;
+  return Number.isFinite(v) ? v : (analysis?.beatConfidence ?? 0);
+}
+
+/** @param {object} analysis @param {'head'|'tail'} side */
+export function sideDownbeatConfidence(analysis, side) {
+  const v = analysis?.downbeatGrid?.[side]?.confidence;
+  return Number.isFinite(v) ? v : (analysis?.downbeatGrid?.confidence ?? 0);
+}
+
+/**
  * Phase 9E (docs/mix-transition-phase9.md §7.2): the beatmix bar-count
  * search space. `preferred`/`minimum` are the same two-tier sweep that
  * existed before this phase (renamed from the standalone
@@ -300,7 +319,7 @@ function scoreTransitionPairDetail({
     : clamp01(1 - Math.abs(tempoInfo.ratio - 1) / HARD_LIMIT_RATIO);
 
   const downbeatConfidence = clamp01((
-    (outgoing?.downbeatGrid?.confidence ?? 0) + (incoming?.downbeatGrid?.confidence ?? 0)
+    sideDownbeatConfidence(outgoing, 'tail') + sideDownbeatConfidence(incoming, 'head')
   ) / 2);
 
   const energy = energyContinuity(exit, entry);
@@ -389,8 +408,8 @@ function rejected(reasons) {
  */
 function extendedTierEligible(outgoing, incoming, stemAware) {
   if (!stemAware) return false;
-  const phraseConfidenceHigh = (outgoing?.downbeatGrid?.confidence ?? 0) >= EXTENDED_PHRASE_CONFIDENCE_MIN
-    && (incoming?.downbeatGrid?.confidence ?? 0) >= EXTENDED_PHRASE_CONFIDENCE_MIN;
+  const phraseConfidenceHigh = sideDownbeatConfidence(outgoing, 'tail') >= EXTENDED_PHRASE_CONFIDENCE_MIN
+    && sideDownbeatConfidence(incoming, 'head') >= EXTENDED_PHRASE_CONFIDENCE_MIN;
   const vocalPlanUsable = (outgoing?.vocalConfidence ?? 0) >= EXTENDED_VOCAL_CONFIDENCE_MIN
     && (incoming?.vocalConfidence ?? 0) >= EXTENDED_VOCAL_CONFIDENCE_MIN;
   return phraseConfidenceHigh && vocalPlanUsable;
@@ -462,12 +481,15 @@ export function planBeatmixTransition(outgoing, incoming, {
   const incomingBpm = incoming.headBpm ?? incoming.bpm;
   if (!(outgoingBpm > 0) || !(incomingBpm > 0)) return rejected(['bpm-unavailable']);
 
-  if ((outgoing.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN || (incoming.beatConfidence ?? 0) < BEAT_CONFIDENCE_MIN) {
+  // Judged on the windows the transition uses (outgoing tail, incoming
+  // head): a track whose intro is shaky but whose outro is steady can still
+  // hand off cleanly, and vice versa.
+  if (sideBeatConfidence(outgoing, 'tail') < BEAT_CONFIDENCE_MIN || sideBeatConfidence(incoming, 'head') < BEAT_CONFIDENCE_MIN) {
     return rejected(['beat-confidence-low']);
   }
 
-  const downbeatConfOutgoing = outgoing.downbeatGrid?.confidence ?? 0;
-  const downbeatConfIncoming = incoming.downbeatGrid?.confidence ?? 0;
+  const downbeatConfOutgoing = sideDownbeatConfidence(outgoing, 'tail');
+  const downbeatConfIncoming = sideDownbeatConfidence(incoming, 'head');
   if (downbeatConfOutgoing < DOWNBEAT_CONFIDENCE_MIN || downbeatConfIncoming < DOWNBEAT_CONFIDENCE_MIN) {
     return rejected(['downbeat-confidence-low']);
   }
