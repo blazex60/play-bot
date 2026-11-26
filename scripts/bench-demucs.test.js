@@ -12,6 +12,9 @@ test('parseArgs: defaults mirror the bot (nice 15) and need a source', () => {
   assert.deepEqual(opts.models, ['htdemucs'])
   assert.deepEqual(opts.clipSec, [0, 90])
   assert.equal(opts.nice, 15)
+  assert.equal(opts.device, 'cpu')
+  assert.equal(parseArgs(['--video', 'x', '--device', 'cuda']).device, 'cuda')
+  assert.throws(() => parseArgs(['--video', 'x', '--device', 'tpu']), /--device/)
   assert.throws(() => parseArgs([]), /--video/)
 })
 

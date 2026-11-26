@@ -8,6 +8,7 @@ import {
   analyzeVocalActivity,
   analyzeVocalActivityFromStems,
 } from './vocalActivity.js';
+import { currentDemucsDevice, resetDemucsDeviceForTest } from './demucsDevice.js';
 
 test('parseRmsLevels extracts ffmpeg astats lines', () => {
   const levels = parseRmsLevels('foo RMS_level=-12.5\nRMS_level=-40.0\n');
@@ -124,6 +125,8 @@ function fakeVocalSpawn({ vocalsStderr, mixStderr, cmds = [] }) {
   };
 }
 
+const cpuDevice = async () => 'cpu';
+
 function levelsToStderr(levels) {
   return levels.map((db) => `RMS_level=${db}`).join('\n');
 }
@@ -143,6 +146,7 @@ test('analyzeVocalActivity runs one Demucs pass and splits head/tail from the co
     durationSec: 20,
     headWindowSec: 3,
     tailWindowSec: 4,
+    deviceFn: cpuDevice,
     spawnFn: fakeVocalSpawn({
       vocalsStderr: levelsToStderr(vocalsLevels),
       mixStderr: levelsToStderr(mixLevels),
@@ -168,6 +172,7 @@ test('analyzeVocalActivity analyzes the whole clip in one pass when head/tail wi
     durationSec: 2,
     headWindowSec: 30,
     tailWindowSec: 45,
+    deviceFn: cpuDevice,
     spawnFn: fakeVocalSpawn({
       vocalsStderr: levelsToStderr(vocalsLevels),
       mixStderr: levelsToStderr(mixLevels),
@@ -199,6 +204,7 @@ test('analyzeVocalActivity slices the overlap-branch envelope to each window (me
   const result = await analyzeVocalActivity('/tmp/fake-medium.wav', {
     durationSec: 60,
     tailWindowSec: 45, // pinned: decouples this test's geometry from TAIL_WINDOW_SEC's default
+    deviceFn: cpuDevice,
     spawnFn: fakeVocalSpawn({
       vocalsStderr: levelsToStderr(vocalsLevels),
       mixStderr: levelsToStderr(mixLevels),
@@ -223,13 +229,47 @@ test('analyzeVocalActivity returns the neutral empty result when the ffmpeg/Demu
     queueMicrotask(() => proc.emit('close', 1));
     return proc;
   };
-  const result = await analyzeVocalActivity('/tmp/fake-fail.wav', { durationSec: 20, spawnFn });
+  const result = await analyzeVocalActivity('/tmp/fake-fail.wav', { durationSec: 20, spawnFn, deviceFn: cpuDevice });
   assert.equal(result.ok, false);
   assert.equal(result.source, 'none');
   assert.equal(result.firstVocalStartSec, null);
   assert.deepEqual(result.headVocalGaps, []);
 });
 
+test('analyzeVocalActivity passes the resolved device to Demucs and retries on CPU after a CUDA error', async () => {
+  resetDemucsDeviceForTest();
+  const demucsDevices = [];
+  const spawnFn = (cmd, args = []) => {
+    const proc = new EventEmitter();
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.kill = () => {};
+    let code = 0;
+    let stderr = '';
+    if (cmd.endsWith('demucs')) {
+      const device = args[args.indexOf('-d') + 1];
+      demucsDevices.push(device);
+      if (device === 'cuda') { code = 1; stderr = 'RuntimeError: CUDA error: out of memory'; }
+    } else if (args.includes('-f') && args[args.indexOf('-f') + 1] === 'null') {
+      stderr = levelsToStderr(new Array(70).fill(-8));
+    }
+    queueMicrotask(() => {
+      if (stderr) proc.stderr.emit('data', stderr);
+      proc.emit('close', code);
+    });
+    return proc;
+  };
+  try {
+    const result = await analyzeVocalActivity('/tmp/fake-cuda.wav', {
+      durationSec: 20, headWindowSec: 3, tailWindowSec: 4, spawnFn, deviceFn: async () => 'cuda',
+    });
+    assert.deepEqual(demucsDevices, ['cuda', 'cpu']);
+    assert.equal(result.source, 'demucs');
+    assert.equal(currentDemucsDevice({ DEMUCS_DEVICE: 'auto' }), 'cpu', 'later runs stay on CPU');
+  } finally {
+    resetDemucsDeviceForTest();
+  }
+});
 
 // --- vocal activity from already-separated stems ---------------------------
 

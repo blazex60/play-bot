@@ -12,6 +12,7 @@ import {
   isStemSeparationAvailable,
   resetStemCircuitForTest,
 } from './stemCache.js';
+import { currentDemucsDevice, resetDemucsDeviceForTest } from './demucsDevice.js';
 import { DEMUCS_MODEL } from './vocalActivity.js';
 import { STEM_HEAD_WINDOW_SEC, STEM_TAIL_WINDOW_SEC } from './stemConfig.js';
 
@@ -33,7 +34,7 @@ async function cleanup(videoId) {
  * effect can't stand in for it the way vocalActivity.js's stderr-only fake
  * can for a read-only ffmpeg -f null pass.
  */
-function fakeSpawn({ cutFails = false, demucsFails = false, cmds = [], durationSec = 100 } = {}) {
+function fakeSpawn({ cutFails = false, demucsFails = false, cmds = [], durationSec = 100, cudaBroken = false, cudaHangs = false } = {}) {
   return (cmd, args = []) => {
     cmds.push({ cmd, args });
     const proc = new EventEmitter();
@@ -59,6 +60,13 @@ function fakeSpawn({ cutFails = false, demucsFails = false, cmds = [], durationS
           return;
         }
         // Anything else stands in for whatever resolveDemucsBin() resolved to.
+        // A wedged GPU: never exits, only the timeout ends it.
+        if (cudaHangs && args[args.indexOf('-d') + 1] === 'cuda') return;
+        if (cudaBroken && args[args.indexOf('-d') + 1] === 'cuda') {
+          proc.stderr.emit('data', 'torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device\n');
+          proc.emit('close', 1);
+          return;
+        }
         if (demucsFails) {
           proc.emit('close', 1);
           return;
@@ -415,5 +423,86 @@ test('after the cooldown the breaker is half-open: one more failure reopens it',
   } finally {
     resetStemCircuitForTest();
     for (const id of ids) await cleanup(id);
+  }
+});
+
+test('on the GPU the whole track is separated in one Demucs run with -d cuda', async () => {
+  resetStemCircuitForTest();
+  resetDemucsDeviceForTest();
+  const videoId = uniqueVideoId('gpu-full');
+  try {
+    const cmds = [];
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, {
+      spawnFn: fakeSpawn({ cmds, durationSec: 300 }),
+      deviceFn: async () => 'cuda',
+    });
+    assert.deepEqual(result.windows.map((w) => [w.name, w.startSec, w.endSec]), [['full', 0, 300]]);
+    const demucs = cmds.find((c) => c.args.includes('--two-stems=vocals'));
+    assert.equal(demucs.args[demucs.args.indexOf('-d') + 1], 'cuda');
+  } finally {
+    await cleanup(videoId);
+  }
+});
+
+test('a CUDA failure retries the job once on CPU (head/tail windows) and degrades later runs to CPU', async () => {
+  resetStemCircuitForTest();
+  resetDemucsDeviceForTest();
+  const videoId = uniqueVideoId('gpu-fallback');
+  try {
+    const cmds = [];
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, {
+      spawnFn: fakeSpawn({ cmds, durationSec: 300, cudaBroken: true }),
+      deviceFn: async () => 'cuda',
+    });
+    assert.ok(result, 'the CPU retry succeeds');
+    assert.deepEqual(result.windows.map((w) => w.name), ['head', 'tail']);
+    const devices = cmds.filter((c) => c.args.includes('--two-stems=vocals')).map((c) => c.args[c.args.indexOf('-d') + 1]);
+    assert.deepEqual(devices, ['cuda', 'cpu']);
+    assert.equal(currentDemucsDevice({ DEMUCS_DEVICE: 'cuda' }), 'cpu');
+  } finally {
+    resetDemucsDeviceForTest();
+    await cleanup(videoId);
+  }
+});
+
+test('a GPU run that times out is treated as a CUDA failure and retried on CPU', async () => {
+  resetStemCircuitForTest();
+  resetDemucsDeviceForTest();
+  const videoId = uniqueVideoId('gpu-hang');
+  try {
+    const cmds = [];
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, {
+      spawnFn: fakeSpawn({ cmds, durationSec: 300, cudaHangs: true }),
+      deviceFn: async () => 'cuda',
+      timeoutMs: 30,
+    });
+    assert.ok(result, 'the CPU retry succeeds');
+    const devices = cmds.filter((c) => c.args.includes('--two-stems=vocals')).map((c) => c.args[c.args.indexOf('-d') + 1]);
+    assert.deepEqual(devices, ['cuda', 'cpu']);
+    assert.equal(currentDemucsDevice({ DEMUCS_DEVICE: 'cuda' }), 'cpu');
+  } finally {
+    resetStemCircuitForTest();
+    resetDemucsDeviceForTest();
+    await cleanup(videoId);
+  }
+});
+
+test('a non-CUDA Demucs failure on the GPU is not retried on CPU', async () => {
+  resetStemCircuitForTest();
+  resetDemucsDeviceForTest();
+  const videoId = uniqueVideoId('gpu-badinput');
+  try {
+    const cmds = [];
+    const result = await separateTrackStems('/tmp/fake-track-source', videoId, {
+      spawnFn: fakeSpawn({ cmds, durationSec: 300, demucsFails: true }),
+      deviceFn: async () => 'cuda',
+    });
+    assert.equal(result, null);
+    assert.equal(cmds.filter((c) => c.args.includes('--two-stems=vocals')).length, 1);
+    assert.equal(currentDemucsDevice({ DEMUCS_DEVICE: 'cuda' }), 'cuda', 'not degraded');
+  } finally {
+    resetStemCircuitForTest();
+    resetDemucsDeviceForTest();
+    await cleanup(videoId);
   }
 });
