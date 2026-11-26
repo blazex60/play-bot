@@ -36,3 +36,19 @@ test('stemRelevantTracks: TRACK loop only keeps the current track', () => {
   assert.deepEqual(stemRelevantTracks(q).map((x) => x.videoId), ['a'])
   assert.equal(isStemJobRelevantFor(q, null), false)
 })
+
+test('isStemJobRelevantFor: the current track needs enough playback left for the job to finish', () => {
+  const q = queueOf(['a', 'b', 'c'])
+  assert.equal(isStemJobRelevantFor(q, 'a', { currentRemainingSec: 300, minRemainingSec: 212 }), true)
+  assert.equal(isStemJobRelevantFor(q, 'a', { currentRemainingSec: 100, minRemainingSec: 212 }), false)
+  assert.equal(isStemJobRelevantFor(q, 'a', { currentRemainingSec: null, minRemainingSec: 212 }), true, 'unknown remaining time is not a reason to skip')
+  assert.equal(isStemJobRelevantFor(q, 'b', { currentRemainingSec: 10, minRemainingSec: 212 }), true, 'upcoming tracks are unaffected')
+})
+
+test('isStemJobRelevantFor: a current track that is also upcoming (short QUEUE loop) stays relevant', () => {
+  const q = queueOf(['a', 'b'], { advance: 1, loopMode: LoopMode.QUEUE })
+  // current b, wrapped upcoming [a]; a two-track loop never re-includes b,
+  // so check the plain current-track rule there and the upcoming rule for a.
+  assert.equal(isStemJobRelevantFor(q, 'a', { currentRemainingSec: 5, minRemainingSec: 212 }), true)
+  assert.equal(isStemJobRelevantFor(q, 'b', { currentRemainingSec: 5, minRemainingSec: 212 }), false)
+})

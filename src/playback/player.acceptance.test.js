@@ -2193,6 +2193,89 @@ test('acceptance (mixer): with the breaker open, stems already on disk still fil
   }
 });
 
+// Stem queue order follow-up: stems already on disk must not wait behind a
+// running Demucs job (production: ~4 min) just to be found in the cache.
+test('acceptance (mixer): cached stems fill the vocal analysis without queueing behind a running separation', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const puts = [];
+  const separations = [];
+  const stemQueue = createAnalysisQueue({ useNice: false });
+  let releaseBlocker;
+  const blocker = stemQueue.enqueue(() => new Promise((resolve) => { releaseBlocker = resolve; }));
+  const stems = { vocalPath: '/tmp/vid-b.vocal.wav', instrumentalPath: '/tmp/vid-b.instrumental.wav' };
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    getTrackAnalysisFn: async () => null,
+    putTrackAnalysisFn: (videoId, analysis) => { puts.push({ videoId, analysis }); },
+    analyzeTrackFileFn: async (_fp, opts) => ({ version: ANALYSIS_VERSION, videoId: opts.videoId, durationSec: 120, bpm: 120, confidence: 0.3, vocalConfidence: 0, analysisSource: 'none' }),
+    prefetchTrackFn: async (track) => ({ filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} }),
+    stageTempFileCopyFn: async (filePath) => `${filePath}-staged`,
+    separateTrackStemsFn: async (fp, videoId) => { separations.push(videoId); return null; },
+    getCachedStemsFn: async (videoId) => (videoId === 'vid-b' ? stems : null),
+    isStemSeparationAvailableFn: () => true,
+    stemQueue,
+    analyzeVocalFromStemsFn: async () => ({ ok: true, source: 'demucs', vocalConfidence: 0.85, lastVocalEndSec: 100, vocalGaps: [], firstVocalStartSec: 5, headVocalGaps: [] }),
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 120, videoId: 'vid-b' }));
+  try {
+    await player.playNext();
+    for (let i = 0; i < 100 && !puts.some((p) => p.videoId === 'vid-b' && p.analysis.analysisSource === 'demucs'); i += 1) await waitMs(20);
+    assert.ok(puts.some((p) => p.videoId === 'vid-b' && p.analysis.analysisSource === 'demucs'),
+      'vocal data must be filled while the stem queue is still busy');
+    assert.equal(separations.includes('vid-b'), false, 'no separation job for a track whose stems are cached');
+  } finally {
+    releaseBlocker?.();
+    await blocker;
+    await player.stop();
+  }
+});
+
+// Stem queue order follow-up: C's speculative prefetch must not take the
+// serial stem queue while B's separation is still in progress.
+test('acceptance (mixer): C\'s stem prefetch waits for B\'s separation, then starts', async () => {
+  const frame = Buffer.alloc(FRAME_BYTES);
+  const events = [];
+  let resolveB;
+  const stemQueue = createAnalysisQueue({ useNice: false });
+  const { player, queue } = makePlayer({
+    trackDuration: 60,
+    track: createTrack({ title: 'Track A', webpageUrl: 'https://example.com/a', duration: 60, videoId: 'vid-a' }),
+    getTrackAnalysisFn: async () => null,
+    analyzeTrackFileFn: async (_fp, opts) => ({ version: ANALYSIS_VERSION, videoId: opts.videoId, durationSec: 60, bpm: 120, analysisSource: 'none' }),
+    prefetchTrackFn: async (track, opts) => {
+      if (opts?.spawnFn) events.push(`stem-download:${track.videoId}`);
+      return { filePath: `/tmp/musicbot-prefetch-${track.videoId}`, measured: {} };
+    },
+    stageTempFileCopyFn: async (filePath) => `${filePath}-staged`,
+    separateTrackStemsFn: async (fp, videoId) => {
+      events.push(`separate:${videoId}`);
+      if (videoId === 'vid-b') return new Promise((resolve) => { resolveB = resolve; });
+      return null;
+    },
+    getCachedStemsFn: async () => null,
+    isStemSeparationAvailableFn: () => true,
+    stemQueue,
+    createPcmSourceFn: async () => PcmSource.fromBuffers(Array.from({ length: 10 }, () => frame)),
+  });
+  queue.add(createTrack({ title: 'Track B', webpageUrl: 'https://example.com/b', duration: 60, videoId: 'vid-b' }));
+  queue.add(createTrack({ title: 'Track C', webpageUrl: 'https://example.com/c', duration: 60, videoId: 'vid-c' }));
+  try {
+    await player.playNext();
+    for (let i = 0; i < 100 && !resolveB; i += 1) await waitMs(20);
+    assert.ok(resolveB, 'B\'s separation should be running');
+    await waitMs(100);
+    assert.equal(events.includes('stem-download:vid-c'), false, `C must wait while B separates: ${events.join(', ')}`);
+    resolveB(null);
+    for (let i = 0; i < 100 && !events.includes('stem-download:vid-c'); i += 1) await waitMs(20);
+    assert.ok(events.includes('stem-download:vid-c'), `C starts once B settles: ${events.join(', ')}`);
+    assert.ok(events.indexOf('separate:vid-b') < events.indexOf('stem-download:vid-c'));
+  } finally {
+    resolveB?.(null);
+    await player.stop();
+  }
+});
+
 test('acceptance (mixer): staged copy is cleaned up even when analysis fails before separation (CodeRabbit)', async () => {
   // CodeRabbit (PR #39, round 15): the round-14 fix's try/finally only
   // wrapped the separation call, not the earlier #lookupPersistentAnalysis()/
@@ -4054,12 +4137,13 @@ test('acceptance (mixer): a track removed from the queue is pruned from stem pre
 
     resolveC(null); // the pending getCachedStemsFn() call for C finally resolves (a miss)
     await nextTurn();
-    await pollUntil(() => byIdState(player, 'vid-c') != null && byIdState(player, 'vid-c') !== 'processing');
-    // Stem plan Phase 1: the LOW job re-checks relevance when it reaches the
-    // front of the stem queue, so a track removed meanwhile is dropped
-    // instead of being downloaded and separated for nothing — it settles as
-    // failed (terminal) rather than ready.
-    assert.equal(byIdState(player, 'vid-c'), 'failed', 'a LOW job whose track left the queue is dropped when it starts');
+    await waitMs(50);
+    // Stem plan: C is either held back (B still in progress — stays QUEUED,
+    // marked held) or, if it got to run, dropped as stale when its job
+    // starts (FAILED). Either way a track that left the queue is never
+    // downloaded and separated.
+    assert.ok(['queued', 'failed'].includes(byIdState(player, 'vid-c')),
+      `a LOW job whose track left the queue must not run, got ${byIdState(player, 'vid-c')}`);
 
     // The next #prefetchUpcoming() checkpoint (B being promoted to current)
     // prunes it, now that it has reached a terminal state and is no longer

@@ -425,3 +425,22 @@ test('analysisQueue passes its threadCount to children as OMP/MKL threads', asyn
   await realtime.enqueue(async ({ spawnNice }) => { spawnNice('aubio', []); });
   assert.equal(envs[1].OMP_NUM_THREADS, '1', 'the realtime queue stays single-threaded');
 });
+
+test('analysisQueue orders pending jobs high → normal → low, FIFO within a tier', async () => {
+  const queue = createAnalysisQueue({ useNice: false, spawnFn: () => fakeProc() });
+  const order = [];
+  let release;
+  const blocker = queue.enqueue(() => new Promise((r) => { release = r; }));
+  const jobs = [
+    queue.enqueue(async () => { order.push('low-1'); }, { priority: 'low' }),
+    queue.enqueue(async () => { order.push('normal-1'); }),
+    queue.enqueue(async () => { order.push('high-1'); }, { priority: 'high' }),
+    queue.enqueue(async () => { order.push('low-2'); }, { priority: 'low' }),
+    queue.enqueue(async () => { order.push('normal-2'); }),
+  ];
+  while (!release) await new Promise((r) => setImmediate(r));
+  release();
+  await blocker;
+  await Promise.all(jobs);
+  assert.deepEqual(order, ['high-1', 'normal-1', 'normal-2', 'low-1', 'low-2']);
+});

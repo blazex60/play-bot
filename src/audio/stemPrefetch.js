@@ -55,6 +55,21 @@ export class StemPrefetchTracker {
   }
 
   /**
+   * Marks a QUEUED entry as deliberately not started (C held back while B is
+   * in progress). It stays visible as QUEUED, but prune() may collect it:
+   * prune() normally keeps QUEUED entries because a pending job will settle
+   * them, and a held one has none. markProcessing() clears the mark.
+   */
+  release(videoId) {
+    const entry = this.#entries.get(videoId);
+    if (!entry || entry.state === StemPreparationState.PROCESSING) return;
+    // A READY/FAILED entry reaching here was re-probed and missed the cache
+    // (e.g. evicted), so it is waiting again, not done.
+    entry.state = StemPreparationState.QUEUED;
+    entry.held = true;
+  }
+
+  /**
    * Registers intent to prefetch this videoId's stems, or returns the
    * existing entry unchanged (state/timestamps preserved) if one is
    * already tracked — except a HIGH request always wins on priority, so a
@@ -91,6 +106,7 @@ export class StemPrefetchTracker {
     if (entry.state !== StemPreparationState.PROCESSING) {
       entry.startedAt = Date.now();
     }
+    entry.held = false;
     entry.state = StemPreparationState.PROCESSING;
   }
 
@@ -125,7 +141,7 @@ export class StemPrefetchTracker {
     const keep = new Set([...activeVideoIds].filter(Boolean));
     for (const [videoId, entry] of this.#entries) {
       if (keep.has(videoId)) continue;
-      if (entry.state === StemPreparationState.QUEUED || entry.state === StemPreparationState.PROCESSING) continue;
+      if ((entry.state === StemPreparationState.QUEUED && !entry.held) || entry.state === StemPreparationState.PROCESSING) continue;
       this.#entries.delete(videoId);
     }
   }
