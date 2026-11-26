@@ -102,3 +102,39 @@ test('isBeatThisAvailable follows BEAT_TRACKER and the worker state', () => {
   assert.equal(isBeatThisAvailable({ DEMUCS_DEVICE: 'cpu' }), false)
   assert.equal(isBeatThisAvailable({ DEMUCS_DEVICE: 'cuda' }), true)
 })
+
+test('BeatThisWorker: a request queued behind a timed-out one gets a fresh worker, not the dying one', async () => {
+  const spawns = []
+  // The first worker never answers; later workers answer normally.
+  const base = fakeWorkerSpawn({ spawns, respond: (req) => ({ id: req.id, ok: true, beats: [2], downbeats: [] }) })
+  const spawnFn = (cmd, args) => {
+    const proc = base(cmd, args)
+    if (spawns.length === 1) proc.stdin.removeAllListeners('data')
+    // Like a real child: `close` arrives a little after SIGKILL.
+    proc.kill = () => { proc.killed = true; setTimeout(() => proc.emit('close', null), 10) }
+    return proc
+  }
+  const worker = new BeatThisWorker({ spawnFn, env: {}, requestTimeoutMs: 20 })
+  const first = worker.analyze('/tmp/hangs')
+  const second = worker.analyze('/tmp/fine')
+  await assert.rejects(first, /timed out/)
+  assert.deepEqual((await second).beatsSec, [2])
+  assert.equal(spawns.length, 2)
+  assert.equal(spawns[0].proc.killed, true)
+  worker.close()
+})
+
+test('BeatThisWorker does not keep the Node process alive (child and pipes are unref()ed)', async () => {
+  const unrefs = []
+  const base = fakeWorkerSpawn()
+  const spawnFn = (cmd, args) => {
+    const proc = base(cmd, args)
+    proc.unref = () => unrefs.push('proc')
+    for (const name of ['stdin', 'stdout', 'stderr']) proc[name].unref = () => unrefs.push(name)
+    return proc
+  }
+  const worker = new BeatThisWorker({ spawnFn, env: {} })
+  await worker.analyze('/tmp/a')
+  assert.deepEqual(unrefs.sort(), ['proc', 'stderr', 'stdin', 'stdout'])
+  worker.close()
+})

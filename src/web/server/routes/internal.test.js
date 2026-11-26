@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { buildWebServer } from '../index.js'
 import { createMemoryDb, createTestConfig } from '../testSupport.js'
-import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
+import { ANALYSIS_VERSION, MIN_SERVED_ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
 
 async function setup(t) {
   const db = createMemoryDb()
@@ -297,6 +297,25 @@ test('GET /internal/track-analysis treats version 1 rows as a cache miss', async
     headers: authHeaders(config),
   })
   assert.equal(get.statusCode, 404)
+})
+
+test('GET /internal/track-analysis still serves the previous version (v5) so the bot can decide to reuse it', async (t) => {
+  assert.equal(MIN_SERVED_ANALYSIS_VERSION, ANALYSIS_VERSION - 1)
+  const { app, config } = await setup(t)
+  for (const [id, version] of [['vid-v5', MIN_SERVED_ANALYSIS_VERSION], ['vid-v4', MIN_SERVED_ANALYSIS_VERSION - 1]]) {
+    const put = await app.inject({
+      method: 'PUT',
+      url: `/internal/track-analysis/${id}`,
+      headers: authHeaders(config),
+      payload: { analysis: { version, durationSec: 120, tailShape: 'fade-out', bpm: 100, confidence: 0.4 } },
+    })
+    assert.equal(put.statusCode, 200)
+  }
+  const v5 = await app.inject({ method: 'GET', url: '/internal/track-analysis/vid-v5', headers: authHeaders(config) })
+  assert.equal(v5.statusCode, 200)
+  assert.equal(v5.json().analysis.version, MIN_SERVED_ANALYSIS_VERSION)
+  const v4 = await app.inject({ method: 'GET', url: '/internal/track-analysis/vid-v4', headers: authHeaders(config) })
+  assert.equal(v4.statusCode, 404)
 })
 
 test('PUT /internal/track-analysis normalizes analyzedAt milliseconds to seconds', async (t) => {

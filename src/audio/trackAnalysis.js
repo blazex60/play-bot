@@ -23,6 +23,10 @@ import { spawnCapture } from './spawnCapture.js';
 // available; aubio + the low-band downbeat heuristic remain the fallback.
 // isReusableAnalysis() keeps v5 rows while Beat This! is unavailable.
 export const ANALYSIS_VERSION = 6;
+// Oldest version the internal API still hands to the bot. v5 differs from v6
+// only in the beat tracker, so isReusableAnalysis() decides per host whether
+// to keep it (no GPU) or re-analyze it (Beat This! available).
+export const MIN_SERVED_ANALYSIS_VERSION = 5;
 // Phase 7 §9.2 prefers entry points in the first 0-30s of the incoming
 // track; keep the BPM window and the vocal head window (vocalActivity.js
 // HEAD_WINDOW_SEC) the same length so beatGrid/vocal boundaries line up.

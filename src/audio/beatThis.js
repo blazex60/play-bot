@@ -59,12 +59,18 @@ export class BeatThisWorker {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.#proc = proc;
+    // Never keep the Node process alive just for the idle worker (the local
+    // player must exit on `quit`). Pending requests hold their own timers,
+    // and the worker exits on stdin EOF once this process is gone.
+    proc.unref?.();
+    for (const stream of [proc.stdin, proc.stdout, proc.stderr]) stream?.unref?.();
     let stderrTail = '';
     proc.stderr?.on('data', (d) => { stderrTail = (stderrTail + d).slice(-500); });
     this.#ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        reject(new Error('Beat This! worker did not become ready'));
-        this.#kill();
+        const err = new Error('Beat This! worker did not become ready');
+        reject(err);
+        this.#discard(proc, err);
       }, this.#readyTimeoutMs);
       const lines = createInterface({ input: proc.stdout });
       lines.on('line', (line) => {
@@ -76,6 +82,7 @@ export class BeatThisWorker {
           else reject(new Error(`Beat This! worker failed to start: ${msg.error ?? 'unknown'}`));
           return;
         }
+        if (this.#proc !== proc) return;
         const entry = this.#pending.get(msg.id);
         if (!entry) return;
         this.#pending.delete(msg.id);
@@ -83,18 +90,25 @@ export class BeatThisWorker {
         if (msg.ok) entry.resolve(msg);
         else entry.reject(new Error(msg.error ?? 'Beat This! failed'));
       });
-      proc.on('error', (err) => { clearTimeout(timer); reject(err); this.#reset(err); });
+      proc.on('error', (err) => { clearTimeout(timer); reject(err); this.#discard(proc, err); });
       proc.on('close', (code) => {
         clearTimeout(timer);
         const err = new Error(`Beat This! worker exited with ${code}: ${stderrTail.trim().split('\n').slice(-2).join(' | ')}`);
         reject(err);
-        this.#reset(err);
+        this.#discard(proc, err);
       });
     });
     return this.#ready;
   }
 
-  #reset(err) {
+  /**
+   * Drop `proc` as the current worker right away (so the next request starts
+   * a fresh one instead of writing to a dying process), fail its pending
+   * requests, and kill it. Late events from an already-replaced process are
+   * ignored, so they cannot clobber its successor.
+   */
+  #discard(proc, err) {
+    if (this.#proc !== proc) return;
     this.#proc = null;
     this.#ready = null;
     for (const entry of this.#pending.values()) {
@@ -102,10 +116,7 @@ export class BeatThisWorker {
       entry.reject(err);
     }
     this.#pending.clear();
-  }
-
-  #kill() {
-    try { this.#proc?.kill('SIGKILL'); } catch { /* already gone */ }
+    try { proc.kill('SIGKILL'); } catch { /* already gone */ }
   }
 
   #fail(err) {
@@ -113,7 +124,7 @@ export class BeatThisWorker {
     if (this.#failures >= MAX_CONSECUTIVE_FAILURES && !this.disabled) {
       this.disabled = true;
       log.warn({ event: 'audio.beat_this.disabled', err }, 'Beat This! が続けて失敗したため、拍の検出を aubio に戻す');
-      this.#kill();
+      if (this.#proc) this.#discard(this.#proc, err);
     }
   }
 
@@ -124,14 +135,14 @@ export class BeatThisWorker {
       try {
         await this.#start(device);
         const id = this.#nextId++;
+        const proc = this.#proc;
         const result = await new Promise((resolve, reject) => {
           const timer = setTimeout(() => {
-            this.#pending.delete(id);
-            reject(new Error(`Beat This! timed out after ${this.#requestTimeoutMs}ms`));
-            this.#kill(); // a wedged worker restarts on the next request
+            // A wedged worker: replace it before the next queued request runs.
+            this.#discard(proc, new Error(`Beat This! timed out after ${this.#requestTimeoutMs}ms`));
           }, this.#requestTimeoutMs);
           this.#pending.set(id, { resolve, reject, timer });
-          this.#proc.stdin.write(`${JSON.stringify({ id, path: filePath })}\n`);
+          proc.stdin.write(`${JSON.stringify({ id, path: filePath })}\n`);
         });
         this.#failures = 0;
         return { beatsSec: result.beats, downbeatsSec: result.downbeats, inferMs: result.inferMs };
@@ -147,7 +158,7 @@ export class BeatThisWorker {
 
   close() {
     this.disabled = true;
-    this.#kill();
+    if (this.#proc) this.#discard(this.#proc, new Error('Beat This! worker closed'));
   }
 }
 
