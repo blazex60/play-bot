@@ -68,8 +68,12 @@ export function stemSeparationConfig(env = process.env) {
     enabled: readBool(env, 'STEM_SEPARATION_ENABLED', true),
     /** OMP/MKL threads for Demucs on the stem queue. 4 is the measured sweet spot. */
     threads: readNumber(env, 'DEMUCS_THREADS', 4, { min: 1, integer: true }),
-    /** Seconds of compute per second of audio at the configured thread count. */
-    rtf: readNumber(env, 'STEM_SEPARATION_RTF', 1.25, { min: 0.05 }),
+    /**
+     * Seconds of compute per second of audio at the configured thread count.
+     * The idle benchmark gave 1.24; live production runs (sharing the host
+     * with playback and other bots) came in at 1.31-1.76, so 1.5.
+     */
+    rtf: readNumber(env, 'STEM_SEPARATION_RTF', 1.5, { min: 0.05 }),
     /** Fixed per-run cost (model load etc.). */
     fixedSec: readNumber(env, 'STEM_SEPARATION_FIXED_SEC', 10, { min: 0 }),
     /** Headroom for CPU contention with playback and other bots. */
@@ -81,6 +85,11 @@ export function stemSeparationConfig(env = process.env) {
     /** How long the breaker stays open. */
     circuitCooldownMs: readNumber(env, 'STEM_CIRCUIT_COOLDOWN_MS', 60 * 60_000, { min: 0 }),
   };
+}
+
+/** Expected wall time of one separation of the usual head + tail windows (no safety factor). */
+export function estimateSeparationSec(config = stemSeparationConfig(), audioSec = STEM_HEAD_WINDOW_SEC + STEM_TAIL_WINDOW_SEC) {
+  return config.rtf * audioSec + config.fixedSec;
 }
 
 /** Timeout for separating `audioSec` seconds of audio; the cap when the length is unknown. */

@@ -25,7 +25,7 @@ import { getAnalysisQueue, getStemPreparationQueue } from '../audio/analysisQueu
 import { getCachedStems, isStemSeparationAvailable, separateTrackStems } from '../audio/stemCache.js';
 import { isStemJobRelevantFor } from './player/stemRelevance.js';
 import { analyzeVocalActivityFromStems } from '../audio/vocalActivity.js';
-import { stemSeparationConfig } from '../audio/stemConfig.js';
+import { estimateSeparationSec, stemSeparationConfig } from '../audio/stemConfig.js';
 import { planStemTransition } from '../audio/stemTransition.js';
 import { logTransitionPlan, logGaplessTransition } from '../audio/transitionLog.js';
 import { StemPreparationState, StemPrefetchTracker } from '../audio/stemPrefetch.js';
@@ -241,7 +241,18 @@ export class GuildPlayer {
     // transition can still involve: the one playing (its tail) and the next
     // two (B's head now, C's once B plays). Same window as
     // SourcePreparer.prefetchUpcoming(), including the QUEUE-loop wrap.
-    const isStemJobRelevant = (videoId) => isStemJobRelevantFor(queue, videoId);
+    // The current track only counts while its job can still finish before
+    // the track does — otherwise its tail stems arrive after its own exit.
+    const isStemJobRelevant = (videoId) => {
+      const current = queue.current;
+      const durationSec = current ? this.#resolvePlaybackDurationSec(current) : null;
+      const currentRemainingSec = Number.isFinite(durationSec) ? durationSec - this.trackPositionSec : null;
+      return isStemJobRelevantFor(queue, videoId, {
+        currentRemainingSec,
+        // 1.2×: production CPU runs came in up to ~17% over the configured RTF.
+        minRemainingSec: estimateSeparationSec(stemSeparationConfig()) * 1.2,
+      });
+    };
     const stemSeparationAvailable = isStemSeparationAvailableFn ?? (() => isStemSeparationAvailable());
     this.#analysis = new AnalysisCoordinator({
       analyzeTrackFileFn,
@@ -258,6 +269,10 @@ export class GuildPlayer {
       analyzeVocalFromStemsFn,
       isStemSeparationEnabledFn: () => stemSeparationConfig().enabled,
       getCachedStemsFn,
+      // B's stems settling (ready or failed) is what lets C's LOW prefetch
+      // start (SourcePreparer #ensureStemPrefetch) — re-evaluate C now so it
+      // does not wait for the next track change.
+      onStemPrefetchSettled: () => this.#sourcePreparer?.retryDeferredStemPrefetch(),
     });
     // Next-source preparation — the prefetch window, the prepared incoming
     // source, and the prepared stem pairs — lives in the SourcePreparer

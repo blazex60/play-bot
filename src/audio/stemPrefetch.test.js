@@ -171,3 +171,25 @@ test('stemPrefetch: snapshot() returns independent copies, not live references',
   snap[0].state = StemPreparationState.READY;
   assert.equal(tracker.get('vid-b').state, StemPreparationState.QUEUED, 'mutating a snapshot entry must not affect tracker state');
 });
+
+test('stemPrefetch: release() marks a QUEUED entry held so prune() can collect it; in-flight work is kept', () => {
+  const tracker = new StemPrefetchTracker();
+  tracker.queue('c', StemPrefetchPriority.LOW);
+  tracker.release('c');
+  assert.equal(tracker.get('c').state, StemPreparationState.QUEUED, 'still visible while held');
+  tracker.prune(new Set(['c']));
+  assert.ok(tracker.get('c'), 'kept while still in the window');
+  tracker.prune(new Set());
+  assert.equal(tracker.get('c'), null, 'collected once it leaves the window');
+
+  tracker.queue('r', StemPrefetchPriority.LOW);
+  tracker.markReady('r');
+  tracker.release('r');
+  assert.equal(tracker.get('r').state, StemPreparationState.QUEUED, 'a READY entry whose cache missed is waiting again');
+  assert.equal(tracker.get('r').held, true);
+
+  tracker.queue('b', StemPrefetchPriority.HIGH);
+  tracker.markProcessing('b');
+  tracker.release('b');
+  assert.equal(tracker.get('b').state, StemPreparationState.PROCESSING, 'in-flight work is never forgotten');
+});

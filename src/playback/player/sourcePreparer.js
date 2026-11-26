@@ -5,7 +5,7 @@ import {
 import { createStreamSource, createFileSource } from '../../audio/pcmSource.js';
 import { probeDurationSec } from '../../audio/duration.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../../audio/analysisQueue.js';
-import { StemPrefetchPriority } from '../../audio/stemPrefetch.js';
+import { StemPrefetchPriority, StemPreparationState } from '../../audio/stemPrefetch.js';
 import { LoopMode } from '../queue.js';
 import { getLogger } from '../../logging/appLogger.js'
 import { findStemWindow } from '../../audio/stemConfig.js';
@@ -722,7 +722,10 @@ export class SourcePreparer {
             // prefetchUpcoming() tick's getCachedStemsFn() probe (above)
             // is what actually detects real separation completion; this
             // only catches the one failure mode visible from here.
-            if (result?.error) this.#stemPrefetchTracker.markFailed(videoId);
+            if (result?.error) {
+              this.#stemPrefetchTracker.markFailed(videoId);
+              this.retryDeferredStemPrefetch();
+            }
           });
         }
         return;
@@ -733,12 +736,33 @@ export class SourcePreparer {
       // separated; with separation switched off or the circuit breaker open
       // that is pure waste, and it would be retried on every prefetch pass.
       if (!this.#isStemSeparationAvailableFn()) return;
+      // C must not take the (serial, non-preemptible) stem queue before B:
+      // at session start C's prefetch is ready seconds after /play while B
+      // still waits on analysis, and in production C's 4-minute run made
+      // the first two transitions miss stems. Hold C while B's stem prefetch
+      // is actually in progress; retryDeferredStemPrefetch() re-evaluates C
+      // as soon as B settles. A B that is not being processed at all (no
+      // normalized file, e.g. a long or live track) does not hold C.
+      if (this.#nextStemPrefetchInProgress()) {
+        this.#stemPrefetchTracker.release(videoId);
+        return;
+      }
+      // A concurrent evaluation may have released the entry while this one
+      // was awaiting the cache check; make sure it is tracked again.
+      this.#stemPrefetchTracker.queue(videoId, priority);
       this.#lowPriorityStemPrefetch.add(videoId);
       this.#stemPrefetchTracker.markProcessing(videoId);
       this.#runLowPriorityStemPrefetch(track)
         .then((stems) => {
           if (stems) this.#stemPrefetchTracker.markReady(videoId);
           else this.#stemPrefetchTracker.markFailed(videoId);
+          // C's analysis usually exists by now (analysis lookahead); fill its
+          // vocal fields right away rather than when C later becomes B.
+          if (stems) {
+            this.#analysis.enrichVocalFromStems(track, stems).catch((err) => {
+              log.warn({ event: 'playback.vocal_analysis_from_stems_failed', trackId: videoId, err }, 'ステムからのボーカル解析に失敗');
+            });
+          }
         })
         .catch((err) => {
           if (err?.code === 'ANALYSIS_KILLED') {
@@ -773,6 +797,35 @@ export class SourcePreparer {
    * Safety") — now via the stem queue's own pause/kill state, forwarded
    * from the realtime queue's underrun event (see #initMixerPipeline()).
    */
+  // "B is in progress" is read from the work itself, not the tracker state:
+  // the tracker can be re-marked PROCESSING with nothing left to settle it,
+  // is still QUEUED for a moment at session start, and is briefly FAILED
+  // between a killed attempt and its retry (code review on this change).
+  #nextStemPrefetchInProgress() {
+    const next = this.#queue.loopMode === LoopMode.TRACK ? null : this.#queue.wrappedUpcoming(1)[0];
+    if (!next?.videoId) return false;
+    const key = this.prefetchKey(next);
+    const full = key ? this.#prefetchEntries.get(key) : null;
+    if (full?.kind === 'full' && full.track === next && full.pending) return true;
+    return this.#analysis.isStemAttemptInFlight(next.videoId);
+  }
+
+  /**
+   * Re-evaluates C's LOW stem prefetch after B's settles (ready or failed),
+   * so C starts right away instead of at the next track change. Narrower
+   * than prefetchUpcoming(): it does not touch full/analysis prefetch.
+   */
+  retryDeferredStemPrefetch() {
+    if (this.#queue.loopMode === LoopMode.TRACK) return;
+    const second = this.#queue.wrappedUpcoming(2)[1];
+    // Only a C that was actually held back needs another look; re-probing
+    // one that already started (or finished) would just add cache lookups.
+    if (!second?.videoId || !this.#stemPrefetchTracker.get(second.videoId)?.held) return;
+    if (isNormalizeDurationAllowed(second)) {
+      this.#ensureStemPrefetch(second, StemPrefetchPriority.LOW);
+    }
+  }
+
   async #runLowPriorityStemPrefetch(track) {
     return this.#stemQ().enqueue(async ({ spawnNice, signal, pausedMs } = {}) => {
       throwIfAborted(signal);
@@ -830,17 +883,20 @@ export class SourcePreparer {
     if (existing?.kind === 'full' && existing.track === track) return;
     if (existing) this.#discardPrefetchKey(key);
 
-    this.#prefetchEntries.set(key, {
-      kind: 'full',
-      track,
-      promise: this.#prefetchTrackFn(track).then(
-        (value) => {
-          this.#analysis.scheduleAnalysis(track, value.filePath);
-          return { value };
-        },
-        (error) => ({ error }),
-      ),
+    const entry = { kind: 'full', track, pending: true, promise: null };
+    entry.promise = this.#prefetchTrackFn(track).then(
+      (value) => {
+        // scheduleAnalysis() registers the separation attempt synchronously,
+        // so clearing `pending` after it leaves no gap where C could slip in.
+        this.#analysis.scheduleAnalysis(track, value.filePath);
+        return { value };
+      },
+      (error) => ({ error }),
+    ).finally(() => {
+      entry.pending = false;
+      this.retryDeferredStemPrefetch();
     });
+    this.#prefetchEntries.set(key, entry);
   }
 
   #ensureAnalysisPrefetch(track) {

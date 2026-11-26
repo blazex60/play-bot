@@ -17,7 +17,7 @@ test('stemSeparationConfig: measured defaults, env overrides, bad values fall ba
   const d = stemSeparationConfig({})
   assert.equal(d.enabled, true)
   assert.equal(d.threads, 4)
-  assert.equal(d.rtf, 1.25)
+  assert.equal(d.rtf, 1.5)
   assert.equal(d.timeoutCapMs, 600_000)
   const o = stemSeparationConfig({ STEM_SEPARATION_ENABLED: 'off', DEMUCS_THREADS: '2', STEM_SEPARATION_RTF: '2.1' })
   assert.equal(o.enabled, false)
@@ -25,14 +25,14 @@ test('stemSeparationConfig: measured defaults, env overrides, bad values fall ba
   assert.equal(o.rtf, 2.1)
   const bad = stemSeparationConfig({ DEMUCS_THREADS: '0', STEM_SEPARATION_RTF: 'fast', STEM_SEPARATION_ENABLED: 'maybe' })
   assert.equal(bad.threads, 4)
-  assert.equal(bad.rtf, 1.25)
+  assert.equal(bad.rtf, 1.5)
   assert.equal(bad.enabled, true)
 })
 
 test('estimateSeparationTimeoutMs: (rtf × audio + fixed) × safety, capped; unknown length gets the cap', () => {
   const config = stemSeparationConfig({})
-  // 135 s of windows: (1.25 × 135 + 10) × 2 = 357.5 s
-  assert.equal(estimateSeparationTimeoutMs(135, config), 357_500)
+  // 135 s of windows: (1.5 × 135 + 10) × 2 = 425 s
+  assert.equal(estimateSeparationTimeoutMs(135, config), 425_000)
   assert.equal(estimateSeparationTimeoutMs(10_000, config), 600_000)
   assert.equal(estimateSeparationTimeoutMs(null, config), 600_000)
   // The old fixed 600 s limit vs. the measured 1-thread cost of a 336 s track

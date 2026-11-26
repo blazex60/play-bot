@@ -335,18 +335,17 @@ export function createAnalysisQueue({
     // before a HIGH job requested afterward. `priority: 'high'` now
     // inserts ahead of every PENDING (not yet started) non-high job,
     // preserving relative order within each priority tier.
+    // 'low' (stem plan: C's speculative prefetch) sits behind every pending
+    // normal/high job, so it only ever uses otherwise idle queue time.
     enqueue(fn, { priority = 'normal' } = {}) {
       return new Promise((resolve, reject) => {
         const job = { fn, resolve, reject, priority };
-        if (priority === 'high') {
-          let insertAt = jobs.length;
-          for (let i = 0; i < jobs.length; i += 1) {
-            if (jobs[i].priority !== 'high') { insertAt = i; break; }
-          }
-          jobs.splice(insertAt, 0, job);
-        } else {
-          jobs.push(job);
+        const rank = (p) => (p === 'high' ? 0 : p === 'low' ? 2 : 1);
+        let insertAt = jobs.length;
+        for (let i = 0; i < jobs.length; i += 1) {
+          if (rank(jobs[i].priority) > rank(priority)) { insertAt = i; break; }
         }
+        jobs.splice(insertAt, 0, job);
         pump();
       });
     },

@@ -112,6 +112,8 @@ export class AnalysisCoordinator {
   #isStemSeparationEnabledFn;
   /** stemCache.js getCachedStems — lets enrichment use stems already on disk. */
   #getCachedStemsFn;
+  /** Called after a tracked stem prefetch settles (player re-runs prefetchUpcoming). */
+  #onStemPrefetchSettled;
   /** Routes a settled analysis result back to the player's duration/tempo apply step. */
   #applyAnalysisDuration;
 
@@ -130,6 +132,7 @@ export class AnalysisCoordinator {
     analyzeVocalFromStemsFn = null,
     isStemSeparationEnabledFn = () => true,
     getCachedStemsFn = null,
+    onStemPrefetchSettled = null,
   }) {
     this.#analyzeTrackFileFn = analyzeTrackFileFn;
     this.#getTrackAnalysisFn = getTrackAnalysisFn;
@@ -145,6 +148,7 @@ export class AnalysisCoordinator {
     this.#analyzeVocalFromStemsFn = analyzeVocalFromStemsFn;
     this.#isStemSeparationEnabledFn = isStemSeparationEnabledFn;
     this.#getCachedStemsFn = getCachedStemsFn;
+    this.#onStemPrefetchSettled = onStemPrefetchSettled;
   }
 
   #analysisQ() {
@@ -203,6 +207,9 @@ export class AnalysisCoordinator {
       if (stagedPath) cleanupTempFile(stagedPath).catch(() => {});
       if (this.#scheduledAnalysisTokens.get(track.videoId) === analysisToken) {
         this.#scheduledAnalysisTokens.delete(track.videoId);
+        // The whole attempt (including any kill retry) is over only here —
+        // this, not the earlier tracker settle, is what lets C proceed.
+        this.#onStemPrefetchSettled?.();
       }
     };
 
@@ -234,6 +241,21 @@ export class AnalysisCoordinator {
         // Skip rather than start a many-minute Demucs run against a job
         // the (realtime) queue already decided to cancel (e.g. a mixer
         // underrun killed this job right as runAnalysis finished).
+        // Stems already on disk (separated earlier, or by C's LOW prefetch):
+        // use them now instead of queueing a job that would only find them
+        // in the cache after waiting behind a running Demucs (~4 min seen in
+        // production).
+        const cachedStems = !signal?.aborted && this.#getCachedStemsFn
+          ? await this.#getCachedStemsFn(track.videoId).catch(() => null)
+          : null;
+        if (cachedStems) {
+          this.#settleStemPrefetch(track.videoId, true);
+          this.enrichVocalFromStems(track, cachedStems).catch((err) => {
+            log.warn({ event: 'playback.vocal_analysis_from_stems_failed', trackId: track.videoId, err }, 'ステムからのボーカル解析に失敗');
+          });
+          finishAnalysisAttempt(stagedPath);
+          return analysis;
+        }
         if (!signal?.aborted && stagedPath && this.#isStemSeparationAvailableFn()) {
           // Phase 9C (docs/mix-transition-phase9.md §5): dispatch the
           // heavy full-track Demucs step on the dedicated
@@ -308,8 +330,8 @@ export class AnalysisCoordinator {
               // untouched by this (§4.2: 9B doesn't change #ensureOutgoingStemPrep()'s
               // existing treatment of A).
               if (this.#stemPrefetchTracker.get(track.videoId)) {
-                if (stems) this.#stemPrefetchTracker.markReady(track.videoId);
-                else this.#stemPrefetchTracker.markFailed(track.videoId);
+                if (stems) this.#settleStemPrefetch(track.videoId, true);
+                else this.#settleStemPrefetch(track.videoId, false);
               }
               if (stems) {
                 this.enrichVocalFromStems(track, stems).catch((err) => {
@@ -320,7 +342,7 @@ export class AnalysisCoordinator {
             (err) => {
               log.warn({ event: 'playback.stem_separation_failed', err }, 'ステム分離に失敗');
               if (this.#stemPrefetchTracker.get(track.videoId)) {
-                this.#stemPrefetchTracker.markFailed(track.videoId);
+                this.#settleStemPrefetch(track.videoId, false);
               }
               // Codex review (PR #45, P2): a stem-queue-level ANALYSIS_KILLED
               // (this queue's own pause/kill machinery preempting the job,
@@ -367,7 +389,7 @@ export class AnalysisCoordinator {
           // reporting PROCESSING forever (prune() deliberately never
           // collects a PROCESSING/QUEUED entry) — a later
           // #prefetchUpcoming() checkpoint will retry it.
-          this.#stemPrefetchTracker.markFailed(track.videoId);
+          this.#settleStemPrefetch(track.videoId, false);
         }
         finishAnalysisAttempt(stagedPath);
         return analysis;
@@ -389,7 +411,7 @@ export class AnalysisCoordinator {
       // forever" reasoning.
       const tracked = this.#stemPrefetchTracker.get(track.videoId);
       if (tracked) {
-        this.#stemPrefetchTracker.markFailed(track.videoId);
+        this.#settleStemPrefetch(track.videoId, false);
       }
       if (err?.code === 'ANALYSIS_KILLED') {
         log.warn({ event: 'playback.analysis_yielded_to_mixer', err }, '解析をミキサーに譲渡');
@@ -529,6 +551,18 @@ export class AnalysisCoordinator {
       vocalConfidence: enriched.vocalConfidence,
     }, 'ステムからボーカル解析を反映');
     return enriched;
+  }
+
+  /** Marks a tracked (B/C) stem prefetch as done. C is released separately, in finishAnalysisAttempt. */
+  #settleStemPrefetch(videoId, ok) {
+    if (!this.#stemPrefetchTracker.get(videoId)) return;
+    if (ok) this.#stemPrefetchTracker.markReady(videoId);
+    else this.#stemPrefetchTracker.markFailed(videoId);
+  }
+
+  /** Whether an analysis → separation attempt (incl. a pending retry) for this track is still running. */
+  isStemAttemptInFlight(videoId) {
+    return Boolean(videoId) && this.#scheduledAnalysisTokens.has(videoId);
   }
 
   async resolveAnalysis(track, filePath = null) {
