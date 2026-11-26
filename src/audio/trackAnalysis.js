@@ -3,6 +3,8 @@ import { BYTES_PER_SECOND } from './fade.js';
 import { analyzeVocalActivity, parseRmsLevels, TAIL_WINDOW_SEC } from './vocalActivity.js';
 import { analyzeKeys } from './keyAnalysis.js';
 import { analyzeDownbeats } from './downbeatAnalysis.js';
+import { buildBeatThisGrids } from './beatGrid.js';
+import { trackBeatsWithBeatThis } from './beatThis.js';
 import { buildPhraseCandidates } from './phraseAnalysis.js';
 import { spawnCapture } from './spawnCapture.js';
 
@@ -17,7 +19,14 @@ import { spawnCapture } from './spawnCapture.js';
 // (applyVocalActivity) instead of a single-threaded Demucs pass that timed
 // out for most v4 rows; bumping re-analyzes those (and v4 rows stuck with
 // bpm: null) the next time each track is played.
-export const ANALYSIS_VERSION = 5;
+// v6: beats and downbeats come from Beat This! (whole track, GPU) when it is
+// available; aubio + the low-band downbeat heuristic remain the fallback.
+// isReusableAnalysis() keeps v5 rows while Beat This! is unavailable.
+export const ANALYSIS_VERSION = 6;
+// Oldest version the internal API still hands to the bot. v5 differs from v6
+// only in the beat tracker, so isReusableAnalysis() decides per host whether
+// to keep it (no GPU) or re-analyze it (Beat This! available).
+export const MIN_SERVED_ANALYSIS_VERSION = 5;
 // Phase 7 §9.2 prefers entry points in the first 0-30s of the incoming
 // track; keep the BPM window and the vocal head window (vocalActivity.js
 // HEAD_WINDOW_SEC) the same length so beatGrid/vocal boundaries line up.
@@ -342,6 +351,9 @@ export async function analyzeTrackFile(filePath, {
   // exist. hasVocalAnalysis() treats 'none' as "not verified", so a deferred
   // analysis is never mistaken for a vocal-safe one in the meantime.
   vocalActivity: vocalMode = 'demucs',
+  // Whole-track beats/downbeats from Beat This! (null when it is not in use
+  // or failed); aubio's head/tail windows are the fallback.
+  beatTrackerFn = trackBeatsWithBeatThis,
 } = {}) {
   throwIfAborted(signal);
   let duration = durationSec;
@@ -363,7 +375,7 @@ export async function analyzeTrackFile(filePath, {
   const headWindow = Math.min(HEAD_BPM_WINDOW_SEC, duration);
   const tailWindow = Math.min(TAIL_BPM_WINDOW_SEC, duration);
 
-  const [tail, headBpm, tailBpm, vocal, keys] = await Promise.all([
+  const [tail, headBpmAubio, tailBpmAubio, vocal, keys, tracked] = await Promise.all([
     analyzeTailShape(filePath, duration, spawnFn),
     analyzeBpmWindow(filePath, { startSec: 0, windowSec: headWindow, spawnFn, role: 'head' })
       .catch(() => ({ available: false, bpm: null, confidence: 0, firstBeatSec: null, beatsSec: [] })),
@@ -374,8 +386,21 @@ export async function analyzeTrackFile(filePath, {
       : analyzeVocalActivity(filePath, { durationSec: duration, spawnFn }).catch(() => noVocalResult())),
     analyzeKeys(filePath, duration, { spawnFn })
       .catch(() => ({ headKey: null, tailKey: null, harmonicConfidence: 0 })),
+    Promise.resolve(beatTrackerFn ? beatTrackerFn(filePath) : null).catch(() => null),
   ]);
   throwIfAborted(signal);
+
+  const beatThis = tracked?.beatsSec?.length
+    ? buildBeatThisGrids(tracked, { headWindowSec: headWindow, tailStartSec: tailStart, tailWindowSec: tailWindow })
+    : null;
+  const fromGrid = (grid, fallback) => (grid
+    ? { bpm: grid.bpm, confidence: 0.6, firstBeatSec: grid.beatsSec[0] ?? null, beatsSec: grid.beatsSec }
+    : fallback);
+  // A window Beat This! could not grid (e.g. a beatless intro) stays empty
+  // rather than borrowing aubio's BPM, so the BPM always matches beatGrid.
+  const noGrid = { bpm: null, confidence: 0, firstBeatSec: null, beatsSec: [] };
+  const headBpm = beatThis ? fromGrid(beatThis.head, noGrid) : headBpmAubio;
+  const tailBpm = beatThis ? fromGrid(beatThis.tail, noGrid) : tailBpmAubio;
 
   const overlapSec = recommendOverlapSec(tail.shape, duration);
   const bpm = tailBpm.bpm ?? headBpm.bpm ?? null;
@@ -387,13 +412,15 @@ export async function analyzeTrackFile(filePath, {
   const vocalConfidence = vocal.vocalConfidence ?? 0;
   const harmonicConfidence = keys.harmonicConfidence ?? 0;
 
-  const beatGrid = {
+  const beatGrid = beatThis?.beatGrid ?? {
     source: 'aubio',
     head: { startSec: 0, beatsSec: headBpm.beatsSec ?? [] },
     tail: { startSec: tailStart, beatsSec: tailBpm.beatsSec ?? [] },
   };
-  const headBeatConfidence = beatGridConfidence(beatGrid.head.beatsSec, headWindow);
-  const tailBeatConfidence = beatGridConfidence(beatGrid.tail.beatsSec, tailWindow);
+  // Beat This!: how well the detected beats sit on the fitted grid. aubio:
+  // interval regularity + coverage (its grid is not fitted).
+  const headBeatConfidence = beatThis ? (beatThis.head?.confidence ?? 0) : beatGridConfidence(beatGrid.head.beatsSec, headWindow);
+  const tailBeatConfidence = beatThis ? (beatThis.tail?.confidence ?? 0) : beatGridConfidence(beatGrid.tail.beatsSec, tailWindow);
   // Both windows can independently report a tight, regular grid while
   // describing different (half/double-related) tempos — that's not a
   // trustworthy beat grid for tempo sync, so dampen it the same way
@@ -405,8 +432,10 @@ export async function analyzeTrackFile(filePath, {
   );
 
   const [downbeatGrid, headFeatures, tailFeatures] = await Promise.all([
-    analyzeDownbeats(filePath, { durationSec: duration, beatGrid, spawnFn })
-      .catch(() => ({ source: 'heuristic', meter: 4, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] }, confidence: 0 })),
+    (beatThis
+      ? Promise.resolve(beatThis.downbeatGrid)
+      : analyzeDownbeats(filePath, { durationSec: duration, beatGrid, spawnFn })
+        .catch(() => ({ source: 'heuristic', meter: 4, head: { downbeatsSec: [] }, tail: { downbeatsSec: [] }, confidence: 0 }))),
     measureRmsEnvelope(filePath, { startSec: 0, windowSec: headWindow, spawnFn })
       .catch(() => ({ ok: false, levels: [] })),
     measureRmsEnvelope(filePath, { startSec: tailStart, windowSec: tailWindow, spawnFn })
@@ -435,6 +464,7 @@ export async function analyzeTrackFile(filePath, {
     tailBpm: tailBpm.bpm ?? null,
     headBeatOffsetSec: headBpm.firstBeatSec ?? 0,
     tailBeatOffsetSec: tailBpm.firstBeatSec ?? null,
+    beatSource: beatGrid.source,
     beatGrid,
     downbeatGrid,
     phrases,

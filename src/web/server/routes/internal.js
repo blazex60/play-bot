@@ -1,5 +1,5 @@
 import { bindRouteError, nowUnix, recordOperationLog } from './route-utils.js'
-import { ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
+import { ANALYSIS_VERSION, MIN_SERVED_ANALYSIS_VERSION } from '../../../audio/trackAnalysis.js'
 
 // Mirrors the operation_logs CHECK(source IN (...)) constraint. recordOperationLog
 // only console.errors on an insert failure (never rethrows), so without this
@@ -105,7 +105,9 @@ export async function internalRoutes(app, {
       FROM track_analysis WHERE video_id = ?
     `).get(videoId)
     if (!row) return reply.code(404).send({ error: 'not_found' })
-    if ((row.version ?? 1) < ANALYSIS_VERSION) {
+    // Rows down to MIN_SERVED_ANALYSIS_VERSION go to the bot, which decides
+    // whether to reuse them (isReusableAnalysis); older ones are a miss.
+    if ((row.version ?? 1) < MIN_SERVED_ANALYSIS_VERSION) {
       return reply.code(404).send({ error: 'stale_analysis' })
     }
     return reply.send({

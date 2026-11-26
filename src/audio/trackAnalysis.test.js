@@ -309,3 +309,37 @@ test('applyVocalActivity leaves the analysis alone when the vocal result failed'
   const base = await analyzeTrackFile('/tmp/fake-apply2.wav', { durationSec: 200, spawnFn: recordingSpawn([]), vocalActivity: 'deferred' })
   assert.equal(applyVocalActivity(base, { ok: false, source: 'none' }), base)
 })
+
+// --- Beat This! as the beat tracker (.omc/plans/beat-this-integration.md) ---
+
+test('analyzeTrackFile takes beats and downbeats from Beat This! when it returns a track', async () => {
+  const period = 60 / 150
+  const beatsSec = []
+  for (let t = 0.2; t < 200; t += period) beatsSec.push(Math.round(t / 0.02) * 0.02)
+  const downbeatsSec = beatsSec.filter((_, i) => i % 4 === 0)
+  const r = await analyzeTrackFile('/tmp/fake-beatthis.wav', {
+    durationSec: 200,
+    spawnFn: recordingSpawn([]),
+    vocalActivity: 'deferred',
+    beatTrackerFn: async () => ({ beatsSec, downbeatsSec }),
+  })
+  assert.equal(r.version, 6)
+  assert.equal(r.beatSource, 'beat_this')
+  assert.equal(r.beatGrid.source, 'beat_this')
+  assert.equal(r.downbeatGrid.source, 'beat_this')
+  assert.ok(Math.abs(r.headBpm - 150) < 0.3 && Math.abs(r.tailBpm - 150) < 0.3, `${r.headBpm}/${r.tailBpm}`)
+  assert.ok(r.beatConfidence >= 0.5, `beat confidence ${r.beatConfidence}`)
+  assert.ok(r.downbeatGrid.confidence >= 0.4, `downbeat confidence ${r.downbeatGrid.confidence}`)
+  assert.ok(r.beatGrid.tail.beatsSec.every((t) => t >= r.beatGrid.tail.startSec))
+})
+
+test('analyzeTrackFile falls back to aubio when Beat This! returns nothing', async () => {
+  const r = await analyzeTrackFile('/tmp/fake-aubio.wav', {
+    durationSec: 200,
+    spawnFn: recordingSpawn([]),
+    vocalActivity: 'deferred',
+    beatTrackerFn: async () => null,
+  })
+  assert.equal(r.beatSource, 'aubio')
+  assert.equal(r.downbeatGrid.source, 'heuristic')
+})
