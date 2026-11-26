@@ -15,6 +15,7 @@ import { startBotApi } from './botApi.js'
 import { checkCommandAllowed } from './permissions.js'
 import { getAppLogger, getLogger, installProcessHandlers } from '../logging/appLogger.js'
 import { randomUUID } from 'node:crypto'
+import { resolveDemucsDevice } from '../audio/demucsDevice.js'
 
 const log = getLogger('main')
 installProcessHandlers()
@@ -48,6 +49,9 @@ for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js') && !f
 
 client.once(Events.ClientReady, c => {
   log.info({ event: 'bot.ready', clientId: c.user.id, guildCount: c.guilds.cache.size, commandCount: commands.size })
+  // Decide CPU/GPU before the first cache lookup: whether a cached v5
+  // analysis is reused depends on Beat This! (GPU) being available.
+  resolveDemucsDevice().catch(() => {})
   startBotApi({ client, sessions, commandNames: [...commands.keys()] }).catch(err => {
     log.error({ event: 'botapi.failed_to_start', err }, '起動に失敗')
     process.exitCode = 1

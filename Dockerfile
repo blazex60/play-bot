@@ -52,6 +52,14 @@ RUN python3 -m venv /opt/demucs-venv \
   && /opt/demucs-venv/bin/pip install --no-cache-dir numpy demucs \
   && /opt/demucs-venv/bin/python -c "from demucs.pretrained import get_model; get_model('htdemucs')"
 
+# Beat This! (CPJKU, MIT code and weights) for beats/downbeats on the GPU
+# (src/audio/beatThis.js). --no-deps so it cannot replace the pinned
+# cu126 torch above; its other runtime deps are listed explicitly. The
+# final0 checkpoint (77 MB) is fetched at build time into TORCH_HOME.
+RUN /opt/demucs-venv/bin/pip install --no-cache-dir --no-deps beat-this==1.1.0 rotary-embedding-torch==0.9.2 \
+  && /opt/demucs-venv/bin/pip install --no-cache-dir einops soxr tqdm \
+  && /opt/demucs-venv/bin/python -c "from beat_this.inference import load_model; load_model('final0', 'cpu')"
+
 # Pinned so a version bump changes this line and busts the Docker layer
 # cache. An unpinned `pip install -U` stayed cached across
 # `docker compose up --build` deploys and kept running a months-old

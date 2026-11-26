@@ -2,6 +2,7 @@ import { cleanupTempFile } from '../../audio/normalize.js';
 import { ANALYSIS_VERSION, applyVocalActivity } from '../../audio/trackAnalysis.js';
 import { getAnalysisQueue, getStemPreparationQueue } from '../../audio/analysisQueue.js';
 import { StemPrefetchPriority } from '../../audio/stemPrefetch.js';
+import { isBeatThisAvailable } from '../../audio/beatThis.js';
 import { getLogger } from '../../logging/appLogger.js'
 
 const log = getLogger('GuildPlayer')
@@ -14,10 +15,19 @@ const log = getLogger('GuildPlayer')
  */
 const BPM_LESS_ANALYSIS_RETRY_AFTER_SEC = 24 * 60 * 60;
 
-export function isReusableAnalysis(cached, { nowSec = Math.floor(Date.now() / 1000) } = {}) {
-  if (!cached || (cached.version ?? 1) < ANALYSIS_VERSION) return false;
-  if (cached.bpm == null && Number.isFinite(cached.analyzedAt)
-    && nowSec - cached.analyzedAt >= BPM_LESS_ANALYSIS_RETRY_AFTER_SEC) return false;
+export function isReusableAnalysis(cached, {
+  nowSec = Math.floor(Date.now() / 1000),
+  beatThisAvailable = isBeatThisAvailable(),
+} = {}) {
+  if (!cached) return false;
+  const version = cached.version ?? 1;
+  // v5 differs from v6 only in the beat tracker: re-analyze it only when
+  // Beat This! can actually run, so a CPU-only host keeps its v5 rows.
+  if (version < ANALYSIS_VERSION && !(version === 5 && !beatThisAvailable)) return false;
+  const stale = Number.isFinite(cached.analyzedAt) && nowSec - cached.analyzedAt >= BPM_LESS_ANALYSIS_RETRY_AFTER_SEC;
+  if (cached.bpm == null && stale) return false;
+  // An aubio fallback (GPU was down) is retried once Beat This! is back.
+  if (version >= ANALYSIS_VERSION && cached.beatSource === 'aubio' && beatThisAvailable && stale) return false;
   return true;
 }
 
